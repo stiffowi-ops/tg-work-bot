@@ -882,44 +882,43 @@ async def ensure_jobs_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         return True
 
     try:
-        # Логируем создание jobs
         logger.info(f"📅 Creating jobs for chat {chat_id}")
 
-        # Ежедневная викторина (Только будни: 0-4 -> пн-пт)
+        # Ежедневная викторина: ПН–ПТ
         jq.run_daily(
             daily_fact_job,
             time=parse_hhmm(DAILY_FACT_TIME_STR),
-            days=(0, 1, 2, 3, 4),
+            days=(1, 2, 3, 4, 5),          # было (0, 1, 2, 3, 4)
             name=f"daily_fact_{chat_id}",
             chat_id=chat_id,
         )
-        logger.info(f"  ✅ Daily fact job: {DAILY_FACT_TIME_STR} (Mon-Fri)")
+        logger.info(f"  ✅ Daily fact job: {DAILY_FACT_TIME_STR} (Mon–Fri)")
 
-        # Напоминание о планёрке: понедельник (0), среда (2), пятница (4)
+        # Напоминание о планёрке: ПН/СР/ПТ
         jq.run_daily(
             standup_reminder_job,
             time=parse_hhmm(STANDUP_REMINDER_TIME_STR),
-            days=(0, 2, 4),
+            days=(1, 3, 5),                # было (0, 2, 4)
             name=f"standup_reminder_{chat_id}",
             chat_id=chat_id,
         )
         logger.info(f"  ✅ Standup reminder job: {STANDUP_REMINDER_TIME_STR} (Mon,Wed,Fri)")
 
-        # Рекомендация фильма: пятница (4)
+        # Рекомендация фильма: ПТ
         jq.run_daily(
             movie_recommendation_job,
             time=parse_hhmm(MOVIE_RECOMMEND_TIME_STR),
-            days=(4,),
+            days=(5,),                      # было (4,)
             name=f"movie_friday_{chat_id}",
             chat_id=chat_id,
         )
         logger.info(f"  ✅ Movie recommendation job: {MOVIE_RECOMMEND_TIME_STR} (Fri)")
 
-        # Итоги недели по викторине: пятница (4)
+        # Итоги недели по викторине: ПТ
         jq.run_daily(
             weekly_quiz_summary_job,
             time=parse_hhmm(WEEKLY_SUMMARY_TIME_STR),
-            days=(4,),
+            days=(5,),                      # было (4,)
             name=f"weekly_quiz_summary_{chat_id}",
             chat_id=chat_id,
         )
@@ -928,7 +927,7 @@ async def ensure_jobs_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         _scheduled_chats.add(chat_id)
         logger.info(f"🎯 All jobs scheduled for chat {chat_id}")
         return True
-        
+
     except Exception as e:
         logger.error(f"Failed to schedule jobs for chat {chat_id}: {e}")
         return False
