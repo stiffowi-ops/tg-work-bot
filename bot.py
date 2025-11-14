@@ -692,14 +692,14 @@ async def debug_schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🏢 Время планёрки: {STANDUP_MEETING_TIME_STR}\n"
     )
 
-    # Проверяем активные jobs
     jq = context.application.job_queue
     if jq:
         jobs = jq.jobs()
-        standup_jobs = [j for j in jobs if f"standup_reminder_{chat_id}" in j.name]
-        text += f"\n🔧 Активных jobs планёрки: {len(standup_jobs)}"
+        # Все jobs, относящиеся к этому чату (по кусочку chat_id в имени)
+        chat_jobs = [j for j in jobs if str(chat_id) in j.name]
 
-        for job in standup_jobs:
+        text += f"\n🔧 Активных jobs для этого чата: {len(chat_jobs)}"
+        for job in chat_jobs:
             text += f"\n  - {job.name}: next_run={job.next_t}"
     else:
         text += "\n❌ JobQueue не доступен"
