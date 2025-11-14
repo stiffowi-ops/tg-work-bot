@@ -663,7 +663,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/test_quiz — прислать тестовую викторину сейчас (только админы)\n"
         "/test_movie — тестовая рекомендация фильма (только админы)\n"
         "/force_standup — принудительно отправить напоминание о планёрке (только админы)\n"
-        "/top — топ участников недели по викторине (только админы)"
+        "/top — топ участников недели по викторине (только админы)\n"
+        "/init_jobs — принудительная инициализация джобов (только админы)"
     )
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -836,6 +837,19 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join(lines)
     await update.effective_message.reply_html(text)
 
+async def init_jobs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительная инициализация джобов для чата"""
+    if not await is_user_admin(update, context):
+        await update.effective_message.reply_text("Эта команда доступна только администраторам чата.")
+        return
+    
+    chat_id = update.effective_chat.id
+    success = await ensure_jobs_for_chat(context, chat_id)
+    if success:
+        await update.effective_message.reply_text("✅ Джобы инициализированы для этого чата")
+    else:
+        await update.effective_message.reply_text("❌ Не удалось инициализировать джобы")
+
 # ------------------ ДРУГИЕ ХЕНДЛЕРЫ ------------------
 
 async def greet_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -861,57 +875,63 @@ async def ensure_jobs_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
     jq = context.application.job_queue
     if not jq:
         logger.error("JobQueue missing.")
-        return
+        return False
 
     if chat_id in _scheduled_chats:
         logger.info(f"Jobs already scheduled for chat {chat_id}")
-        return
+        return True
 
-    # Логируем создание jobs
-    logger.info(f"📅 Creating jobs for chat {chat_id}")
+    try:
+        # Логируем создание jobs
+        logger.info(f"📅 Creating jobs for chat {chat_id}")
 
-    # Ежедневная викторина (Только будни: 0-4 -> пн-пт)
-    jq.run_daily(
-        daily_fact_job,
-        time=parse_hhmm(DAILY_FACT_TIME_STR),
-        days=(0, 1, 2, 3, 4),
-        name=f"daily_fact_{chat_id}",
-        chat_id=chat_id,
-    )
-    logger.info(f"  ✅ Daily fact job: {DAILY_FACT_TIME_STR} (Mon-Fri)")
+        # Ежедневная викторина (Только будни: 0-4 -> пн-пт)
+        jq.run_daily(
+            daily_fact_job,
+            time=parse_hhmm(DAILY_FACT_TIME_STR),
+            days=(0, 1, 2, 3, 4),
+            name=f"daily_fact_{chat_id}",
+            chat_id=chat_id,
+        )
+        logger.info(f"  ✅ Daily fact job: {DAILY_FACT_TIME_STR} (Mon-Fri)")
 
-    # Напоминание о планёрке: понедельник (0), среда (2), пятница (4)
-    jq.run_daily(
-        standup_reminder_job,
-        time=parse_hhmm(STANDUP_REMINDER_TIME_STR),
-        days=(0, 2, 4),
-        name=f"standup_reminder_{chat_id}",
-        chat_id=chat_id,
-    )
-    logger.info(f"  ✅ Standup reminder job: {STANDUP_REMINDER_TIME_STR} (Mon,Wed,Fri)")
+        # Напоминание о планёрке: понедельник (0), среда (2), пятница (4)
+        jq.run_daily(
+            standup_reminder_job,
+            time=parse_hhmm(STANDUP_REMINDER_TIME_STR),
+            days=(0, 2, 4),
+            name=f"standup_reminder_{chat_id}",
+            chat_id=chat_id,
+        )
+        logger.info(f"  ✅ Standup reminder job: {STANDUP_REMINDER_TIME_STR} (Mon,Wed,Fri)")
 
-    # Рекомендация фильма: пятница (4)
-    jq.run_daily(
-        movie_recommendation_job,
-        time=parse_hhmm(MOVIE_RECOMMEND_TIME_STR),
-        days=(4,),
-        name=f"movie_friday_{chat_id}",
-        chat_id=chat_id,
-    )
-    logger.info(f"  ✅ Movie recommendation job: {MOVIE_RECOMMEND_TIME_STR} (Fri)")
+        # Рекомендация фильма: пятница (4)
+        jq.run_daily(
+            movie_recommendation_job,
+            time=parse_hhmm(MOVIE_RECOMMEND_TIME_STR),
+            days=(4,),
+            name=f"movie_friday_{chat_id}",
+            chat_id=chat_id,
+        )
+        logger.info(f"  ✅ Movie recommendation job: {MOVIE_RECOMMEND_TIME_STR} (Fri)")
 
-    # Итоги недели по викторине: пятница (4)
-    jq.run_daily(
-        weekly_quiz_summary_job,
-        time=parse_hhmm(WEEKLY_SUMMARY_TIME_STR),
-        days=(4,),
-        name=f"weekly_quiz_summary_{chat_id}",
-        chat_id=chat_id,
-    )
-    logger.info(f"  ✅ Weekly summary job: {WEEKLY_SUMMARY_TIME_STR} (Fri)")
+        # Итоги недели по викторине: пятница (4)
+        jq.run_daily(
+            weekly_quiz_summary_job,
+            time=parse_hhmm(WEEKLY_SUMMARY_TIME_STR),
+            days=(4,),
+            name=f"weekly_quiz_summary_{chat_id}",
+            chat_id=chat_id,
+        )
+        logger.info(f"  ✅ Weekly summary job: {WEEKLY_SUMMARY_TIME_STR} (Fri)")
 
-    _scheduled_chats.add(chat_id)
-    logger.info(f"🎯 All jobs scheduled for chat {chat_id}")
+        _scheduled_chats.add(chat_id)
+        logger.info(f"🎯 All jobs scheduled for chat {chat_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to schedule jobs for chat {chat_id}: {e}")
+        return False
 
 async def auto_ensure_jobs_for_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Любое сообщение в группе/супергруппе: убеждаемся, что для этого чата есть джобы."""
@@ -953,6 +973,7 @@ def main():
     app.add_handler(CommandHandler("test_movie", test_movie_cmd))
     app.add_handler(CommandHandler("force_standup", force_standup_cmd))
     app.add_handler(CommandHandler("top", top_cmd))
+    app.add_handler(CommandHandler("init_jobs", init_jobs_cmd))
 
     # Автоподвешивание джобов + учёт отслеживаемых по любому сообщению
     app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, auto_ensure_jobs_for_chat))
