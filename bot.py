@@ -695,7 +695,7 @@ async def debug_schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     jq = context.application.job_queue
     if jq:
         jobs = jq.jobs()
-        # Все jobs, относящиеся к этому чату (по кусочку chat_id в имени)
+        # все джобы, в имени которых есть id этого чата
         chat_jobs = [j for j in jobs if str(chat_id) in j.name]
 
         text += f"\n🔧 Активных jobs для этого чата: {len(chat_jobs)}"
