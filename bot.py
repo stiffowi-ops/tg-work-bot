@@ -1721,15 +1721,44 @@ async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TY
         logger.info(f"Scheduled jobs for chat {chat.id} (my_chat_member)")
 
 async def ensure_jobs_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Вешает джобы для конкретного чата."""
+    """Вешает джобы для конкретного чата.
+
+    Логика устойчивая:
+    * проверяем, что нужные задания реально висят в JobQueue;
+    * если что‑то пропало (например, JobQueue перезапускался), пересоздаём джобы;
+    * если всё на месте — просто выходим.
+    """
     jq = context.application.job_queue
     if not jq:
         logger.error("JobQueue missing.")
         return False
 
-    if chat_id in _scheduled_chats:
+    # Набор обязательных задач для этого чата (по именам)
+    required_job_names = {
+        f"daily_fact_{chat_id}",
+        f"standup_reminder_{chat_id}",
+        f"movie_friday_{chat_id}",
+        f"weekly_quiz_summary_{chat_id}",
+    }
+
+    # Смотрим, какие из нужных задач реально есть в очереди
+    existing_names = {job.name for job in jq.jobs() if job.name in required_job_names}
+
+    if chat_id in _scheduled_chats and required_job_names.issubset(existing_names):
+        # И флаг стоит, и все джобы на месте — ничего делать не нужно
         logger.info(f"Jobs already scheduled for chat {chat_id}")
         return True
+
+    if not required_job_names.issubset(existing_names):
+        # Что‑то отсутствует — подчистим возможные старые/битые задачи и создадим заново
+        logger.warning(
+            "Jobs marker/_scheduled_chats and real JobQueue are out of sync for chat %s. "
+            "Recreating jobs…",
+            chat_id,
+        )
+        for name in required_job_names:
+            for job in jq.get_jobs_by_name(name):
+                job.schedule_removal()
 
     try:
         logger.info(f"📅 Creating jobs for chat {chat_id}")
@@ -1782,7 +1811,9 @@ async def ensure_jobs_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         logger.error(f"Failed to schedule jobs for chat {chat_id}: {e}")
         return False
 
+
 async def auto_ensure_jobs_for_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Любое сообщение в группе/супергруппе: убеждаемся, что для этого чата есть джобы."""
     chat = update.effective_chat
     user = update.effective_user
