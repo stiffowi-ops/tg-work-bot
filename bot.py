@@ -288,7 +288,7 @@ def update_weekly_scores(chat_id: int, participants_ids: set[int], answers: list
     save_weekly_scores()
 
 def get_on_this_day_fact(dt: datetime) -> tuple[str | None, str | None]:
-    """Возвращает (текст факта без года, год события как строку) с Wikipedia OnThisDay."""
+    """Возвращает (текст факта без года, год события) с Wikipedia OnThisDay."""
     url = f"https://ru.wikipedia.org/api/rest_v1/feed/onthisday/events/{dt.month}/{dt.day}"
     headers = {"User-Agent": "tg-work-bot/1.0"}
     try:
@@ -305,7 +305,7 @@ def get_on_this_day_fact(dt: datetime) -> tuple[str | None, str | None]:
         for tag in ("<b>", "</b>", "<i>", "</i>", "<br>", "</br>"):
             text = text.replace(tag, "")
         text_without_year = text.replace(str(year), "***").replace(f"в {year}", "в ***")
-        return text_without_year, str(year)
+        return text_without_year, year
     except Exception as e:
         logger.warning(f"Wikipedia fact fetch error: {e}")
         return None, None
@@ -1168,8 +1168,8 @@ async def daily_fact_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Факт и викторина
     fact_text, correct_year = get_on_this_day_fact(today)
     if fact_text and correct_year:
-        correct_year = str(correct_year)
-        year_options = generate_year_options(correct_year)
+        correct_year_str = str(correct_year)
+        year_options = generate_year_options(correct_year_str)
         keyboard = [[InlineKeyboardButton(year, callback_data=year)] for year in year_options]
         reply_markup = InlineKeyboardMarkup(keyboard)
         quiz_message = await context.bot.send_message(
@@ -1184,7 +1184,7 @@ async def daily_fact_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         _current_quiz[chat_id] = {
             "message_id": quiz_message.message_id,
-            "correct_year": correct_year,
+            "correct_year": correct_year_str,
             "answered_users": set(),
             "answers": [],
             "winner": None,
@@ -1424,7 +1424,7 @@ async def weekly_quiz_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     # Небольшой топ-5 в конце (если есть больше одного участника)
-    если (len(week_scores) > 1):
+    if len(week_scores) > 1:
         sorted_scores = sorted(week_scores.items(), key=lambda kv: kv[1], reverse=True)
         top_lines = []
         for i, (uid_str, score) in enumerate(sorted_scores[:5], start=1):
@@ -1522,8 +1522,8 @@ async def test_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     fact_text, correct_year = get_on_this_day_fact(now_msk())
     if fact_text and correct_year:
-        correct_year = str(correct_year)
-        year_options = generate_year_options(correct_year)
+        correct_year_str = str(correct_year)
+        year_options = generate_year_options(correct_year_str)
         keyboard = [[InlineKeyboardButton(year, callback_data=year)] for year in year_options]
         reply_markup = InlineKeyboardMarkup(keyboard)
         quiz_message = await update.effective_message.reply_text(
@@ -1538,7 +1538,7 @@ async def test_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         _current_quiz[chat_id] = {
             "message_id": quiz_message.message_id,
-            "correct_year": correct_year,
+            "correct_year": correct_year_str,
             "answered_users": set(),
             "answers": [],
             "winner": None,
