@@ -281,8 +281,6 @@ def update_weekly_scores(chat_id: int, participants_ids: set[int], answers: list
         if ans:
             if ans.get("ok"):  # правильный ответ: +1
                 current_score += 1
-            else:  # неправильный: 0
-                pass
         else:  # не ответил вообще: -1
             current_score -= 1
         week_scores[uid_key] = current_score
@@ -290,7 +288,7 @@ def update_weekly_scores(chat_id: int, participants_ids: set[int], answers: list
     save_weekly_scores()
 
 def get_on_this_day_fact(dt: datetime) -> tuple[str | None, str | None]:
-    """Возвращает (текст факта без года, год события) с Wikipedia OnThisDay."""
+    """Возвращает (текст факта без года, год события как строку) с Wikipedia OnThisDay."""
     url = f"https://ru.wikipedia.org/api/rest_v1/feed/onthisday/events/{dt.month}/{dt.day}"
     headers = {"User-Agent": "tg-work-bot/1.0"}
     try:
@@ -307,7 +305,7 @@ def get_on_this_day_fact(dt: datetime) -> tuple[str | None, str | None]:
         for tag in ("<b>", "</b>", "<i>", "</i>", "<br>", "</br>"):
             text = text.replace(tag, "")
         text_without_year = text.replace(str(year), "***").replace(f"в {year}", "в ***")
-        return text_without_year, year
+        return text_without_year, str(year)
     except Exception as e:
         logger.warning(f"Wikipedia fact fetch error: {e}")
         return None, None
@@ -413,20 +411,12 @@ async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: i
     msg = await context.bot.send_message(
         chat_id,
         text=(
-            f"👑 *Администратор {admin_name} запускает игру 'Виселица'!*
-
-"
-            "📖 *Правила:*
-"
-            "• Бот загадывает слово
-"
-            "• Игроки пишут буквы в ЛС боту
-"
-            "• У команды 6 попыток
-"
-            "• Победит тот, кто угадает слово!
-
-"
+            f"👑 *Администратор {admin_name} запускает игру 'Виселица'!*\n\n"
+            "📖 *Правила:*\n"
+            "• Бот загадывает слово\n"
+            "• Игроки пишут буквы в ЛС боту\n"
+            "• У команды 6 попыток\n"
+            "• Победит тот, кто угадает слово!\n\n"
             "🎯 *Выберите категорию слов:*"
         ),
         parse_mode=ParseMode.MARKDOWN,
@@ -464,12 +454,10 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
             medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
             players_text += (
                 f"{medal} {player_data['name']}: "
-                f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}
-"
+                f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}\n"
             )
     else:
-        players_text = "❌ Нет активных игроков
-💡 Используйте /hangman_join чтобы присоединиться"
+        players_text = "❌ Нет активных игроков\n💡 Используйте /hangman_join чтобы присоединиться"
 
     # Текущая стадия виселицы
     stage_index = 6 - game["attempts_left"]
@@ -594,14 +582,12 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
         active_players.items(), key=lambda x: x[1]["correct_guesses"], reverse=True
     )
 
-    leaderboard = "🏆 *Результаты:*
-"
+    leaderboard = "🏆 *Результаты:*\n"
     for i, (player_id, player_data) in enumerate(players_sorted, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
         leaderboard += (
             f"{medal} {player_data['name']}: "
-            f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}
-"
+            f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}\n"
         )
 
     message_text = f"""
@@ -641,14 +627,12 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
         active_players.items(), key=lambda x: x[1]["correct_guesses"], reverse=True
     )
 
-    leaderboard = "📊 *Результаты:*
-"
+    leaderboard = "📊 *Результаты:*\n"
     for i, (player_id, player_data) in enumerate(players_sorted, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
         leaderboard += (
             f"{medal} {player_data['name']}: "
-            f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}
-"
+            f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}\n"
         )
 
     message_text = f"""
@@ -687,8 +671,7 @@ async def hangman_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await is_user_admin(update, context):
         await message.reply_text(
-            "❌ Только администраторы могут запускать игру!
-"
+            "❌ Только администраторы могут запускать игру!\n"
             "👑 Обратитесь к администратору чата."
         )
         return
@@ -746,21 +729,12 @@ async def handle_hangman_category_selection(update: Update, context: ContextType
             chat_id=chat_id,
             message_id=query.message.message_id,
             text=(
-                f"🎮 *Категория выбрана: {category.upper()}*
-
-"
-                "📖 Слово загадано! Игроки, пишите буквы мне в личные сообщения!
-
-"
-                "💡 *Как играть:*
-"
-                "1. Напишите боту в ЛС
-"
-                "2. Отправьте одну букву
-"
-                "3. Следите за прогрессом в чате
-
-"
+                f"🎮 *Категория выбрана: {category.upper()}*\n\n"
+                "📖 Слово загадано! Игроки, пишите буквы мне в личные сообщения!\n\n"
+                "💡 *Как играть:*\n"
+                "1. Напишите боту в ЛС\n"
+                "2. Отправьте одну букву\n"
+                "3. Следите за прогрессом в чате\n\n"
                 f"👑 Игру запустил: {game['started_by_name']}"
             ),
             parse_mode=ParseMode.MARKDOWN,
@@ -852,9 +826,7 @@ async def handle_private_guess(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.send_message(
                 chat_id=user_id,
                 text=(
-                    "🎮 Вы автоматически присоединились к игре!
-
-"
+                    "🎮 Вы автоматически присоединились к игре!\n\n"
                     "💡 Теперь можете отправлять буквы."
                 ),
             )
@@ -970,18 +942,14 @@ async def hangman_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Топ игроков
     top_players = sorted(user_scores.items(), key=lambda x: x[1], reverse=True)[:10]
 
-    stats_text = "🏆 *Топ игроков виселицы:*
-
-"
+    stats_text = "🏆 *Топ игроков виселицы:*\n\n"
     for i, (player_id, score) in enumerate(top_players, 1):
         try:
             member = await context.bot.get_chat_member(update.effective_chat.id, player_id)
             name = member.user.first_name
-            stats_text += f"{i}. {name}: {score} побед
-"
+            stats_text += f"{i}. {name}: {score} побед\n"
         except Exception:
-            stats_text += f"{i}. Игрок {player_id}: {score} побед
-"
+            stats_text += f"{i}. Игрок {player_id}: {score} побед\n"
 
     await message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -1022,9 +990,7 @@ async def hangman_admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = chat.id
     try:
         admins = await context.bot.get_chat_administrators(chat_id)
-        admin_list = "👑 *Администраторы чата:*
-
-"
+        admin_list = "👑 *Администраторы чата:*\n\n"
 
         for admin in admins:
             if not admin.user.is_bot:
@@ -1202,6 +1168,7 @@ async def daily_fact_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Факт и викторина
     fact_text, correct_year = get_on_this_day_fact(today)
     if fact_text and correct_year:
+        correct_year = str(correct_year)
         year_options = generate_year_options(correct_year)
         keyboard = [[InlineKeyboardButton(year, callback_data=year)] for year in year_options]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1457,7 +1424,7 @@ async def weekly_quiz_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     # Небольшой топ-5 в конце (если есть больше одного участника)
-    if len(week_scores) > 1:
+    если (len(week_scores) > 1):
         sorted_scores = sorted(week_scores.items(), key=lambda kv: kv[1], reverse=True)
         top_lines = []
         for i, (uid_str, score) in enumerate(sorted_scores[:5], start=1):
@@ -1476,21 +1443,12 @@ async def weekly_quiz_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "Привет, команда! 👋
-"
-        "Я ваш рабочий бот-помощник 🤖
-
-"
-        "🕘 Каждое утро по будням напомню о себе маленькой викториной с историческим фактом.
-"
-        "Обязательно участвуйте — это и полезно, и поднимает настроение! 💡✨
-
-"
-        "📣 В нужное время напомню о планёрке, чтобы никто не пропустил общий созвон и был готов к обсуждению дел дня 🧑‍💻📅
-
-"
-        "🎮 А ещё у нас есть командная игра «Виселица» — её можно запустить в чате по запросу руководителя.
-"
+        "Привет, команда! 👋\n"
+        "Я ваш рабочий бот-помощник 🤖\n\n"
+        "🕘 Каждое утро по будням напомню о себе маленькой викториной с историческим фактом.\n"
+        "Обязательно участвуйте — это и полезно, и поднимает настроение! 💡✨\n\n"
+        "📣 В нужное время напомню о планёрке, чтобы никто не пропустил общий созвон и был готов к обсуждению дел дня 🧑‍💻📅\n\n"
+        "🎮 А ещё у нас есть командная игра «Виселица» — её можно запустить в чате по запросу руководителя.\n"
         "Собирайтесь вместе, выбирайте категорию и попробуйте отгадать слово, пока человечек ещё жив! 😄🪢"
     )
     await update.effective_message.reply_text(text)
@@ -1564,6 +1522,7 @@ async def test_quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     fact_text, correct_year = get_on_this_day_fact(now_msk())
     if fact_text and correct_year:
+        correct_year = str(correct_year)
         year_options = generate_year_options(correct_year)
         keyboard = [[InlineKeyboardButton(year, callback_data=year)] for year in year_options]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1725,7 +1684,7 @@ async def ensure_jobs_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
 
     Логика устойчивая:
     * проверяем, что нужные задания реально висят в JobQueue;
-    * если что‑то пропало (например, JobQueue перезапускался), пересоздаём джобы;
+    * если что-то пропало (например, JobQueue перезапускался), пересоздаём джобы;
     * если всё на месте — просто выходим.
     """
     jq = context.application.job_queue
@@ -1750,7 +1709,7 @@ async def ensure_jobs_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         return True
 
     if not required_job_names.issubset(existing_names):
-        # Что‑то отсутствует — подчистим возможные старые/битые задачи и создадим заново
+        # Что-то отсутствует — подчистим возможные старые/битые задачи и создадим заново
         logger.warning(
             "Jobs marker/_scheduled_chats and real JobQueue are out of sync for chat %s. "
             "Recreating jobs…",
@@ -1813,7 +1772,6 @@ async def ensure_jobs_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
 
 
 async def auto_ensure_jobs_for_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Любое сообщение в группе/супергруппе: убеждаемся, что для этого чата есть джобы."""
     chat = update.effective_chat
     user = update.effective_user
