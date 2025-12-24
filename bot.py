@@ -24,6 +24,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 active_games: dict[int, dict] = {}  # chat_id -> game_data
 user_scores: dict[int, int] = {}  # user_id -> wins
 _last_guess_time: dict[str, float] = {}  # "chat_id_user_id" -> timestamp
+_current_turn: dict[int, int] = {}  # chat_id -> current player index
 
 # Стадии виселицы для визуализации
 hangman_stages = [
@@ -127,7 +128,7 @@ russian_word_categories = {
     "города": [
         "МОСКВА", "ПИТЕР", "НОВОСИБИРСК", "ЕКАТЕРИНБУРГ", "НИЖНИЙНОВГОРОД",
         "КАЗАНЬ", "ЧЕЛЯБИНСК", "ОМСК", "САМАРА", "РОСТОВ", "УФА", "КРАСНОЯРСК",
-        "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАд", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
+        "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАД", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
         "ТОЛЬЯТТИ", "ИЖЕВСК", "БАРНАУЛ", "УЛЬЯНОВСК", "ИРКУТСК", "ХАБАРОВСК",
         "ЯРОСЛАВЛЬ", "ВЛАДИВОСТОК", "СЕВАСТОПОЛЬ", "СИМФЕРОПОЛЬ", "МУРМАНСК",
         "АРХАНГЕЛЬСК", "КАЛИНИНГРАД", "СМОЛЕНСК", "ТВЕРЬ", "ТУЛА", "РЯЗАНЬ"
@@ -230,13 +231,6 @@ def save_game_history(game_data):
     except Exception as e:
         print(f"Failed to save game history: {e}")
 
-# ------------------ ОЧИСТКА ТАЙМАУТОВ ------------------
-def cleanup_timeouts(chat_id: int):
-    """Очищает таймауты для завершенной игры"""
-    keys_to_remove = [k for k in _last_guess_time.keys() if k.startswith(f"{chat_id}_")]
-    for key in keys_to_remove:
-        del _last_guess_time[key]
-
 # ------------------ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ------------------
 async def is_user_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Проверяет, является ли пользователь админом/владельцем чата."""
@@ -272,8 +266,8 @@ def join_game(chat_id: int, user_id: int, user_name: str) -> bool:
     """Игрок присоединяется к активной игре."""
     if chat_id in active_games:
         game = active_games[chat_id]
-        # Проверяем лимит игроков (макс 20)
-        if len(game["players"]) >= 20:
+        # Проверяем лимит игроков (макс 10)
+        if len(game["players"]) >= 10:
             return False
         if user_id not in game["players"]:
             game["players"][user_id] = {
@@ -292,6 +286,35 @@ def leave_game(chat_id: int, user_id: int) -> bool:
         del active_games[chat_id]["players"][user_id]
         return True
     return False
+
+def get_current_player(chat_id: int) -> tuple[int, str] | None:
+    """Получает текущего игрока, чья очередь ходить."""
+    if chat_id not in active_games or chat_id not in _current_turn:
+        return None
+    
+    game = active_games[chat_id]
+    players_list = list(game["players"].keys())
+    
+    if not players_list:
+        return None
+    
+    turn_index = _current_turn[chat_id] % len(players_list)
+    player_id = players_list[turn_index]
+    player_name = game["players"][player_id]["name"]
+    
+    return player_id, player_name
+
+def next_turn(chat_id: int) -> tuple[int, str] | None:
+    """Передает ход следующему игроку."""
+    if chat_id not in active_games:
+        return None
+    
+    if chat_id not in _current_turn:
+        _current_turn[chat_id] = 0
+    else:
+        _current_turn[chat_id] += 1
+    
+    return get_current_player(chat_id)
 
 # ------------------ ОТОБРАЖЕНИЕ ИГРЫ ------------------
 async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -334,8 +357,7 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     else:
         players_text = "❌ Нет активных игроков\n💡 Используйте /join чтобы присоединиться"
 
-    # Текущая стадия виселицы - ОЧЕНЬ ВАЖНО: считаем количество неправильных букв
-    # Каждая неправильная буква = 1 попытка
+    # Текущая стадия виселицы
     wrong_count = len(game["wrong_letters"])
     
     # Убедимся, что wrong_count не превышает доступные стадии
@@ -349,12 +371,19 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
 
     # Формируем список неправильных букв для отображения
     wrong_letters_text = ', '.join(sorted(game['wrong_letters'])) if game['wrong_letters'] else 'пока нет'
+    
+    # Определяем, чья очередь ходить
+    current_player_info = get_current_player(chat_id)
+    turn_text = ""
+    if current_player_info:
+        player_id, player_name = current_player_info
+        turn_text = f"🎮 *Сейчас ходит:* {player_name}\n\n"
 
     message_text = f"""
 🎮 *ВИСЕЛИЦА* | {category_emoji} Категория: {game['category'].upper()}
 👑 Запустил: {game['started_by_name']}
 
-{hangman_display}
+{turn_text}{hangman_display}
 
 📖 Слово: `{display_word.strip()}`
 
@@ -365,10 +394,16 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
 👥 *Активные игроки ({len(active_players)}):*
 {players_text}
 
-💡 *Команды:*
+💡 *Как играть:*
+• Пишите ОДНУ букву в чат
+• Ждите своей очереди
+• Бот сам подскажет, чей ход
+
+📝 *Команды:*
 /join - присоединиться к игре
 /leave - выйти из игры
 /hint - получить подсказку (1 за игру)
+/skip - пропустить ход (если игрок не отвечает 30 сек)
     """.strip()
 
     # Кнопки
@@ -379,6 +414,7 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         ],
         [
             InlineKeyboardButton("💡 Подсказка", callback_data="hangman_hint"),
+            InlineKeyboardButton("⏭️ Пропустить ход", callback_data="hangman_skip"),
         ]
     ]
 
@@ -431,9 +467,10 @@ async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: i
                 f"👑 *Администратор {admin_name} запускает игру 'Виселица'!*\n\n"
                 "📖 *Правила:*\n"
                 "• Бот загадывает слово\n"
-                "• Игроки пишут буквы в ЛС боту\n"
-                "• У команды 6 попыток\n"
-                "• Победит тот, кто угадает слово!\n"
+                "• Игроки присоединяются командой /join\n"
+                "• Игроки пишут буквы в ОБЩИЙ чат по очереди\n"
+                "• У команды 6 попыток на ошибки\n"
+                "• Побеждает тот, кто угадает слово!\n"
                 "• Можно получить 1 подсказку за игру\n\n"
                 "🎯 *Выберите категорию слов:*"
             ),
@@ -448,16 +485,21 @@ async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: i
 async def process_guess(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, guess: str
 ) -> None:
-    """Обработка хода игрока."""
+    """Обработка хода игрока в общем чате."""
     if chat_id not in active_games:
         return
 
     game = active_games[chat_id]
     word = game["word"]
 
-    # Если игрок не зарегистрирован в игре — игнорируем
+    # Если игрок не зарегистрирован в игре
     if user_id not in game["players"]:
         return
+
+    # Проверяем, чья очередь ходить
+    current_player = get_current_player(chat_id)
+    if not current_player or current_player[0] != user_id:
+        return  # Не очередь этого игрока
 
     player = game["players"][user_id]
 
@@ -466,10 +508,6 @@ async def process_guess(
     last_time = _last_guess_time.get(user_key)
     now_time = time.time()
     if last_time and now_time - last_time < 1:  # 1 секунда между ходами
-        await context.bot.send_message(
-            chat_id=user_id, 
-            text="⏳ Подождите 1 секунду перед следующим ходом!"
-        )
         return
     _last_guess_time[user_key] = now_time
 
@@ -480,30 +518,32 @@ async def process_guess(
     # Проверяем, не угадывали ли эту букву уже
     if guess in game["guessed_letters"]:
         await context.bot.send_message(
-            chat_id=user_id, 
-            text=f"❌ Буква '{guess}' уже была угадана!"
+            chat_id=chat_id,
+            text=f"@{context.bot.username} {player['name']}, буква '{guess}' уже была угадана! ❌",
+            parse_mode=ParseMode.HTML,
         )
+        next_turn(chat_id)
+        await update_game_display(context, chat_id)
         return
     
     if guess in game["wrong_letters"]:
         await context.bot.send_message(
-            chat_id=user_id, 
-            text=f"❌ Буква '{guess}' уже была ошибочной!"
+            chat_id=chat_id,
+            text=f"@{context.bot.username} {player['name']}, буква '{guess}' уже была ошибочной! ❌",
+            parse_mode=ParseMode.HTML,
         )
+        next_turn(chat_id)
+        await update_game_display(context, chat_id)
         return
     
-    # ДЕБАГ: выводим текущее состояние
-    print(f"DEBUG: Попытка буквы '{guess}' в слове '{word}'")
-    print(f"DEBUG: Правильные буквы: {game['guessed_letters']}")
-    print(f"DEBUG: Неправильные буквы: {game['wrong_letters']}")
-    print(f"DEBUG: Осталось попыток до: {game['attempts_left']}")
+    print(f"DEBUG: Игрок {player['name']} пытается букву '{guess}' в слове '{word}'")
     
     if guess in word:
         # Правильная буква
         game["guessed_letters"].add(guess)
         player["correct_guesses"] += 1
 
-        # Формируем текущее состояние слова для ЛС
+        # Формируем текущее состояние слова
         display_word = ""
         for letter in word:
             if letter in game["guessed_letters"] or not letter.isalpha():
@@ -512,14 +552,21 @@ async def process_guess(
                 display_word += "_ "
         
         await context.bot.send_message(
-            chat_id=user_id, 
-            text=f"✅ Буква '{guess}' есть в слове!\n\n📖 Текущее слово: `{display_word.strip()}`"
+            chat_id=chat_id,
+            text=(
+                f"✅ {player['name']} угадал(а) букву '{guess}'!\n\n"
+                f"📖 Текущее слово: `{display_word.strip()}`"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
         )
 
         # Проверяем, угадано ли слово полностью
         if all(letter in game["guessed_letters"] for letter in word if letter.isalpha()):
             await end_game_win(context, chat_id, user_id)
             return
+        else:
+            # Тот же игрок продолжает ходить после правильного ответа
+            await update_game_display(context, chat_id)
 
     else:
         # Неправильная буква
@@ -527,7 +574,7 @@ async def process_guess(
         game["attempts_left"] -= 1
         player["wrong_guesses"] += 1
         
-        # Формируем текущее состояние слова для ЛС
+        # Формируем текущее состояние слова
         display_word = ""
         for letter in word:
             if letter in game["guessed_letters"] or not letter.isalpha():
@@ -536,21 +583,28 @@ async def process_guess(
                 display_word += "_ "
 
         await context.bot.send_message(
-            chat_id=user_id,
+            chat_id=chat_id,
             text=(
-                f"❌ Буквы '{guess}' нет в слове.\n"
+                f"❌ {player['name']}, буквы '{guess}' нет в слове.\n"
                 f"❤️ Осталось попыток: {game['attempts_left']}\n\n"
                 f"📖 Текущее слово: `{display_word.strip()}`"
             ),
+            parse_mode=ParseMode.MARKDOWN,
         )
 
         # Проверяем поражение
         if game["attempts_left"] <= 0:
             await end_game_lose(context, chat_id)
             return
-
-    # Обновляем отображение игры
-    await update_game_display(context, chat_id)
+        else:
+            # Передаем ход следующему игроку
+            next_player = next_turn(chat_id)
+            if next_player:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🎮 Теперь ходит: {next_player[1]}",
+                )
+            await update_game_display(context, chat_id)
 
 async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
     """Дать подсказку игроку (открыть одну букву)."""
@@ -587,8 +641,9 @@ async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
             display_word += "_ "
     
     await context.bot.send_message(
-        chat_id=user_id,
-        text=f"💡 Подсказка: в слове есть буква '{hint_letter}'!\n\n📖 Текущее слово: `{display_word.strip()}`"
+        chat_id=chat_id,
+        text=f"💡 Подсказка: в слове есть буква '{hint_letter}'!\n\n📖 Текущее слово: `{display_word.strip()}`",
+        parse_mode=ParseMode.MARKDOWN,
     )
     
     # Проверяем, не выиграли ли мы после подсказки
@@ -598,6 +653,41 @@ async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
     
     await update_game_display(context, chat_id)
     return True
+
+async def skip_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    """Пропустить ход текущего игрока."""
+    if chat_id not in active_games:
+        return False
+    
+    game = active_games[chat_id]
+    
+    # Только админ или текущий игрок может пропустить ход
+    current_player = get_current_player(chat_id)
+    if not current_player:
+        return False
+    
+    current_player_id = current_player[0]
+    
+    # Проверяем права
+    is_admin = await is_chat_admin(context.bot, chat_id, user_id)
+    if not is_admin and user_id != current_player_id:
+        return False
+    
+    # Пропускаем ход
+    next_player = next_turn(chat_id)
+    if next_player:
+        player_name = game["players"][current_player_id]["name"]
+        next_player_name = next_player[1]
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏭️ Ход игрока {player_name} пропущен!\n🎮 Теперь ходит: {next_player_name}",
+        )
+        
+        await update_game_display(context, chat_id)
+        return True
+    
+    return False
 
 async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_id: int) -> None:
     """Завершение игры победой."""
@@ -670,7 +760,14 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
         print(f"Error editing message on win: {e}")
 
     # Очищаем таймауты и удаляем игру
-    cleanup_timeouts(chat_id)
+    if chat_id in _last_guess_time:
+        keys_to_remove = [k for k in _last_guess_time.keys() if k.startswith(f"{chat_id}_")]
+        for key in keys_to_remove:
+            del _last_guess_time[key]
+    
+    if chat_id in _current_turn:
+        del _current_turn[chat_id]
+    
     del active_games[chat_id]
 
 async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -728,7 +825,14 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
         print(f"Error editing message on lose: {e}")
 
     # Очищаем таймауты и удаляем игру
-    cleanup_timeouts(chat_id)
+    if chat_id in _last_guess_time:
+        keys_to_remove = [k for k in _last_guess_time.keys() if k.startswith(f"{chat_id}_")]
+        for key in keys_to_remove:
+            del _last_guess_time[key]
+    
+    if chat_id in _current_turn:
+        del _current_turn[chat_id]
+    
     del active_games[chat_id]
 
 # ------------------ КОМАНДЫ БОТА ------------------
@@ -744,13 +848,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 2. Администратор использует команду /newgame
 3. Выбирает категорию слов
 4. Все присоединяются командой /join
-5. Пишут буквы мне в личные сообщения
+5. Пишут буквы прямо в чат по очереди
 
 📚 *Команды:*
 /newgame - начать новую игру (админы)
 /join - присоединиться к игре
 /leave - выйти из игры
 /hint - получить подсказку (1 за игру)
+/skip - пропустить ход (если игрок не отвечает)
 /stop - остановить игру (админы)
 /stats - статистика игроков
 /history - история игр
@@ -835,11 +940,20 @@ async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎮 {user_name} присоединился к игре!",
             reply_to_message_id=message.message_id,
         )
+        
+        # Если это первый игрок, назначаем его текущим
+        if len(active_games[chat_id]["players"]) == 1:
+            _current_turn[chat_id] = 0
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🎮 Первым ходит: {user_name}",
+            )
+        
         await update_game_display(context, chat_id)
     else:
-        if len(active_games[chat_id]["players"]) >= 20:
+        if len(active_games[chat_id]["players"]) >= 10:
             await message.reply_text(
-                "❌ В игре уже максимальное количество игроков (20)!",
+                "❌ В игре уже максимальное количество игроков (10)!",
                 reply_to_message_id=message.message_id,
             )
         else:
@@ -866,6 +980,16 @@ async def leave_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = f"{user.first_name} {(user.last_name or '')}".strip()
 
     if leave_game(chat_id, user_id):
+        # Если ушел текущий игрок, передаем ход следующему
+        current_player = get_current_player(chat_id)
+        if current_player and current_player[0] == user_id:
+            next_player = next_turn(chat_id)
+            if next_player:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"👋 {user_name} вышел из игры.\n🎮 Теперь ходит: {next_player[1]}",
+                )
+        
         await message.reply_text(
             f"👋 {user_name} вышел из игры.",
             reply_to_message_id=message.message_id,
@@ -896,12 +1020,40 @@ async def hint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = await give_hint(context, chat_id, user_id)
     if success:
         await message.reply_text(
-            "💡 Вы получили подсказку! Проверьте ЛС с ботом.",
+            "💡 Подсказка получена!",
             reply_to_message_id=message.message_id,
         )
     else:
         await message.reply_text(
             "❌ Подсказка уже была использована или нет доступных букв!",
+            reply_to_message_id=message.message_id,
+        )
+
+async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пропустить ход текущего игрока."""
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if not chat:
+        return
+    chat_id = chat.id
+
+    if chat_id not in active_games:
+        await message.reply_text("❌ Сейчас нет активной игры!")
+        return
+
+    user = update.effective_user
+    user_id = user.id
+
+    success = await skip_turn(context, chat_id, user_id)
+    if success:
+        await message.reply_text(
+            "⏭️ Ход пропущен!",
+            reply_to_message_id=message.message_id,
+        )
+    else:
+        await message.reply_text(
+            "❌ Не удалось пропустить ход! Только администратор или текущий игрок могут пропускать ход.",
             reply_to_message_id=message.message_id,
         )
 
@@ -921,8 +1073,17 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Только администраторы могут останавливать игру!")
         return
 
+    # Очищаем состояние
+    if chat_id in _last_guess_time:
+        keys_to_remove = [k for k in _last_guess_time.keys() if k.startswith(f"{chat_id}_")]
+        for key in keys_to_remove:
+            del _last_guess_time[key]
+    
+    if chat_id in _current_turn:
+        del _current_turn[chat_id]
+    
     del active_games[chat_id]
-    cleanup_timeouts(chat_id)
+    
     await message.reply_text(f"🛑 Игра остановлена администратором {update.effective_user.first_name}.")
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -987,21 +1148,24 @@ async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 1. Администратор запускает игру командой /newgame
 2. Игроки присоединяются командой /join
 3. Бот загадывает слово из выбранной категории
-4. Игроки пишут буквы боту в ЛИЧНЫЕ СООБЩЕНИЯ
-5. Бот показывает прогресс в общем чате
+4. Игроки пишут буквы в ОБЩИЙ чат по очереди
+5. Бот показывает прогресс и чей ход
 
 ⚡ *Особенности:*
 • У команды 6 попыток на ошибки
 • Все видят прогресс в реальном времени
-• Побеждает игрок, угадавший последнюю букву
-• Можно играть одновременно всем составом!
+• Игроки ходят по очереди
+• После правильной буквы ход остается у того же игрока
+• После ошибки ход передается следующему
 • Можно получить 1 подсказку за игру (/hint)
+• Можно пропустить ход (/skip)
 
 🎯 *Команды:*
 /newgame - начать игру (только админы)
 /join - присоединиться к игре
 /leave - выйти из игры
 /hint - получить подсказку
+/skip - пропустить ход
 /stop - остановить игру (только админы)
 /stats - статистика игроков
 /history - история игр
@@ -1020,6 +1184,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /join - присоединиться к игре
 /leave - выйти из игры
 /hint - получить подсказку (1 за игру)
+/skip - пропустить ход
 /stop - остановить игру (админы)
 
 📊 *Информация:*
@@ -1032,69 +1197,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 1. Админ запускает игру /newgame
 2. Выбирает категорию слов
 3. Все присоединяются /join
-4. Пишут буквы боту в ЛС
+4. Пишут буквы в чат по очереди
 5. Угадывают слово!
 
 ✨ Удачи в игре! 🎯
     """.strip()
     
     await update.effective_message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает текущее состояние игры в ЛС."""
-    user = update.effective_user
-    user_id = user.id
-    
-    # Ищем активную игру для этого пользователя
-    active_chat_id = None
-    for chat_id, game in active_games.items():
-        if user_id in game.get("players", {}):
-            active_chat_id = chat_id
-            break
-    
-    if active_chat_id is None:
-        await update.effective_message.reply_text(
-            "🤔 У вас нет активных игр. "
-            "Присоединитесь к игре в групповом чате командой /join!"
-        )
-        return
-    
-    game = active_games[active_chat_id]
-    player = game["players"].get(user_id)
-    
-    if not player:
-        await update.effective_message.reply_text("❌ Вы не найдены в игре!")
-        return
-    
-    # Формируем отображение слова
-    display_word = ""
-    if game["word"]:
-        for letter in game["word"]:
-            if letter in game["guessed_letters"] or not letter.isalpha():
-                display_word += letter + " "
-            else:
-                display_word += "_ "
-    
-    status_text = f"""
-📊 *Ваш статус в игре:*
-
-📖 Категория: {game['category'].upper()}
-📖 Слово: `{display_word.strip() if game['word'] else 'Загадывается...'}`
-📏 Длина слова: {len(game['word']) if game['word'] else '?'} букв
-
-✅ Ваши правильные буквы: {player['correct_guesses']}
-❌ Ваши ошибки: {player['wrong_guesses']}
-
-❌ Неправильные буквы команды: {', '.join(sorted(game['wrong_letters'])) or 'пока нет'}
-❤️ Осталось попыток: {game['attempts_left']}
-
-💡 *Совет:* 
-• Пишите буквы боту в ЛС
-• Можно использовать /hint для подсказки
-• Следите за прогрессом в групповом чате
-    """.strip()
-    
-    await update.effective_message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
 
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отладочная команда для проверки прав."""
@@ -1156,9 +1265,9 @@ async def handle_hangman_category_selection(update: Update, context: ContextType
                 f"📖 Слово загадано: {len(word)} букв\n\n"
                 "💡 *Как играть:*\n"
                 "1. Присоединяйтесь командой /join\n"
-                "2. Напишите боту в ЛС\n"
-                "3. Отправляйте по одной букве\n"
-                "4. Следите за прогрессом в чате\n\n"
+                "2. Пишите буквы в чат по очереди\n"
+                "3. Бот покажет, чей ход\n"
+                "4. Следите за прогрессом\n\n"
                 f"👑 Игру запустил: {game['started_by_name']}"
             ),
             parse_mode=ParseMode.MARKDOWN,
@@ -1170,7 +1279,7 @@ async def handle_hangman_category_selection(update: Update, context: ContextType
     await update_game_display(context, chat_id)
 
 async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка инлайн-кнопок игры (join/leave/stop/hint)."""
+    """Обработка инлайн-кнопок игры (join/leave/stop/hint/skip)."""
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat.id
@@ -1192,8 +1301,16 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         if chat_id in active_games:
+            # Очищаем состояние
+            if chat_id in _last_guess_time:
+                keys_to_remove = [k for k in _last_guess_time.keys() if k.startswith(f"{chat_id}_")]
+                for key in keys_to_remove:
+                    del _last_guess_time[key]
+            
+            if chat_id in _current_turn:
+                del _current_turn[chat_id]
+            
             del active_games[chat_id]
-            cleanup_timeouts(chat_id)
             try:
                 await query.edit_message_text(
                     text="🛑 Игра остановлена администратором.",
@@ -1207,12 +1324,31 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
         if join_game(chat_id, user_id, user_name):
             await query.answer("🎮 Вы присоединились к игре!")
             await context.bot.send_message(chat_id=chat_id, text=f"🎮 {user_name} присоединился к игре!")
+            
+            # Если это первый игрок, назначаем его текущим
+            if len(active_games[chat_id]["players"]) == 1:
+                _current_turn[chat_id] = 0
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🎮 Первым ходит: {user_name}",
+                )
         else:
             await query.answer("❌ Вы уже в игре или достигнут лимит игроков!")
 
     elif data == "hangman_leave":
         if leave_game(chat_id, user_id):
             await query.answer("👋 Вы вышли из игры")
+            
+            # Если ушел текущий игрок, передаем ход следующему
+            current_player = get_current_player(chat_id)
+            if current_player and current_player[0] == user_id:
+                next_player = next_turn(chat_id)
+                if next_player:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"👋 {user_name} вышел из игры.\n🎮 Теперь ходит: {next_player[1]}",
+                    )
+            
             await context.bot.send_message(chat_id=chat_id, text=f"👋 {user_name} вышел из игры.")
         else:
             await query.answer("❌ Вы не в играх!")
@@ -1220,89 +1356,47 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
     elif data == "hangman_hint":
         success = await give_hint(context, chat_id, user_id)
         if success:
-            await query.answer("💡 Подсказка отправлена в ЛС!")
+            await query.answer("💡 Подсказка получена!")
         else:
             await query.answer("❌ Подсказка уже использована или нет доступных букв!", show_alert=True)
 
+    elif data == "hangman_skip":
+        success = await skip_turn(context, chat_id, user_id)
+        if success:
+            await query.answer("⏭️ Ход пропущен!")
+        else:
+            await query.answer("❌ Не удалось пропустить ход!", show_alert=True)
+
     await update_game_display(context, chat_id)
 
-# ------------------ ОБРАБОТКА ЛС С БУКВАМИ ------------------
-async def handle_private_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка букв, присланных в ЛС боту для игры 'Виселица'."""
+# ------------------ ОБРАБОТКА БУКВ В ЧАТЕ ------------------
+async def handle_chat_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка букв, присланных в общий чат для игры 'Виселица'."""
     message = update.effective_message
+    chat = update.effective_chat
     user = update.effective_user
-    user_id = user.id
+    
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
+    
+    chat_id = chat.id
+    
+    # Проверяем, есть ли активная игра в этом чате
+    if chat_id not in active_games:
+        return
+    
     guess = (message.text or "").strip().upper()
-
-    # Проверяем, что это буква
+    
+    # Проверяем, что это одна буква
     if len(guess) != 1 or not guess.isalpha():
-        await context.bot.send_message(chat_id=user_id, text="❌ Пожалуйста, отправьте ОДНУ букву!")
         return
-
-    # Ищем активную игру для этого пользователя
-    active_chat_id = None
-    for chat_id, game in active_games.items():
-        if user_id in game.get("players", {}):
-            active_chat_id = chat_id
-            break
-
-    # Если пользователь не в игре, но есть активная игра - присоединяем автоматически
-    if active_chat_id is None and active_games:
-        active_chat_id = list(active_games.keys())[0]
-        user_name = f"{user.first_name} {(user.last_name or '')}".strip()
-
-        if join_game(active_chat_id, user_id, user_name):
-            # Формируем текущее состояние слова для приветствия
-            game = active_games[active_chat_id]
-            display_word = ""
-            if game["word"]:
-                for letter in game["word"]:
-                    if letter in game["guessed_letters"] or not letter.isalpha():
-                        display_word += letter + " "
-                    else:
-                        display_word += "_ "
-            
-            welcome_text = (
-                "🎮 Вы автоматически присоединились к игре!\n\n"
-                f"📖 Категория: {game['category'].upper() if game['category'] else 'Выбирается...'}\n"
-                f"📖 Слово: `{display_word.strip() if game['word'] else 'Загадывается...'}`\n"
-                f"❤️ Осталось попыток: {game['attempts_left']}\n\n"
-                "💡 Теперь можете отправлять буквы."
-            )
-            
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=welcome_text,
-            )
-            # Уведомляем в группе
-            await context.bot.send_message(
-                chat_id=active_chat_id,
-                text=f"🎮 {user_name} присоединился к игре (первый ход в ЛС)!",
-            )
-            await update_game_display(context, active_chat_id)
-        else:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="❌ Не удалось присоединиться к игре. Возможно, достигнут лимит игроков.",
-            )
-            return
-
-    if active_chat_id is None:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "🤔 У вас нет активных игр. "
-                "Присоединитесь к игре в групповом чате командой /join!"
-            ),
-        )
+    
+    # Проверяем, что пользователь участвует в игре
+    if user.id not in active_games[chat_id]["players"]:
         return
-
-    game = active_games.get(active_chat_id)
-    if not game:
-        await context.bot.send_message(chat_id=user_id, text="❌ Игра уже завершена.")
-        return
-
-    await process_guess(context, active_chat_id, user_id, guess)
+    
+    # Обрабатываем ход
+    await process_guess(context, chat_id, user.id, guess)
 
 # ------------------ MAIN ------------------
 def main():
@@ -1322,25 +1416,25 @@ def main():
     app.add_handler(CommandHandler("join", join_cmd))
     app.add_handler(CommandHandler("leave", leave_cmd))
     app.add_handler(CommandHandler("hint", hint_cmd))
+    app.add_handler(CommandHandler("skip", skip_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("rules", rules_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
 
-    # Обработка букв для виселицы в ЛС
+    # Обработка букв для виселицы в общем чате
     app.add_handler(
         MessageHandler(
-            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            handle_private_guess,
+            filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+            handle_chat_guess,
         )
     )
 
     # Callback-обработчики
     app.add_handler(CallbackQueryHandler(handle_hangman_category_selection, pattern=r"^hangman_category_"))
-    app.add_handler(CallbackQueryHandler(handle_hangman_buttons, pattern=r"^(hangman_join|hangman_leave|admin_stop_game|hangman_hint)$"))
+    app.add_handler(CallbackQueryHandler(handle_hangman_buttons, pattern=r"^(hangman_join|hangman_leave|admin_stop_game|hangman_hint|hangman_skip)$"))
 
     print("🤖 Бот запущен! Ожидание сообщений...")
     print("📝 Используйте /debug для проверки прав")
