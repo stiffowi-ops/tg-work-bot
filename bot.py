@@ -1,3 +1,4 @@
+import asyncio
 import os
 import random
 import json
@@ -25,6 +26,7 @@ active_games: dict[int, dict] = {}  # chat_id -> game_data
 user_scores: dict[int, int] = {}  # user_id -> wins
 _last_guess_time: dict[str, float] = {}  # "chat_id_user_id" -> timestamp
 _current_turn: dict[int, int] = {}  # chat_id -> current player index
+_update_locks: dict[int, asyncio.Lock] = {}  # chat_id -> lock для предотвращения гонок
 
 # Стадии виселицы для визуализации
 hangman_stages = [
@@ -351,91 +353,90 @@ def get_active_players_count(chat_id: int) -> int:
 # ------------------ ОТОБРАЖЕНИЕ ИГРЫ ------------------
 async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     """Обновить основное сообщение с состоянием игры."""
-    if chat_id not in active_games:
-        print(f"DEBUG update_game_display: Нет активной игры для chat_id {chat_id}")
-        return
+    # Создаем или получаем блокировку для этого чата
+    if chat_id not in _update_locks:
+        _update_locks[chat_id] = asyncio.Lock()
     
-    game = active_games[chat_id]
-    
-    print(f"DEBUG update_game_display: attempts_left = {game['attempts_left']}")
-    print(f"DEBUG update_game_display: wrong_letters = {game['wrong_letters']}")
-    print(f"DEBUG update_game_display: wrong_attempts = {6 - game['attempts_left']}")
-    
-    # Если игра еще не начата (слово не выбрано)
-    if not game["word"]:
-        return
-    
-    word = game["word"]
+    # Используем блокировку для предотвращения гонок
+    async with _update_locks[chat_id]:
+        if chat_id not in active_games:
+            print(f"DEBUG update_game_display: Нет активной игры для chat_id {chat_id}")
+            return
+        
+        game = active_games[chat_id]
+        
+        # Если игра еще не начата (слово не выбрано)
+        if not game["word"]:
+            return
+        
+        word = game["word"]
 
-    # Формируем отображение слова
-    display_word = ""
-    for letter in word:
-        if letter in game["guessed_letters"] or not letter.isalpha():
-            display_word += letter + " "
-        else:
-            display_word += "_ "
-    
-    print(f"DEBUG update_game_display: Слово: {word}, Отображение: {display_word}")
-    print(f"DEBUG update_game_display: guessed_letters: {game['guessed_letters']}")
+        # Формируем отображение слова
+        display_word = ""
+        for letter in word:
+            if letter in game["guessed_letters"] or not letter.isalpha():
+                display_word += letter + " "
+            else:
+                display_word += "_ "
+        
+        # Формируем список ТОЛЬКО активных невыбывших игроков
+        active_players = {
+            pid: data for pid, data in game["players"].items() 
+            if data.get("active", True) and not data.get("eliminated", False)
+        }
 
-    # Формируем список ТОЛЬКО активных невыбывших игроков
-    active_players = {
-        pid: data for pid, data in game["players"].items() 
-        if data.get("active", True) and not data.get("eliminated", False)
-    }
+        # Формируем список выбывших игроков
+        eliminated_players = {
+            pid: data for pid, data in game["players"].items() 
+            if data.get("eliminated", False)
+        }
 
-    # Формируем список выбывших игроков
-    eliminated_players = {
-        pid: data for pid, data in game["players"].items() 
-        if data.get("eliminated", False)
-    }
-
-    players_text = ""
-    if active_players:
-        # Сортируем по количеству правильных ответов
-        sorted_players = sorted(
-            active_players.items(), key=lambda x: x[1]["correct_guesses"], reverse=True
-        )
-
-        for i, (player_id, player_data) in enumerate(sorted_players, 1):
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
-            players_text += (
-                f"{medal} {player_data['name']}: "
-                f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}\n"
+        players_text = ""
+        if active_players:
+            # Сортируем по количеству правильных ответов
+            sorted_players = sorted(
+                active_players.items(), key=lambda x: x[1]["correct_guesses"], reverse=True
             )
-    else:
-        players_text = "❌ Нет активных игроков\n💡 Все игроки выбыли или покинули игру"
 
-    # Список выбывших игроков
-    eliminated_text = ""
-    if eliminated_players:
-        eliminated_text = "💀 *Выбывшие игроки:*\n"
-        for player_id, player_data in eliminated_players.items():
-            eliminated_text += f"☠️ {player_data['name']}\n"
+            for i, (player_id, player_data) in enumerate(sorted_players, 1):
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
+                players_text += (
+                    f"{medal} {player_data['name']}: "
+                    f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}\n"
+                )
+        else:
+            players_text = "❌ Нет активных игроков\n💡 Все игроки выбыли или покинули игру"
 
-    # Текущая стадия виселицы
-    # Используем количество неправильных попыток
-    wrong_attempts = 6 - game["attempts_left"]
-    
-    # Определяем стадию виселицы (0-6)
-    stage_index = min(wrong_attempts, len(hangman_stages) - 1)
-    
-    hangman_display = hangman_stages[stage_index]
+        # Список выбывших игроков
+        eliminated_text = ""
+        if eliminated_players:
+            eliminated_text = "💀 *Выбывшие игроки:*\n"
+            for player_id, player_data in eliminated_players.items():
+                eliminated_text += f"☠️ {player_data['name']}\n"
 
-    # Получаем эмодзи для категории
-    category_emoji = category_emojis.get(game['category'], '🎯')
+        # Текущая стадия виселицы
+        # Используем количество неправильных попыток
+        wrong_attempts = 6 - game["attempts_left"]
+        
+        # Определяем стадию виселицы (0-6)
+        stage_index = min(wrong_attempts, len(hangman_stages) - 1)
+        
+        hangman_display = hangman_stages[stage_index]
 
-    # Формируем список неправильных букв для отображения
-    wrong_letters_text = ', '.join(sorted(game['wrong_letters'])) if game['wrong_letters'] else 'пока нет'
-    
-    # Определяем, чья очередь ходить
-    current_player_info = get_current_player(chat_id)
-    turn_text = ""
-    if current_player_info:
-        player_id, player_name = current_player_info
-        turn_text = f"🎮 *Сейчас ходит:* {player_name}\n\n"
+        # Получаем эмодзи для категории
+        category_emoji = category_emojis.get(game['category'], '🎯')
 
-    message_text = f"""
+        # Формируем список неправильных букв для отображения
+        wrong_letters_text = ', '.join(sorted(game['wrong_letters'])) if game['wrong_letters'] else 'пока нет'
+        
+        # Определяем, чья очередь ходить
+        current_player_info = get_current_player(chat_id)
+        turn_text = ""
+        if current_player_info:
+            player_id, player_name = current_player_info
+            turn_text = f"🎮 *Сейчас ходит:* {player_name}\n\n"
+
+        message_text = f"""
 🎮 *ВИСЕЛИЦА* | {category_emoji} Категория: {game['category'].upper()}
 👑 Запустил: {game['started_by_name']}
 
@@ -464,52 +465,56 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
 /leave - выйти из игры
 /hint - получить подсказку (1 за игру)
 /skip - пропустить ход (если игрок не отвечает 30 сек)
-    """.strip()
+        """.strip()
 
-    # Кнопки
-    buttons = [
-        [
-            InlineKeyboardButton("🎮 Присоединиться", callback_data="hangman_join"),
-            InlineKeyboardButton("👋 Выйти", callback_data="hangman_leave"),
-        ],
-        [
-            InlineKeyboardButton("💡 Подсказка", callback_data="hangman_hint"),
-            InlineKeyboardButton("⏭️ Пропустить ход", callback_data="hangman_skip"),
+        # Кнопки
+        buttons = [
+            [
+                InlineKeyboardButton("🎮 Присоединиться", callback_data="hangman_join"),
+                InlineKeyboardButton("👋 Выйти", callback_data="hangman_leave"),
+            ],
+            [
+                InlineKeyboardButton("💡 Подсказка", callback_data="hangman_hint"),
+                InlineKeyboardButton("⏭️ Пропустить ход", callback_data="hangman_skip"),
+            ]
         ]
-    ]
 
-    # Кнопку остановки показываем только админу, который запустил игру
-    is_admin = await is_chat_admin(context.bot, chat_id, game["started_by"])
-    if is_admin:
-        buttons.append([InlineKeyboardButton("🛑 Остановить игру", callback_data="admin_stop_game")])
+        # Кнопку остановки показываем только админу, который запустил игру
+        is_admin = await is_chat_admin(context.bot, chat_id, game["started_by"])
+        if is_admin:
+            buttons.append([InlineKeyboardButton("🛑 Остановить игру", callback_data="admin_stop_game")])
 
-    markup = InlineKeyboardMarkup(buttons)
+        markup = InlineKeyboardMarkup(buttons)
 
-    try:
-        if game.get("message_id"):
-            # Принудительное обновление: удаляем старое сообщение и создаем новое
-            try:
-                await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=game["message_id"]
-                )
-            except Exception as delete_error:
-                print(f"Не удалось удалить сообщение: {delete_error}")
-            
-            # Отправляем новое сообщение
-            msg = await context.bot.send_message(
-                chat_id=chat_id,
-                text=message_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=markup,
-            )
-            
-            # Обновляем ID сообщения
-            active_games[chat_id]["message_id"] = msg.message_id
-            print(f"DEBUG: Обновлено сообщение с ID {msg.message_id}")
-            
-    except Exception as e:
-        print(f"Error updating hangman display: {e}")
+        try:
+            if game.get("message_id"):
+                # Просто редактируем существующее сообщение
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=game["message_id"],
+                        text=message_text,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=markup,
+                    )
+                    print(f"DEBUG: Успешно обновлено сообщение с ID {game['message_id']}")
+                except Exception as edit_error:
+                    print(f"Ошибка редактирования сообщения: {edit_error}")
+                    # Если не удалось отредактировать (например, сообщение удалено), 
+                    # пробуем отправить новое
+                    try:
+                        msg = await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=message_text,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=markup,
+                        )
+                        active_games[chat_id]["message_id"] = msg.message_id
+                        print(f"DEBUG: Создано новое сообщение с ID {msg.message_id}")
+                    except Exception as send_error:
+                        print(f"Ошибка отправки нового сообщения: {send_error}")
+        except Exception as e:
+            print(f"Error updating hangman display: {e}")
 
 async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     """Показать инлайн-меню выбора категории для виселицы."""
@@ -593,6 +598,7 @@ async def process_word_guess(
         # Игрок не угадал слово - выбывает
         eliminate_player(chat_id, user_id)
         
+        # Отправляем сообщение о выбывании
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -622,7 +628,8 @@ async def process_word_guess(
                 text=f"🎮 Теперь ходит: {next_player[1]}",
             )
         
-        # ОБНОВЛЯЕМ главное сообщение
+        # ОБНОВЛЯЕМ главное сообщение с небольшой задержкой
+        await asyncio.sleep(0.5)
         await update_game_display(context, chat_id)
         return False
 
@@ -636,9 +643,6 @@ async def process_guess(
 
     game = active_games[chat_id]
     word = game["word"]
-    
-    print(f"DEBUG process_guess: Начало. attempts_left до хода: {game['attempts_left']}")
-    print(f"DEBUG process_guess: wrong_letters до хода: {game['wrong_letters']}")
 
     # Если игрок не зарегистрирован в игре
     if user_id not in game["players"]:
@@ -903,6 +907,9 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
     if chat_id in _current_turn:
         del _current_turn[chat_id]
     
+    if chat_id in _update_locks:
+        del _update_locks[chat_id]
+    
     del active_games[chat_id]
 
 async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -968,6 +975,9 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
     
     if chat_id in _current_turn:
         del _current_turn[chat_id]
+    
+    if chat_id in _update_locks:
+        del _update_locks[chat_id]
     
     del active_games[chat_id]
 
@@ -1222,6 +1232,9 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in _current_turn:
         del _current_turn[chat_id]
     
+    if chat_id in _update_locks:
+        del _update_locks[chat_id]
+    
     del active_games[chat_id]
     
     await message.reply_text(f"🛑 Игра остановлена администратором {update.effective_user.first_name}.")
@@ -1450,6 +1463,9 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
             
             if chat_id in _current_turn:
                 del _current_turn[chat_id]
+            
+            if chat_id in _update_locks:
+                del _update_locks[chat_id]
             
             del active_games[chat_id]
             try:
