@@ -145,7 +145,7 @@ russian_word_categories = {
     "спорт": [
         "ФУТБОЛ", "ХОККЕЙ", "БАСКЕТБОЛ", "ВОЛЕЙБОЛ", "ТЕННИС", "БЕЙСБОЛ",
         "БОКС", "БОРЬБА", "ПЛАВАНИЕ", "ГОЛЬФ", "КРИКЕТ", "РЕГБИ", "БАДМИНТОН",
-        "НАСТОЛЬНЫЙТЕННИС", "ГАНДБОЛ", "ВОДНОЕПОЛО", "ЛЫЖИ", "СНОУБОРД",
+        "НАСТОЛЬНЫЙТЕННИС", "ГАНДБОЛ", "ВОДНОЕПОЛО", "ЛЫЖИ", "СНОУБОРд",
         "КОНЬКИ", "СЕРФИНГ", "СКЕЙТБОРД", "ЛЕГКАЯАТЛЕТИКА", "МАРАФОН",
         "ТРИАТЛОН", "ГИМНАСТИКА", "ДЗЮДО", "КАРАТЕ", "ТХЭКВОНДО", "ФЕХТОВАНИЕ",
         "СТРЕЛЬБА", "СТРЕЛЬБАИЗЛУКА", "ВЕЛОСПОРТ", "МОТОСПОРТ", "АВТОСПОРТ"
@@ -276,6 +276,7 @@ def join_game(chat_id: int, user_id: int, user_name: str) -> bool:
                 "wrong_guesses": 0,
                 "joined_at": time.time(),
                 "active": True,
+                "eliminated": False,  # Новое поле: выбыл ли игрок
             }
             return True
     return False
@@ -287,22 +288,51 @@ def leave_game(chat_id: int, user_id: int) -> bool:
         return True
     return False
 
+def eliminate_player(chat_id: int, user_id: int) -> bool:
+    """Игрок выбывает из игры за неправильную попытку угадать слово."""
+    if chat_id in active_games and user_id in active_games[chat_id]["players"]:
+        active_games[chat_id]["players"][user_id]["eliminated"] = True
+        active_games[chat_id]["players"][user_id]["active"] = False
+        return True
+    return False
+
 def get_current_player(chat_id: int) -> tuple[int, str] | None:
     """Получает текущего игрока, чья очередь ходить."""
     if chat_id not in active_games or chat_id not in _current_turn:
         return None
     
     game = active_games[chat_id]
-    players_list = list(game["players"].keys())
     
-    if not players_list:
+    # Получаем только активных невыбывших игроков
+    active_players = [
+        pid for pid, data in game["players"].items() 
+        if data.get("active", True) and not data.get("eliminated", False)
+    ]
+    
+    if not active_players:
         return None
     
-    turn_index = _current_turn[chat_id] % len(players_list)
-    player_id = players_list[turn_index]
-    player_name = game["players"][player_id]["name"]
+    # Находим следующего активного игрока
+    for _ in range(len(active_players)):
+        turn_index = _current_turn[chat_id] % len(game["players"])
+        players_list = list(game["players"].keys())
+        
+        if turn_index >= len(players_list):
+            _current_turn[chat_id] = 0
+            turn_index = 0
+        
+        player_id = players_list[turn_index]
+        player_data = game["players"][player_id]
+        
+        # Если игрок активен и не выбыл - возвращаем его
+        if player_data.get("active", True) and not player_data.get("eliminated", False):
+            player_name = player_data["name"]
+            return player_id, player_name
+        else:
+            # Переходим к следующему игроку
+            _current_turn[chat_id] += 1
     
-    return player_id, player_name
+    return None
 
 def next_turn(chat_id: int) -> tuple[int, str] | None:
     """Передает ход следующему игроку."""
@@ -315,6 +345,17 @@ def next_turn(chat_id: int) -> tuple[int, str] | None:
         _current_turn[chat_id] += 1
     
     return get_current_player(chat_id)
+
+def get_active_players_count(chat_id: int) -> int:
+    """Возвращает количество активных невыбывших игроков."""
+    if chat_id not in active_games:
+        return 0
+    
+    game = active_games[chat_id]
+    return len([
+        pid for pid, data in game["players"].items() 
+        if data.get("active", True) and not data.get("eliminated", False)
+    ])
 
 # ------------------ ОТОБРАЖЕНИЕ ИГРЫ ------------------
 async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -338,8 +379,17 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         else:
             display_word += "_ "
 
-    # Формируем список ТОЛЬКО активных игроков
-    active_players = {pid: data for pid, data in game["players"].items() if data.get("active", True)}
+    # Формируем список ТОЛЬКО активных невыбывших игроков
+    active_players = {
+        pid: data for pid, data in game["players"].items() 
+        if data.get("active", True) and not data.get("eliminated", False)
+    }
+
+    # Формируем список выбывших игроков
+    eliminated_players = {
+        pid: data for pid, data in game["players"].items() 
+        if data.get("eliminated", False)
+    }
 
     players_text = ""
     if active_players:
@@ -355,7 +405,14 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
                 f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}\n"
             )
     else:
-        players_text = "❌ Нет активных игроков\n💡 Используйте /join чтобы присоединиться"
+        players_text = "❌ Нет активных игроков\n💡 Все игроки выбыли или покинули игру"
+
+    # Список выбывших игроков
+    eliminated_text = ""
+    if eliminated_players:
+        eliminated_text = "💀 *Выбывшие игроки:*\n"
+        for player_id, player_data in eliminated_players.items():
+            eliminated_text += f"☠️ {player_data['name']}\n"
 
     # Текущая стадия виселицы
     wrong_count = len(game["wrong_letters"])
@@ -386,16 +443,20 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
 {turn_text}{hangman_display}
 
 📖 Слово: `{display_word.strip()}`
+📏 Длина слова: {len(word)} букв
 
 ❌ Неправильные буквы ({wrong_count}/6): {wrong_letters_text}
 
 ❤️ Осталось попыток: {game['attempts_left']}
+👥 Активных игроков: {len(active_players)}
 
-👥 *Активные игроки ({len(active_players)}):*
+*Активные игроки ({len(active_players)}):*
 {players_text}
 
+{eliminated_text}
 💡 *Как играть:*
 • Пишите ОДНУ букву в чат
+• Или попробуйте угадать слово целиком (выбываете при ошибке)
 • Ждите своей очереди
 • Бот сам подскажет, чей ход
 
@@ -469,6 +530,7 @@ async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: i
                 "• Бот загадывает слово\n"
                 "• Игроки присоединяются командой /join\n"
                 "• Игроки пишут буквы в ОБЩИЙ чат по очереди\n"
+                "• Можно угадать слово целиком (выбываешь при ошибке)\n"
                 "• У команды 6 попыток на ошибки\n"
                 "• Побеждает тот, кто угадает слово!\n"
                 "• Можно получить 1 подсказку за игру\n\n"
@@ -482,6 +544,75 @@ async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         print(f"Ошибка отправки сообщения с категориями: {e}")
 
 # ------------------ ЛОГИКА ИГРЫ ------------------
+async def process_word_guess(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, guessed_word: str
+) -> bool:
+    """Обработка попытки угадать слово целиком."""
+    if chat_id not in active_games:
+        return False
+
+    game = active_games[chat_id]
+    word = game["word"]
+
+    # Если игрок не зарегистрирован в игре
+    if user_id not in game["players"]:
+        return False
+
+    player = game["players"][user_id]
+    player_name = player["name"]
+
+    # Нормализуем слово (верхний регистр, Ё -> Е)
+    guessed_word = guessed_word.upper().replace('Ё', 'Е')
+    
+    print(f"DEBUG: Игрок {player_name} пытается угадать слово '{guessed_word}' (правильное: '{word}')")
+    
+    if guessed_word == word:
+        # Игрок угадал слово!
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🎉🎉🎉 *ПОБЕДА!* 🎉🎉🎉\n\n{player_name} угадал(а) слово: *{word}*!",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        
+        # Завершаем игру победой
+        await end_game_win(context, chat_id, user_id)
+        return True
+    else:
+        # Игрок не угадал слово - выбывает
+        eliminate_player(chat_id, user_id)
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"💀 *{player_name} выбывает из игры!*\n\n"
+                f"Названное слово: *{guessed_word}*\n"
+                f"Правильное слово: *{word}*\n\n"
+                "Игрок выбывает за неправильную попытку угадать слово целиком!"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        
+        # Проверяем, остались ли активные игроки
+        active_players_count = get_active_players_count(chat_id)
+        if active_players_count == 0:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="💀 Все игроки выбыли! Игра окончена.",
+            )
+            await end_game_lose(context, chat_id)
+            return False
+        
+        # Передаем ход следующему активному игроку
+        next_player = next_turn(chat_id)
+        if next_player:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🎮 Теперь ходит: {next_player[1]}",
+            )
+        
+        await update_game_display(context, chat_id)
+        return False
+
 async def process_guess(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, guess: str
 ) -> None:
@@ -502,6 +633,7 @@ async def process_guess(
         return  # Не очередь этого игрока
 
     player = game["players"][user_id]
+    player_name = player["name"]
 
     # Проверяем скорость хода (защита от флуда)
     user_key = f"{chat_id}_{user_id}"
@@ -519,8 +651,7 @@ async def process_guess(
     if guess in game["guessed_letters"]:
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"@{context.bot.username} {player['name']}, буква '{guess}' уже была угадана! ❌",
-            parse_mode=ParseMode.HTML,
+            text=f"{player_name}, буква '{guess}' уже была угадана! ❌",
         )
         next_turn(chat_id)
         await update_game_display(context, chat_id)
@@ -529,14 +660,13 @@ async def process_guess(
     if guess in game["wrong_letters"]:
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"@{context.bot.username} {player['name']}, буква '{guess}' уже была ошибочной! ❌",
-            parse_mode=ParseMode.HTML,
+            text=f"{player_name}, буква '{guess}' уже была ошибочной! ❌",
         )
         next_turn(chat_id)
         await update_game_display(context, chat_id)
         return
     
-    print(f"DEBUG: Игрок {player['name']} пытается букву '{guess}' в слове '{word}'")
+    print(f"DEBUG: Игрок {player_name} пытается букву '{guess}' в слове '{word}'")
     
     if guess in word:
         # Правильная буква
@@ -554,7 +684,7 @@ async def process_guess(
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"✅ {player['name']} угадал(а) букву '{guess}'!\n\n"
+                f"✅ {player_name} угадал(а) букву '{guess}'!\n\n"
                 f"📖 Текущее слово: `{display_word.strip()}`"
             ),
             parse_mode=ParseMode.MARKDOWN,
@@ -585,7 +715,7 @@ async def process_guess(
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"❌ {player['name']}, буквы '{guess}' нет в слове.\n"
+                f"❌ {player_name}, буквы '{guess}' нет в слове.\n"
                 f"❤️ Осталось попыток: {game['attempts_left']}\n\n"
                 f"📖 Текущее слово: `{display_word.strip()}`"
             ),
@@ -711,7 +841,10 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
     }
     
     # Обновляем счет ТОЛЬКО для активных игроков
-    active_players = {pid: data for pid, data in game["players"].items() if data.get("active", True)}
+    active_players = {
+        pid: data for pid, data in game["players"].items() 
+        if data.get("active", True) and not data.get("eliminated", False)
+    }
 
     for player_id in active_players:
         user_scores[player_id] = user_scores.get(player_id, 0) + 1  # Все активные игроки получают очко
@@ -789,17 +922,17 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
     }
     save_game_history(game_data)
 
-    # Формируем итоговую таблицу ТОЛЬКО активных игроков
-    active_players = {pid: data for pid, data in game["players"].items() if data.get("active", True)}
+    # Формируем итоговую таблицу всех игроков
     players_sorted = sorted(
-        active_players.items(), key=lambda x: x[1]["correct_guesses"], reverse=True
+        game["players"].items(), key=lambda x: x[1]["correct_guesses"], reverse=True
     )
 
     leaderboard = "📊 *Результаты:*\n"
     for i, (player_id, player_data) in enumerate(players_sorted, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
+        status = "☠️" if player_data.get("eliminated", False) else "✅"
         leaderboard += (
-            f"{medal} {player_data['name']}: "
+            f"{medal} {status} {player_data['name']}: "
             f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}\n"
         )
 
@@ -849,6 +982,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 3. Выбирает категорию слов
 4. Все присоединяются командой /join
 5. Пишут буквы прямо в чат по очереди
+6. Можно рискнуть и угадать слово целиком!
 
 📚 *Команды:*
 /newgame - начать новую игру (админы)
@@ -1142,21 +1276,22 @@ async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rules_text = """
 🎮 *Правила игры "Виселица":*
 
-📖 *Цель игры:* угадать загаданное слово по буквам
+📖 *Цель игры:* угадать загаданное слово
 
 👥 *Как играть:*
 1. Администратор запускает игру командой /newgame
 2. Игроки присоединяются командой /join
 3. Бот загадывает слово из выбранной категории
 4. Игроки пишут буквы в ОБЩИЙ чат по очереди
-5. Бот показывает прогресс и чей ход
+5. Можно рискнуть и угадать слово целиком!
 
 ⚡ *Особенности:*
 • У команды 6 попыток на ошибки
-• Все видят прогресс в реальном времени
 • Игроки ходят по очереди
 • После правильной буквы ход остается у того же игрока
 • После ошибки ход передается следующему
+• Если игрок угадывает слово целиком - ПОБЕДА!
+• Если игрок ошибся в слове целиком - ВЫБЫВАЕТ!
 • Можно получить 1 подсказку за игру (/hint)
 • Можно пропустить ход (/skip)
 
@@ -1198,7 +1333,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 2. Выбирает категорию слов
 3. Все присоединяются /join
 4. Пишут буквы в чат по очереди
-5. Угадывают слово!
+5. Рискуйте - угадывайте слово целиком!
 
 ✨ Удачи в игре! 🎯
     """.strip()
@@ -1266,8 +1401,8 @@ async def handle_hangman_category_selection(update: Update, context: ContextType
                 "💡 *Как играть:*\n"
                 "1. Присоединяйтесь командой /join\n"
                 "2. Пишите буквы в чат по очереди\n"
-                "3. Бот покажет, чей ход\n"
-                "4. Следите за прогрессом\n\n"
+                "3. Или угадайте слово целиком (риск!)\n"
+                "4. Бот покажет, чей ход\n\n"
                 f"👑 Игру запустил: {game['started_by_name']}"
             ),
             parse_mode=ParseMode.MARKDOWN,
@@ -1369,9 +1504,9 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
 
     await update_game_display(context, chat_id)
 
-# ------------------ ОБРАБОТКА БУКВ В ЧАТЕ ------------------
-async def handle_chat_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка букв, присланных в общий чат для игры 'Виселица'."""
+# ------------------ ОБРАБОТКА СООБЩЕНИЙ В ЧАТЕ ------------------
+async def handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка сообщений в общем чате для игры 'Виселица'."""
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
@@ -1385,18 +1520,31 @@ async def handle_chat_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id not in active_games:
         return
     
-    guess = (message.text or "").strip().upper()
-    
-    # Проверяем, что это одна буква
-    if len(guess) != 1 or not guess.isalpha():
-        return
+    text = (message.text or "").strip().upper()
     
     # Проверяем, что пользователь участвует в игре
     if user.id not in active_games[chat_id]["players"]:
         return
     
-    # Обрабатываем ход
-    await process_guess(context, chat_id, user.id, guess)
+    # Проверяем, не выбыл ли игрок
+    player_data = active_games[chat_id]["players"][user.id]
+    if player_data.get("eliminated", False):
+        return
+    
+    # Проверяем, чья очередь ходить
+    current_player = get_current_player(chat_id)
+    if not current_player or current_player[0] != user.id:
+        return  # Не очередь этого игрока
+    
+    # Если сообщение - одна буква
+    if len(text) == 1 and text.isalpha():
+        await process_guess(context, chat_id, user.id, text)
+    
+    # Если сообщение - слово целиком (длина >= 2 букв)
+    elif len(text) >= 2:
+        # Проверяем, что это похоже на слово (только буквы)
+        if all(c.isalpha() or c.isspace() for c in text):
+            await process_word_guess(context, chat_id, user.id, text)
 
 # ------------------ MAIN ------------------
 def main():
@@ -1424,11 +1572,11 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
 
-    # Обработка букв для виселицы в общем чате
+    # Обработка сообщений для виселицы в общем чате
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
-            handle_chat_guess,
+            handle_chat_message,
         )
     )
 
