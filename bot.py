@@ -351,7 +351,7 @@ def get_active_players_count(chat_id: int) -> int:
     ])
 
 # ------------------ ОТОБРАЖЕНИЕ ИГРЫ ------------------
-async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int, force_update: bool = False) -> None:
     """Обновить основное сообщение с состоянием игры."""
     # Создаем или получаем блокировку для этого чата
     if chat_id not in _update_locks:
@@ -366,7 +366,7 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         game = active_games[chat_id]
         
         # Если игра еще не начата (слово не выбрано)
-        if not game["word"]:
+        if not game.get("word"):
             return
         
         word = game["word"]
@@ -374,20 +374,20 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         # Формируем отображение слова
         display_word = ""
         for letter in word:
-            if letter in game["guessed_letters"] or not letter.isalpha():
+            if letter in game.get("guessed_letters", set()) or not letter.isalpha():
                 display_word += letter + " "
             else:
                 display_word += "_ "
         
         # Формируем список ТОЛЬКО активных невыбывших игроков
         active_players = {
-            pid: data for pid, data in game["players"].items() 
+            pid: data for pid, data in game.get("players", {}).items() 
             if data.get("active", True) and not data.get("eliminated", False)
         }
 
         # Формируем список выбывших игроков
         eliminated_players = {
-            pid: data for pid, data in game["players"].items() 
+            pid: data for pid, data in game.get("players", {}).items() 
             if data.get("eliminated", False)
         }
 
@@ -395,14 +395,14 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         if active_players:
             # Сортируем по количеству правильных ответов
             sorted_players = sorted(
-                active_players.items(), key=lambda x: x[1]["correct_guesses"], reverse=True
+                active_players.items(), key=lambda x: x[1].get("correct_guesses", 0), reverse=True
             )
 
             for i, (player_id, player_data) in enumerate(sorted_players, 1):
                 medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
                 players_text += (
-                    f"{medal} {player_data['name']}: "
-                    f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}\n"
+                    f"{medal} {player_data.get('name', 'Unknown')}: "
+                    f"✅{player_data.get('correct_guesses', 0)} ❌{player_data.get('wrong_guesses', 0)}\n"
                 )
         else:
             players_text = "❌ Нет активных игроков\n💡 Все игроки выбыли или покинули игру"
@@ -412,11 +412,11 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         if eliminated_players:
             eliminated_text = "💀 *Выбывшие игроки:*\n"
             for player_id, player_data in eliminated_players.items():
-                eliminated_text += f"☠️ {player_data['name']}\n"
+                eliminated_text += f"☠️ {player_data.get('name', 'Unknown')}\n"
 
         # Текущая стадия виселицы
         # Используем количество неправильных попыток
-        wrong_attempts = 6 - game["attempts_left"]
+        wrong_attempts = 6 - game.get("attempts_left", 6)
         
         # Определяем стадию виселицы (0-6)
         stage_index = min(wrong_attempts, len(hangman_stages) - 1)
@@ -424,10 +424,10 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         hangman_display = hangman_stages[stage_index]
 
         # Получаем эмодзи для категории
-        category_emoji = category_emojis.get(game['category'], '🎯')
+        category_emoji = category_emojis.get(game.get('category', ''), '🎯')
 
         # Формируем список неправильных букв для отображения
-        wrong_letters_text = ', '.join(sorted(game['wrong_letters'])) if game['wrong_letters'] else 'пока нет'
+        wrong_letters_text = ', '.join(sorted(game.get('wrong_letters', []))) if game.get('wrong_letters') else 'пока нет'
         
         # Определяем, чья очередь ходить
         current_player_info = get_current_player(chat_id)
@@ -437,8 +437,8 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
             turn_text = f"🎮 *Сейчас ходит:* {player_name}\n\n"
 
         message_text = f"""
-🎮 *ВИСЕЛИЦА* | {category_emoji} Категория: {game['category'].upper()}
-👑 Запустил: {game['started_by_name']}
+🎮 *ВИСЕЛИЦА* | {category_emoji} Категория: {game.get('category', '').upper()}
+👑 Запустил: {game.get('started_by_name', 'Unknown')}
 
 {turn_text}{hangman_display}
 
@@ -447,7 +447,7 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
 
 ❌ Неправильные попытки ({wrong_attempts}/6): {wrong_letters_text}
 
-❤️ Осталось попыток: {game['attempts_left']}
+❤️ Осталось попыток: {game.get('attempts_left', 6)}
 👥 Активных игроков: {len(active_players)}
 
 *Активные игроки ({len(active_players)}):*
@@ -480,24 +480,25 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         ]
 
         # Кнопку остановки показываем только админу, который запустил игру
-        is_admin = await is_chat_admin(context.bot, chat_id, game["started_by"])
+        is_admin = await is_chat_admin(context.bot, chat_id, game.get("started_by", 0))
         if is_admin:
             buttons.append([InlineKeyboardButton("🛑 Остановить игру", callback_data="admin_stop_game")])
 
         markup = InlineKeyboardMarkup(buttons)
 
         try:
-            if game.get("message_id"):
+            message_id = game.get("message_id")
+            if message_id:
                 # Просто редактируем существующее сообщение
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
-                        message_id=game["message_id"],
+                        message_id=message_id,
                         text=message_text,
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=markup,
                     )
-                    print(f"DEBUG: Успешно обновлено сообщение с ID {game['message_id']}")
+                    print(f"DEBUG: Успешно обновлено сообщение с ID {message_id}")
                 except Exception as edit_error:
                     print(f"Ошибка редактирования сообщения: {edit_error}")
                     # Если не удалось отредактировать (например, сообщение удалено), 
@@ -522,7 +523,7 @@ async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         return
     
     game = active_games[chat_id]
-    admin_name = game["started_by_name"]
+    admin_name = game.get("started_by_name", "Unknown")
 
     buttons = []
     for category in russian_word_categories.keys():
@@ -571,14 +572,14 @@ async def process_word_guess(
         return False
 
     game = active_games[chat_id]
-    word = game["word"]
+    word = game.get("word", "")
 
     # Если игрок не зарегистрирован в игре
-    if user_id not in game["players"]:
+    if user_id not in game.get("players", {}):
         return False
 
     player = game["players"][user_id]
-    player_name = player["name"]
+    player_name = player.get("name", "Unknown")
 
     # Нормализуем слово (верхний регистр, Ё -> Е)
     guessed_word = guessed_word.upper().replace('Ё', 'Е')
@@ -642,10 +643,10 @@ async def process_guess(
         return
 
     game = active_games[chat_id]
-    word = game["word"]
+    word = game.get("word", "")
 
     # Если игрок не зарегистрирован в игре
-    if user_id not in game["players"]:
+    if user_id not in game.get("players", {}):
         print(f"DEBUG: Игрок {user_id} не зарегистрирован в игре")
         return
 
@@ -660,7 +661,7 @@ async def process_guess(
         return  # Не очередь этого игрока
 
     player = game["players"][user_id]
-    player_name = player["name"]
+    player_name = player.get("name", "Unknown")
 
     # Проверяем скорость хода (защита от флуда)
     user_key = f"{chat_id}_{user_id}"
@@ -675,7 +676,10 @@ async def process_guess(
         guess = 'Е'
     
     # Проверяем, не угадывали ли эту букву уже
-    if guess in game["guessed_letters"]:
+    guessed_letters = game.get("guessed_letters", set())
+    wrong_letters = game.get("wrong_letters", set())
+    
+    if guess in guessed_letters:
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"❌ {player_name}, буква '{guess}' уже была угадана! Попробуйте другую букву.",
@@ -683,7 +687,7 @@ async def process_guess(
         # Ход НЕ пропускается при повторной букве
         return
     
-    if guess in game["wrong_letters"]:
+    if guess in wrong_letters:
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"❌ {player_name}, буква '{guess}' уже была ошибочной! Попробуйте другую букву.",
@@ -693,10 +697,12 @@ async def process_guess(
     
     if guess in word:
         # Правильная буква
+        if "guessed_letters" not in game:
+            game["guessed_letters"] = set()
         game["guessed_letters"].add(guess)
-        player["correct_guesses"] += 1
+        player["correct_guesses"] = player.get("correct_guesses", 0) + 1
         
-        print(f"DEBUG: Правильная буква '{guess}'. guessed_letters теперь: {game['guessed_letters']}")
+        print(f"DEBUG: Правильная буква '{guess}'. guessed_letters теперь: {game.get('guessed_letters', set())}")
         
         # Отправляем сообщение о правильной букве
         await context.bot.send_message(
@@ -705,36 +711,34 @@ async def process_guess(
         )
         
         # ОБНОВЛЯЕМ главное сообщение с виселицей
+        await asyncio.sleep(0.3)  # Небольшая задержка перед обновлением
         await update_game_display(context, chat_id)
 
         # Проверяем, угадано ли слово полностью
-        if all(letter in game["guessed_letters"] for letter in word if letter.isalpha()):
+        if all(letter in game.get("guessed_letters", set()) for letter in word if letter.isalpha()):
             await end_game_win(context, chat_id, user_id)
             return
 
     else:
         # Неправильная буква
+        if "wrong_letters" not in game:
+            game["wrong_letters"] = set()
         game["wrong_letters"].add(guess)
-        game["attempts_left"] -= 1
-        player["wrong_guesses"] += 1
+        game["attempts_left"] = game.get("attempts_left", 6) - 1
+        player["wrong_guesses"] = player.get("wrong_guesses", 0) + 1
         
-        print(f"DEBUG: Неправильная буква '{guess}'. attempts_left теперь: {game['attempts_left']}")
-        print(f"DEBUG: wrong_letters теперь: {game['wrong_letters']}")
-        
-        # Явно обновляем состояние в active_games
-        active_games[chat_id] = game
+        print(f"DEBUG: Неправильная буква '{guess}'. attempts_left теперь: {game.get('attempts_left', 6)}")
+        print(f"DEBUG: wrong_letters теперь: {game.get('wrong_letters', set())}")
         
         # Отправляем сообщение о неправильной букве
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ {player_name}, буквы '{guess}' нет в слове. Осталось попыток: {game['attempts_left']}",
+            text=f"❌ {player_name}, буквы '{guess}' нет в слове. Осталось попыток: {game.get('attempts_left', 6)}",
         )
         
-        # ОБНОВЛЯЕМ главное сообщение с виселицей СРАЗУ
-        await update_game_display(context, chat_id)
-
         # Проверяем поражение
-        if game["attempts_left"] <= 0:
+        if game.get("attempts_left", 6) <= 0:
+            await asyncio.sleep(0.3)  # Задержка перед проверкой поражения
             await end_game_lose(context, chat_id)
             return
         else:
@@ -745,7 +749,9 @@ async def process_guess(
                     chat_id=chat_id,
                     text=f"🎮 Теперь ходит: {next_player[1]}",
                 )
-            # ОБНОВЛЯЕМ главное сообщение снова, чтобы показать нового игрока
+            
+            # ОБНОВЛЯЕМ главное сообщение с задержкой
+            await asyncio.sleep(0.5)  # Увеличенная задержка для стабильности
             await update_game_display(context, chat_id)
 
 async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
@@ -754,36 +760,41 @@ async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
         return False
     
     game = active_games[chat_id]
-    word = game["word"]
+    word = game.get("word", "")
     
     # Проверяем, что игрок еще не использовал подсказку
     if game.get("hint_used"):
         return False
     
     # Находим неотгаданные буквы
-    unguessed = [letter for letter in word if letter.isalpha() and letter not in game["guessed_letters"]]
+    guessed_letters = game.get("guessed_letters", set())
+    unguessed = [letter for letter in word if letter.isalpha() and letter not in guessed_letters]
     if not unguessed:
         return False
     
     # Выбираем случайную букву для подсказки
     hint_letter = random.choice(unguessed)
+    if "guessed_letters" not in game:
+        game["guessed_letters"] = set()
     game["guessed_letters"].add(hint_letter)
     game["hint_used"] = True
     
     # Даем бонус игроку, который запросил подсказку
-    if user_id in game["players"]:
-        game["players"][user_id]["correct_guesses"] += 1
+    if user_id in game.get("players", {}):
+        player = game["players"][user_id]
+        player["correct_guesses"] = player.get("correct_guesses", 0) + 1
     
     await context.bot.send_message(
         chat_id=chat_id,
         text=f"💡 Подсказка: в слове есть буква '{hint_letter}'!",
     )
     
-    # ОБНОВЛЯЕМ главное сообщение
+    # ОБНОВЛЯЕМ главное сообщение с задержкой
+    await asyncio.sleep(0.3)
     await update_game_display(context, chat_id)
     
     # Проверяем, не выиграли ли мы после подсказки
-    if all(letter in game["guessed_letters"] for letter in word if letter.isalpha()):
+    if all(letter in game.get("guessed_letters", set()) for letter in word if letter.isalpha()):
         await end_game_win(context, chat_id, user_id)
         return True
     
@@ -811,7 +822,7 @@ async def skip_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
     # Пропускаем ход
     next_player = next_turn(chat_id)
     if next_player:
-        player_name = game["players"][current_player_id]["name"]
+        player_name = game["players"][current_player_id].get("name", "Unknown")
         next_player_name = next_player[1]
         
         await context.bot.send_message(
@@ -819,7 +830,8 @@ async def skip_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
             text=f"⏭️ Ход игрока {player_name} пропущен!\n🎮 Теперь ходит: {next_player_name}",
         )
         
-        # ОБНОВЛЯЕМ главное сообщение
+        # ОБНОВЛЯЕМ главное сообщение с задержкой
+        await asyncio.sleep(0.3)
         await update_game_display(context, chat_id)
         return True
     
@@ -831,24 +843,24 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
         return
     
     game = active_games[chat_id]
-    word = game["word"]
-    winner_name = game["players"].get(winner_id, {}).get("name", "Игрок")
+    word = game.get("word", "")
+    winner_name = game.get("players", {}).get(winner_id, {}).get("name", "Игрок")
     
     # Сохраняем данные игры для истории
     game_data = {
         "chat_id": chat_id,
         "word": word,
-        "category": game["category"],
+        "category": game.get("category", ""),
         "winner_id": winner_id,
         "winner_name": winner_name,
-        "players_count": len(game["players"]),
+        "players_count": len(game.get("players", {})),
         "timestamp": datetime.now().isoformat(),
         "result": "win"
     }
     
     # Обновляем счет ТОЛЬКО для активных игроков
     active_players = {
-        pid: data for pid, data in game["players"].items() 
+        pid: data for pid, data in game.get("players", {}).items() 
         if data.get("active", True) and not data.get("eliminated", False)
     }
 
@@ -864,15 +876,15 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
 
     # Формируем итоговую таблицу ТОЛЬКО активных игроков
     players_sorted = sorted(
-        active_players.items(), key=lambda x: x[1]["correct_guesses"], reverse=True
+        active_players.items(), key=lambda x: x[1].get("correct_guesses", 0), reverse=True
     )
 
     leaderboard = "🏆 *Результаты:*\n"
     for i, (player_id, player_data) in enumerate(players_sorted, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
         leaderboard += (
-            f"{medal} {player_data['name']}: "
-            f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}\n"
+            f"{medal} {player_data.get('name', 'Unknown')}: "
+            f"✅{player_data.get('correct_guesses', 0)} ❌{player_data.get('wrong_guesses', 0)}\n"
         )
 
     message_text = f"""
@@ -888,10 +900,11 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
     """.strip()
 
     try:
-        if game.get("message_id"):
+        message_id = game.get("message_id")
+        if message_id:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
-                message_id=game["message_id"],
+                message_id=message_id,
                 text=message_text,
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -910,7 +923,8 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
     if chat_id in _update_locks:
         del _update_locks[chat_id]
     
-    del active_games[chat_id]
+    if chat_id in active_games:
+        del active_games[chat_id]
 
 async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     """Завершение игры поражением (закончились попытки)."""
@@ -918,14 +932,14 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
         return
     
     game = active_games[chat_id]
-    word = game["word"]
+    word = game.get("word", "")
     
     # Сохраняем данные игры для истории
     game_data = {
         "chat_id": chat_id,
         "word": word,
-        "category": game["category"],
-        "players_count": len(game["players"]),
+        "category": game.get("category", ""),
+        "players_count": len(game.get("players", {})),
         "timestamp": datetime.now().isoformat(),
         "result": "lose"
     }
@@ -933,7 +947,7 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
 
     # Формируем итоговую таблицу всех игроков
     players_sorted = sorted(
-        game["players"].items(), key=lambda x: x[1]["correct_guesses"], reverse=True
+        game.get("players", {}).items(), key=lambda x: x[1].get("correct_guesses", 0), reverse=True
     )
 
     leaderboard = "📊 *Результаты:*\n"
@@ -941,15 +955,15 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
         status = "☠️" if player_data.get("eliminated", False) else "✅"
         leaderboard += (
-            f"{medal} {status} {player_data['name']}: "
-            f"✅{player_data['correct_guesses']} ❌{player_data['wrong_guesses']}\n"
+            f"{medal} {status} {player_data.get('name', 'Unknown')}: "
+            f"✅{player_data.get('correct_guesses', 0)} ❌{player_data.get('wrong_guesses', 0)}\n"
         )
 
     message_text = f"""
 💀 *ИГРА ОКОНЧЕНА*
 
 📖 Загаданное слово было: *{word}*
-❌ Неправильных попыток: {6 - game.get('attempts_left', 0)} из 6
+❌ Неправильных попыток: {6 - game.get('attempts_left', 6)} из 6
 
 {leaderboard}
 
@@ -957,10 +971,11 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
     """.strip()
 
     try:
-        if game.get("message_id"):
+        message_id = game.get("message_id")
+        if message_id:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
-                message_id=game["message_id"],
+                message_id=message_id,
                 text=message_text,
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -979,7 +994,8 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
     if chat_id in _update_locks:
         del _update_locks[chat_id]
     
-    del active_games[chat_id]
+    if chat_id in active_games:
+        del active_games[chat_id]
 
 # ------------------ КОМАНДЫ БОТА ------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1235,7 +1251,8 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in _update_locks:
         del _update_locks[chat_id]
     
-    del active_games[chat_id]
+    if chat_id in active_games:
+        del active_games[chat_id]
     
     await message.reply_text(f"🛑 Игра остановлена администратором {update.effective_user.first_name}.")
 
@@ -1430,6 +1447,7 @@ async def handle_hangman_category_selection(update: Update, context: ContextType
         print(f"Error editing category selection message: {e}")
 
     # Показываем текущее состояние игры
+    await asyncio.sleep(0.5)
     await update_game_display(context, chat_id)
 
 async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1524,6 +1542,7 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
         else:
             await query.answer("❌ Не удалось пропустить ход!", show_alert=True)
 
+    await asyncio.sleep(0.3)
     await update_game_display(context, chat_id)
 
 # ------------------ ОБРАБОТКА СООБЩЕНИЙ В ЧАТЕ ------------------
@@ -1545,7 +1564,7 @@ async def handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = (message.text or "").strip().upper()
     
     # Проверяем, что пользователь участвует в игре
-    if user.id not in active_games[chat_id]["players"]:
+    if user.id not in active_games[chat_id].get("players", {}):
         return
     
     # Проверяем, не выбыл ли игрок
@@ -1568,6 +1587,26 @@ async def handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if all(c.isalpha() or c.isspace() for c in text):
             await process_word_guess(context, chat_id, user.id, text)
 
+# ------------------ ОБРАБОТКА ОШИБОК ------------------
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик ошибок для предотвращения падения бота."""
+    try:
+        raise context.error
+    except Exception as e:
+        print(f"Exception while handling an update: {e}")
+        print(f"Update: {update}")
+        print(f"Context: {context}")
+        
+        # Логируем ошибку, но не падаем
+        try:
+            if update and update.effective_chat:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="⚠️ Произошла ошибка при обработке команды. Пожалуйста, попробуйте еще раз."
+                )
+        except:
+            pass
+
 # ------------------ MAIN ------------------
 def main():
     if not BOT_TOKEN:
@@ -1577,8 +1616,11 @@ def main():
     load_scores()
     print(f"🤖 Загружено {len(user_scores)} игроков в статистике")
 
-    # Создаем приложение
+    # Создаем приложение с обработчиком ошибок
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Добавляем обработчик ошибок
+    app.add_error_handler(error_handler)
 
     # Команды
     app.add_handler(CommandHandler("start", start_cmd))
