@@ -128,7 +128,7 @@ russian_word_categories = {
     "города": [
         "МОСКВА", "ПИТЕР", "НОВОСИБИРСК", "ЕКАТЕРИНБУРГ", "НИЖНИЙНОВГОРОД",
         "КАЗАНЬ", "ЧЕЛЯБИНСК", "ОМСК", "САМАРА", "РОСТОВ", "УФА", "КРАСНОЯРСК",
-        "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАд", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
+        "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАД", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
         "ТОЛЬЯТТИ", "ИЖЕВСК", "БАРНАУЛ", "УЛЬЯНОВСК", "ИРКУТСК", "ХАБАРОВСК",
         "ЯРОСЛАВЛЬ", "ВЛАДИВОСТОК", "СЕВАСТОПОЛЬ", "СИМФЕРОПОЛЬ", "МУРМАНСК",
         "АРХАНГЕЛЬСК", "КАЛИНИНГРАД", "СМОЛЕНСК", "ТВЕРЬ", "ТУЛА", "РЯЗАНЬ"
@@ -157,7 +157,7 @@ russian_word_categories = {
         "РЕПОРТЕР", "ФОТОГРАФ", "ХУДОЖНИК", "МУЗЫКАНТ", "ПЕВЕЦ",
         "АКТЕР", "ПИСАТЕЛЬ", "ПОЭТ", "УЧЕНЫЙ", "ИССЛЕДОВАТЕЛЬ", "АНАЛИТИК",
         "ВОДИТЕЛЬ", "ПИЛОТ", "КАПИТАН", "ШЕФПОВАР", "ПОВАР", "ОФИЦИАНТ",
-        "МЕДСЕСТРА", "СТОМАТОЛОГ", "ПСИХОЛОГ", "АРХИТЕКТОР", "СТРОИТЕЛЬ",
+        "МЕДСЕСТРА", "СТОМАТОЛГ", "ПСИХОЛОГ", "АРХИТЕКТОР", "СТРОИТЕЛЬ",
         "ФЕРМЕР", "ПОЛИЦЕЙСКИЙ", "ПОЖАРНЫЙ", "СПАСАТЕЛЬ", "КОСМОНАВТ"
     ],
     
@@ -417,7 +417,7 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     # Текущая стадия виселицы
     wrong_count = len(game["wrong_letters"])
     
-    # Определяем стадию виселицы
+    # Определяем стадию виселицы (0-7)
     stage_index = wrong_count
     if stage_index >= len(hangman_stages):
         stage_index = len(hangman_stages) - 1
@@ -663,8 +663,6 @@ async def process_guess(
         # Ход НЕ пропускается при повторной букве
         return
     
-    print(f"DEBUG: Игрок {player_name} пытается букву '{guess}' в слове '{word}'")
-    
     if guess in word:
         # Правильная буква
         game["guessed_letters"].add(guess)
@@ -687,13 +685,13 @@ async def process_guess(
     else:
         # Неправильная буква
         game["wrong_letters"].add(guess)
-        game["attempts_left"] -= 1
+        game["attempts_left"] -= 1  # ВАЖНО: уменьшаем счетчик попыток
         player["wrong_guesses"] += 1
         
         # Отправляем сообщение о неправильной букве
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ {player_name}, буквы '{guess}' нет в слове.",
+            text=f"❌ {player_name}, буквы '{guess}' нет в слове. Осталось попыток: {game['attempts_left']}",
         )
         
         # Обновляем отображение игры
@@ -1381,7 +1379,7 @@ async def handle_hangman_category_selection(update: Update, context: ContextType
     await update_game_display(context, chat_id)
 
 async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка инлайн-кнопок игры (join/leave/stop/hint/skip)."""
+    """Обработка инлайн -кнопок игры (join/leave/stop/hint/skip)."""
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat.id
