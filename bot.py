@@ -26,7 +26,7 @@ user_scores: dict[int, int] = {}  # user_id -> wins
 _last_guess_time: dict[str, float] = {}  # "chat_id_user_id" -> timestamp
 _current_turn: dict[int, int] = {}  # chat_id -> current player index
 
-# Стадии виселицы для визуализации (исправленная)
+# Стадии виселицы для визуализации
 hangman_stages = [
     """
     
@@ -122,7 +122,7 @@ russian_word_categories = {
         "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАД", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
         "ТОЛЬЯТТИ", "ИЖЕВСК", "БАРНАУЛ", "УЛЬЯНОВСК", "ИРКУТСК", "ХАБАРОВСК",
         "ЯРОСЛАВЛЬ", "ВЛАДИВОСТОК", "СЕВАСТОПОЛЬ", "СИМФЕРОПОЛЬ", "МУРМАНСК",
-        "АРХАНГЕЛЬСК", "КАЛИНИНГРАд", "СМОЛЕНСК", "ТВЕРЬ", "ТУЛА", "РЯЗАНЬ"
+        "АРХАНГЕЛЬСК", "КАЛИНИНГРАД", "СМОЛЕНСК", "ТВЕРЬ", "ТУЛА", "РЯЗАНЬ"
     ],
     
     "еда": [
@@ -352,9 +352,14 @@ def get_active_players_count(chat_id: int) -> int:
 async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     """Обновить основное сообщение с состоянием игры."""
     if chat_id not in active_games:
+        print(f"DEBUG update_game_display: Нет активной игры для chat_id {chat_id}")
         return
     
     game = active_games[chat_id]
+    
+    print(f"DEBUG update_game_display: attempts_left = {game['attempts_left']}")
+    print(f"DEBUG update_game_display: wrong_letters = {game['wrong_letters']}")
+    print(f"DEBUG update_game_display: wrong_attempts = {6 - game['attempts_left']}")
     
     # Если игра еще не начата (слово не выбрано)
     if not game["word"]:
@@ -369,6 +374,9 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
             display_word += letter + " "
         else:
             display_word += "_ "
+    
+    print(f"DEBUG update_game_display: Слово: {word}, Отображение: {display_word}")
+    print(f"DEBUG update_game_display: guessed_letters: {game['guessed_letters']}")
 
     # Формируем список ТОЛЬКО активных невыбывших игроков
     active_players = {
@@ -479,13 +487,27 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
 
     try:
         if game.get("message_id"):
-            await context.bot.edit_message_text(
+            # Принудительное обновление: удаляем старое сообщение и создаем новое
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=game["message_id"]
+                )
+            except Exception as delete_error:
+                print(f"Не удалось удалить сообщение: {delete_error}")
+            
+            # Отправляем новое сообщение
+            msg = await context.bot.send_message(
                 chat_id=chat_id,
-                message_id=game["message_id"],
                 text=message_text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=markup,
             )
+            
+            # Обновляем ID сообщения
+            active_games[chat_id]["message_id"] = msg.message_id
+            print(f"DEBUG: Обновлено сообщение с ID {msg.message_id}")
+            
     except Exception as e:
         print(f"Error updating hangman display: {e}")
 
@@ -531,6 +553,7 @@ async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: i
             reply_markup=markup,
         )
         active_games[chat_id]["message_id"] = msg.message_id
+        print(f"DEBUG: Создано сообщение с категориями, ID: {msg.message_id}")
     except Exception as e:
         print(f"Ошибка отправки сообщения с категориями: {e}")
 
@@ -608,18 +631,28 @@ async def process_guess(
 ) -> None:
     """Обработка хода игрока в общем чате."""
     if chat_id not in active_games:
+        print(f"DEBUG: Нет активной игры для chat_id {chat_id}")
         return
 
     game = active_games[chat_id]
     word = game["word"]
+    
+    print(f"DEBUG process_guess: Начало. attempts_left до хода: {game['attempts_left']}")
+    print(f"DEBUG process_guess: wrong_letters до хода: {game['wrong_letters']}")
 
     # Если игрок не зарегистрирован в игре
     if user_id not in game["players"]:
+        print(f"DEBUG: Игрок {user_id} не зарегистрирован в игре")
         return
 
     # Проверяем, чья очередь ходить
     current_player = get_current_player(chat_id)
-    if not current_player or current_player[0] != user_id:
+    if not current_player:
+        print(f"DEBUG: Нет текущего игрока для chat_id {chat_id}")
+        return
+        
+    if current_player[0] != user_id:
+        print(f"DEBUG: Не очередь игрока {user_id}. Сейчас ходит: {current_player[0]}")
         return  # Не очередь этого игрока
 
     player = game["players"][user_id]
@@ -659,6 +692,8 @@ async def process_guess(
         game["guessed_letters"].add(guess)
         player["correct_guesses"] += 1
         
+        print(f"DEBUG: Правильная буква '{guess}'. guessed_letters теперь: {game['guessed_letters']}")
+        
         # Отправляем сообщение о правильной букве
         await context.bot.send_message(
             chat_id=chat_id,
@@ -678,6 +713,12 @@ async def process_guess(
         game["wrong_letters"].add(guess)
         game["attempts_left"] -= 1
         player["wrong_guesses"] += 1
+        
+        print(f"DEBUG: Неправильная буква '{guess}'. attempts_left теперь: {game['attempts_left']}")
+        print(f"DEBUG: wrong_letters теперь: {game['wrong_letters']}")
+        
+        # Явно обновляем состояние в active_games
+        active_games[chat_id] = game
         
         # Отправляем сообщение о неправильной букве
         await context.bot.send_message(
@@ -1002,7 +1043,7 @@ async def newgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "word": "",
         "guessed_letters": set(),
         "wrong_letters": set(),
-        "attempts_left": 6,
+        "attempts_left": 6,  # НАЧАЛЬНОЕ ЗНАЧЕНИЕ
         "category": "",
         "players": {},
         "message_id": None,
@@ -1011,6 +1052,9 @@ async def newgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "start_time": time.time(),
         "hint_used": False,
     }
+    
+    print(f"DEBUG newgame: Создана новая игра для chat_id {chat_id}")
+    print(f"DEBUG newgame: attempts_left инициализировано как 6")
 
     await show_category_selection(context, chat_id)
 
@@ -1093,7 +1137,7 @@ async def leave_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_game_display(context, chat_id)
     else:
         await message.reply_text(
-            f"❌ {user_name}, вы не в играх!",
+            f"❌ {user_name}, вы не в игре!",
             reply_to_message_id=message.message_id,
         )
 
