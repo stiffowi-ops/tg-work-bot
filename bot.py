@@ -127,7 +127,7 @@ russian_word_categories = {
     "города": [
         "МОСКВА", "ПИТЕР", "НОВОСИБИРСК", "ЕКАТЕРИНБУРГ", "НИЖНИЙНОВГОРОД",
         "КАЗАНЬ", "ЧЕЛЯБИНСК", "ОМСК", "САМАРА", "РОСТОВ", "УФА", "КРАСНОЯРСК",
-        "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАД", "КРАСНОДАр", "САРАТОВ", "ТЮМЕНЬ",
+        "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАД", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
         "ТОЛЬЯТТИ", "ИЖЕВСК", "БАРНАУЛ", "УЛЬЯНОВСК", "ИРКУТСК", "ХАБАРОВСК",
         "ЯРОСЛАВЛЬ", "ВЛАДИВОСТОК", "СЕВАСТОПОЛЬ", "СИМФЕРОПОЛЬ", "МУРМАНСК",
         "АРХАНГЕЛЬСК", "КАЛИНИНГРАД", "СМОЛЕНСК", "ТВЕРЬ", "ТУЛА", "РЯЗАНЬ"
@@ -153,7 +153,7 @@ russian_word_categories = {
     "профессии": [
         "ВРАЧ", "УЧИТЕЛЬ", "ИНЖЕНЕР", "ПРОГРАММИСТ", "ДИЗАЙНЕР",
         "МЕНЕДЖЕР", "ДИРЕКТОР", "БУХГАЛТЕР", "ЮРИСТ", "ЖУРНАЛИСТ",
-        "РЕПОРТЕР", "ФОТОГРАФ", "ХУДОЖНИк", "МУЗЫКАНТ", "ПЕВЕЦ",
+        "РЕПОРТЕР", "ФОТОГРАФ", "ХУДОЖНИК", "МУЗЫКАНТ", "ПЕВЕЦ",
         "АКТЕР", "ПИСАТЕЛЬ", "ПОЭТ", "УЧЕНЫЙ", "ИССЛЕДОВАТЕЛЬ", "АНАЛИТИК",
         "ВОДИТЕЛЬ", "ПИЛОТ", "КАПИТАН", "ШЕФПОВАР", "ПОВАР", "ОФИЦИАНТ",
         "МЕДСЕСТРА", "СТОМАТОЛОГ", "ПСИХОЛОГ", "АРХИТЕКТОР", "СТРОИТЕЛЬ",
@@ -334,13 +334,15 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     else:
         players_text = "❌ Нет активных игроков\n💡 Используйте /join чтобы присоединиться"
 
-    # Текущая стадия виселицы
-    stage_index = 6 - game["attempts_left"]
-    if stage_index < 0:
-        stage_index = 0
-    if stage_index >= len(hangman_stages):
-        stage_index = len(hangman_stages) - 1
-    hangman_display = hangman_stages[stage_index]
+    # Текущая стадия виселицы - ОЧЕНЬ ВАЖНО: считаем количество неправильных букв
+    # Каждая неправильная буква = 1 попытка
+    wrong_count = len(game["wrong_letters"])
+    
+    # Убедимся, что wrong_count не превышает доступные стадии
+    if wrong_count >= len(hangman_stages):
+        wrong_count = len(hangman_stages) - 1
+    
+    hangman_display = hangman_stages[wrong_count]
 
     # Получаем эмодзи для категории
     category_emoji = category_emojis.get(game['category'], '🎯')
@@ -353,7 +355,7 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
 
 📖 Слово: `{display_word.strip()}`
 
-❌ Неправильные буквы: {', '.join(sorted(game['wrong_letters'])) or 'пока нет'}
+❌ Неправильные буквы ({wrong_count}/6): {', '.join(sorted(game['wrong_letters'])) or 'пока нет'}
 
 ❤️ Осталось попыток: {game['attempts_left']}
 
@@ -472,14 +474,43 @@ async def process_guess(
     if guess == 'Ё':
         guess = 'Е'
     
+    # Проверяем, не угадывали ли эту букву уже
+    if guess in game["guessed_letters"]:
+        await context.bot.send_message(
+            chat_id=user_id, 
+            text=f"❌ Буква '{guess}' уже была угадана!"
+        )
+        return
+    
+    if guess in game["wrong_letters"]:
+        await context.bot.send_message(
+            chat_id=user_id, 
+            text=f"❌ Буква '{guess}' уже была ошибочной!"
+        )
+        return
+    
+    # ДЕБАГ: выводим текущее состояние
+    print(f"DEBUG: Попытка буквы '{guess}' в слове '{word}'")
+    print(f"DEBUG: Правильные буквы: {game['guessed_letters']}")
+    print(f"DEBUG: Неправильные буквы: {game['wrong_letters']}")
+    print(f"DEBUG: Осталось попыток до: {game['attempts_left']}")
+    
     if guess in word:
         # Правильная буква
         game["guessed_letters"].add(guess)
         player["correct_guesses"] += 1
 
+        # Формируем текущее состояние слова для ЛС
+        display_word = ""
+        for letter in word:
+            if letter in game["guessed_letters"] or not letter.isalpha():
+                display_word += letter + " "
+            else:
+                display_word += "_ "
+        
         await context.bot.send_message(
             chat_id=user_id, 
-            text=f"✅ Буква '{guess}' есть в слове!"
+            text=f"✅ Буква '{guess}' есть в слове!\n\n📖 Текущее слово: `{display_word.strip()}`"
         )
 
         # Проверяем, угадано ли слово полностью
@@ -492,10 +523,22 @@ async def process_guess(
         game["wrong_letters"].add(guess)
         game["attempts_left"] -= 1
         player["wrong_guesses"] += 1
+        
+        # Формируем текущее состояние слова для ЛС
+        display_word = ""
+        for letter in word:
+            if letter in game["guessed_letters"] or not letter.isalpha():
+                display_word += letter + " "
+            else:
+                display_word += "_ "
 
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"❌ Буквы '{guess}' нет в слове. Осталось попыток: {game['attempts_left']}",
+            text=(
+                f"❌ Буквы '{guess}' нет в слове.\n"
+                f"❤️ Осталось попыток: {game['attempts_left']}\n\n"
+                f"📖 Текущее слово: `{display_word.strip()}`"
+            ),
         )
 
         # Проверяем поражение
@@ -532,9 +575,17 @@ async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
     if user_id in game["players"]:
         game["players"][user_id]["correct_guesses"] += 1
     
+    # Формируем текущее состояние слова
+    display_word = ""
+    for letter in word:
+        if letter in game["guessed_letters"] or not letter.isalpha():
+            display_word += letter + " "
+        else:
+            display_word += "_ "
+    
     await context.bot.send_message(
         chat_id=user_id,
-        text=f"💡 Подсказка: в слове есть буква '{hint_letter}'!"
+        text=f"💡 Подсказка: в слове есть буква '{hint_letter}'!\n\n📖 Текущее слово: `{display_word.strip()}`"
     )
     
     # Проверяем, не выиграли ли мы после подсказки
@@ -986,6 +1037,62 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.effective_message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущее состояние игры в ЛС."""
+    user = update.effective_user
+    user_id = user.id
+    
+    # Ищем активную игру для этого пользователя
+    active_chat_id = None
+    for chat_id, game in active_games.items():
+        if user_id in game.get("players", {}):
+            active_chat_id = chat_id
+            break
+    
+    if active_chat_id is None:
+        await update.effective_message.reply_text(
+            "🤔 У вас нет активных игр. "
+            "Присоединитесь к игре в групповом чате командой /join!"
+        )
+        return
+    
+    game = active_games[active_chat_id]
+    player = game["players"].get(user_id)
+    
+    if not player:
+        await update.effective_message.reply_text("❌ Вы не найдены в игре!")
+        return
+    
+    # Формируем отображение слова
+    display_word = ""
+    if game["word"]:
+        for letter in game["word"]:
+            if letter in game["guessed_letters"] or not letter.isalpha():
+                display_word += letter + " "
+            else:
+                display_word += "_ "
+    
+    status_text = f"""
+📊 *Ваш статус в игре:*
+
+📖 Категория: {game['category'].upper()}
+📖 Слово: `{display_word.strip() if game['word'] else 'Загадывается...'}`
+📏 Длина слова: {len(game['word']) if game['word'] else '?'} букв
+
+✅ Ваши правильные буквы: {player['correct_guesses']}
+❌ Ваши ошибки: {player['wrong_guesses']}
+
+❌ Неправильные буквы команды: {', '.join(sorted(game['wrong_letters'])) or 'пока нет'}
+❤️ Осталось попыток: {game['attempts_left']}
+
+💡 *Совет:* 
+• Пишите буквы боту в ЛС
+• Можно использовать /hint для подсказки
+• Следите за прогрессом в групповом чате
+    """.strip()
+    
+    await update.effective_message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
+
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отладочная команда для проверки прав."""
     chat = update.effective_chat
@@ -1105,7 +1212,7 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("👋 Вы вышли из игры")
             await context.bot.send_message(chat_id=chat_id, text=f"👋 {user_name} вышел из игры.")
         else:
-            await query.answer("❌ Вы не в игре!")
+            await query.answer("❌ Вы не в играх!")
 
     elif data == "hangman_hint":
         success = await give_hint(context, chat_id, user_id)
@@ -1142,12 +1249,27 @@ async def handle_private_guess(update: Update, context: ContextTypes.DEFAULT_TYP
         user_name = f"{user.first_name} {(user.last_name or '')}".strip()
 
         if join_game(active_chat_id, user_id, user_name):
+            # Формируем текущее состояние слова для приветствия
+            game = active_games[active_chat_id]
+            display_word = ""
+            if game["word"]:
+                for letter in game["word"]:
+                    if letter in game["guessed_letters"] or not letter.isalpha():
+                        display_word += letter + " "
+                    else:
+                        display_word += "_ "
+            
+            welcome_text = (
+                "🎮 Вы автоматически присоединились к игре!\n\n"
+                f"📖 Категория: {game['category'].upper() if game['category'] else 'Выбирается...'}\n"
+                f"📖 Слово: `{display_word.strip() if game['word'] else 'Загадывается...'}`\n"
+                f"❤️ Осталось попыток: {game['attempts_left']}\n\n"
+                "💡 Теперь можете отправлять буквы."
+            )
+            
             await context.bot.send_message(
                 chat_id=user_id,
-                text=(
-                    "🎮 Вы автоматически присоединились к игре!\n\n"
-                    "💡 Теперь можете отправлять буквы."
-                ),
+                text=welcome_text,
             )
             # Уведомляем в группе
             await context.bot.send_message(
@@ -1177,11 +1299,6 @@ async def handle_private_guess(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.send_message(chat_id=user_id, text="❌ Игра уже завершена.")
         return
 
-    # Проверяем, не угадывали ли эту букву уже
-    if guess in game["guessed_letters"] or guess in game["wrong_letters"]:
-        await context.bot.send_message(chat_id=user_id, text="❌ Эта буква уже была!")
-        return
-
     await process_guess(context, active_chat_id, user_id, guess)
 
 # ------------------ MAIN ------------------
@@ -1207,7 +1324,8 @@ def main():
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("rules", rules_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("debug", debug_cmd))  # Добавил отладочную команду
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("debug", debug_cmd))
 
     # Обработка букв для виселицы в ЛС
     app.add_handler(
