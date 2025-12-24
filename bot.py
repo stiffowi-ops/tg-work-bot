@@ -135,7 +135,7 @@ russian_word_categories = {
     ],
     
     "еда": [
-        "ПИЦЦА", "СУШИ", "ПАСТА", "БУРГЕР", "ТАКО", "САЛАТ", "СУП", "СТЕЙК",
+        "ПИЦЦА", "СУШИ", "ПАСТА", "БУРГЕР", "ТАКО", "САЛАТ", "СУП", "СТЕЙк",
         "КАРРИ", "СЭНДВИЧ", "ХЛЕБ", "СЫР", "МАСЛО", "МОЛОКО", "КОФЕ", "ЧАЙ",
         "СОК", "ВОДА", "ЛИМОНАД", "КОКТЕЙЛЬ", "ПИВО", "ВИНО", "ВИСКИ", "ВОДКА",
         "ШОКОЛАД", "ПЕЧЕНЬЕ", "ТОРТ", "ПИРОГ", "МОРОЖЕНОЕ", "БЛИНЫ", "ВАФЛИ",
@@ -414,23 +414,19 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         for player_id, player_data in eliminated_players.items():
             eliminated_text += f"☠️ {player_data['name']}\n"
 
-    # Текущая стадия виселицы - ИСПРАВЛЕНО
+    # Текущая стадия виселицы - ИСПРАВЛЕНО: показываем с 1 ошибки
     wrong_count = len(game["wrong_letters"])
     
-    # Преобразуем количество ошибок в индекс стадии виселицы
-    # 0 ошибок -> стадия 0 (пустая виселица)
+    # Определяем стадию виселицы
+    # 0 ошибок -> стадия 0 (пустая)
     # 1 ошибка -> стадия 1
     # 2 ошибки -> стадия 2
     # 3 ошибки -> стадия 3
     # 4 ошибки -> стадия 4
     # 5 ошибок -> стадия 5
-    # 6 ошибок -> стадия 6
-    # Дополнительная стадия для полной виселицы при 7 ошибках (для совместимости)
+    # 6 ошибок -> стадия 6 (полная виселица)
     
-    # Исправление: индекс стадии должен быть равен wrong_count
     stage_index = wrong_count
-    
-    # Защита от выхода за границы массива
     if stage_index >= len(hangman_stages):
         stage_index = len(hangman_stages) - 1
     
@@ -662,21 +658,31 @@ async def process_guess(
     
     # Проверяем, не угадывали ли эту букву уже
     if guess in game["guessed_letters"]:
-        await context.bot.send_message(
+        # Только уведомление, но ход не пропускается
+        sent_msg = await context.bot.send_message(
             chat_id=chat_id,
-            text=f"{player_name}, буква '{guess}' уже была угадана! ❌",
+            text=f"❌ {player_name}, буква '{guess}' уже была угадана! Попробуйте другую букву.",
         )
-        next_turn(chat_id)
-        await update_game_display(context, chat_id)
+        # Удаляем сообщение через 3 секунды
+        await asyncio.sleep(3)
+        try:
+            await sent_msg.delete()
+        except:
+            pass
         return
     
     if guess in game["wrong_letters"]:
-        await context.bot.send_message(
+        # Только уведомление, но ход не пропускается
+        sent_msg = await context.bot.send_message(
             chat_id=chat_id,
-            text=f"{player_name}, буква '{guess}' уже была ошибочной! ❌",
+            text=f"❌ {player_name}, буква '{guess}' уже была ошибочной! Попробуйте другую букву.",
         )
-        next_turn(chat_id)
-        await update_game_display(context, chat_id)
+        # Удаляем сообщение через 3 секунды
+        await asyncio.sleep(3)
+        try:
+            await sent_msg.delete()
+        except:
+            pass
         return
     
     print(f"DEBUG: Игрок {player_name} пытается букву '{guess}' в слове '{word}'")
@@ -686,30 +692,13 @@ async def process_guess(
         game["guessed_letters"].add(guess)
         player["correct_guesses"] += 1
 
-        # Формируем текущее состояние слова
-        display_word = ""
-        for letter in word:
-            if letter in game["guessed_letters"] or not letter.isalpha():
-                display_word += letter + " "
-            else:
-                display_word += "_ "
-        
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"✅ {player_name} угадал(а) букву '{guess}'!\n\n"
-                f"📖 Текущее слово: `{display_word.strip()}`"
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        # ТОЛЬКО обновляем основное сообщение, не отправляем отдельное
+        await update_game_display(context, chat_id)
 
         # Проверяем, угадано ли слово полностью
         if all(letter in game["guessed_letters"] for letter in word if letter.isalpha()):
             await end_game_win(context, chat_id, user_id)
             return
-        else:
-            # Тот же игрок продолжает ходить после правильного ответа
-            await update_game_display(context, chat_id)
 
     else:
         # Неправильная буква
@@ -717,23 +706,8 @@ async def process_guess(
         game["attempts_left"] -= 1
         player["wrong_guesses"] += 1
         
-        # Формируем текущее состояние слова
-        display_word = ""
-        for letter in word:
-            if letter in game["guessed_letters"] or not letter.isalpha():
-                display_word += letter + " "
-            else:
-                display_word += "_ "
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"❌ {player_name}, буквы '{guess}' нет в слове.\n"
-                f"❤️ Осталось попыток: {game['attempts_left']}\n\n"
-                f"📖 Текущее слово: `{display_word.strip()}`"
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        # ТОЛЬКО обновляем основное сообщение
+        await update_game_display(context, chat_id)
 
         # Проверяем поражение
         if game["attempts_left"] <= 0:
@@ -743,11 +717,19 @@ async def process_guess(
             # Передаем ход следующему игроку
             next_player = next_turn(chat_id)
             if next_player:
-                await context.bot.send_message(
+                # Отправляем короткое уведомление о смене хода
+                sent_msg = await context.bot.send_message(
                     chat_id=chat_id,
                     text=f"🎮 Теперь ходит: {next_player[1]}",
                 )
-            await update_game_display(context, chat_id)
+                # Удаляем сообщение через 5 секунд
+                await asyncio.sleep(5)
+                try:
+                    await sent_msg.delete()
+                except:
+                    pass
+
+import asyncio
 
 async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
     """Дать подсказку игроку (открыть одну букву)."""
@@ -775,19 +757,17 @@ async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
     if user_id in game["players"]:
         game["players"][user_id]["correct_guesses"] += 1
     
-    # Формируем текущее состояние слова
-    display_word = ""
-    for letter in word:
-        if letter in game["guessed_letters"] or not letter.isalpha():
-            display_word += letter + " "
-        else:
-            display_word += "_ "
-    
-    await context.bot.send_message(
+    # Отправляем уведомление о подсказке
+    sent_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"💡 Подсказка: в слове есть буква '{hint_letter}'!\n\n📖 Текущее слово: `{display_word.strip()}`",
-        parse_mode=ParseMode.MARKDOWN,
+        text=f"💡 Подсказка: в слове есть буква '{hint_letter}'!",
     )
+    # Удаляем через 5 секунд
+    await asyncio.sleep(5)
+    try:
+        await sent_msg.delete()
+    except:
+        pass
     
     # Проверяем, не выиграли ли мы после подсказки
     if all(letter in game["guessed_letters"] for letter in word if letter.isalpha()):
@@ -822,10 +802,16 @@ async def skip_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
         player_name = game["players"][current_player_id]["name"]
         next_player_name = next_player[1]
         
-        await context.bot.send_message(
+        sent_msg = await context.bot.send_message(
             chat_id=chat_id,
             text=f"⏭️ Ход игрока {player_name} пропущен!\n🎮 Теперь ходит: {next_player_name}",
         )
+        # Удаляем через 5 секунд
+        await asyncio.sleep(5)
+        try:
+            await sent_msg.delete()
+        except:
+            pass
         
         await update_game_display(context, chat_id)
         return True
