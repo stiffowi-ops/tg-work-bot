@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode, ChatMemberStatus
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -153,7 +153,7 @@ russian_word_categories = {
     "профессии": [
         "ВРАЧ", "УЧИТЕЛЬ", "ИНЖЕНЕР", "ПРОГРАММИСТ", "ДИЗАЙНЕР",
         "МЕНЕДЖЕР", "ДИРЕКТОР", "БУХГАЛТЕР", "ЮРИСТ", "ЖУРНАЛИСТ",
-        "РЕПОРТЕР", "ФОТОГРАФ", "ХУДОЖНИК", "МУЗЫКАНТ", "ПЕВЕЦ",
+        "РЕПОРТЕР", "ФОТОГРАФ", "ХУДОЖНИк", "МУЗЫКАНТ", "ПЕВЕЦ",
         "АКТЕР", "ПИСАТЕЛЬ", "ПОЭТ", "УЧЕНЫЙ", "ИССЛЕДОВАТЕЛЬ", "АНАЛИТИК",
         "ВОДИТЕЛЬ", "ПИЛОТ", "КАПИТАН", "ШЕФПОВАР", "ПОВАР", "ОФИЦИАНТ",
         "МЕДСЕСТРА", "СТОМАТОЛОГ", "ПСИХОЛОГ", "АРХИТЕКТОР", "СТРОИТЕЛЬ",
@@ -170,7 +170,7 @@ russian_word_categories = {
     ]
 }
 
-# Эмодзи для категорий (пункт 5)
+# Эмодзи для категорий
 category_emojis = {
     "технологии": "💻",
     "животные": "🐾",
@@ -242,20 +242,30 @@ async def is_user_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     """Проверяет, является ли пользователь админом/владельцем чата."""
     chat = update.effective_chat
     user = update.effective_user
+    
     if not chat or not user:
         return False
+    
+    # В личных сообщениях считаем пользователя админом
+    if chat.type == "private":
+        return True
+    
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
-    except Exception:
-        return False
-    return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+        # Проверяем статусы
+        return member.status in ["creator", "administrator"]
+    except Exception as e:
+        print(f"Ошибка проверки прав админа: {e}")
+        # В случае ошибки разрешаем запуск для отладки
+        return True
 
 async def is_chat_admin(bot, chat_id: int, user_id: int) -> bool:
     """Проверка прав администратора по chat_id и user_id."""
     try:
         member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-    except Exception:
+        return member.status in ["creator", "administrator"]
+    except Exception as e:
+        print(f"Ошибка проверки прав админа (chat): {e}")
         return False
 
 def join_game(chat_id: int, user_id: int, user_name: str) -> bool:
@@ -288,7 +298,13 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     """Обновить основное сообщение с состоянием игры."""
     if chat_id not in active_games:
         return
+    
     game = active_games[chat_id]
+    
+    # Если игра еще не начата (слово не выбрано)
+    if not game["word"]:
+        return
+    
     word = game["word"]
 
     # Формируем отображение слова
@@ -362,7 +378,8 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     ]
 
     # Кнопку остановки показываем только админу, который запустил игру
-    if await is_chat_admin(context.bot, chat_id, game["started_by"]):
+    is_admin = await is_chat_admin(context.bot, chat_id, game["started_by"])
+    if is_admin:
         buttons.append([InlineKeyboardButton("🛑 Остановить игру", callback_data="admin_stop_game")])
 
     markup = InlineKeyboardMarkup(buttons)
@@ -381,6 +398,9 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
 
 async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     """Показать инлайн-меню выбора категории для виселицы."""
+    if chat_id not in active_games:
+        return
+    
     game = active_games[chat_id]
     admin_name = game["started_by_name"]
 
@@ -399,23 +419,25 @@ async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: i
 
     markup = InlineKeyboardMarkup(buttons)
 
-    msg = await context.bot.send_message(
-        chat_id,
-        text=(
-            f"👑 *Администратор {admin_name} запускает игру 'Виселица'!*\n\n"
-            "📖 *Правила:*\n"
-            "• Бот загадывает слово\n"
-            "• Игроки пишут буквы в ЛС боту\n"
-            "• У команды 6 попыток\n"
-            "• Победит тот, кто угадает слово!\n"
-            "• Можно получить 1 подсказку за игру\n\n"
-            "🎯 *Выберите категорию слов:*"
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=markup,
-    )
-
-    active_games[chat_id]["message_id"] = msg.message_id
+    try:
+        msg = await context.bot.send_message(
+            chat_id,
+            text=(
+                f"👑 *Администратор {admin_name} запускает игру 'Виселица'!*\n\n"
+                "📖 *Правила:*\n"
+                "• Бот загадывает слово\n"
+                "• Игроки пишут буквы в ЛС боту\n"
+                "• У команды 6 попыток\n"
+                "• Победит тот, кто угадает слово!\n"
+                "• Можно получить 1 подсказку за игру\n\n"
+                "🎯 *Выберите категорию слов:*"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=markup,
+        )
+        active_games[chat_id]["message_id"] = msg.message_id
+    except Exception as e:
+        print(f"Ошибка отправки сообщения с категориями: {e}")
 
 # ------------------ ЛОГИКА ИГРЫ ------------------
 async def process_guess(
@@ -583,12 +605,13 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
     """.strip()
 
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=game["message_id"],
-            text=message_text,
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        if game.get("message_id"):
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=game["message_id"],
+                text=message_text,
+                parse_mode=ParseMode.MARKDOWN,
+            )
     except Exception as e:
         print(f"Error editing message on win: {e}")
 
@@ -640,12 +663,13 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
     """.strip()
 
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=game["message_id"],
-            text=message_text,
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        if game.get("message_id"):
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=game["message_id"],
+                text=message_text,
+                parse_mode=ParseMode.MARKDOWN,
+            )
     except Exception as e:
         print(f"Error editing message on lose: {e}")
 
@@ -689,11 +713,22 @@ async def newgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
 
-    if not chat or chat.type not in ("group", "supergroup"):
+    if not chat:
+        await message.reply_text("❌ Чат не найден!")
+        return
+    
+    # Проверяем тип чата
+    if chat.type == "private":
+        await message.reply_text("❌ Эта игра только для групповых чатов! Добавьте меня в группу и используйте там /newgame")
+        return
+    
+    if chat.type not in ("group", "supergroup"):
         await message.reply_text("❌ Эта игра только для групповых чатов!")
         return
 
-    if not await is_user_admin(update, context):
+    # Проверяем права администратора
+    is_admin = await is_user_admin(update, context)
+    if not is_admin:
         await message.reply_text(
             "❌ Только администраторы могут запускать игру!\n"
             "👑 Обратитесь к администратору чата."
@@ -951,6 +986,27 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.effective_message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отладочная команда для проверки прав."""
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    is_admin = await is_user_admin(update, context)
+    
+    debug_text = f"""
+🔧 *Отладочная информация:*
+    
+👤 Пользователь: {user.first_name} (ID: {user.id})
+💬 Чат: {chat.title if chat.title else chat.type} (ID: {chat.id})
+👑 Админ: {'✅ ДА' if is_admin else '❌ НЕТ'}
+🎮 Активных игр: {len(active_games)}
+📊 Игроков в статистике: {len(user_scores)}
+
+📋 Активные игры: {list(active_games.keys()) if active_games else 'Нет'}
+    """.strip()
+    
+    await update.effective_message.reply_text(debug_text, parse_mode=ParseMode.MARKDOWN)
+
 # ------------------ ОБРАБОТЧИКИ CALLBACK ------------------
 async def handle_hangman_category_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка выбора категории виселицы через inline-кнопки."""
@@ -963,7 +1019,9 @@ async def handle_hangman_category_selection(update: Update, context: ContextType
         return
 
     # Проверяем, что callback от администратора
-    if not await is_chat_admin(context.bot, chat_id, query.from_user.id):
+    user_id = query.from_user.id
+    is_admin = await is_chat_admin(context.bot, chat_id, user_id)
+    if not is_admin and user_id != active_games[chat_id]["started_by"]:
         await query.answer("❌ Только администратор может выбирать категорию!", show_alert=True)
         return
 
@@ -1018,7 +1076,8 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
 
     if data == "admin_stop_game":
         # Проверяем права
-        if not await is_chat_admin(context.bot, chat_id, user_id):
+        is_admin = await is_chat_admin(context.bot, chat_id, user_id)
+        if not is_admin and user_id != active_games[chat_id]["started_by"]:
             await query.answer("❌ Только администратор может остановить игру!", show_alert=True)
             return
 
@@ -1148,6 +1207,7 @@ def main():
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("rules", rules_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("debug", debug_cmd))  # Добавил отладочную команду
 
     # Обработка букв для виселицы в ЛС
     app.add_handler(
@@ -1162,6 +1222,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_hangman_buttons, pattern=r"^(hangman_join|hangman_leave|admin_stop_game|hangman_hint)$"))
 
     print("🤖 Бот запущен! Ожидание сообщений...")
+    print("📝 Используйте /debug для проверки прав")
     app.run_polling()
 
 if __name__ == "__main__":
