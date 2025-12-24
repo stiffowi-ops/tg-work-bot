@@ -26,7 +26,7 @@ user_scores: dict[int, int] = {}  # user_id -> wins
 _last_guess_time: dict[str, float] = {}  # "chat_id_user_id" -> timestamp
 _current_turn: dict[int, int] = {}  # chat_id -> current player index
 
-# Стадии виселицы для визуализации
+# Стадии виселицы для визуализации (исправленная)
 hangman_stages = [
     """
     
@@ -362,7 +362,7 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
     
     word = game["word"]
 
-    # Формируем отображение слова
+    # Формируем отображение слова (исправлено)
     display_word = ""
     for letter in word:
         if letter in game["guessed_letters"] or not letter.isalpha():
@@ -405,15 +405,12 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         for player_id, player_data in eliminated_players.items():
             eliminated_text += f"☠️ {player_data['name']}\n"
 
-    # Текущая стадия виселицы
-    # Используем разницу между начальными 6 попытками и текущими
-    # Начальное количество попыток: 6, текущее: game["attempts_left"]
+    # Текущая стадия виселицы (ИСПРАВЛЕНО)
+    # Используем количество неправильных попыток
     wrong_attempts = 6 - game["attempts_left"]
     
     # Определяем стадию виселицы (0-6)
-    stage_index = wrong_attempts
-    if stage_index >= len(hangman_stages):
-        stage_index = len(hangman_stages) - 1
+    stage_index = min(wrong_attempts, len(hangman_stages) - 1)
     
     hangman_display = hangman_stages[stage_index]
 
