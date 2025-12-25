@@ -225,6 +225,11 @@ def save_game_history(game_data):
         print(f"Failed to save game history: {e}")
 
 # ------------------ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ------------------
+def get_attempts_left(game: dict) -> int:
+    """Вычисляет оставшиеся попытки на основе wrong_letters."""
+    wrong_count = len(game.get("wrong_letters", set()))
+    return max(0, 6 - wrong_count)  # Защита от отрицательных значений
+
 async def is_user_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Проверяет, является ли пользователь админом/владельцем чата."""
     chat = update.effective_chat
@@ -418,12 +423,9 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
             for player_id, player_data in eliminated_players.items():
                 eliminated_text += f"☠️ {player_data.get('name', 'Unknown')}\n"
 
-        # Текущая стадия виселицы
-        # Используем количество неправильных попыток
-        wrong_attempts = 6 - game.get("attempts_left", 6)
-        
-        # Определяем стадию виселицы (0-6)
-        stage_index = min(wrong_attempts, len(hangman_stages) - 1)
+        # Текущая стадия виселицы - вычисляем из wrong_letters
+        wrong_count = len(game.get("wrong_letters", set()))
+        stage_index = min(wrong_count, len(hangman_stages) - 1)
         
         hangman_display = hangman_stages[stage_index]
 
@@ -432,6 +434,9 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
 
         # Формируем список неправильных букв для отображения
         wrong_letters_text = ', '.join(sorted(game.get('wrong_letters', []))) if game.get('wrong_letters') else 'пока нет'
+        
+        # Вычисляем оставшиеся попытки
+        attempts_left = get_attempts_left(game)
         
         # Определяем, чья очередь ходить
         current_player_info = get_current_player(chat_id)
@@ -449,9 +454,9 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
 📖 Слово: `{display_word.strip()}`
 📏 Длина слова: {len(word)} букв
 
-❌ Неправильные попытки ({wrong_attempts}/6): {wrong_letters_text}
+❌ Неправильные попытки ({wrong_count}/6): {wrong_letters_text}
 
-❤️ Осталось попыток: {game.get('attempts_left', 6)}
+❤️ Осталось попыток: {attempts_left}
 👥 Активных игроков: {len(active_players)}
 
 *Активные игроки ({len(active_players)}):*
@@ -692,11 +697,12 @@ async def process_guess(
         return
     
     if guess in wrong_letters:
+        # ОШИБКА! Буква уже была ошибочной
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"❌ {player_name}, буква '{guess}' уже была ошибочной! Попробуйте другую букву.",
         )
-        # Ход НЕ пропускается при повторной букве
+        # Счётчик НЕ меняем, ход НЕ пропускается
         return
     
     if guess in word:
@@ -724,14 +730,15 @@ async def process_guess(
             return
 
     else:
-        # Неправильная буква
+        # Неправильная буква - ДОБАВЛЯЕМ в wrong_letters
         if "wrong_letters" not in game:
             game["wrong_letters"] = set()
         game["wrong_letters"].add(guess)
-        game["attempts_left"] = game.get("attempts_left", 6) - 1
         player["wrong_guesses"] = player.get("wrong_guesses", 0) + 1
         
-        print(f"DEBUG: Неправильная буква '{guess}'. attempts_left теперь: {game.get('attempts_left', 6)}")
+        # Вычисляем текущее количество попыток
+        attempts_left = get_attempts_left(game)
+        print(f"DEBUG: Неправильная буква '{guess}'. attempts_left теперь: {attempts_left}")
         print(f"DEBUG: wrong_letters теперь: {game.get('wrong_letters', set())}")
         
         # Отправляем сообщение о неправильной букве (БЕЗ счетчика попыток)
@@ -740,8 +747,8 @@ async def process_guess(
             text=f"❌ {player_name}, буквы '{guess}' нет в слове.",
         )
         
-        # Проверяем поражение
-        if game.get("attempts_left", 6) <= 0:
+        # Проверяем поражение (используем вычисленное значение)
+        if attempts_left <= 0:
             await asyncio.sleep(0.3)
             await end_game_lose(context, chat_id)
             return
@@ -937,6 +944,7 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
     
     game = active_games[chat_id]
     word = game.get("word", "")
+    wrong_count = len(game.get("wrong_letters", set()))
     
     # Сохраняем данные игры для истории
     game_data = {
@@ -944,6 +952,7 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
         "word": word,
         "category": game.get("category", ""),
         "players_count": len(game.get("players", {})),
+        "wrong_attempts": wrong_count,
         "timestamp": datetime.now().isoformat(),
         "result": "lose"
     }
@@ -967,7 +976,7 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
 💀 *ИГРА ОКОНЧЕНА*
 
 📖 Загаданное слово было: *{word}*
-❌ Неправильных попыток: {6 - game.get('attempts_left', 6)} из 6
+❌ Неправильных попыток: {wrong_count} из 6
 
 {leaderboard}
 
@@ -1073,7 +1082,6 @@ async def newgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "word": "",
         "guessed_letters": set(),
         "wrong_letters": set(),
-        "attempts_left": 6,  # НАЧАЛЬНОЕ ЗНАЧЕНИЕ
         "category": "",
         "players": {},
         "message_id": None,
@@ -1084,7 +1092,6 @@ async def newgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     print(f"DEBUG newgame: Создана новая игра для chat_id {chat_id}")
-    print(f"DEBUG newgame: attempts_left инициализировано как 6")
 
     await show_category_selection(context, chat_id)
 
