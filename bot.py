@@ -1124,6 +1124,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stats - статистика игроков
 /history - история игр
 /rules - правила игры
+/debug - отладка (админы)
 
 ✨ Удачи в игре! Начните с /newgame в групповом чате!
     """.strip()
@@ -1179,8 +1180,317 @@ async def newgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await show_category_selection(context, chat_id)
 
-# Остальные команды оставляем без изменений для краткости...
-# [Здесь должны быть join_cmd, leave_cmd, hint_cmd, skip_cmd, stop_cmd, stats_cmd, history_cmd, rules_cmd, help_cmd, debug_cmd]
+async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Присоединиться к активной игре."""
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    
+    if not chat or chat.type not in ("group", "supergroup"):
+        await message.reply_text("❌ Эта команда только для групповых чатов!")
+        return
+    
+    chat_id = chat.id
+    
+    if chat_id not in active_games:
+        await message.reply_text("❌ Нет активной игры! Используйте /newgame чтобы начать.")
+        return
+    
+    user_name = f"{user.first_name} {(user.last_name or '')}".strip()
+    
+    if join_game(chat_id, user.id, user_name):
+        # Если это первый игрок, устанавливаем его текущим
+        if len(active_games[chat_id]["players"]) == 1:
+            _current_turn[chat_id] = 0
+            await message.reply_text(
+                f"🎮 {user_name} присоединился к игре!\n\n"
+                f"🎯 Теперь ходит: {user_name}"
+            )
+        else:
+            await message.reply_text(f"🎮 {user_name} присоединился к игре!")
+        
+        await safe_update_game_display(context, chat_id)
+    else:
+        await message.reply_text("❌ Вы уже в игре или достигнут лимит игроков (10)!")
+
+async def leave_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Покинуть активную игру."""
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    
+    if not chat or chat.type not in ("group", "supergroup"):
+        await message.reply_text("❌ Эта команда только для групповых чатов!")
+        return
+    
+    chat_id = chat.id
+    
+    if chat_id not in active_games:
+        await message.reply_text("❌ Нет активной игры!")
+        return
+    
+    user_name = f"{user.first_name} {(user.last_name or '')}".strip()
+    
+    if leave_game(chat_id, user.id):
+        # Если уходил текущий игрок, передаем ход
+        current_player = get_current_player(chat_id)
+        if current_player and current_player[0] == user.id:
+            next_player = next_turn(chat_id)
+            if next_player:
+                await message.reply_text(
+                    f"👋 {user_name} вышел из игры.\n\n"
+                    f"🎮 Теперь ходит: {next_player[1]}"
+                )
+            else:
+                await message.reply_text(f"👋 {user_name} вышел из игры.")
+        else:
+            await message.reply_text(f"👋 {user_name} вышел из игры.")
+        
+        await safe_update_game_display(context, chat_id)
+    else:
+        await message.reply_text("❌ Вы не участвуете в игре!")
+
+async def hint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить подсказку."""
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    
+    if not chat or chat.type not in ("group", "supergroup"):
+        await message.reply_text("❌ Эта команда только для групповых чатов!")
+        return
+    
+    chat_id = chat.id
+    
+    if chat_id not in active_games:
+        await message.reply_text("❌ Нет активной игры!")
+        return
+    
+    if user.id not in active_games[chat_id].get("players", {}):
+        await message.reply_text("❌ Вы не участвуете в игре!")
+        return
+    
+    success = await give_hint(context, chat_id, user.id)
+    if success:
+        await message.reply_text("💡 Подсказка получена!")
+    else:
+        await message.reply_text("❌ Подсказка уже использована или нет доступных букв!")
+
+async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пропустить ход текущего игрока."""
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    
+    if not chat or chat.type not in ("group", "supergroup"):
+        await message.reply_text("❌ Эта команда только для групповых чатов!")
+        return
+    
+    chat_id = chat.id
+    
+    if chat_id not in active_games:
+        await message.reply_text("❌ Нет активной игры!")
+        return
+    
+    success = await skip_turn(context, chat_id, user.id)
+    if success:
+        await message.reply_text("⏭️ Ход пропущен!")
+    else:
+        await message.reply_text("❌ Не удалось пропустить ход! Вы не админ и не текущий игрок.")
+
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Остановить игру (только для админов)."""
+    chat = update.effective_chat
+    message = update.effective_message
+    
+    if not chat or chat.type not in ("group", "supergroup"):
+        await message.reply_text("❌ Эта команда только для групповых чатов!")
+        return
+    
+    chat_id = chat.id
+    
+    if chat_id not in active_games:
+        await message.reply_text("❌ Нет активной игры!")
+        return
+    
+    # Проверяем права
+    is_admin = await is_user_admin(update, context)
+    if not is_admin:
+        await message.reply_text("❌ Только администраторы могут останавливать игру!")
+        return
+    
+    cleanup_game_state(chat_id)
+    await message.reply_text("🛑 Игра остановлена администратором.")
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать статистику игроков."""
+    chat = update.effective_chat
+    message = update.effective_message
+    
+    if len(user_scores) == 0:
+        await message.reply_text("📊 Статистика пока пуста. Сыграйте хотя бы одну игру!")
+        return
+    
+    # Сортируем игроков по количеству побед
+    sorted_scores = sorted(user_scores.items(), key=lambda x: x[1], reverse=True)
+    
+    stats_text = "🏆 *ТОП-10 ИГРОКОВ:*\n\n"
+    for i, (user_id, wins) in enumerate(sorted_scores[:10], 1):
+        try:
+            user_data = await context.bot.get_chat(user_id)
+            username = user_data.username
+            first_name = user_data.first_name
+            last_name = user_data.last_name
+            
+            display_name = f"@{username}" if username else f"{first_name} {last_name or ''}".strip()
+        except:
+            display_name = f"Игрок {user_id}"
+        
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        stats_text += f"{medal} {escape_markdown(display_name)}: {wins} побед\n"
+    
+    await message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать историю последних игр."""
+    history = load_games_history()
+    
+    if not history:
+        await update.effective_message.reply_text("📜 История игр пока пуста.")
+        return
+    
+    # Берем последние 5 игр
+    recent_games = history[-5:]
+    
+    history_text = "📜 *ПОСЛЕДНИЕ 5 ИГР:*\n\n"
+    
+    for game in reversed(recent_games):
+        timestamp = datetime.fromisoformat(game.get("timestamp", "")).strftime("%d.%m %H:%M")
+        category = game.get("category", "неизвестно").upper()
+        word = escape_markdown(game.get("word", "неизвестно"))
+        
+        if game.get("result") == "win":
+            winner_name = escape_markdown(game.get("winner_name", "неизвестно"))
+            history_text += f"✅ {timestamp} | {category}\n"
+            history_text += f"   👑 {winner_name} угадал(а): {word}\n"
+        else:
+            history_text += f"💀 {timestamp} | {category}\n"
+            history_text += f"   📖 Слово: {word}\n"
+        
+        history_text += f"   👥 Игроков: {game.get('players_count', 0)}\n\n"
+    
+    await update.effective_message.reply_text(history_text, parse_mode=ParseMode.MARKDOWN)
+
+async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать правила игры."""
+    rules_text = """
+🎮 *ПРАВИЛА ИГРЫ "ВИСЕЛИЦА":*
+
+🎯 *Цель игры:*
+Угадать загаданное слово, называя буквы по очереди.
+
+👥 *Игровой процесс:*
+1. Админ запускает игру командой /newgame
+2. Игроки присоединяются командой /join
+3. Бот загадывает слово из выбранной категории
+4. Игроки по очереди называют буквы или слово целиком
+5. У команды есть 6 неправильных попыток
+6. Игра продолжается, пока слово не будет угадано или не закончатся попытки
+
+📚 *Основные правила:*
+• Игроки ходят строго по очереди
+• Можно называть только одну букву за ход
+• Можно рискнуть и назвать слово целиком
+• Если слово названо неправильно - игрок ВЫБЫВАЕТ
+• Подсказку можно использовать 1 раз за игру
+• Админ может пропустить ход любого игрока
+
+⚠️ *Внимание:*
+• Буква 'Ё' автоматически заменяется на 'Е'
+• Регистр букв не имеет значения
+• Пробелы и дефисы в словах считаются частью слова
+
+🏆 *Победитель:*
+Тот, кто угадает слово целиком или последнюю букву!
+
+Удачи! 🍀
+    """.strip()
+    
+    await update.effective_message.reply_text(rules_text, parse_mode=ParseMode.MARKDOWN)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать справку по командам."""
+    help_text = """
+📚 *СПРАВКА ПО КОМАНДАМ:*
+
+👑 *Команды для админов:*
+/newgame - начать новую игру
+/stop - остановить текущую игру
+/skip - пропустить ход игрока
+
+👤 *Команды для игроков:*
+/join - присоединиться к игре
+/leave - выйти из игры
+/hint - получить подсказку (1 за игру)
+
+📊 *Общие команды:*
+/stats - статистика лучших игроков
+/history - история последних игр
+/rules - правила игры
+/help - эта справка
+
+💬 *В чате во время игры:*
+• Пишите одну букву, чтобы угадать её
+• Или напишите слово целиком, чтобы рискнуть!
+
+❓ *Проблемы?*
+Если бот не отвечает или есть ошибки, используйте /debug
+    """.strip()
+    
+    await update.effective_message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отладочная информация."""
+    chat = update.effective_chat
+    message = update.effective_message
+    
+    if not chat:
+        return
+    
+    is_admin = await is_user_admin(update, context)
+    if not is_admin:
+        await message.reply_text("❌ Только администраторы могут использовать эту команду!")
+        return
+    
+    debug_info = f"""
+🔧 *ОТЛАДОЧНАЯ ИНФОРМАЦИЯ:*
+
+📊 *Статистика:*
+• Игроков в статистике: {len(user_scores)}
+• Активных игр: {len(active_games)}
+• Всего игр в истории: {len(load_games_history())}
+
+🔄 *Активные игры:*
+"""
+    
+    for chat_id, game in active_games.items():
+        debug_info += f"\nЧат ID: {chat_id}"
+        debug_info += f"\n• Слово: {'Загадано' if game.get('word') else 'Не выбрано'}"
+        debug_info += f"\n• Категория: {game.get('category', 'Не выбрана')}"
+        debug_info += f"\n• Игроков: {len(game.get('players', {}))}"
+        debug_info += f"\n• Попыток: {len(game.get('wrong_letters', set()))}/6"
+        debug_info += f"\n• Запустил: {game.get('started_by_name', 'Неизвестно')}"
+    
+    if not active_games:
+        debug_info += "\n❌ Нет активных игр"
+    
+    debug_info += f"\n\n📝 *Последние 3 игры из истории:*"
+    history = load_games_history()
+    for game in history[-3:]:
+        timestamp = datetime.fromisoformat(game.get("timestamp", "")).strftime("%d.%m %H:%M")
+        debug_info += f"\n• {timestamp}: {game.get('word', 'Неизвестно')} - {game.get('result', 'Неизвестно')}"
+    
+    await message.reply_text(debug_info, parse_mode=ParseMode.MARKDOWN)
 
 # ------------------ ОБРАБОТЧИКИ CALLBACK ------------------
 async def handle_hangman_category_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
