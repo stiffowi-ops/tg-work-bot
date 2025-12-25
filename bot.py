@@ -114,7 +114,7 @@ russian_word_categories = {
         "СЛОН", "ТИГР", "ЛЕВ", "ВОЛК", "МЕДВЕДЬ", "ЗАЯЦ", "ЛИСА", "ЕНОТ",
         "БЕЛКА", "ЕЖ", "КРОЛИК", "ХОМЯК", "СОБАКА", "КОШКА", "КОРОВА",
         "ЛОШАДЬ", "ОВЦА", "КОЗА", "СВИНЬЯ", "КУРИЦА", "УТКА", "ГУСЬ",
-        "ПЕТУХ", "ИНДЮК", "ВОРОБЕЙ", "СОРОКА", "ВОРОН", "СОВА", "ОРЁЛ",
+        "ПЕТУХ", "ИНДЮК", "ВОРОБЕЙ", "СОРОКА", "ВОРОН", "СОВА", "ОРЁл",
         "ЯСТРЕБ", "КРОКОДИЛ", "АЛЛИГАТОР", "ЧЕРЕПАХА", "ЯЩЕРИЦА", "ЗМЕЯ"
     ],
     
@@ -291,7 +291,7 @@ def eliminate_player(chat_id: int, user_id: int) -> bool:
 
 def get_current_player(chat_id: int) -> tuple[int, str] | None:
     """Получает текущего игрока, чья очередь ходить."""
-    if chat_id not in active_games or chat_id not in _current_turn:
+    if chat_id not in active_games:
         return None
     
     game = active_games[chat_id]
@@ -305,10 +305,14 @@ def get_current_player(chat_id: int) -> tuple[int, str] | None:
     if not active_players:
         return None
     
+    # Если нет текущего хода, устанавливаем первого игрока
+    if chat_id not in _current_turn:
+        _current_turn[chat_id] = 0
+    
     # Находим следующего активного игрока
     for _ in range(len(active_players)):
-        turn_index = _current_turn[chat_id] % len(game["players"])
-        players_list = list(game["players"].keys())
+        turn_index = _current_turn[chat_id] % len(active_players)
+        players_list = list(active_players)
         
         if turn_index >= len(players_list):
             _current_turn[chat_id] = 0
@@ -711,7 +715,7 @@ async def process_guess(
         )
         
         # ОБНОВЛЯЕМ главное сообщение с виселицей
-        await asyncio.sleep(0.3)  # Небольшая задержка перед обновлением
+        await asyncio.sleep(0.3)
         await update_game_display(context, chat_id)
 
         # Проверяем, угадано ли слово полностью
@@ -738,7 +742,7 @@ async def process_guess(
         
         # Проверяем поражение
         if game.get("attempts_left", 6) <= 0:
-            await asyncio.sleep(0.3)  # Задержка перед проверкой поражения
+            await asyncio.sleep(0.3)
             await end_game_lose(context, chat_id)
             return
         else:
@@ -751,7 +755,7 @@ async def process_guess(
                 )
             
             # ОБНОВЛЯЕМ главное сообщение с задержкой
-            await asyncio.sleep(0.5)  # Увеличенная задержка для стабильности
+            await asyncio.sleep(0.5)
             await update_game_display(context, chat_id)
 
 async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
