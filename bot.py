@@ -776,9 +776,9 @@ async def process_guess(
             text=f"❌ {player_name}, буквы '{guess}' нет в слове.",
         )
         
-        # СРАЗУ обновляем отображение игры (ВАЖНО!)
+        # СРАЗУ обновляем отображение игры ПЕРЕД проверкой поражения
         await asyncio.sleep(0.3)
-        await update_game_display(context, chat_id)
+        await update_game_display(context, chat_id, force_update=True)
         
         # Проверяем поражение (используем вычисленное значение)
         if attempts_left <= 0:
@@ -796,7 +796,7 @@ async def process_guess(
                 )
                 # Обновляем отображение после смены игрока
                 await asyncio.sleep(0.5)
-                await update_game_display(context, chat_id)
+                await update_game_display(context, chat_id, force_update=True)
             else:
                 # Если next_player вернул None (например, активных игроков нет)
                 # Назначаем нового текущего игрока принудительно
@@ -809,7 +809,7 @@ async def process_guess(
                     )
                     # Обновляем отображение
                     await asyncio.sleep(0.5)
-                    await update_game_display(context, chat_id)
+                    await update_game_display(context, chat_id, force_update=True)
                 else:
                     # Если вообще нет активных игроков - завершаем игру
                     await context.bot.send_message(
