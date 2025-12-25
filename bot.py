@@ -816,7 +816,7 @@ async def _process_guess_internal(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ {player_name}, буквы '{guess}' нет в слове.",
+            text=f"❌ {player_name}, буквы '{guess}' нет в слове. С тебя короткий, или нет, факт о себе?",
         )
         
         # Обновляем отображение
