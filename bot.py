@@ -329,79 +329,87 @@ def get_current_player(chat_id: int) -> tuple[int, str] | None:
     
     game = active_games[chat_id]
     
-    # Получаем только активных невыбывших игроков
-    active_players = [
-        pid for pid, data in game["players"].items() 
-        if data.get("active", True) and not data.get("eliminated", False)
-    ]
-    
-    if not active_players:
+    # Если нет игроков вообще
+    if not game.get("players"):
         return None
     
-    # Если нет текущего хода, устанавливаем первого игрока
+    # Если нет текущего хода, устанавливаем первого активного игрока
     if chat_id not in _current_turn:
-        _current_turn[chat_id] = 0
+        # Ищем первого активного невыбывшего игрока
+        players_list = list(game["players"].keys())
+        for i, player_id in enumerate(players_list):
+            player_data = game["players"][player_id]
+            if player_data.get("active", True) and not player_data.get("eliminated", False):
+                _current_turn[chat_id] = i
+                return player_id, player_data.get("name", "Unknown")
+        # Если не нашли активных, возвращаем None
+        return None
+    
+    # Получаем текущий индекс
+    current_index = _current_turn[chat_id]
+    players_list = list(game["players"].keys())
     
     # Проверяем, что индекс в пределах диапазона
-    if _current_turn[chat_id] >= len(active_players):
-        _current_turn[chat_id] = _current_turn[chat_id] % len(active_players)
+    if current_index >= len(players_list):
+        current_index = 0
+        _current_turn[chat_id] = 0
     
-    # Находим активного игрока по индексу
-    turn_index = _current_turn[chat_id] % len(active_players)
-    players_list = list(active_players)
+    # Проверяем, активен ли текущий игрок и не выбыл ли он
+    player_id = players_list[current_index]
+    player_data = game["players"][player_id]
     
-    # Безопасное получение игрока
-    if turn_index < len(players_list):
-        player_id = players_list[turn_index]
-        player_data = game["players"][player_id]
-        
-        # Двойная проверка, что игрок активен и не выбыл
-        if player_data.get("active", True) and not player_data.get("eliminated", False):
-            player_name = player_data["name"]
-            return player_id, player_name
+    if player_data.get("active", True) and not player_data.get("eliminated", False):
+        return player_id, player_data.get("name", "Unknown")
     
-    # Если что-то пошло не так, возвращаем первого активного игрока
-    if active_players:
-        player_id = active_players[0]
-        player_data = game["players"][player_id]
-        player_name = player_data["name"]
-        return player_id, player_name
-    
-    return None
+    # Если текущий игрок не активен или выбыл, ищем следующего активного
+    return next_turn(chat_id)
 
 def next_turn(chat_id: int) -> tuple[int, str] | None:
-    """Передает ход следующему игроку. Если игрок один, возвращает его же."""
+    """Передает ход следующему активному игроку."""
     if chat_id not in active_games:
         return None
     
+    game = active_games[chat_id]
+    players_list = list(game["players"].keys())
+    
+    if not players_list:
+        return None
+    
     if chat_id not in _current_turn:
         _current_turn[chat_id] = 0
-    else:
-        _current_turn[chat_id] += 1
     
-    # Получаем следующего игрока
-    next_player = get_current_player(chat_id)
+    # Ищем следующего активного игрока
+    start_index = _current_turn[chat_id]
+    attempts = 0
+    max_attempts = len(players_list) * 2  # Максимум два полных круга
     
-    # Если следующий игрок не найден (все выбыли или проблемы с индексами)
-    # Сбрасываем счетчик и пробуем снова
-    if not next_player:
-        # Сбрасываем счетчик и ищем первого активного игрока
-        _current_turn[chat_id] = 0
+    while attempts < max_attempts:
+        # Переходим к следующему игроку
+        _current_turn[chat_id] = (_current_turn[chat_id] + 1) % len(players_list)
+        attempts += 1
         
-        # Получаем список активных игроков
-        game = active_games[chat_id]
-        active_players = [
-            pid for pid, data in game["players"].items() 
-            if data.get("active", True) and not data.get("eliminated", False)
-        ]
+        # Если вернулись к начальной точке, прерываем цикл
+        if _current_turn[chat_id] == start_index and attempts > 0:
+            break
         
-        if active_players:
-            # Берем первого активного игрока
-            player_id = active_players[0]
-            player_name = game["players"][player_id]["name"]
-            return player_id, player_name
+        # Проверяем текущего игрока
+        player_id = players_list[_current_turn[chat_id]]
+        player_data = game["players"][player_id]
+        
+        if player_data.get("active", True) and not player_data.get("eliminated", False):
+            return player_id, player_data.get("name", "Unknown")
     
-    return next_player
+    # Если не нашли активных игроков
+    print(f"DEBUG next_turn: Не удалось найти активного игрока после {attempts} попыток")
+    
+    # Ищем любого активного игрока с начала
+    for i, player_id in enumerate(players_list):
+        player_data = game["players"][player_id]
+        if player_data.get("active", True) and not player_data.get("eliminated", False):
+            _current_turn[chat_id] = i
+            return player_id, player_data.get("name", "Unknown")
+    
+    return None
 
 def get_active_players_count(chat_id: int) -> int:
     """Возвращает количество активных невыбывших игроков."""
@@ -694,7 +702,10 @@ async def process_word_guess(
             parse_mode=ParseMode.MARKDOWN,
         )
         
-        # Проверяем, остались ли активные игроки
+        # ВАЖНОЕ ИСПРАВЛЕНИЕ: Передаем ход следующему игроку ДО проверки окончания игры
+        next_player = next_turn(chat_id)
+        
+        # Проверяем, остались ли активные игроки ПОСЛЕ передачи хода
         active_players_count = get_active_players_count(chat_id)
         if active_players_count == 0:
             await context.bot.send_message(
@@ -703,10 +714,8 @@ async def process_word_guess(
             )
             await end_game_lose(context, chat_id)
             return False
-        
-        # Передаем ход следующему активному игроку
-        next_player = next_turn(chat_id)
-        if next_player:
+        elif next_player:
+            # Если есть следующий игрок, сообщаем об этом
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"🎮 Теперь ходит: {next_player[1]}",
@@ -1028,7 +1037,7 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
     except Exception as e:
         print(f"Error editing message on win: {e}")
 
-    # Очищаем таймауты и удаляем игру
+    # Очищаем таймауты и удаляем игре
     if chat_id in _last_guess_time:
         keys_to_remove = [k for k in _last_guess_time.keys() if k.startswith(f"{chat_id}_")]
         for key in keys_to_remove:
@@ -1493,7 +1502,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 4. Пишут буквы в чат по очереди
 5. Рискуйте - угадывайте слово целиком!
 
-✨ Удачи в игре! 🎯
+✨ Удачи в игра! 🎯
     """.strip()
     
     await update.effective_message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
