@@ -230,6 +230,34 @@ def get_attempts_left(game: dict) -> int:
     wrong_count = len(game.get("wrong_letters", set()))
     return max(0, 6 - wrong_count)  # Защита от отрицательных значений
 
+def escape_markdown(text: str) -> str:
+    """Экранирует символы, ломающие Markdown."""
+    # Экранируем только основные символы Markdown
+    replacements = {
+        '_': '\\_',
+        '*': '\\*',
+        '[': '\\[',
+        ']': '\\]',
+        '(': '\\(',
+        ')': '\\)',
+        '~': '\\~',
+        '`': '\\`',
+        '>': '\\>',
+        '#': '\\#',
+        '+': '\\+',
+        '-': '\\-',
+        '=': '\\=',
+        '|': '\\|',
+        '{': '\\{',
+        '}': '\\}',
+        '.': '\\.',
+        '!': '\\!'
+    }
+    result = text
+    for char, escaped in replacements.items():
+        result = result.replace(char, escaped)
+    return result
+
 async def is_user_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Проверяет, является ли пользователь админом/владельцем чата."""
     chat = update.effective_chat
@@ -441,8 +469,10 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
 
             for i, (player_id, player_data) in enumerate(sorted_players, 1):
                 medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
+                # Экранируем имена игроков на всякий случай
+                player_name = escape_markdown(player_data.get('name', 'Unknown'))
                 players_text += (
-                    f"{medal} {player_data.get('name', 'Unknown')}: "
+                    f"{medal} {player_name}: "
                     f"✅{player_data.get('correct_guesses', 0)} ❌{player_data.get('wrong_guesses', 0)}\n"
                 )
         else:
@@ -453,12 +483,16 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
         if eliminated_players:
             eliminated_text = "💀 *Выбывшие игроки:*\n"
             for player_id, player_data in eliminated_players.items():
-                eliminated_text += f"☠️ {player_data.get('name', 'Unknown')}\n"
+                # Экранируем имена игроков
+                player_name = escape_markdown(player_data.get('name', 'Unknown'))
+                eliminated_text += f"☠️ {player_name}\n"
 
         # Текущая стадия виселицы - вычисляем из wrong_letters
         stage_index = min(wrong_count, len(hangman_stages) - 1)
         
-        hangman_display = hangman_stages[stage_index]
+        # ВАЖНОЕ ИСПРАВЛЕНИЕ: Заворачиваем виселицу в code block
+        raw_hangman = hangman_stages[stage_index]
+        hangman_display = f"```\n{raw_hangman}\n```"
 
         # Получаем эмодзи для категории
         category_emoji = category_emojis.get(game.get('category', ''), '🎯')
@@ -470,19 +504,30 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
         current_player_info = get_current_player(chat_id)
         turn_text = ""
         if current_player_info:
-            player_id, player_name = current_player_info
+            player_id, player_name_raw = current_player_info
+            # Экранируем имя игрока
+            player_name = escape_markdown(player_name_raw)
             turn_text = f"🎮 *Сейчас ходит:* {player_name}\n\n"
 
+        # Экранируем название категории
+        category_name = escape_markdown(game.get('category', '').upper())
+        # Экранируем имя того, кто запустил игру
+        started_by_name = escape_markdown(game.get('started_by_name', 'Unknown'))
+        # Экранируем отображение слова
+        safe_display_word = escape_markdown(display_word.strip())
+        # Экранируем неправильные буквы
+        safe_wrong_letters = escape_markdown(wrong_letters_text)
+
         message_text = f"""
-🎮 *ВИСЕЛИЦА* | {category_emoji} Категория: {game.get('category', '').upper()}
-👑 Запустил: {game.get('started_by_name', 'Unknown')}
+🎮 *ВИСЕЛИЦА* | {category_emoji} Категория: {category_name}
+👑 Запустил: {started_by_name}
 
 {turn_text}{hangman_display}
 
-📖 Слово: `{display_word.strip()}`
+📖 Слово: `{safe_display_word}`
 📏 Длина слова: {len(word)} букв
 
-❌ Неправильные попытки ({wrong_count}/6): {wrong_letters_text}
+❌ Неправильные попытки ({wrong_count}/6): {safe_wrong_letters}
 
 ❤️ Осталось попыток: {attempts_left}
 👥 Активных игроков: {len(active_players)}
@@ -538,6 +583,7 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
                     print(f"DEBUG: Успешно обновлено сообщение с ID {message_id}")
                 except Exception as edit_error:
                     print(f"Ошибка редактирования сообщения: {edit_error}")
+                    print(f"Текст сообщения: {message_text}")
                     # Если не удалось отредактировать (например, сообщение удалено), 
                     # пробуем отправить новое
                     try:
@@ -947,17 +993,23 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
     leaderboard = "🏆 *Результаты:*\n"
     for i, (player_id, player_data) in enumerate(players_sorted, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
+        # Экранируем имя игрока
+        player_name = escape_markdown(player_data.get('name', 'Unknown'))
         leaderboard += (
-            f"{medal} {player_data.get('name', 'Unknown')}: "
+            f"{medal} {player_name}: "
             f"✅{player_data.get('correct_guesses', 0)} ❌{player_data.get('wrong_guesses', 0)}\n"
         )
 
+    # Экранируем слово и имя победителя
+    safe_word = escape_markdown(word)
+    safe_winner_name = escape_markdown(winner_name)
+    
     message_text = f"""
 🎉 *ПОБЕДА!*
 
-👑 Победитель: *{winner_name}*
+👑 Победитель: *{safe_winner_name}*
 
-📖 Загаданное слово: *{word}*
+📖 Загаданное слово: *{safe_word}*
 
 {leaderboard}
 
@@ -1021,15 +1073,20 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
     for i, (player_id, player_data) in enumerate(players_sorted, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
         status = "☠️" if player_data.get("eliminated", False) else "✅"
+        # Экранируем имя игрока
+        player_name = escape_markdown(player_data.get('name', 'Unknown'))
         leaderboard += (
-            f"{medal} {status} {player_data.get('name', 'Unknown')}: "
+            f"{medal} {status} {player_name}: "
             f"✅{player_data.get('correct_guesses', 0)} ❌{player_data.get('wrong_guesses', 0)}\n"
         )
 
+    # Экранируем слово
+    safe_word = escape_markdown(word)
+    
     message_text = f"""
 💀 *ИГРА ОКОНЧЕНА*
 
-📖 Загаданное слово было: *{word}*
+📖 Загаданное слово было: *{safe_word}*
 ❌ Неправильных попыток: {wrong_count} из 6
 
 {leaderboard}
