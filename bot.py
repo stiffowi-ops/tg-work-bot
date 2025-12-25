@@ -708,7 +708,7 @@ async def process_guess(
         
         print(f"DEBUG: Правильная буква '{guess}'. guessed_letters теперь: {game.get('guessed_letters', set())}")
         
-        # Отправляем сообщение о правильной букве
+        # Отправляем сообщение о правильной букве (БЕЗ счетчика)
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"✅ {player_name}, буква '{guess}' есть в слове! {player_name} ходит ещё раз.",
@@ -734,10 +734,10 @@ async def process_guess(
         print(f"DEBUG: Неправильная буква '{guess}'. attempts_left теперь: {game.get('attempts_left', 6)}")
         print(f"DEBUG: wrong_letters теперь: {game.get('wrong_letters', set())}")
         
-        # Отправляем сообщение о неправильной букве
+        # Отправляем сообщение о неправильной букве (БЕЗ счетчика попыток)
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ {player_name}, буквы '{guess}' нет в слове. Осталось попыток: {game.get('attempts_left', 6)}",
+            text=f"❌ {player_name}, буквы '{guess}' нет в слове.",
         )
         
         # Проверяем поражение
