@@ -122,7 +122,7 @@ russian_word_categories = {
     "города": [
         "МОСКВА", "ПИТЕР", "НОВОСИБИРСК", "ЕКАТЕРИНБУРГ", "НИЖНИЙНОВГОРОД",
         "КАЗАНЬ", "ЧЕЛЯБИНСК", "ОМСК", "САМАРА", "РОСТОВ", "УФА", "КРАСНОЯРСК",
-        "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАД", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
+        "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАд", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
         "ТОЛЬЯТТИ", "ИЖЕВСК", "БАРНАУЛ", "УЛЬЯНОВСК", "ИРКУТСК", "ХАБАРОВСК",
         "ЯРОСЛАВЛЬ", "ВЛАДИВОСТОК", "СЕВАСТОПОЛЬ", "СИМФЕРОПОЛЬ", "МУРМАНСК",
         "АРХАНГЕЛЬСК", "КАЛИНИНГРАД", "СМОЛЕНСК", "ТВЕРЬ", "ТУЛА", "РЯЗАНЬ"
@@ -393,14 +393,35 @@ async def safe_update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     """Безопасное обновление отображения игры с таймаутом."""
     try:
         # Используем таймаут для обновления
-        await asyncio.wait_for(update_game_display(context, chat_id), timeout=5.0)
+        await asyncio.wait_for(update_game_display(context, chat_id), timeout=10.0)
         return True
     except asyncio.TimeoutError:
         print(f"ERROR: Timeout updating game display for chat_id {chat_id}")
+        # Пробуем удалить старое сообщение и создать новое
+        await force_update_game_display(context, chat_id)
         return False
     except Exception as e:
         print(f"ERROR in safe_update_game_display: {e}")
         return False
+
+async def force_update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Принудительное обновление сообщения игры."""
+    if chat_id not in active_games:
+        return
+    
+    game = active_games[chat_id]
+    message_id = game.get("message_id")
+    
+    # Пробуем удалить старое сообщение
+    if message_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            game["message_id"] = None  # Сбрасываем ID
+        except:
+            pass
+    
+    # Создаем новое сообщение
+    await update_game_display(context, chat_id)
 
 # ------------------ ОТОБРАЖЕНИЕ ИГРЫ ------------------
 async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -409,17 +430,13 @@ async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
         print(f"DEBUG update_game_display: Нет активной игры для chat_id {chat_id}")
         return
     
-    # Создаем блокировку для этого чата (но используем с таймаутом)
+    # Создаем блокировку для этого чата
     if chat_id not in _update_locks:
         _update_locks[chat_id] = asyncio.Lock()
     
     try:
-        # Пробуем захватить блокировку с таймаутом
-        async with asyncio.timeout(3.0):
-            async with _update_locks[chat_id]:
-                await _update_game_display_internal(context, chat_id)
-    except asyncio.TimeoutError:
-        print(f"WARNING: Could not acquire update lock for chat_id {chat_id}")
+        async with _update_locks[chat_id]:
+            await _update_game_display_internal(context, chat_id)
     except Exception as e:
         print(f"ERROR in update_game_display: {e}")
 
@@ -435,7 +452,7 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
     wrong_count = len(game.get("wrong_letters", set()))
     attempts_left = get_attempts_left(game)
     
-    print(f"DEBUG update_game_display: chat_id={chat_id}, wrong_count={wrong_count}, attempts_left={attempts_left}")
+    print(f"DEBUG update_game_display: chat_id={chat_id}, wrong_count={wrong_count}, attempts_left={attempts_left}, players={len(game.get('players', {}))}")
 
     # Формируем отображение слова
     display_word = ""
@@ -526,11 +543,9 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
 {eliminated_text}
 💡 *Как играть:*
 • Пишите ОДНУ букву в чат
-• Угадал букву - ходишь снова
-• Знаешь слово и твой ход - пиши его целиком
+• Или попробуйте угадать слово целиком (выбываете при ошибке)
 • Ждите своей очереди
 • Бот сам подскажет, чей ход
-
 
 📝 *Команды:*
 /join - присоединиться к игре
@@ -568,6 +583,7 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
         message_id = game.get("message_id")
         if message_id:
             try:
+                # Сначала пытаемся отредактировать существующее сообщение
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -575,11 +591,18 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=markup,
                 )
-                print(f"DEBUG: Успешно обновлено сообщение с ID {message_id}")
+                print(f"DEBUG: Успешно обновлено сообщение с ID {message_id} для {len(active_players)} игроков")
             except Exception as edit_error:
                 print(f"Ошибка редактирования сообщения: {edit_error}")
-                # Если не удалось отредактировать, отправляем новое
+                # Если не удалось отредактировать, создаем новое сообщение
                 try:
+                    # Пробуем удалить старое сообщение
+                    try:
+                        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    except:
+                        pass
+                    
+                    # Отправляем новое сообщение
                     msg = await context.bot.send_message(
                         chat_id=chat_id,
                         text=message_text,
@@ -587,9 +610,19 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
                         reply_markup=markup,
                     )
                     active_games[chat_id]["message_id"] = msg.message_id
-                    print(f"DEBUG: Создано новое сообщение с ID {msg.message_id}")
+                    print(f"DEBUG: Создано новое сообщение с ID {msg.message_id} для {len(active_players)} игроков")
                 except Exception as send_error:
                     print(f"Ошибка отправки нового сообщения: {send_error}")
+        else:
+            # Если нет message_id, создаем новое сообщение
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=message_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=markup,
+            )
+            active_games[chat_id]["message_id"] = msg.message_id
+            print(f"DEBUG: Создано первоначальное сообщение с ID {msg.message_id}")
     except Exception as e:
         print(f"Error in update display: {e}")
 
@@ -818,7 +851,7 @@ async def _process_guess_internal(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"❌ {player_name}, буквы '{guess}' нет в слове. С тебя короткий, или нет, факт о себе?",
+            text=f"❌ {player_name}, буквы '{guess}' нет в слове.",
         )
         
         # Обновляем отображение
