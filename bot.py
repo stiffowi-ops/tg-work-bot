@@ -34,7 +34,7 @@ PENALTY_TASK = "Расскажи короткий (или не очень) ин�
 PENALTY_TIME_LIMIT = 120  # 2 минуты на выполнение
 
 # Состояние для отслеживания штрафных заданий
-penalty_assignments: dict[int, dict] = {}  # chat_id -> {user_id: {"time": float, "completed": bool}}
+penalty_assignments: dict[int, dict] = {}  # chat_id -> {user_id: {"time": float, "completed": bool, "message_id": int}}
 
 # Стадии виселицы для визуализации
 hangman_stages = [
@@ -132,7 +132,7 @@ russian_word_categories = {
         "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАД", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
         "ТОЛЬЯТТИ", "ИЖЕВСК", "БАРНАУЛ", "УЛЬЯНОВСК", "ИРКУТСК", "ХАБАРОВСК",
         "ЯРОСЛАВЛЬ", "ВЛАДИВОСТОК", "СЕВАСТОПОЛЬ", "СИМФЕРОПОЛЬ", "МУРМАНСК",
-        "АРХАНГЕЛЬСК", "КАЛИНИНГРАД", "СМОЛЕНСК", "ТВЕРЬ", "ТУЛА", "РЯЗАНЬ"
+        "АРХАНГЕЛЬСК", "КАЛИНИНГРАд", "СМОЛЕНСК", "ТВЕРЬ", "ТУЛА", "РЯЗАНЬ"
     ],
     
     "еда": [
@@ -431,14 +431,15 @@ async def force_update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id:
     await update_game_display(context, chat_id)
 
 # ------------------ ФУНКЦИИ ДЛЯ ШТРАФНЫХ ЗАДАНИЙ ------------------
-def assign_penalty_task(chat_id: int, user_id: int):
+def assign_penalty_task(chat_id: int, user_id: int, message_id: int):
     """Назначить штрафное задание игроку, который ошибся."""
     if chat_id not in penalty_assignments:
         penalty_assignments[chat_id] = {}
     
     penalty_assignments[chat_id][user_id] = {
         "time": time.time(),
-        "completed": False
+        "completed": False,
+        "message_id": message_id
     }
 
 def has_active_penalty(chat_id: int, user_id: int) -> bool:
@@ -481,6 +482,50 @@ async def check_penalty_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int
                 text=f"⏰ Время на выполнение задания для {player_name} вышло!\n🎮 Теперь ходит: {next_player[1]}",
             )
             await safe_update_game_display(context, chat_id)
+
+async def update_penalty_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    """Обновить сообщение с заданием (показать кнопку)."""
+    if chat_id not in active_games or chat_id not in penalty_assignments or user_id not in penalty_assignments[chat_id]:
+        return
+    
+    task_data = penalty_assignments[chat_id][user_id]
+    if task_data["completed"]:
+        return
+    
+    message_id = task_data.get("message_id")
+    if not message_id:
+        return
+    
+    player_name = active_games[chat_id]["players"][user_id].get("name", "Unknown")
+    time_left = get_penalty_time_left(chat_id, user_id)
+    minutes = time_left // 60
+    seconds = time_left % 60
+    
+    message_text = f"""
+❌ {player_name}, буквы нет в слове.
+
+🎯 *Штрафное задание для {player_name}:*
+📝 *{PENALTY_TASK}*
+
+⏳ Осталось времени: {minutes}:{seconds:02d}
+💡 Расскажи факт о себе в чате, затем нажми кнопку ниже:
+    """.strip()
+    
+    # Кнопка "✅ Факт рассказан"
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Факт рассказан", callback_data=f"penalty_complete_{user_id}")]
+    ])
+    
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=message_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=markup,
+        )
+    except Exception as e:
+        print(f"Ошибка обновления сообщения с заданием: {e}")
 
 # ------------------ ОТОБРАЖЕНИЕ ИГРЫ ------------------
 async def update_game_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -591,7 +636,7 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
             time_left = get_penalty_time_left(chat_id, player_id)
             minutes = time_left // 60
             seconds = time_left % 60
-            penalty_warning = f"\n⚠️ *У {player_name} активное задание!*\n⏳ Осталось времени: {minutes}:{seconds:02d}\n📝 Задание: {PENALTY_TASK}"
+            penalty_warning = f"\n⚠️ *У {player_name} активное задание!*\n⏳ Осталось времени: {minutes}:{seconds:02d}"
             turn_text = f"🎮 *Сейчас должен выполнить задание:* {player_name}\n"
         else:
             turn_text = f"🎮 *Сейчас ходит:* {player_name}\n"
@@ -624,7 +669,8 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
 • Пишите ОДНУ букву в чат
 • Или попробуйте угадать слово целиком (выбываете при ошибке)
 • При ошибке в букве - получите задание рассказать факт о себе
-• После рассказа факта ход переходит следующему игроку
+• После рассказа факта нажмите кнопку в сообщении с заданием
+• Ход переходит следующему игроку
 • Ждите своей очереди
 • Бот сам подскажет, чей ход
 
@@ -632,7 +678,6 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
 /join - присоединиться к игре
 /leave - выйти из игры
 /hint - получить подсказку (1 за игру)
-/fact - отметить факт о себе как рассказанный
 /skip - пропустить ход (если игрок не отвечает 2 минуты)
     """.strip()
 
@@ -647,12 +692,10 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
         ]
     ]
 
-    # Проверяем, есть ли у текущего игрока активное задание
+    # Кнопку пропуска хода показываем только если у текущего игрока нет задания
     if current_player_info:
         player_id = current_player_info[0]
-        if has_active_penalty(chat_id, player_id):
-            buttons[1].append(InlineKeyboardButton("✅ Факт рассказан", callback_data="hangman_fact_complete"))
-        else:
+        if not has_active_penalty(chat_id, player_id):
             buttons[1].append(InlineKeyboardButton("⏭️ Пропустить ход", callback_data="hangman_skip"))
 
     # Кнопку остановки показываем только админу
@@ -748,9 +791,10 @@ async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: i
                 "• Игроки присоединяются командой /join\n"
                 "• Игроки пишут буквы в чат по очереди\n"
                 "• Можно угадать слово целиком (выбываешь при ошибке)\n"
-                "• У команды 6 попыток на ошибки\n"
+                "• У команды есть 6 попыток на ошибки\n"
                 f"• При ошибке в букве: {PENALTY_TASK}\n"
-                "• После рассказа факта ход переходит следующему игроку\n"
+                "• После рассказа факта нажмите кнопку в сообщении с заданием\n"
+                "• Ход переходит следующему игроку\n"
                 "• Побеждает тот, кто угадает слово!\n"
                 "• Можно получить 1 подсказку за игру\n\n"
                 "🎯 *Выберите категорию слов:*"
@@ -791,7 +835,7 @@ async def process_word_guess(
                 f"⚠️ {player_name}, у тебя есть активное задание!\n\n"
                 f"📝 Задание: {PENALTY_TASK}\n"
                 f"⏳ Осталось времени: {minutes}:{seconds:02d}\n\n"
-                "💡 Сначала расскажи факт о себе кнопкой '✅ Факт рассказан'"
+                "💡 Сначала расскажи факт о себе и нажми кнопку в сообщении с заданием"
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -915,7 +959,7 @@ async def _process_guess_internal(context: ContextTypes.DEFAULT_TYPE, chat_id: i
                 f"⚠️ {player_name}, у тебя есть активное задание!\n\n"
                 f"📝 Задание: {PENALTY_TASK}\n"
                 f"⏳ Осталось времени: {minutes}:{seconds:02d}\n\n"
-                "💡 Сначала расскажи факт о себе кнопкой '✅ Факт рассказан'"
+                "💡 Сначала расскажи факт о себе и нажми кнопку в сообщении с заданием"
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -974,23 +1018,42 @@ async def _process_guess_internal(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         wrong_count = len(game["wrong_letters"])
         attempts_left = get_attempts_left(game)
         
-        # Назначаем штрафное задание
-        assign_penalty_task(chat_id, user_id)
+        # Отправляем сообщение с заданием и кнопкой
+        time_left = PENALTY_TIME_LIMIT
+        minutes = time_left // 60
+        seconds = time_left % 60
         
-        await context.bot.send_message(
+        message_text = f"""
+❌ {player_name}, буквы '{guess}' нет в слове.
+
+🎯 *Штрафное задание для {player_name}:*
+📝 *{PENALTY_TASK}*
+
+⏳ Осталось времени: {minutes}:{seconds:02d}
+💡 Расскажи факт о себе в чате, затем нажми кнопку ниже:
+        """.strip()
+        
+        # Кнопка "✅ Факт рассказан"
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Факт рассказан", callback_data=f"penalty_complete_{user_id}")]
+        ])
+        
+        # Отправляем сообщение с заданием
+        msg = await context.bot.send_message(
             chat_id=chat_id,
-            text=(
-                f"❌ {player_name}, буквы '{guess}' нет в слове.\n\n"
-                f"🎯 *Штрафное задание для {player_name}:*\n"
-                f"📝 *{PENALTY_TASK}*\n\n"
-                f"💡 Чтобы продолжить игру, расскажи факт о себе и нажми кнопку '✅ Факт рассказан'\n"
-                f"⏰ У тебя есть 2 минуты, иначе ход будет передан следующему игроку."
-            ),
+            text=message_text,
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=markup,
         )
         
-        # Обновляем отображение
+        # Назначаем штрафное задание с ID сообщения
+        assign_penalty_task(chat_id, user_id, msg.message_id)
+        
+        # Обновляем главное сообщение игры
         await safe_update_game_display(context, chat_id)
+        
+        # Запускаем таймер для обновления сообщения с заданием
+        asyncio.create_task(update_penalty_timer(context, chat_id, user_id))
         
         # Запускаем таймер для проверки времени
         asyncio.create_task(check_penalty_timeout_delayed(context, chat_id, user_id))
@@ -999,6 +1062,15 @@ async def _process_guess_internal(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         if attempts_left <= 0:
             await end_game_lose(context, chat_id)
             return
+
+async def update_penalty_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    """Обновлять таймер в сообщении с заданием каждые 10 секунд."""
+    for i in range(12):  # 12 * 10 = 120 секунд (2 минуты)
+        if not has_active_penalty(chat_id, user_id):
+            break
+        
+        await asyncio.sleep(10)  # Обновляем каждые 10 секунд
+        await update_penalty_message(context, chat_id, user_id)
 
 async def check_penalty_timeout_delayed(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
     """Запустить проверку таймаута задания с задержкой."""
@@ -1028,7 +1100,7 @@ async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
                 f"⚠️ У тебя есть активное задание!\n\n"
                 f"📝 Задание: {PENALTY_TASK}\n"
                 f"⏳ Осталось времени: {minutes}:{seconds:02d}\n\n"
-                "💡 Сначала расскажи факт о себе кнопкой '✅ Факт рассказан'"
+                "💡 Сначала расскажи факт о себе и нажми кнопку в сообщении с заданием"
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -1040,7 +1112,7 @@ async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
     if not unguessed:
         return False
     
-    # Выбираем случайную букву для подсказку
+    # Выбираем случайную букву для подсказки
     hint_letter = random.choice(unguessed)
     if "guessed_letters" not in game:
         game["guessed_letters"] = set()
@@ -1301,7 +1373,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📚 *Особенность игры:*
 При ошибке в букве игрок получает задание:
 📝 *"{PENALTY_TASK}"*
-У игрока есть 2 минуты на выполнение. После рассказа факта ход переходит следующему игроку.
+В сообщении с заданием будет кнопка "✅ Факт рассказан"
+У игрока есть 2 минуты на выполнение. После рассказа факта и нажатия кнопки ход переходит следующему игроку.
 
 📝 *Команды:*
 /newgame - начать новую игру (админы)
@@ -1597,7 +1670,8 @@ async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Если слово названо неправильно - игрок ВЫБЫВАЕТ
 • При ошибке в букве: {PENALTY_TASK}
 • Время на выполнение задания: {PENALTY_TIME_LIMIT//60} минуты
-• После рассказа факта ход переходит следующему игроку
+• После рассказа факта нажмите кнопку в сообщении с заданием
+• Ход переходит следующему игроку
 • Подсказку можно использовать 1 раз за игру
 • Админ может пропустить ход любого игрока
 
@@ -1639,7 +1713,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Пишите одну букву, чтобы угадать её
 • Или напишите слово целиком, чтобы рискнуть!
 • При ошибке в букве: {PENALTY_TASK}
-• После рассказа факта нажмите кнопку '✅ Факт рассказан'
+• После рассказа факта нажмите кнопку в сообщении с заданием
 
 ❓ *Проблемы?*
 Если бот не отвечает или есть ошибки, используйте /debug
@@ -1743,7 +1817,8 @@ async def handle_hangman_category_selection(update: Update, context: ContextType
                 "2. Пишите буквы в чат по очереди\n"
                 "3. Или угадайте слово целиком (риск!)\n"
                 f"4. При ошибке в букве: {PENALTY_TASK}\n"
-                "5. После рассказа факта ход переходит следующему игроку\n\n"
+                "5. После рассказа факта нажмите кнопку в сообщении с заданием\n"
+                "6. Ход переходит следующему игроку\n\n"
                 f"👑 Игру запустил: {game['started_by_name']}"
             ),
             parse_mode=ParseMode.MARKDOWN,
@@ -1823,41 +1898,6 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
         else:
             await query.answer("❌ Подсказка уже использована или нет доступных букв!", show_alert=True)
 
-    elif data == "hangman_fact_complete":
-        # Проверяем, является ли игрок текущим
-        current_player = get_current_player(chat_id)
-        if not current_player or current_player[0] != user_id:
-            await query.answer("❌ Сейчас не ваш ход!", show_alert=True)
-            return
-        
-        # Проверяем, есть ли активное задание
-        if not has_active_penalty(chat_id, user_id):
-            await query.answer("✅ У вас нет активных заданий!", show_alert=True)
-            return
-        
-        # Отмечаем задание как выполненное
-        complete_penalty_task(chat_id, user_id)
-        
-        # Передаем ход следующему игроку
-        next_player = next_turn(chat_id)
-        
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"🎉 *{user_name} рассказал(а) факт о себе!*\n\n"
-                f"✅ Задание выполнено!\n"
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        
-        if next_player:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"🎮 Теперь ходит: {next_player[1]}",
-            )
-        
-        await query.answer("✅ Факт о себе отмечен как рассказанный!")
-        
     elif data == "hangman_skip":
         success = await skip_turn(context, chat_id, user_id)
         if success:
@@ -1865,6 +1905,66 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
         else:
             await query.answer("❌ Не удалось пропустить ход!", show_alert=True)
 
+    await safe_update_game_display(context, chat_id)
+
+async def handle_penalty_complete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатия кнопки 'Факт рассказан' в сообщении с заданием."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat.id
+
+    if chat_id not in active_games:
+        await query.edit_message_text("❌ Игра уже завершена.")
+        return
+
+    # Получаем user_id из callback_data (формат: "penalty_complete_{user_id}")
+    data = query.data
+    if not data.startswith("penalty_complete_"):
+        return
+    
+    target_user_id = int(data.replace("penalty_complete_", ""))
+    user_id = query.from_user.id
+    user_name = f"{query.from_user.first_name} {(query.from_user.last_name or '')}".strip()
+
+    # Проверяем, является ли пользователь тем, кому назначено задание
+    if user_id != target_user_id:
+        await query.answer("❌ Это не ваше задание!", show_alert=True)
+        return
+
+    # Проверяем, есть ли активное задание
+    if not has_active_penalty(chat_id, user_id):
+        await query.answer("✅ У вас нет активных заданий!", show_alert=True)
+        return
+
+    # Отмечаем задание как выполненное
+    complete_penalty_task(chat_id, user_id)
+
+    # Редактируем сообщение с заданием
+    try:
+        await query.edit_message_text(
+            text=f"✅ *{user_name} рассказал(а) факт о себе!*\n\n🎯 Задание выполнено!",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=None,
+        )
+    except Exception as e:
+        print(f"Ошибка редактирования сообщения с заданием: {e}")
+
+    # Передаем ход следующему игроку
+    next_player = next_turn(chat_id)
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🎉 *{user_name} выполнил(а) задание!*\n✅ Факт о себе рассказан!",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    
+    if next_player:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🎮 Теперь ходит: {next_player[1]}",
+        )
+    
+    # Обновляем главное сообщение игры
     await safe_update_game_display(context, chat_id)
 
 # ------------------ ОБРАБОТКА СООБЩЕНИЙ В ЧАТЕ ------------------
@@ -1929,7 +2029,7 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан в .env")
 
-    # Загружаем статистика
+    # Загружаем статистику
     load_scores()
     print(f"🤖 Загружено {len(user_scores)} игроков в статистике")
 
@@ -1963,7 +2063,8 @@ def main():
 
     # Callback-обработчики
     app.add_handler(CallbackQueryHandler(handle_hangman_category_selection, pattern=r"^hangman_category_"))
-    app.add_handler(CallbackQueryHandler(handle_hangman_buttons, pattern=r"^(hangman_join|hangman_leave|admin_stop_game|hangman_hint|hangman_fact_complete|hangman_skip)$"))
+    app.add_handler(CallbackQueryHandler(handle_hangman_buttons, pattern=r"^(hangman_join|hangman_leave|admin_stop_game|hangman_hint|hangman_skip)$"))
+    app.add_handler(CallbackQueryHandler(handle_penalty_complete, pattern=r"^penalty_complete_\d+$"))
 
     print("🤖 Бот запущен! Ожидание сообщений...")
     app.run_polling()
