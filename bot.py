@@ -392,7 +392,7 @@ def get_active_players_count(chat_id: int) -> int:
     
     game = active_games[chat_id]
     return len([
-        pid for pid, data in game["players"].items() 
+        pid for pid, data in game.get("players", {}).items() 
         if data.get("active", True) and not data.get("eliminated", False)
     ])
 
@@ -1942,7 +1942,7 @@ async def handle_penalty_complete(update: Update, context: ContextTypes.DEFAULT_
     # Редактируем сообщение с заданием
     try:
         await query.edit_message_text(
-            text=f"✅ *{user_name} рассказал(а) факт о себе!*\n\n🎯 Задание выполнено!",
+            text=f"✅ *{user_name} рассказал(а) факт о себе!*\n\n🎯 Задание выполнено!\n\n⏳ Загрузка обновленного состояния игры...",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=None,
         )
@@ -1952,6 +1952,7 @@ async def handle_penalty_complete(update: Update, context: ContextTypes.DEFAULT_
     # Передаем ход следующему игроку
     next_player = next_turn(chat_id)
     
+    # Отправляем уведомление в чат
     await context.bot.send_message(
         chat_id=chat_id,
         text=f"🎉 *{user_name} выполнил(а) задание!*\n✅ Факт о себе рассказан!",
@@ -1964,8 +1965,104 @@ async def handle_penalty_complete(update: Update, context: ContextTypes.DEFAULT_
             text=f"🎮 Теперь ходит: {next_player[1]}",
         )
     
-    # Обновляем главное сообщение игры
-    await safe_update_game_display(context, chat_id)
+    # ОТПРАВЛЯЕМ ОСНОВНОЕ СООБЩЕНИЕ С ИГРОЙ В ЧАТ (АЛЬТЕРНАТИВНЫЙ ВАРИАНТ)
+    try:
+        # Создаем и отправляем новое сообщение с текущим состоянием игры
+        game = active_games[chat_id]
+        word = game.get("word", "")
+        wrong_count = len(game.get("wrong_letters", set()))
+        attempts_left = get_attempts_left(game)
+        
+        # Формируем отображение слова
+        display_word = ""
+        for letter in word:
+            if letter in game.get("guessed_letters", set()) or not letter.isalpha():
+                display_word += letter + " "
+            else:
+                display_word += "_ "
+        
+        # Формируем список активных игроков
+        active_players = {
+            pid: data for pid, data in game.get("players", {}).items() 
+            if data.get("active", True) and not data.get("eliminated", False)
+        }
+        
+        players_text = ""
+        if active_players:
+            sorted_players = sorted(
+                active_players.items(), key=lambda x: x[1].get("correct_guesses", 0), reverse=True
+            )
+            
+            for i, (player_id, player_data) in enumerate(sorted_players, 1):
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
+                player_name_display = escape_markdown(player_data.get('name', 'Unknown'))
+                players_text += (
+                    f"{medal} {player_name_display}: "
+                    f"✅{player_data.get('correct_guesses', 0)} ❌{player_data.get('wrong_guesses', 0)}\n"
+                )
+        else:
+            players_text = "❌ Нет активных игроков"
+        
+        # Текущая стадия виселицы
+        stage_index = min(wrong_count, len(hangman_stages) - 1)
+        raw_hangman = hangman_stages[stage_index]
+        hangman_display = f"```\n{raw_hangman}\n```"
+        
+        # Получаем эмодзи для категории
+        category_emoji = category_emojis.get(game.get('category', ''), '🎯')
+        
+        # Формируем список неправильных букв
+        wrong_letters_text = ', '.join(sorted(game.get('wrong_letters', []))) if game.get('wrong_letters') else 'пока нет'
+        
+        # Определяем, чья очередь ходить
+        current_player_info = get_current_player(chat_id)
+        turn_text = ""
+        
+        if current_player_info:
+            _, next_player_name_raw = current_player_info
+            next_player_name = escape_markdown(next_player_name_raw)
+            turn_text = f"🎮 *Сейчас ходит:* {next_player_name}\n"
+        
+        # Экранируем все тексты
+        category_name = escape_markdown(game.get('category', '').upper())
+        started_by_name = escape_markdown(game.get('started_by_name', 'Unknown'))
+        safe_display_word = escape_markdown(display_word.strip())
+        safe_wrong_letters = escape_markdown(wrong_letters_text)
+        
+        game_state_text = f"""
+🎮 *ВИСЕЛИЦА* | {category_emoji} Категория: {category_name}
+👑 Запустил: {started_by_name}
+
+{turn_text}{hangman_display}
+
+📖 Слово: `{safe_display_word}`
+📏 Длина слова: {len(word)} букв
+
+❌ Неправильные попытки ({wrong_count}/6): {safe_wrong_letters}
+
+❤️ Осталось попыток: {attempts_left}
+👥 Активных игроков: {len(active_players)}
+
+*Активные игроки ({len(active_players)}):*
+{players_text}
+
+💡 Продолжаем игру!
+        """.strip()
+        
+        # Отправляем сообщение с текущим состоянием игры в чат
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=game_state_text,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        
+        # Обновляем главное сообщение игры
+        await safe_update_game_display(context, chat_id)
+        
+    except Exception as e:
+        print(f"Ошибка при отправке состояния игры в чат: {e}")
+        # Если не удалось отправить состояние, просто обновляем главное сообщение
+        await safe_update_game_display(context, chat_id)
 
 # ------------------ ОБРАБОТКА СООБЩЕНИЙ В ЧАТЕ ------------------
 async def handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
