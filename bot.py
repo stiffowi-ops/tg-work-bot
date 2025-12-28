@@ -580,6 +580,9 @@ async def check_penalty_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     """Проверить таймаут штрафного задания и передать ход."""
     if has_active_penalty(chat_id, user_id):
         complete_penalty_task(chat_id, user_id)
+
+        # 🔄 ОБНОВЛЯЕМ ОСНОВНОЕ ИГРОВОЕ ОКНО
+        await update_game_display_with_retry(context, chat_id)
         try:
             await query.answer("✅ Задание выполнено!")
         except:
@@ -1294,9 +1297,15 @@ async def end_game_win(context: ContextTypes.DEFAULT_TYPE, chat_id: int, winner_
     """.strip()
 
     try:
-        message_id = game.get("message_id")
-        if message_id:
-            await context.bot.edit_message_text(
+        # ⬇️ Финал ВСЕГДА отправляем НОВЫМ сообщением
+        try:
+            message_id = game.get("message_id")
+            if message_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except:
+            pass
+
+        await context.bot.send_message(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=message_text,
@@ -1365,9 +1374,15 @@ async def end_game_lose(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
     """.strip()
 
     try:
-        message_id = game.get("message_id")
-        if message_id:
-            await context.bot.edit_message_text(
+        # ⬇️ Финал ВСЕГДА отправляем НОВЫМ сообщением
+        try:
+            message_id = game.get("message_id")
+            if message_id:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except:
+            pass
+
+        await context.bot.send_message(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=message_text,
