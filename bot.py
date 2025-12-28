@@ -580,6 +580,10 @@ async def check_penalty_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     """Проверить таймаут штрафного задания и передать ход."""
     if has_active_penalty(chat_id, user_id):
         complete_penalty_task(chat_id, user_id)
+        try:
+            await query.answer("✅ Задание выполнено!")
+        except:
+            pass
         next_player = next_turn(chat_id)
         if next_player:
             player_name = active_games[chat_id]["players"][user_id].get("name", "Unknown")
@@ -1102,6 +1106,8 @@ async def _process_guess_internal(context: ContextTypes.DEFAULT_TYPE, chat_id: i
             return
 
 async def update_penalty_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    if chat_id not in active_games:
+        return
     """Обновлять таймер в сообщении с заданием каждые 10 секунд."""
     for i in range(12):
         if not has_active_penalty(chat_id, user_id):
@@ -1111,6 +1117,8 @@ async def update_penalty_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         await update_penalty_message(context, chat_id, user_id)
 
 async def check_penalty_timeout_delayed(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    if chat_id not in active_games:
+        return
     """Запустить проверку таймаута задания с задержкой."""
     await asyncio.sleep(PENALTY_TIME_LIMIT)
     await check_penalty_timeout(context, chat_id, user_id)
