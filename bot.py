@@ -148,7 +148,7 @@ russian_word_categories = {
     "города": [
         "МОСКВА", "ПИТЕР", "НОВОСИБИРСК", "ЕКАТЕРИНБУРГ", "НИЖНИЙНОВГОРОД",
         "КАЗАНЬ", "ЧЕЛЯБИНСК", "ОМСК", "САМАРА", "РОСТОВ", "УФА", "КРАСНОЯРСК",
-        "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАД", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
+        "ПЕРМЬ", "ВОРОНЕЖ", "ВОЛГОГРАд", "КРАСНОДАР", "САРАТОВ", "ТЮМЕНЬ",
         "ТОЛЬЯТТИ", "ИЖЕВСК", "БАРНАУЛ", "УЛЬЯНОВСК", "ИРКУТСК", "ХАБАРОВСК",
         "ЯРОСЛАВЛЬ", "ВЛАДИВОСТОК", "СЕВАСТОПОЛЬ", "СИМФЕРОПОЛЬ", "МУРМАНСК",
         "АРХАНГЕЛЬСК", "КАЛИНИНГРАД", "СМОЛЕНСК", "ТВЕРЬ", "ТУЛА", "РЯЗАНЬ"
@@ -2065,22 +2065,87 @@ async def handle_penalty_complete(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"Ошибка редактирования сообщения с заданием: {e}")
 
-    # ПЕРЕД тем как передавать ход, проверяем - если это была 6-я ошибка, завершаем игру
+    # Получаем состояние игры
     game = active_games[chat_id]
     wrong_count = len(game.get("wrong_letters", set()))
     attempts_left = get_attempts_left(game)
     
-    # Если попыток не осталось (6 ошибок), завершаем игру поражением
+    # Если попыток не осталось (6 ошибок), показываем итоговое состояние виселицы
     if attempts_left <= 0:
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🎉 *{user_name} выполнил(а) задание!*\n✅ Факт о себе рассказан!",
+            text=f"🎉 *{user_name} выполнил(а) задание!*\n✅ Факт о себе рассказан!\n\n💀 *Это была 6-я ошибка - игра завершена!*",
             parse_mode=ParseMode.MARKDOWN,
         )
-        await end_game_lose(context, chat_id)
+        
+        # Отправляем итоговое сообщение с полной виселицей
+        word = game.get("word", "")
+        wrong_count = len(game.get("wrong_letters", set()))
+        
+        game_data = {
+            "chat_id": chat_id,
+            "word": word,
+            "category": game.get("category", ""),
+            "players_count": len(game.get("players", {})),
+            "wrong_attempts": wrong_count,
+            "timestamp": datetime.now().isoformat(),
+            "result": "lose"
+        }
+        save_game_history(game_data)
+
+        players_sorted = sorted(
+            game.get("players", {}).items(), key=lambda x: x[1].get("correct_guesses", 0), reverse=True
+        )
+
+        leaderboard = "📊 *Результаты:*\n"
+        for i, (player_id, player_data) in enumerate(players_sorted, 1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "👤"
+            status = "☠️" if player_data.get("eliminated", False) else "✅"
+            player_name = escape_markdown(player_data.get('name', 'Unknown'))
+            leaderboard += (
+                f"{medal} {status} {player_name}: "
+                f"✅{player_data.get('correct_guesses', 0)} ❌{player_data.get('wrong_guesses', 0)}\n"
+            )
+
+        safe_word = escape_markdown(word)
+        
+        raw_hangman = hangman_stages[6]
+        hangman_display = f"```\n{raw_hangman}\n```"
+        
+        category_name = escape_markdown(game.get('category', '').upper())
+        category_emoji = category_emojis.get(game.get('category', ''), '🎯')
+
+        message_text = f"""
+💀 *ИГРА ОКОНЧЕНА*
+
+🎮 *ВИСЕЛИЦА* | {category_emoji} Категория: {category_name}
+
+{hangman_display}
+
+📖 Загаданное слово было: *{safe_word}*
+❌ Неправильных попыток: {wrong_count} из 6
+
+{leaderboard}
+
+🎯 Для новой игры используйте /newgame
+        """.strip()
+
+        try:
+            message_id = game.get("message_id")
+            if message_id:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=message_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+        except Exception as e:
+            logger.error(f"Error editing final message: {e}")
+        
+        cleanup_game_state(chat_id)
         return
     
-    # Иначе передаем ход следующему игроку (как было раньше)
+    # Если 1-5 ошибок, передаем ход следующему игроку и обновляем основное окно
     next_player = next_turn(chat_id)
     
     await context.bot.send_message(
@@ -2095,6 +2160,7 @@ async def handle_penalty_complete(update: Update, context: ContextTypes.DEFAULT_
             text=f"🎮 Теперь ходит: {next_player[1]}",
         )
     
+    # ВАЖНО: Обновляем основное окно с виселицей для 1-5 ошибок
     await update_game_display_with_retry(context, chat_id)
 
 # ------------------ ОБРАБОТКА СООБЩЕНИЙ В ЧАТЕ ------------------
