@@ -718,9 +718,17 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
     safe_display_word = escape_markdown(display_word.strip())
     safe_wrong_letters = escape_markdown(wrong_letters_text)
 
+    # Добавляем информацию о подсказке, если она была использована
+    hint_info = game.get('hint_info', {})
+    hint_text = ""
+    if hint_info.get('used', False) and hint_info.get('letters'):
+        hint_letters = hint_info.get('letters', [])
+        hint_text = f"\n💡 *Использована подсказка:* {', '.join(sorted(hint_letters))}"
+
     message_text = f"""
 🎮 *ВИСЕЛИЦА* | {category_emoji} Категория: {category_name}
 👑 Запустил: {started_by_name}
+{hint_text}
 
 {turn_text}{penalty_warning}{hangman_display}
 
@@ -748,7 +756,7 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
 📝 *Команды:*
 /join - присоединиться к игре
 /leave - выйти из игры
-/hint - получить подсказку (1 за игру)
+/hint - получить подсказку (1 за игру, только админы, 3 буквы)
 /skip - пропустить ход (если игрок не отвечает 2 минуты)
     """.strip()
 
@@ -756,16 +764,25 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
         [
             InlineKeyboardButton("🎮 Присоединиться", callback_data="hangman_join"),
             InlineKeyboardButton("👋 Выйти", callback_data="hangman_leave"),
-        ],
-        [
-            InlineKeyboardButton("💡 Подсказка", callback_data="hangman_hint"),
         ]
     ]
 
     if current_player_info:
         player_id = current_player_info[0]
         if not has_active_penalty(chat_id, player_id):
-            buttons[1].append(InlineKeyboardButton("⏭️ Пропустить ход", callback_data="hangman_skip"))
+            buttons.append([InlineKeyboardButton("⏭️ Пропустить ход", callback_data="hangman_skip")])
+
+    # Проверяем, является ли пользователь админом для отображения кнопки подсказки
+    try:
+        message = context._chat_id_to_message.get(chat_id)
+        if message:
+            user_id = message.from_user.id if hasattr(message, 'from_user') else None
+            if user_id:
+                is_admin = await is_chat_admin(context.bot, chat_id, user_id)
+                if is_admin and not hint_info.get('used', False):
+                    buttons.append([InlineKeyboardButton("💡 Подсказка (админ)", callback_data="hangman_hint")])
+    except:
+        pass
 
     try:
         is_admin = await asyncio.wait_for(
@@ -858,7 +875,7 @@ async def show_category_selection(context: ContextTypes.DEFAULT_TYPE, chat_id: i
                 "• После рассказа факта нажмите кнопку в сообщении с заданием\n"
                 "• Ход переходит следующему игроку\n"
                 "• Побеждает тот, кто угадает слово!\n"
-                "• Можно получить 1 подсказку за игру\n\n"
+                "• Админ может использовать подсказку 1 раз за игру (3 буквы)\n\n"
                 "🎯 *Выберите категорию слов:*"
             ),
             parse_mode=ParseMode.MARKDOWN,
@@ -1101,14 +1118,24 @@ async def check_penalty_timeout_delayed(context: ContextTypes.DEFAULT_TYPE, chat
     await check_penalty_timeout(context, chat_id, user_id)
 
 async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
-    """Дать подсказку игроку."""
+    """Дать подсказку игроку (3 случайные буквы, только для админа)."""
     if chat_id not in active_games:
         return False
     
     game = active_games[chat_id]
     word = game.get("word", "")
     
-    if game.get("hint_used"):
+    hint_info = game.get("hint_info", {})
+    if hint_info.get("used", False):
+        return False
+    
+    # Проверяем, является ли пользователь админом
+    is_admin = await is_chat_admin(context.bot, chat_id, user_id)
+    if not is_admin:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Только администраторы могут использовать подсказку!",
+        )
         return False
     
     if has_active_penalty(chat_id, user_id):
@@ -1129,27 +1156,41 @@ async def give_hint(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
     
     guessed_letters = game.get("guessed_letters", set())
     unguessed = [letter for letter in word if letter.isalpha() and letter not in guessed_letters]
+    
     if not unguessed:
         return False
     
-    hint_letter = random.choice(unguessed)
+    # Выбираем 3 случайные неправильные буквы ИЛИ все оставшиеся, если их меньше 3
+    hint_count = min(3, len(unguessed))
+    hint_letters = random.sample(unguessed, hint_count)
+    
+    # Добавляем буквы в угаданные
     if "guessed_letters" not in game:
         game["guessed_letters"] = set()
-    game["guessed_letters"].add(hint_letter)
-    game["hint_used"] = True
+    for letter in hint_letters:
+        game["guessed_letters"].add(letter)
     
+    # Обновляем информацию о подсказке
+    if "hint_info" not in game:
+        game["hint_info"] = {}
+    game["hint_info"]["used"] = True
+    game["hint_info"]["letters"] = hint_letters
+    
+    # Обновляем статистику игрока, если он участвует в игре
     if user_id in game.get("players", {}):
         player = game["players"][user_id]
-        player["correct_guesses"] = player.get("correct_guesses", 0) + 1
+        player["correct_guesses"] = player.get("correct_guesses", 0) + hint_count
     
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"💡 Подсказка: в слове есть буква '{hint_letter}'!",
+        text=f"💡 *Подсказка от админа!*\nВ слове есть буквы: {', '.join(sorted(hint_letters))}",
+        parse_mode=ParseMode.MARKDOWN,
     )
     
     # 🔄 ПЕРЕЗАПУСКАЕМ ОСНОВНОЕ ОКНО
     await force_update_game_display(context, chat_id)
     
+    # Проверяем, не угадали ли слово полностью после подсказки
     if all(letter in game.get("guessed_letters", set()) for letter in word if letter.isalpha()):
         await end_game_win(context, chat_id, user_id)
         return True
@@ -1462,11 +1503,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 В сообщении с заданием будет кнопка "✅ Факт рассказан"
 У игрока есть 2 минуты на выполнение. После рассказа факта и нажатия кнопки ход переходит следующему игроку.
 
+🎁 *Новая функция:*
+Администратор может использовать подсказку 1 раз за игру командой /hint
+Подсказка показывает 3 случайные буквы из слова!
+
 📝 *Команды:*
 /newgame - начать новую игру (админы)
 /join - присоединиться к игре
 /leave - выйти из игры
-/hint - получить подсказку (1 за игру)
+/hint - получить подсказку (1 за игру, только админы, 3 буквы)
 /skip - пропустить ход (если игрок не отвечает)
 /stop - остановить игру (админы)
 /stats - статистика игроков
@@ -1525,7 +1570,11 @@ async def newgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "started_by": user.id,
         "started_by_name": started_by_name,
         "start_time": time.time(),
-        "hint_used": False,
+        # НОВАЯ СТРУКТУРА ДЛЯ ПОДСКАЗКИ
+        "hint_info": {
+            "used": False,
+            "letters": []
+        },
     }
     
     logger.info(f"Новая игра начата в чате {chat_id} пользователем {user.id}")
@@ -1603,7 +1652,7 @@ async def leave_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Вы не участвуете в игре!")
 
 async def hint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получить подсказку."""
+    """Получить подсказку (только для админов, 3 буквы)."""
     chat = update.effective_chat
     message = update.effective_message
     user = update.effective_user
@@ -1618,15 +1667,22 @@ async def hint_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Нет активной игры!")
         return
     
-    if user.id not in active_games[chat_id].get("players", {}):
-        await message.reply_text("❌ Вы не участвуете в игре!")
+    # Проверяем права администратора
+    is_admin = await is_user_admin(update, context)
+    if not is_admin:
+        await message.reply_text("❌ Только администраторы могут использовать подсказку!")
         return
     
     success = await give_hint(context, chat_id, user.id)
     if success:
-        await message.reply_text("💡 Подсказка получена!")
+        await message.reply_text("💡 Подсказка получена! Показаны 3 случайные буквы из слова.")
     else:
-        await message.reply_text("❌ Подсказка уже использована или нет доступных букв!")
+        game = active_games[chat_id]
+        hint_info = game.get("hint_info", {})
+        if hint_info.get("used", False):
+            await message.reply_text("❌ Подсказка уже использована в этой игре!")
+        else:
+            await message.reply_text("❌ Не удалось дать подсказку!")
 
 async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Пропустить ход текущего игрока."""
@@ -1759,6 +1815,12 @@ async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 5. У команды есть 6 неправильных попыток
 6. Игра продолжается, пока слово не будет угадано или не закончатся попытки
 
+🎁 *Новая функция - Подсказка:*
+• Только администратор может использовать подсказку
+• 1 раз за игру командой /hint или кнопкой
+• Показывает 3 случайные буквы из слова
+• Буквы добавляются в угаданные
+
 📚 *Основные правила:*
 • Игроки ходят строго по очереди
 • Можно называть только одну букву за ход
@@ -1768,7 +1830,6 @@ async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Время на выполнение задания: {PENALTY_TIME_LIMIT//60} минуты
 • После рассказа факта нажмите кнопку в сообщении с заданием
 • Ход переходит следующему игроку
-• Подсказку можно использовать 1 раз за игру
 • Админ может пропустить ход любого игрока
 
 ⚠️ *Внимание:*
@@ -1793,11 +1854,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /newgame - начать новую игру
 /stop - остановить текущую игру
 /skip - пропустить ход игрока
+/hint - получить подсказку (3 буквы, 1 за игру)
 
 👤 *Команды для игроков:*
 /join - присоединиться к игре
 /leave - выйти из игры
-/hint - получить подсказку (1 за игру)
 
 📊 *Общие команды:*
 /stats - статистика лучших игроков
@@ -1850,6 +1911,12 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         debug_info += f"\n• Попыток: {len(game.get('wrong_letters', set()))}/6"
         debug_info += f"\n• Запустил: {game.get('started_by_name', 'Неизвестно')}"
         
+        hint_info = game.get('hint_info', {})
+        if hint_info.get('used', False):
+            debug_info += f"\n• Подсказка использована: {', '.join(hint_info.get('letters', []))}"
+        else:
+            debug_info += f"\n• Подсказка: доступна"
+        
         if chat_id in penalty_assignments:
             active_penalties = []
             for uid, task_data in penalty_assignments[chat_id].items():
@@ -1893,7 +1960,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             word = game.get("word", "Не выбрано")
             players = len(game.get("players", {}))
             wrong = len(game.get("wrong_letters", set()))
-            status_text += f"• ID {chat_id}: '{word[:10]}...' | Игроков: {players} | Ошибок: {wrong}/6\n"
+            hint_used = game.get('hint_info', {}).get('used', False)
+            hint_status = "✅" if hint_used else "❌"
+            status_text += f"• ID {chat_id}: '{word[:10]}...' | Игроков: {players} | Ошибок: {wrong}/6 | Подсказка: {hint_status}\n"
     
     await update.effective_message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -1936,7 +2005,8 @@ async def handle_hangman_category_selection(update: Update, context: ContextType
                 "3. Или угадайте слово целиком (риск!)\n"
                 f"4. При ошибке в букве: {PENALTY_TASK}\n"
                 "5. После рассказа факта нажмите кнопку в сообщении с заданием\n"
-                "6. Ход переходит следующему игроку\n\n"
+                "6. Ход переходит следующему игроку\n"
+                "7. Админ может использовать подсказку 1 раз (3 буквы)\n\n"
                 f"👑 Игру запустил: {game['started_by_name']}"
             ),
             parse_mode=ParseMode.MARKDOWN,
@@ -2010,11 +2080,22 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("❌ Вы не в играх!")
 
     elif data == "hangman_hint":
+        # Проверяем права администратора для подсказки
+        is_admin = await is_chat_admin(context.bot, chat_id, user_id)
+        if not is_admin:
+            await query.answer("❌ Только администраторы могут использовать подсказку!", show_alert=True)
+            return
+        
         success = await give_hint(context, chat_id, user_id)
         if success:
-            await query.answer("💡 Подсказка получена!")
+            await query.answer("💡 Подсказка получена! Показаны 3 случайные буквы")
         else:
-            await query.answer("❌ Подсказка уже использована или нет доступных букв!", show_alert=True)
+            game = active_games[chat_id]
+            hint_info = game.get("hint_info", {})
+            if hint_info.get("used", False):
+                await query.answer("❌ Подсказка уже использована!", show_alert=True)
+            else:
+                await query.answer("❌ Не удалось дать подсказку!", show_alert=True)
 
     elif data == "hangman_skip":
         success = await skip_turn(context, chat_id, user_id)
