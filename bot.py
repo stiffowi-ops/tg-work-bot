@@ -303,18 +303,6 @@ async def is_chat_admin(bot, chat_id: int, user_id: int) -> bool:
         logger.error(f"Ошибка проверки прав админа (chat): {e}")
         return False
 
-async def is_query_user_admin(query) -> bool:
-    """Проверяет, является ли пользователь админом через callback query."""
-    chat_id = query.message.chat.id
-    user_id = query.from_user.id
-    
-    try:
-        member = await query.bot.get_chat_member(chat_id, user_id)
-        return member.status in ["creator", "administrator"]
-    except Exception as e:
-        logger.error(f"Ошибка проверки прав админа (query): {e}")
-        return False
-
 def join_game(chat_id: int, user_id: int, user_name: str) -> bool:
     """Игрок присоединяется к активной игре."""
     if chat_id in active_games:
@@ -784,12 +772,18 @@ async def _update_game_display_internal(context: ContextTypes.DEFAULT_TYPE, chat
         if not has_active_penalty(chat_id, player_id):
             buttons.append([InlineKeyboardButton("⏭️ Пропустить ход", callback_data="hangman_skip")])
 
-    # Кнопка подсказки - показываем всегда, если подсказка не использована
-    hint_info = game.get('hint_info', {})
-    if not hint_info.get('used', False):
-        buttons.append([InlineKeyboardButton("💡 Подсказка (админ)", callback_data="hangman_hint")])
+    # Проверяем, является ли пользователь админом для отображения кнопки подсказки
+    try:
+        message = context._chat_id_to_message.get(chat_id)
+        if message:
+            user_id = message.from_user.id if hasattr(message, 'from_user') else None
+            if user_id:
+                is_admin = await is_chat_admin(context.bot, chat_id, user_id)
+                if is_admin and not hint_info.get('used', False):
+                    buttons.append([InlineKeyboardButton("💡 Подсказка (админ)", callback_data="hangman_hint")])
+    except:
+        pass
 
-    # Кнопка остановки игры - показываем для создателя игры
     try:
         is_admin = await asyncio.wait_for(
             is_chat_admin(context.bot, chat_id, game.get("started_by", 0)),
@@ -1240,7 +1234,7 @@ async def skip_turn(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
     return False
 
 async def safe_end_game(context: ContextTypes.DEFAULT_TYPE, chat_id: int, is_win: bool, winner_id: int = None):
-    """Безопасное завершение игры с обработкой ошибки."""
+    """Безопасное завершение игры с обработкой ошибок."""
     try:
         if is_win and winner_id:
             await end_game_win(context, chat_id, winner_id)
@@ -1984,7 +1978,7 @@ async def handle_hangman_category_selection(update: Update, context: ContextType
         return
 
     user_id = query.from_user.id
-    is_admin = await is_chat_admin(query.bot, chat_id, user_id)
+    is_admin = await is_chat_admin(context.bot, chat_id, user_id)
     if not is_admin and user_id != active_games[chat_id]["started_by"]:
         await query.answer("❌ Только администратор может выбирать категорию!", show_alert=True)
         return
@@ -2038,7 +2032,7 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
     user_name = f"{user.first_name} {(user.last_name or '')}".strip()
 
     if data == "admin_stop_game":
-        is_admin = await is_query_user_admin(query)
+        is_admin = await is_chat_admin(context.bot, chat_id, user_id)
         if not is_admin and user_id != active_games[chat_id]["started_by"]:
             await query.answer("❌ Только администратор может остановить игру!", show_alert=True)
             return
@@ -2087,7 +2081,7 @@ async def handle_hangman_buttons(update: Update, context: ContextTypes.DEFAULT_T
 
     elif data == "hangman_hint":
         # Проверяем права администратора для подсказки
-        is_admin = await is_query_user_admin(query)
+        is_admin = await is_chat_admin(context.bot, chat_id, user_id)
         if not is_admin:
             await query.answer("❌ Только администраторы могут использовать подсказку!", show_alert=True)
             return
