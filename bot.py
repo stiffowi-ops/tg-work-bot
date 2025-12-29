@@ -208,7 +208,7 @@ CATEGORIES_FILE = Path(__file__).with_name("categories.json")
 
 # ------------------ УТИЛИТЫ СОХРАНЕНИЯ/ЗАГРУЗКИ ------------------
 def load_scores():
-    """Загружает статистику из файла"""
+    """Загружает статистика из файла"""
     global user_scores
     if SCORES_FILE.exists():
         try:
@@ -222,7 +222,7 @@ def load_scores():
             user_scores = {}
 
 def save_scores():
-    """Сохраняет статистику в файл"""
+    """Сохраняет статистика в файл"""
     try:
         with SCORES_FILE.open("w", encoding="utf-8") as f:
             json.dump(user_scores, f, ensure_ascii=False, indent=2)
@@ -1092,8 +1092,8 @@ async def _process_guess_internal(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         
         assign_penalty_task(chat_id, user_id, msg.message_id)
         
-        # 🔄 ПЕРЕЗАПУСКАЕМ ОСНОВНОЕ ОКНО при ошибке
-        await force_update_game_display(context, chat_id)
+        # 🔄 НЕ перезапускаем основное окно при ошибке (перезапуск будет после нажатия кнопки)
+        # Убрали: await force_update_game_display(context, chat_id)
         
         asyncio.create_task(update_penalty_timer(context, chat_id, user_id))
         asyncio.create_task(check_penalty_timeout_delayed(context, chat_id, user_id))
@@ -2181,7 +2181,7 @@ async def handle_penalty_complete(update: Update, context: ContextTypes.DEFAULT_
             text=f"🎮 Теперь ходит: {next_player[1]}",
         )
     
-    # 🔄 ПЕРЕЗАПУСКАЕМ основное окно с виселицей для 1-5 ошибок
+    # 🔄 ПЕРЕЗАПУСКАЕМ основное окно с виселицей для 1-5 ошибок (после выполнения задания)
     await force_update_game_display(context, chat_id)
 
 # ------------------ ОБРАБОТКА СООБЩЕНИЙ В ЧАТЕ ------------------
