@@ -68,6 +68,8 @@ def restricted(func):
 def get_greeting_by_meeting_day() -> str:
     """Специальные приветствия для дней планёрок с ссылкой на Zoom"""
     weekday = datetime.now(TIMEZONE).weekday()
+    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    current_day = day_names_ru[weekday]
     
     # Только для дней планёрок (пн/ср/пт)
     if weekday in MEETING_DAYS:
@@ -114,7 +116,7 @@ def get_greeting_by_meeting_day() -> str:
     else:
         # Если почему-то напоминание отправлено не в день планёрки
         zoom_link_formatted = f"[Ссылка на Zoom]({ZOOM_LINK})"
-        return f"👋 Доброе утро!\n\n📋 *Напоминаю о планёрке в 9:15 по МСК*.\nПрисоединяйтесь к звонку! 🤝\n\n🎥 *{zoom_link_formatted}* - подключение через календарное приглашение"
+        return f"👋 Доброе утро! Сегодня *{current_day}*.\n\n📋 *Напоминаю о планёрке в 9:15 по МСК*.\nПрисоединяйтесь к звонку! 🤝\n\n🎥 *{zoom_link_formatted}* - подключение через календарное приглашение"
 
 
 class BotConfig:
@@ -656,6 +658,7 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
         return
 
+    # Создаем задачу, которая вызовет send_reminder через 5 секунд
     context.application.job_queue.run_once(
         send_reminder, 
         5, 
@@ -663,7 +666,24 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         name=f"test_reminder_{datetime.now().timestamp()}"
     )
 
-    await update.message.reply_text("⏳ *Тестовое напоминание будет отправлено через 5 секунд...*", parse_mode="Markdown")
+    # Получаем информацию о текущем дне
+    weekday = datetime.now(TIMEZONE).weekday()
+    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    current_day = day_names_ru[weekday]
+    
+    # Проверяем, является ли сегодня день планёрки
+    if weekday in MEETING_DAYS:
+        day_type = "день планёрки ✅"
+    else:
+        day_type = "не день планёрки ⚠️"
+    
+    await update.message.reply_text(
+        f"⏳ *Тестовое напоминание будет отправлено через 5 секунд...*\n\n"
+        f"📅 *Сегодня:* {current_day} ({day_type})\n"
+        f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
+        f"🎥 *Zoom-ссылка:* {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != 'https://us04web.zoom.us/j/1234567890?pwd=example' else 'не установлена ⚠️'}",
+        parse_mode="Markdown"
+    )
 
 
 @restricted
@@ -674,7 +694,17 @@ async def test_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
         return
 
-    await update.message.reply_text("🚀 *Отправляю тестовое напоминание прямо сейчас...*", parse_mode="Markdown")
+    # Получаем информацию о текущем дне
+    weekday = datetime.now(TIMEZONE).weekday()
+    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    current_day = day_names_ru[weekday]
+    
+    await update.message.reply_text(
+        f"🚀 *Отправляю тестовое напоминание прямо сейчас...*\n\n"
+        f"📅 *Сегодня:* {current_day}\n"
+        f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК",
+        parse_mode="Markdown"
+    )
     
     # Создаем контекст для отправки
     class DummyJob:
