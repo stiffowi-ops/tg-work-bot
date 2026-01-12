@@ -1,8 +1,8 @@
 import os
 import logging
-import asyncio
-from datetime import datetime, time, timedelta
-from typing import Dict, List, Optional
+import json
+from datetime import datetime, timedelta
+from typing import Optional, Dict
 import pytz
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,440 +13,308 @@ from telegram.ext import (
     ContextTypes,
     JobQueue,
     MessageHandler,
-    filters,
+    filters
 )
 
-# ==================== КОНФИГУРАЦИЯ ====================
-
-# Получаем токен из переменной окружения
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-if not BOT_TOKEN:
-    print("⚠️  ОШИБКА: Переменная окружения TELEGRAM_BOT_TOKEN не установлена!")
-    print("Установите её командой: export TELEGRAM_BOT_TOKEN='ваш_токен'")
-    exit(1)
-
-# ID чата будет сохраняться в файле после первого сообщения в чате
-CHAT_ID_FILE = "chat_id.txt"
-
-# Пользователи с правами администратора (могут отменять планёрки)
-ADMIN_USERS = ["@Stiff_OWi", "@gshabanov"]
-
-# Время планёрки (по Москве)
-MEETING_TIME = time(hour=9, minute=15)
-
-# Дни недели для планёрок (понедельник=0, среда=2, пятница=4)
-MEETING_DAYS = [0, 2, 4]  # Пн, Ср, Пт
-
-# Текст напоминания
-REMINDER_TEXT = """👋 Коллеги, доброе утро!
-
-📅 Напоминаю о ежедневной планёрке в 9:15 по МСК.
-
-Пожалуйста, подготовьтесь к обсуждению:
-1. Что сделали вчера
-2. Планы на сегодня
-3. Есть ли блокеры
-
-Жду всех в канале для созвонов!"""
-
-# Варианты отмены планёрки (редактируемые)
-CANCEL_OPTIONS = [
-    "Перенесём на другой день. Дата такая-то",
-    "Причину сообщу позже",
-    "Технические проблемы с подключением",
-    "Многие участники отсутствуют",
-    "Срочные задачи с дедлайном",
-    "Выходной день/праздник"
-]
-
-# ==================== ЛОГГИРОВАНИЕ ====================
-
+# Настройка логирования
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ==================== УПРАВЛЕНИЕ CHAT_ID ====================
+# Конфигурация
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Токен бота из переменных окружения
+CONFIG_FILE = "bot_config.json"  # Файл для хранения настроек
 
-def save_chat_id(chat_id: int) -> None:
-    """Сохраняет ID чата в файл"""
+ALLOWED_USERS = ["Stiff_OWi", "gshabanov"]  # Разрешенные пользователи для отмены
+
+# Время планёрки (9:15 по Москве)
+MEETING_TIME = {"hour": 9, "minute": 15}
+TIMEZONE = pytz.timezone("Europe/Moscow")
+
+# Дни недели для планёрки (понедельник=0, среда=2, пятница=4)
+MEETING_DAYS = [0, 2, 4]
+
+# Варианты отмены планёрки (можно редактировать)
+CANCELLATION_OPTIONS = [
+    "Перенесём на другой день. Дата такая-то",
+    "Причину сообщу позже",
+    "Все вопросы решены, планёрка не нужна",
+    "Ключевые участники отсутствуют",
+    "Экстренная ситуация, подробности в ЛС",
+]
+
+# Глобальная переменная для хранения активного напоминания
+active_reminder: Optional[Dict] = None
+
+def load_config() -> Dict:
+    """Загрузка конфигурации из файла"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Ошибка загрузки конфига: {e}")
+    return {"chat_id": None}
+
+def save_config(config: Dict) -> None:
+    """Сохранение конфигурации в файл"""
     try:
-        with open(CHAT_ID_FILE, 'w') as f:
-            f.write(str(chat_id))
-        logger.info(f"Chat ID сохранен: {chat_id}")
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f)
     except Exception as e:
-        logger.error(f"Ошибка сохранения chat_id: {e}")
-
-def load_chat_id() -> Optional[int]:
-    """Загружает ID чата из файла"""
-    try:
-        if os.path.exists(CHAT_ID_FILE):
-            with open(CHAT_ID_FILE, 'r') as f:
-                return int(f.read().strip())
-    except Exception as e:
-        logger.error(f"Ошибка загрузки chat_id: {e}")
-    return None
-
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-
-def is_admin(username: str) -> bool:
-    """Проверяет, является ли пользователь администратором"""
-    return username in ADMIN_USERS
-
-def get_next_meeting_time() -> Optional[datetime]:
-    """Возвращает следующее время планёрки"""
-    moscow_tz = pytz.timezone('Europe/Moscow')
-    now = datetime.now(moscow_tz)
-    
-    # Проверяем текущий день и время
-    current_weekday = now.weekday()
-    current_time = now.time()
-    
-    # Ищем следующий день с планёркой
-    for days_ahead in range(8):  # Ищем на неделю вперёд
-        check_date = now + timedelta(days=days_ahead)
-        if check_date.weekday() in MEETING_DAYS:
-            # Если это сегодня и время ещё не наступило
-            if days_ahead == 0 and current_time < MEETING_TIME:
-                meeting_datetime = datetime.combine(check_date.date(), MEETING_TIME)
-            else:
-                if days_ahead == 0:  # Сегодня, но время уже прошло
-                    continue
-                meeting_datetime = datetime.combine(check_date.date(), MEETING_TIME)
-            
-            return moscow_tz.localize(meeting_datetime)
-    
-    return None
-
-# ==================== ОСНОВНОЙ ФУНКЦИОНАЛ ====================
+        logger.error(f"Ошибка сохранения конфига: {e}")
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправляет напоминание о планёрке"""
+    """Отправка напоминания о планёрке"""
+    global active_reminder
+    
+    config = load_config()
+    chat_id = config.get("chat_id")
+    
+    if not chat_id:
+        logger.error("Chat ID не установлен!")
+        return
+    
+    # Создаем клавиатуру с кнопкой отмены
+    keyboard = [
+        [InlineKeyboardButton("Отменить планёрку", callback_data="cancel_meeting")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Текст напоминания
+    message_text = (
+        "👋 Коллеги, доброе утро!\n\n"
+        "📋 Напоминаю о ежедневной планёрке в 9:15 по МСК.\n"
+        "Присоединяйтесь к звонку!"
+    )
+    
     try:
-        chat_id = load_chat_id()
-        if not chat_id:
-            logger.error("Chat ID не установлен! Отправьте любое сообщение боту в чате.")
-            return
-        
-        # Создаем клавиатуру для отмены
-        keyboard = [
-            [InlineKeyboardButton("✅ Планёрка состоится", callback_data="meeting_on")],
-            [InlineKeyboardButton("❌ Отменить планёрку", callback_data="cancel_meeting")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await context.bot.send_message(
+        message = await context.bot.send_message(
             chat_id=chat_id,
-            text=REMINDER_TEXT,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
+            text=message_text,
+            reply_markup=reply_markup
         )
-        logger.info(f"Напоминание отправлено в чат {chat_id}")
+        
+        # Сохраняем информацию о напоминании
+        active_reminder = {
+            "message_id": message.message_id,
+            "chat_id": chat_id,
+            "job": context.job
+        }
+        
+        logger.info(f"Отправлено напоминание о планёрке в чат {chat_id}")
+        
     except Exception as e:
         logger.error(f"Ошибка при отправке напоминания: {e}")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /start"""
-    chat_id = update.effective_chat.id
-    save_chat_id(chat_id)
-    
-    await update.message.reply_text(
-        "🤖 Бот для напоминаний о планёрках запущен!\n"
-        "✅ Этот чат установлен для получения напоминаний\n\n"
-        "Я буду отправлять напоминания в:\n"
-        "• Понедельник\n• Среда\n• Пятница\n"
-        "В 9:15 по МСК\n\n"
-        f"👑 Администраторы: {', '.join(ADMIN_USERS)}\n\n"
-        f"Следующая планёрка: {get_next_meeting_time()}\n\n"
-        "Используйте /help для списка команд"
-    )
-
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик всех сообщений для сохранения chat_id"""
-    chat_id = update.effective_chat.id
-    save_chat_id(chat_id)
-    
-    # Логируем, но не отвечаем на все сообщения
-    logger.info(f"Сообщение в чате {chat_id} от {update.effective_user.username}")
-
-async def setup_jobs(application: Application) -> None:
-    """Настраивает регулярные задачи"""
-    job_queue = application.job_queue
-    
-    if job_queue:
-        # Проверяем, сохранен ли chat_id
-        chat_id = load_chat_id()
-        if not chat_id:
-            logger.warning("Chat ID не установлен! Задачи не будут запускаться.")
-            logger.warning("Добавьте бота в чат и отправьте любое сообщение.")
-            return
-        
-        # Добавляем задачу на нужные дни
-        moscow_tz = pytz.timezone('Europe/Moscow')
-        
-        for day in MEETING_DAYS:
-            # Создаем время для задачи (9:15 по Москве)
-            job_time = time(hour=9, minute=15, tzinfo=moscow_tz)
-            
-            # Добавляем задачу на конкретные дни
-            job_queue.run_daily(
-                send_reminder,
-                time=job_time,
-                days=tuple(MEETING_DAYS),
-                name=f"meeting_reminder_{day}"
-            )
-        
-        logger.info(f"Задачи настроены на дни: {MEETING_DAYS} в {MEETING_TIME}")
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик нажатий на кнопки"""
+async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка нажатия на кнопку отмены планёрки"""
     query = update.callback_query
+    
+    # Проверяем, разрешен ли пользователь
+    username = query.from_user.username
+    if username not in ALLOWED_USERS:
+        await query.answer("❌ У вас нет прав для отмены планёрки", show_alert=True)
+        return
+    
     await query.answer()
     
-    user = query.from_user
-    user_mention = f"@{user.username}" if user.username else user.first_name
+    # Создаем варианты отмены
+    keyboard = []
+    for i, option in enumerate(CANCELLATION_OPTIONS):
+        keyboard.append([InlineKeyboardButton(option, callback_data=f"reason_{i}")])
     
-    # Проверяем, является ли пользователь администратором
-    if not is_admin(f"@{user.username}" if user.username else ""):
-        await query.edit_message_text(
-            text=f"⚠️ {user_mention}, у вас нет прав для отмены планёрки.\n"
-                 f"Только администраторы ({', '.join(ADMIN_USERS)}) могут это делать.",
-            reply_markup=None
-        )
-        return
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Обработка разных callback_data
-    if query.data == "meeting_on":
-        await query.edit_message_text(
-            text=f"✅ {user_mention} подтвердил, что планёрка состоится!\n\n{REMINDER_TEXT}",
-            parse_mode='HTML'
-        )
-        
-    elif query.data == "cancel_meeting":
-        # Показываем варианты отмены
-        keyboard = []
-        for i, option in enumerate(CANCEL_OPTIONS):
-            keyboard.append([InlineKeyboardButton(
-                f"• {option}", 
-                callback_data=f"cancel_reason_{i}"
-            )])
-        
-        keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back_to_main")])
-        
-        await query.edit_message_text(
-            text=f"📝 {user_mention}, выберите причину отмены:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    elif query.data == "back_to_main":
-        # Возвращаемся к основному меню
-        keyboard = [
-            [InlineKeyboardButton("✅ Планёрка состоится", callback_data="meeting_on")],
-            [InlineKeyboardButton("❌ Отменить планёрку", callback_data="cancel_meeting")]
-        ]
-        
-        await query.edit_message_text(
-            text=REMINDER_TEXT,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
-        )
-    
-    elif query.data.startswith("cancel_reason_"):
-        # Обработка выбора причины отмены
-        reason_index = int(query.data.split("_")[2])
-        reason = CANCEL_OPTIONS[reason_index]
-        
-        # Обновляем сообщение с информацией об отмене
-        await query.edit_message_text(
-            text=f"🚫 **ПЛАНЁРКА ОТМЕНЕНА**\n\n"
-                 f"👤 Отменил: {user_mention}\n"
-                 f"📝 Причина: {reason}\n"
-                 f"🕐 Время: {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%d.%m.%Y %H:%M')}\n\n"
-                 f"Следующая планёрка: {get_next_meeting_time()}",
-            parse_mode='HTML',
-            reply_markup=None
-        )
-        
-        logger.info(f"Планёрка отменена пользователем {user_mention}, причина: {reason}")
+    # Редактируем сообщение
+    await query.edit_message_text(
+        text="📝 Выберите причину отмены планёрки:",
+        reply_markup=reply_markup
+    )
 
-async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает команды для администраторов"""
-    user = update.effective_user
-    if is_admin(f"@{user.username}" if user.username else ""):
-        await update.message.reply_text(
-            "👑 **Команды администратора:**\n\n"
-            "/next - Показать следующую планёрку\n"
-            "/test - Тестовое напоминание\n"
-            "/options - Показать текущие варианты отмены\n"
-            "/add_option [текст] - Добавить вариант отмены\n"
-            "/remove_option [номер] - Удалить вариант отмены\n"
-            "/admins - Показать список администраторов\n"
-            "/status - Статус бота\n"
-            "/set_time [HH:MM] - Установить новое время планёрки\n"
-            "/set_days [01234] - Установить дни (0-Пн,1-Вт,2-Ср,3-Чт,4-Пт)",
-            parse_mode='HTML'
-        )
-    else:
-        await update.message.reply_text("У вас нет прав администратора.")
-
-async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Тестовая отправка напоминания (только для админов)"""
-    user = update.effective_user
-    if is_admin(f"@{user.username}" if user.username else ""):
-        await send_reminder(context)
-        await update.message.reply_text("✅ Тестовое напоминание отправлено!")
-    else:
-        await update.message.reply_text("У вас нет прав для этой команды.")
-
-async def show_next_meeting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает следующую планёрку"""
-    next_meeting = get_next_meeting_time()
-    if next_meeting:
-        await update.message.reply_text(
-            f"📅 Следующая планёрка:\n"
-            f"Дата: {next_meeting.strftime('%d.%m.%Y')}\n"
-            f"День недели: {['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'][next_meeting.weekday()]}\n"
-            f"Время: {next_meeting.strftime('%H:%M')} по МСК"
-        )
-    else:
-        await update.message.reply_text("Не удалось определить следующую планёрку.")
-
-async def show_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает текущие варианты отмены"""
-    options_text = "📋 **Текущие варианты отмены:**\n\n"
-    for i, option in enumerate(CANCEL_OPTIONS, 1):
-        options_text += f"{i}. {option}\n"
+async def reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка выбора причины отмены"""
+    global active_reminder
     
-    await update.message.reply_text(options_text, parse_mode='HTML')
-
-async def add_option(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Добавляет новый вариант отмены"""
-    user = update.effective_user
-    if not is_admin(f"@{user.username}" if user.username else ""):
-        await update.message.reply_text("У вас нет прав для этой команды.")
-        return
+    query = update.callback_query
+    reason_index = int(query.data.split("_")[1])
+    reason = CANCELLATION_OPTIONS[reason_index]
+    username = query.from_user.username
     
-    if not context.args:
-        await update.message.reply_text("Использование: /add_option [текст варианта]")
-        return
+    # Отменяем задачу напоминания
+    if active_reminder and "job" in active_reminder:
+        active_reminder["job"].schedule_removal()
+        active_reminder = None
     
-    new_option = " ".join(context.args)
-    CANCEL_OPTIONS.append(new_option)
-    
-    await update.message.reply_text(f"✅ Добавлен новый вариант: {new_option}")
-    logger.info(f"Пользователь {user.username} добавил вариант: {new_option}")
-
-async def remove_option(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Удаляет вариант отмены"""
-    user = update.effective_user
-    if not is_admin(f"@{user.username}" if user.username else ""):
-        await update.message.reply_text("У вас нет прав для этой команды.")
-        return
-    
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Использование: /remove_option [номер]")
-        return
-    
-    index = int(context.args[0]) - 1
-    if 0 <= index < len(CANCEL_OPTIONS):
-        removed = CANCEL_OPTIONS.pop(index)
-        await update.message.reply_text(f"✅ Удалён вариант: {removed}")
-        logger.info(f"Пользователь {user.username} удалил вариант: {removed}")
-    else:
-        await update.message.reply_text("❌ Неверный номер варианта")
-
-async def show_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает список администраторов"""
-    admins_text = "👑 **Администраторы бота:**\n\n"
-    for admin in ADMIN_USERS:
-        admins_text += f"• {admin}\n"
-    
-    await update.message.reply_text(admins_text, parse_mode='HTML')
-
-async def bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает статус бота"""
-    chat_id = load_chat_id()
-    next_meeting = get_next_meeting_time()
-    
-    status_text = (
-        "🤖 **Статус бота:**\n\n"
-        f"• Chat ID сохранен: {'✅' if chat_id else '❌'}\n"
-        f"• Токен установлен: {'✅' if BOT_TOKEN else '❌'}\n"
-        f"• Админов: {len(ADMIN_USERS)}\n"
-        f"• Вариантов отмены: {len(CANCEL_OPTIONS)}\n"
-        f"• Время планёрки: {MEETING_TIME.strftime('%H:%M')}\n"
-        f"• Дни: {', '.join(['Пн', 'Ср', 'Пт'])}\n"
+    # Обновляем сообщение
+    await query.edit_message_text(
+        text=f"❌ @{username} отменил планёрку\n\nПричина: {reason}",
+        reply_markup=None
     )
     
-    if next_meeting:
-        status_text += f"• Следующая планёрка: {next_meeting.strftime('%d.%m.%Y %H:%M')}"
+    logger.info(f"Планёрка отменена пользователем @{username}. Причина: {reason}")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /start для проверки работы бота"""
+    await update.message.reply_text(
+        "Бот для напоминаний о планёрке активен!\n"
+        f"Напоминания отправляются по понедельникам, средам и пятницам в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК.\n\n"
+        "Для установки чата используйте команду /setchat"
+    )
+
+async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Установка текущего чата для отправки уведомлений"""
+    if update.effective_user.username not in ALLOWED_USERS:
+        await update.message.reply_text("❌ У вас нет прав для этой команды")
+        return
     
-    await update.message.reply_text(status_text, parse_mode='HTML')
+    chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or "личный чат"
+    
+    config = load_config()
+    config["chat_id"] = chat_id
+    save_config(config)
+    
+    await update.message.reply_text(
+        f"✅ Чат установлен: {chat_title}\n"
+        f"Chat ID: {chat_id}\n\n"
+        f"Напоминания будут отправляться в этот чат."
+    )
+    
+    logger.info(f"Установлен чат: {chat_title} (ID: {chat_id})")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик ошибок"""
-    logger.error(f"Ошибка: {context.error}", exc_info=context.error)
+async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать информацию о текущих настройках"""
+    config = load_config()
+    chat_id = config.get("chat_id")
+    
+    if update.effective_user.username not in ALLOWED_USERS:
+        await update.message.reply_text("❌ У вас нет прав для этой команды")
+        return
+    
+    if chat_id:
+        status = f"✅ Чат установлен (ID: {chat_id})"
+    else:
+        status = "❌ Чат не установлен. Используйте /setchat"
+    
+    await update.message.reply_text(
+        f"Информация о боте:\n\n"
+        f"{status}\n"
+        f"Дни планёрок: понедельник, среда, пятница\n"
+        f"Время: {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
+        f"Разрешённые пользователи: {', '.join(ALLOWED_USERS)}"
+    )
 
-# ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
+async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Тестовая отправка напоминания"""
+    if update.effective_user.username not in ALLOWED_USERS:
+        await update.message.reply_text("❌ У вас нет прав для этой команды")
+        return
+    
+    config = load_config()
+    if not config.get("chat_id"):
+        await update.message.reply_text("❌ Сначала установите чат командой /setchat")
+        return
+    
+    # Отправляем тестовое напоминание через 5 секунд
+    context.application.job_queue.run_once(send_reminder, 5, chat_id=config["chat_id"])
+    await update.message.reply_text("✅ Тестовое напоминание будет отправлено через 5 секунд...")
+
+def calculate_next_reminder() -> datetime:
+    """Вычисляет время следующего напоминания"""
+    now = datetime.now(TIMEZONE)
+    
+    # Проверяем текущий день
+    current_weekday = now.weekday()
+    
+    # Если сегодня день планёрки и время еще не прошло
+    if current_weekday in MEETING_DAYS:
+        reminder_time = now.replace(
+            hour=MEETING_TIME['hour'],
+            minute=MEETING_TIME['minute'],
+            second=0,
+            microsecond=0
+        )
+        
+        if now < reminder_time:
+            return reminder_time
+    
+    # Ищем следующий день планёрки
+    days_ahead = 1
+    while True:
+        next_day = now + timedelta(days=days_ahead)
+        if next_day.weekday() in MEETING_DAYS:
+            reminder_time = next_day.replace(
+                hour=MEETING_TIME['hour'],
+                minute=MEETING_TIME['minute'],
+                second=0,
+                microsecond=0
+            )
+            return reminder_time
+        days_ahead += 1
+
+async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Планирует следующее напоминание"""
+    next_time = calculate_next_reminder()
+    config = load_config()
+    chat_id = config.get("chat_id")
+    
+    if not chat_id:
+        logger.warning("Chat ID не установлен, планирование отложено")
+        return
+    
+    # Рассчитываем интервал до следующего напоминания
+    now = datetime.now(TIMEZONE)
+    delay = (next_time - now).total_seconds()
+    
+    if delay > 0:
+        job = context.application.job_queue.run_once(
+            send_reminder,
+            delay,
+            chat_id=chat_id,
+            name=f"meeting_reminder_{next_time.strftime('%Y%m%d_%H%M')}"
+        )
+        
+        # После отправки напоминания планируем следующее
+        context.application.job_queue.run_once(
+            schedule_next_reminder,
+            delay + 60,  # Через минуту после отправки напоминания
+            chat_id=chat_id
+        )
+        
+        logger.info(f"Следующее напоминание запланировано на {next_time} (через {delay/3600:.1f} часов)")
 
 def main() -> None:
     """Запуск бота"""
-    # Проверяем токен
-    if not BOT_TOKEN or BOT_TOKEN == "ВАШ_ТОКЕН_БОТА_ЗДЕСЬ":
-        print("❌ ОШИБКА: Токен бота не установлен!")
-        print("Установите переменную окружения:")
-        print("export TELEGRAM_BOT_TOKEN='ваш_реальный_токен'")
-        print("Или добавьте в .env файл")
-        exit(1)
+    # Проверка токена
+    if not TOKEN:
+        logger.error("Токен бота не найден! Установите переменную окружения TELEGRAM_BOT_TOKEN")
+        return
     
     # Создаем приложение
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(TOKEN).build()
     
-    # Добавляем обработчики команд
+    # Обработчики команд
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", admin_commands))
-    application.add_handler(CommandHandler("admin", admin_commands))
+    application.add_handler(CommandHandler("setchat", set_chat))
+    application.add_handler(CommandHandler("info", show_info))
     application.add_handler(CommandHandler("test", test_reminder))
-    application.add_handler(CommandHandler("next", show_next_meeting))
-    application.add_handler(CommandHandler("options", show_options))
-    application.add_handler(CommandHandler("add_option", add_option))
-    application.add_handler(CommandHandler("remove_option", remove_option))
-    application.add_handler(CommandHandler("admins", show_admins))
-    application.add_handler(CommandHandler("status", bot_status))
     
-    # Добавляем обработчик всех сообщений для сохранения chat_id
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    # Обработчики callback-кнопок
+    application.add_handler(CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$"))
+    application.add_handler(CallbackQueryHandler(reason_callback, pattern="^reason_"))
     
-    # Добавляем обработчик кнопок
-    application.add_handler(CallbackQueryHandler(button_handler))
+    # Запускаем планировщик при старте
+    application.job_queue.run_once(
+        lambda context: schedule_next_reminder(context),
+        2,
+        chat_id=None
+    )
     
-    # Добавляем обработчик ошибок
-    application.add_error_handler(error_handler)
-    
-    # Проверяем начальный статус
-    chat_id = load_chat_id()
-    
-    # Запускаем бота
-    print("=" * 50)
-    print("🤖 Бот для напоминаний о планёрках")
-    print("=" * 50)
-    print(f"⏰ Время планёрки: {MEETING_TIME.strftime('%H:%M')} по МСК")
-    print(f"📅 Дни: Понедельник, Среда, Пятница")
-    print(f"👑 Администраторы: {', '.join(ADMIN_USERS)}")
-    print(f"💾 Chat ID: {'Сохранен' if chat_id else 'Не установлен'}")
-    print("-" * 50)
-    
-    if not chat_id:
-        print("⚠️  ВНИМАНИЕ: Chat ID не установлен!")
-        print("Добавьте бота в нужный чат и отправьте любое сообщение или /start")
-        print("Бот сохранит ID автоматически")
-    
-    print("✅ Бот запускается...")
-    print("=" * 50)
-    
-    # Запускаем polling
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # Запуск бота
+    logger.info("Бот запущен...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
