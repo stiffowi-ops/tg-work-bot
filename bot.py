@@ -66,7 +66,7 @@ def restricted(func):
 
 
 def get_greeting_by_meeting_day() -> str:
-    """Специальные приветствия для дней планёрок с ссылкой на Zoom"""
+    """Специальные приветствия для дней планёрок со ссылкой на Zoom"""
     weekday = datetime.now(TIMEZONE).weekday()
     day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     current_day = day_names_ru[weekday]
@@ -80,9 +80,9 @@ def get_greeting_by_meeting_day() -> str:
         }
         
         # Форматируем ссылку на Zoom для Markdown
-        zoom_link_formatted = f"[Ссылка на Zoom]({ZOOM_LINK})"
+        zoom_link_formatted = f"[Присоединиться к Zoom]({ZOOM_LINK})"
         
-        # Новые формулировки, учитывая что ссылка уже в чате
+        # Формулировки с новой ссылкой
         zoom_notes = [
             f"\n\n🎥 {zoom_link_formatted} | Присоединяйтесь к встрече",
             f"\n\n👨‍💻 {zoom_link_formatted} | Нажмите для подключения",
@@ -119,7 +119,7 @@ def get_greeting_by_meeting_day() -> str:
         return random.choice(greetings[weekday])
     else:
         # Если почему-то напоминание отправлено не в день планёрки
-        zoom_link_formatted = f"[Ссылка на Zoom]({ZOOM_LINK})"
+        zoom_link_formatted = f"[Присоединиться к Zoom]({ZOOM_LINK})"
         return f"👋 Доброе утро! Сегодня *{current_day}*.\n\n📋 *Напоминаю о планёрке в 9:15 по МСК*.\nПрисоединяйтесь к звонку! 🤝\n\n🎥 {zoom_link_formatted} | Присоединяйтесь к встрече"
 
 
@@ -687,16 +687,22 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     zoom_preview = ZOOM_LINK[:50] + "..." if len(ZOOM_LINK) > 50 else ZOOM_LINK
     zoom_status = "установлена ✅" if ZOOM_LINK and ZOOM_LINK != "https://us04web.zoom.us/j/1234567890?pwd=example" else "не установлена ⚠️"
     
+    # Показываем пример сообщения
+    example_text = get_greeting_by_meeting_day()
+    example_preview = example_text[:200] + "..." if len(example_text) > 200 else example_text
+    
     await update.message.reply_text(
         f"⏳ *Тестовое напоминание будет отправлено через 5 секунд...*\n\n"
         f"{day_emoji} *Сегодня:* {current_day} ({day_type})\n"
         f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
         f"🎥 *Zoom-ссылка:* {zoom_status}\n"
         f"🔗 *Предпросмотр:* {zoom_preview}\n\n"
+        f"*Пример сообщения:*\n"
+        f"`{example_preview}`\n\n"
         f"*Сообщение будет содержать:*\n"
         f"• Приветствие для {current_day.lower()}\n"
         f"• Время планёрки\n"
-        f"• Кликабельную Zoom-ссылку\n"
+        f"• Кликабельную ссылку 'Присоединиться к Zoom'\n"
         f"• Кнопку для отмены планёрки",
         parse_mode="Markdown"
     )
@@ -724,7 +730,8 @@ async def test_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"🚀 *Отправляю тестовое напоминание прямо сейчас...*\n\n"
         f"📅 *Сегодня:* {current_day} ({day_type})\n"
-        f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК",
+        f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
+        f"*Ссылка в сообщении:* [Присоединиться к Zoom]({ZOOM_LINK})",
         parse_mode="Markdown"
     )
     
@@ -1035,6 +1042,7 @@ def main() -> None:
 
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d}")
+        logger.info(f"🔗 Текст ссылки: 'Присоединиться к Zoom'")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
