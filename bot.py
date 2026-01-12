@@ -266,7 +266,7 @@ def setup_jobs(application):
             )
     
     logger.info(f"Запланировано {len(REMINDER_TIMES) * len(REMINDER_DAYS)} напоминаний для чата {CHAT_ID}")
-    logger.info(f"Расписание: ПН, СР, ПТ в {time_config['hour']:02d}:{time_config['minute']:02d} UTC (9:15 МСК)")
+    logger.info(f"Расписание: ПН, СР, ПТ в {time_config['hour']:02d}:{time_config['minute']:02d} UTC (11:30 МСК)")
 
 # ================== Запуск бота ==================
 
