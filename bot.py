@@ -1,40 +1,127 @@
-import logging
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Telegram бот для напоминаний о планёрках
+ПН, СР, ПТ в 9:15 по МСК (6:15 UTC)
+"""
+
+import os
 import json
+import logging
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
-from config import (
-    BOT_TOKEN,
-    CHAT_ID,
-    ADMIN_IDS,
-    IS_CONFIGURED,
-    REMINDER_TIMES,
-    REMINDER_DAYS,
-    REMINDER_TEXT,
-    CANCELLATION_REASONS,
-    save_settings,
-    settings,
-)
-from utils import update_chat_settings, get_chat_admins
 
-# Настройка логирования
+# ================== НАСТРОЙКА ==================
+load_dotenv()
+
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+
+# Файл для хранения настроек чата
+SETTINGS_FILE = "chat_settings.json"
+
+# Настройки по умолчанию
+DEFAULT_SETTINGS = {
+    "chat_id": None,
+    "admin_ids": [],
+    "is_configured": False
+}
+
+def load_settings():
+    """Загружает настройки чата из файла"""
+    try:
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return DEFAULT_SETTINGS.copy()
+
+def save_settings(settings):
+    """Сохраняет настройки чата в файл"""
+    with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+
+# Загружаем текущие настройки
+settings = load_settings()
+CHAT_ID = settings.get("chat_id")
+ADMIN_IDS = settings.get("admin_ids", [])
+IS_CONFIGURED = settings.get("is_configured", False)
+
+# ================== НАСТРОЙКИ ДЛЯ ТЕСТА ==================
+# Получаем текущее время UTC
+now_utc = datetime.utcnow()
+# Добавляем 2 минуты для теста
+test_time = now_utc + timedelta(minutes=2)
+
+print(f"=== ТЕСТОВЫЙ РЕЖИМ ===")
+print(f"Текущее время UTC: {now_utc.strftime('%H:%M')}")
+print(f"Напоминание будет в: {test_time.strftime('%H:%M')} UTC")
+print(f"День недели: {now_utc.weekday()} (0=пн, 6=вс)")
+
+# Время напоминаний (UTC время!) - ТЕСТ на ближайшие минуты
+REMINDER_TIMES = [
+    {"hour": test_time.hour, "minute": test_time.minute},
+]
+
+# Дни недели - только сегодня для теста
+today_weekday = now_utc.weekday()  # 0=пн, 1=вт, 2=ср, 3=чт, 4=пт, 5=сб, 6=вс
+REMINDER_DAYS = [today_weekday]  # только сегодня для теста
+
+# Текст напоминания (добавим метку ТЕСТ)
+REMINDER_TEXT = "🧪 ТЕСТОВОЕ НАПОМИНАНИЕ\n📢 Внимание! Планёрка через 15 минут (в 9:30 по МСК). Приготовьте вопросы!"
+
+# Варианты отмены планёрки
+CANCELLATION_REASONS = [
+    "Перенесём на другой день. Дата: ",
+    "Причину сообщу позже",
+    "Все ключевые участники заняты",
+    "Нет срочных вопросов для обсуждения",
+    "Технические проблемы",
+]
+
+# ================== НАСТРОЙКА ЛОГИРОВАНИЯ ==================
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # Хранилище отменённых планёрок
 cancelled_meetings = {}
 
-# ================== Клавиатуры ==================
+# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
+def get_chat_admins(chat_id, bot):
+    """Получает список администраторов чата"""
+    try:
+        admins = bot.get_chat_administrators(chat_id)
+        admin_ids = []
+        for admin in admins:
+            # Включаем владельца и администраторов (но не ботов)
+            from telegram import ChatMemberAdministrator, ChatMemberOwner
+            if isinstance(admin, (ChatMemberOwner, ChatMemberAdministrator)):
+                if not admin.user.is_bot:  # Исключаем ботов
+                    admin_ids.append(admin.user.id)
+        return admin_ids
+    except Exception as e:
+        logger.error(f"Ошибка получения администраторов: {e}")
+        return []
 
+def update_chat_settings(chat_id, admin_ids):
+    """Обновляет настройки чата"""
+    settings_data = {
+        "chat_id": chat_id,
+        "admin_ids": admin_ids,
+        "is_configured": True
+    }
+    save_settings(settings_data)
+    return settings_data
+
+# ================== КЛАВИАТУРЫ ==================
 def get_reminder_keyboard():
     keyboard = [
         [InlineKeyboardButton("❌ Отменить планёрку", callback_data="cancel_meeting")]
@@ -43,35 +130,39 @@ def get_reminder_keyboard():
 
 def get_cancellation_reasons_keyboard():
     keyboard = []
-    for reason in CANCELLATION_REASONS:
+    for i, reason in enumerate(CANCELLATION_REASONS):
         if reason.startswith("Перенесём на другой день"):
             tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
             reason_with_date = reason + tomorrow
             keyboard.append([InlineKeyboardButton(reason_with_date, callback_data=f"cancel_reason:0:{tomorrow}")])
         else:
-            idx = CANCELLATION_REASONS.index(reason)
-            keyboard.append([InlineKeyboardButton(reason, callback_data=f"cancel_reason:{idx}")])
+            keyboard.append([InlineKeyboardButton(reason, callback_data=f"cancel_reason:{i}")])
     
     keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back_to_cancel")])
     return InlineKeyboardMarkup(keyboard)
 
-# ================== Обработчики команд ==================
-
+# ================== ОБРАБОТЧИКИ КОМАНД ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     user_id = update.effective_user.id
     
     if update.message.chat.type == "private":
         if IS_CONFIGURED and CHAT_ID:
-            chat_info = await context.bot.get_chat(CHAT_ID)
-            await update.message.reply_text(
-                f"Бот уже настроен для чата:\n"
-                f"📋 Название: {chat_info.title}\n"
-                f"🆔 Chat ID: {CHAT_ID}\n"
-                f"👑 Админов: {len(ADMIN_IDS)}\n"
-                f"⏰ Напоминания: ПН, СР, ПТ в 9:15 по МСК\n\n"
-                f"Планёрка в 9:30 по МСК."
-            )
+            try:
+                chat_info = await context.bot.get_chat(CHAT_ID)
+                await update.message.reply_text(
+                    f"Бот уже настроен для чата:\n"
+                    f"📋 Название: {chat_info.title}\n"
+                    f"🆔 Chat ID: {CHAT_ID}\n"
+                    f"👑 Админов: {len(ADMIN_IDS)}\n"
+                    f"⏰ Напоминания: ПН, СР, ПТ в 9:15 по МСК\n\n"
+                    f"Планёрка в 9:30 по МСК."
+                )
+            except:
+                await update.message.reply_text(
+                    f"Бот настроен для чата ID: {CHAT_ID}\n"
+                    f"Администраторов: {len(ADMIN_IDS)}"
+                )
         else:
             await update.message.reply_text(
                 "Привет! Я бот для напоминаний о планёрках.\n\n"
@@ -119,17 +210,14 @@ async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Форматируем время для отображения
     reminder_time = REMINDER_TIMES[0]
-    utc_time = f"{reminder_time['hour']:02d}:{reminder_time['minute']:02d} UTC"
     
     await update.message.reply_text(
         f"✅ Настройка завершена!\n"
         f"Чат: {chat.title}\n"
         f"ID чата: {chat.id}\n"
         f"Администраторы: {len(admin_ids)} пользователей\n\n"
-        f"Напоминания будут отправляться:\n"
-        f"📅 Дни: понедельник, среда, пятница\n"
-        f"⏰ Время: {utc_time} (9:15 по МСК)\n"
-        f"🎯 Планёрка в 9:30 по МСК\n\n"
+        f"Тестовое напоминание будет через 2 минуты.\n"
+        f"После теста настройте рабочее время в коде.\n\n"
         f"Используйте /refresh_admins чтобы обновить список администраторов."
     )
     
@@ -165,8 +253,34 @@ async def refresh_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Теперь администраторов: {len(admin_ids)}"
     )
 
-# ================== Напоминания ==================
+async def send_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Немедленная отправка тестового напоминания"""
+    if not IS_CONFIGURED or not CHAT_ID:
+        await update.message.reply_text("Бот не настроен! Используйте /setup в группе.")
+        return
+    
+    # Проверяем права
+    try:
+        member = await update.effective_chat.get_member(update.effective_user.id)
+        if member.status not in ["creator", "administrator"]:
+            await update.message.reply_text("Только администраторы могут тестировать!")
+            return
+    except:
+        await update.message.reply_text("Не удалось проверить ваши права!")
+        return
+    
+    try:
+        keyboard = get_reminder_keyboard()
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text="⏰ ТЕСТОВОЕ НАПОМИНАНИЕ\n" + REMINDER_TEXT,
+            reply_markup=keyboard,
+        )
+        await update.message.reply_text("✅ Тестовое напоминание отправлено в чат!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
 
+# ================== НАПОМИНАНИЯ ==================
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     """Отправка напоминания в чат"""
     if not IS_CONFIGURED or not CHAT_ID:
@@ -181,14 +295,13 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard,
         )
         context.job.data = message.message_id
-        logger.info(f"Напоминание отправлено в чат {CHAT_ID} (9:15 МСК)")
+        logger.info(f"Напоминание отправлено в чат {CHAT_ID}")
     except Exception as e:
         logger.error(f"Ошибка отправки напоминания: {e}")
 
-# ================== Обработчики кнопок ==================
-
+# ================== ОБРАБОТЧИКИ КНОПОК ==================
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатий на кнопок"""
+    """Обработка нажатий на кнопки"""
     query = update.callback_query
     await query.answer()
     
@@ -245,8 +358,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         logger.info(f"Планёрка отменена пользователем {user_id}. Причина: {reason_text}")
 
-# ================== Планировщик ==================
-
+# ================== ПЛАНИРОВЩИК ==================
 def setup_jobs(application):
     """Настройка регулярных напоминаний"""
     if not IS_CONFIGURED:
@@ -266,14 +378,14 @@ def setup_jobs(application):
             )
     
     logger.info(f"Запланировано {len(REMINDER_TIMES) * len(REMINDER_DAYS)} напоминаний для чата {CHAT_ID}")
-    logger.info(f"Расписание: ПН, СР, ПТ в {time_config['hour']:02d}:{time_config['minute']:02d} UTC (11:30 МСК)")
 
-# ================== Запуск бота ==================
-
+# ================== ЗАПУСК БОТА ==================
 def main():
     """Запуск бота"""
     if not BOT_TOKEN:
         logger.error("Токен бота не найден! Проверьте файл .env")
+        print("Создайте файл .env с содержимым:")
+        print("BOT_TOKEN=ваш_токен_от_BotFather")
         return
     
     # Создаём приложение
@@ -283,6 +395,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("setup", setup))
     application.add_handler(CommandHandler("refresh_admins", refresh_admins))
+    application.add_handler(CommandHandler("send_now", send_now))
     
     # Обработчик кнопок
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -295,7 +408,14 @@ def main():
     
     # Запускаем бота
     logger.info("Бот запущен...")
-    logger.info(f"Напоминания: ПН, СР, ПТ в 6:15 UTC (9:15 МСК)")
+    print("=" * 50)
+    print("Бот запущен! Для настройки:")
+    print("1. Добавьте бота в группу")
+    print("2. Дайте права администратора")
+    print("3. Отправьте в группе команду /setup")
+    print("4. Для теста отправьте /send_now")
+    print("=" * 50)
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
