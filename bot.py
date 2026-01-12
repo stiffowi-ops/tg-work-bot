@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import random
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from functools import wraps
@@ -61,6 +62,60 @@ def restricted(func):
             return None
         return await func(update, context, *args, **kwargs)
     return wrapped
+
+
+def get_greeting_by_meeting_day():
+    """Специальные приветствия для дней планёрок"""
+    weekday = datetime.now(TIMEZONE).weekday()
+    
+    # Только для дней планёрок (пн/ср/пт)
+    if weekday in MEETING_DAYS:
+        day_names = {
+            0: "ПОНЕДЕЛЬНИК",
+            2: "СРЕДА", 
+            4: "ПЯТНИЦА"
+        }
+        
+        # Варианты напоминания о календаре
+        calendar_reminders = [
+            "\n\n📅 *Ссылка на Zoom:* в календарном приглашении в почте",
+            "\n\n💌 *Присоединиться:* ссылка в календарном приглашении",
+            "\n\n👨‍💻 *Подключиться:* подробности в рабочем календаре в почте",
+            "\n\n🔗 *Zoom-ссылка:* как всегда, в календарном приглашении",
+            "\n\n📧 *Для подключения:* проверьте календарное приглашение в почте",
+            "\n\n🗓️ *Детали встречи:* в календарном приглашении у вас в почте",
+            "\n\n📨 *Ссылка на звонок:* как обычно, в календарном приглашении",
+            "\n\n✉️ *Подробности:* в приглашении в рабочем календаре",
+        ]
+        
+        calendar_note = random.choice(calendar_reminders)
+        
+        greetings = {
+            0: [
+                f"🚀 **{day_names[0]}** - старт новой недели!\n\n📋 Планёрка в 9:15 по МСК.\nДавайте обсудим планы на неделю! 🌟{calendar_note}",
+                f"🌞 Доброе утро! Сегодня **{day_names[0]}**!\n\n🤝 Планёрка в 9:15 по МСК.\nНачинаем неделю продуктивно! 💪{calendar_note}",
+                f"⚡ **{day_names[0]}**, время действовать!\n\n🎯 Утренняя планёрка в 9:15 по МСК.\nГотовьте вопросы и обновления! 📊{calendar_note}"
+            ],
+            2: [
+                f"⚡ **{day_names[2]}** - середина недели!\n\n📋 Планёрка в 9:15 по МСК.\nВремя для корректировок и обновлений! 🔄{calendar_note}",
+                f"🌞 **{day_names[2]}**, доброе утро!\n\n🤝 Планёрка в 9:15 по МСК.\nКак продвигаются задачи? 📈{calendar_note}",
+                f"💪 **{day_names[2]}** - день прорыва!\n\n🎯 Планёрка в 9:15 по МСК.\nДелитесь прогрессом! 🚀{calendar_note}"
+            ],
+            4: [
+                f"🎉 **{day_names[4]}** - завершаем неделю!\n\n📋 Планёрка в 9:15 по МСК.\nДавайте подведем итоги недели! 🏆{calendar_note}",
+                f"🌞 Пятничное утро! 🎊\n\n🤝 **{day_names[4]}**, планёрка в 9:15 по МСК.\nГотовьте отчеты о неделе! 📊{calendar_note}",
+                f"✨ **{day_names[4]}** - время подводить итоги!\n\n🎯 Планёрка в 9:15 по МСК.\nЧто успели за неделю? 📈{calendar_note}"
+            ]
+        }
+        
+        return random.choice(greetings[weekday])
+    else:
+        # Если почему-то напоминание отправлено не в день планёрки
+        calendar_reminders = [
+            "\n\n📅 *Ссылка на Zoom:* в календарном приглашении в почте",
+            "\n\n💌 *Присоединиться:* ссылка в календарном приглашении",
+        ]
+        return f"👋 Доброе утро!\n\n📋 Напоминаю о планёрке в 9:15 по МСК.\nПрисоединяйтесь к звонку! 🤝{random.choice(calendar_reminders)}"
 
 
 class BotConfig:
@@ -180,17 +235,15 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    message_text = (
-        "👋 Коллеги, доброе утро!\n\n"
-        "📋 Напоминаю о ежедневной планёрке в 9:15 по МСК.\n"
-        "Присоединяйтесь к звонку!"
-    )
+    # Используем наше улучшенное приветствие
+    message_text = get_greeting_by_meeting_day()
 
     try:
         message = await context.bot.send_message(
             chat_id=chat_id,
             text=message_text,
-            reply_markup=reply_markup
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
         )
 
         # Сохраняем информацию о напоминании
@@ -250,29 +303,39 @@ async def show_date_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Показать выбор даты для переноса"""
     query = update.callback_query
     
-    # Создаем клавиатуру с датами на ближайшую неделю
+    # Создаем клавиатуру с датами на ближайшие 2 недели
     keyboard = []
     today = datetime.now(TIMEZONE)
     
     # Добавляем ближайшие дни планёрок
-    for i in range(1, 14):  # 2 недели вперед
+    meeting_dates = []
+    for i in range(1, 15):  # 2 недели вперед
         next_day = today + timedelta(days=i)
         if next_day.weekday() in MEETING_DAYS:
             date_str = next_day.strftime("%d.%m.%Y (%A)")
             callback_data = f"date_{next_day.strftime('%Y-%m-%d')}"
-            keyboard.append([InlineKeyboardButton(date_str, callback_data=callback_data)])
+            meeting_dates.append((next_day, date_str, callback_data))
     
-    # Добавляем кнопки быстрого выбора
-    quick_dates = []
-    for i in range(1, 4):
-        quick_day = today + timedelta(days=i)
-        if quick_day.weekday() in MEETING_DAYS:
-            date_str = f"Через {i} день" if i == 1 else f"Через {i} дня"
-            callback_data = f"date_{quick_day.strftime('%Y-%m-%d')}"
-            quick_dates.append(InlineKeyboardButton(date_str, callback_data=callback_data))
+    # Группируем по неделям
+    current_week = []
+    for date_obj, date_str, callback_data in meeting_dates:
+        week_num = date_obj.isocalendar()[1]
+        
+        # Начинаем новую неделю
+        if not current_week or week_num != current_week[0][0]:
+            if current_week:
+                # Добавляем предыдущую неделю как строку кнопок
+                week_buttons = [InlineKeyboardButton(date_str, callback_data=cb) for _, date_str, cb in current_week]
+                keyboard.append(week_buttons)
+            
+            current_week = [(week_num, date_str, callback_data)]
+        else:
+            current_week.append((week_num, date_str, callback_data))
     
-    if quick_dates:
-        keyboard.insert(0, quick_dates)
+    # Добавляем последнюю неделю
+    if current_week:
+        week_buttons = [InlineKeyboardButton(date_str, callback_data=cb) for _, date_str, cb in current_week]
+        keyboard.append(week_buttons)
     
     # Кнопка для ввода своей даты
     keyboard.append([InlineKeyboardButton("✏️ Ввести свою дату", callback_data="custom_date")])
@@ -280,7 +343,7 @@ async def show_date_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await query.edit_message_text(
         text="📅 Выберите дату для переноса планёрки:\n\n"
-             "*Ближайшие дни планёрок:*",
+             "*Ближайшие дни планёрок (Пн/Ср/Пт):*",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -297,7 +360,9 @@ async def date_selected_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(
             text="✏️ Введите дату в формате ДД.ММ.ГГГГ\n"
                  "Например: 15.12.2024\n\n"
-                 "Или отправьте 'отмена' для возврата."
+                 "*Важно:* выбирайте только дни планёрок (понедельник, среда, пятница)\n\n"
+                 "Или отправьте 'отмена' для возврата.",
+            parse_mode="Markdown"
         )
         return CONFIRMING_DATE
     
@@ -366,12 +431,12 @@ async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         # Проверяем, что это день планёрки
         if selected_date.weekday() not in MEETING_DAYS:
-            days_names = ["понедельник", "среду", "пятницу"]
+            days_names = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
             meeting_days_names = [days_names[i] for i in MEETING_DAYS]
             
             await update.message.reply_text(
                 f"❌ В эту дату нет планёрок! Планёрки бывают по {', '.join(meeting_days_names)}.\n"
-                "Попробуйте снова:"
+                "Попробуйте снова или отправьте 'отмена':"
             )
             return CONFIRMING_DATE
         
@@ -379,7 +444,7 @@ async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["selected_date"] = selected_date.strftime("%Y-%m-%d")
         context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
         
-        # Переходим к подтверждению через inline-клавиатуру
+        # Переходим к подтверждению
         return await show_confirmation(update, context)
         
     except ValueError as e:
@@ -396,16 +461,16 @@ async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     reason = context.user_data.get("selected_reason", "")
     selected_date = context.user_data.get("selected_date_display", "")
     
-    message = f"📋 Подтверждение отмены планёрки:\n\n"
+    message = f"📋 *Подтверждение отмены планёрки:*\n\n"
     
     if "Перенесём" in reason:
-        message += f"❌ Отмена планёрки\n"
-        message += f"📅 Перенос на {selected_date}\n\n"
-        message += "✅ Подтвердить отмену?"
+        message += f"❌ *Отмена сегодняшней планёрки*\n"
+        message += f"📅 *Перенос на {selected_date}*\n\n"
+        message += "*Подтвердить отмену?*"
     else:
-        message += f"❌ Отмена планёрки\n"
-        message += f"📝 Причина: {reason}\n\n"
-        message += "✅ Подтвердить отмену?"
+        message += f"❌ *Отмена планёрки*\n"
+        message += f"📝 *Причина:* {reason}\n\n"
+        message += "*Подтвердить отмену?*"
     
     keyboard = [
         [
@@ -417,12 +482,14 @@ async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if update.callback_query:
         await update.callback_query.edit_message_text(
             text=message,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
             text=message,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
         )
     
     return CONFIRMING_DATE
@@ -446,9 +513,9 @@ async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
     # Формируем финальное сообщение
     if reason_index == 2:  # "Перенесём на другой день"
         selected_date = context.user_data.get("selected_date_display", "")
-        final_message = f"❌ @{username} отменил планёрку\n\n📅 Перенос на {selected_date}"
+        final_message = f"❌ @{username} отменил сегодняшнюю планёрку\n\n📅 *Перенос на {selected_date}*"
     else:
-        final_message = f"❌ @{username} отменил планёрку\n\n📝 Причина: {reason}"
+        final_message = f"❌ @{username} отменил планёрку\n\n📝 *Причина:* {reason}"
     
     # Удаляем задание из планировщика
     original_message_id = context.user_data.get("original_message_id")
@@ -468,7 +535,10 @@ async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
         config.remove_active_reminder(job_name_to_remove)
     
     # Отправляем финальное сообщение
-    await query.edit_message_text(text=final_message)
+    await query.edit_message_text(
+        text=final_message,
+        parse_mode="Markdown"
+    )
     
     logger.info(f"Планёрка отменена @{username} — {reason}")
     
@@ -488,20 +558,22 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /start"""
     await update.message.reply_text(
-        "🤖 Бот для напоминаний о планёрке активен!\n\n"
-        f"📅 Напоминания отправляются по понедельникам, средам и пятницам\n"
-        f"⏰ В {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
-        "🔧 Доступные команды:\n"
+        "🤖 *Бот для напоминаний о планёрке активен!*\n\n"
+        f"📅 *Напоминания отправляются:*\n"
+        f"• Понедельник\n• Среда\n• Пятница\n"
+        f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
+        "🔧 *Доступные команды:*\n"
         "/info - информация о боте\n"
         "/jobs - список запланированных задач\n"
         "/test - тестовое напоминание (через 5 сек)\n"
         "/testnow - мгновенное тестовое напоминание\n\n"
-        "👮‍♂️ Команды для администраторов:\n"
+        "👮‍♂️ *Команды для администраторов:*\n"
         "/setchat - установить чат для уведомлений\n"
         "/adduser @username - добавить пользователя\n"
         "/removeuser @username - удалить пользователя\n"
         "/users - список пользователей\n"
-        "/cancelall - отменить все напоминания"
+        "/cancelall - отменить все напоминания",
+        parse_mode="Markdown"
     )
 
 
@@ -515,9 +587,10 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config.chat_id = chat_id
 
     await update.message.reply_text(
-        f"✅ Чат установлен: {chat_title}\n"
-        f"Chat ID: {chat_id}\n\n"
-        "Напоминания будут отправляться в этот чат."
+        f"✅ *Чат установлен:* {chat_title}\n"
+        f"*Chat ID:* {chat_id}\n\n"
+        "Напоминания будут отправляться в этот чат.",
+        parse_mode="Markdown"
     )
 
     logger.info(f"Установлен чат {chat_title} ({chat_id})")
@@ -530,9 +603,9 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = config.chat_id
 
     if chat_id:
-        status = f"✅ Чат установлен (ID: {chat_id})"
+        status = f"✅ *Чат установлен* (ID: {chat_id})"
     else:
-        status = "❌ Чат не установлен. Используйте /setchat"
+        status = "❌ *Чат не установлен*. Используйте /setchat"
 
     # Подсчет запланированных задач
     job_count = len([j for j in context.application.job_queue.jobs() 
@@ -546,18 +619,28 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 next_job = job
     
     next_time = next_job.next_t.astimezone(TIMEZONE) if next_job else "не запланировано"
+    
+    # Ближайшие дни планёрок
+    today = datetime.now(TIMEZONE)
+    upcoming_meetings = []
+    for i in range(1, 8):
+        next_day = today + timedelta(days=i)
+        if next_day.weekday() in MEETING_DAYS:
+            upcoming_meetings.append(next_day.strftime("%d.%m.%Y"))
 
     await update.message.reply_text(
-        f"📊 Информация о боте:\n\n"
+        f"📊 *Информация о боте:*\n\n"
         f"{status}\n"
-        f"📅 Дни планёрок: понедельник, среда, пятница\n"
-        f"⏰ Время: {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"👥 Разрешённые пользователи: {len(config.allowed_users)}\n"
-        f"📋 Активные напоминания: {len(config.active_reminders)}\n"
-        f"⏳ Запланировано задач: {job_count}\n"
-        f"➡️ Следующее напоминание: {next_time}\n\n"
+        f"📅 *Дни планёрок:* понедельник, среда, пятница\n"
+        f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
+        f"👥 *Разрешённые пользователи:* {len(config.allowed_users)}\n"
+        f"📋 *Активные напоминания:* {len(config.active_reminders)}\n"
+        f"⏳ *Запланировано задач:* {job_count}\n"
+        f"➡️ *Следующее напоминание:* {next_time}\n"
+        f"📈 *Ближайшие планёрки:* {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}\n\n"
         f"Используйте /users для списка пользователей\n"
-        f"Используйте /jobs для списка задач"
+        f"Используйте /jobs для списка задач",
+        parse_mode="Markdown"
     )
 
 
@@ -576,7 +659,7 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         name=f"test_reminder_{datetime.now().timestamp()}"
     )
 
-    await update.message.reply_text("⏳ Тестовое напоминание будет отправлено через 5 секунд...")
+    await update.message.reply_text("⏳ *Тестовое напоминание будет отправлено через 5 секунд...*", parse_mode="Markdown")
 
 
 @restricted
@@ -587,7 +670,7 @@ async def test_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
         return
 
-    await update.message.reply_text("🚀 Отправляю тестовое напоминание прямо сейчас...")
+    await update.message.reply_text("🚀 *Отправляю тестовое напоминание прямо сейчас...*", parse_mode="Markdown")
     
     # Создаем контекст для отправки
     class DummyJob:
@@ -607,62 +690,62 @@ async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     jobs = context.application.job_queue.jobs()
     
     if not jobs:
-        await update.message.reply_text("📭 Нет запланированных задач.")
+        await update.message.reply_text("📭 *Нет запланированных задач.*", parse_mode="Markdown")
         return
     
     meeting_jobs = [j for j in jobs if j.name and j.name.startswith("meeting_reminder_")]
     other_jobs = [j for j in jobs if j not in meeting_jobs]
     
-    message = "📋 Запланированные задачи:\n\n"
+    message = "📋 *Запланированные задачи:*\n\n"
     
     if meeting_jobs:
-        message += "🔔 Напоминания о планёрках:\n"
+        message += "🔔 *Напоминания о планёрках:*\n"
         for job in sorted(meeting_jobs, key=lambda j: j.next_t):
             next_time = job.next_t.astimezone(TIMEZONE)
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name})\n"
     
     if other_jobs:
-        message += "\n🔧 Другие задачи:\n"
+        message += "\n🔧 *Другие задачи:*\n"
         for job in other_jobs:
             next_time = job.next_t.astimezone(TIMEZONE)
             job_name = job.name or "Без имени"
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job_name})\n"
     
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, parse_mode="Markdown")
 
 
 @restricted
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Добавить пользователя в список разрешенных"""
     if not context.args:
-        await update.message.reply_text("❌ Используйте: /adduser @username")
+        await update.message.reply_text("❌ *Используйте:* /adduser @username", parse_mode="Markdown")
         return
     
     username = context.args[0].lstrip('@')
     config = BotConfig()
     
     if config.add_allowed_user(username):
-        await update.message.reply_text(f"✅ Пользователь @{username} добавлен")
+        await update.message.reply_text(f"✅ *Пользователь @{username} добавлен*", parse_mode="Markdown")
         logger.info(f"Добавлен пользователь @{username}")
     else:
-        await update.message.reply_text(f"ℹ️ Пользователь @{username} уже есть в списке")
+        await update.message.reply_text(f"ℹ️ *Пользователь @{username} уже есть в списке*", parse_mode="Markdown")
 
 
 @restricted
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Удалить пользователя из списка разрешенных"""
     if not context.args:
-        await update.message.reply_text("❌ Используйте: /removeuser @username")
+        await update.message.reply_text("❌ *Используйте:* /removeuser @username", parse_mode="Markdown")
         return
     
     username = context.args[0].lstrip('@')
     config = BotConfig()
     
     if config.remove_allowed_user(username):
-        await update.message.reply_text(f"✅ Пользователь @{username} удален")
+        await update.message.reply_text(f"✅ *Пользователь @{username} удален*", parse_mode="Markdown")
         logger.info(f"Удален пользователь @{username}")
     else:
-        await update.message.reply_text(f"❌ Пользователь @{username} не найден")
+        await update.message.reply_text(f"❌ *Пользователь @{username} не найден*", parse_mode="Markdown")
 
 
 @restricted
@@ -672,15 +755,15 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     users = config.allowed_users
     
     if not users:
-        await update.message.reply_text("📭 Список пользователей пуст")
+        await update.message.reply_text("📭 *Список пользователей пуст*", parse_mode="Markdown")
         return
     
-    message = "👥 Разрешенные пользователи:\n\n"
+    message = "👥 *Разрешенные пользователи:*\n\n"
     for i, user in enumerate(users, 1):
         message += f"{i}. @{user}\n"
     
-    message += f"\nВсего: {len(users)} пользователь(ей)"
-    await update.message.reply_text(message)
+    message += f"\n*Всего:* {len(users)} пользователь(ей)"
+    await update.message.reply_text(message, parse_mode="Markdown")
 
 
 @restricted
@@ -699,8 +782,9 @@ async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     config.clear_active_reminders()
     
     await update.message.reply_text(
-        f"✅ Отменено {canceled_count} напоминаний(я)\n"
-        f"Очищено {len(config.active_reminders)} активных напоминаний в конфиге"
+        f"✅ *Отменено {canceled_count} напоминаний(я)*\n"
+        f"Очищено {len(config.active_reminders)} активных напоминаний в конфиге",
+        parse_mode="Markdown"
     )
     logger.info(f"Отменено {canceled_count} напоминаний")
 
