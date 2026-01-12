@@ -2,7 +2,7 @@ import os
 import logging
 import json
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from functools import wraps
 import pytz
 
@@ -14,7 +14,8 @@ from telegram.ext import (
     ContextTypes,
     JobQueue,
     MessageHandler,
-    filters
+    filters,
+    ConversationHandler
 )
 
 # Настройка логирования
@@ -22,6 +23,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Состояния для ConversationHandler
+SELECTING_REASON, SELECTING_DATE, CONFIRMING_DATE = range(3)
 
 # Конфигурация
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Токен бота из переменных окружения
@@ -36,11 +40,9 @@ MEETING_DAYS = [0, 2, 4]
 
 # Варианты отмены планёрки
 CANCELLATION_OPTIONS = [
-    "Перенесём на другой день. Дата такая-то",
-    "Причину сообщу позже",
     "Все вопросы решены, планёрка не нужна",
     "Ключевые участники отсутствуют",
-    "Экстренная ситуация, подробности в ЛС",
+    "Перенесём на другой день",
 ]
 
 # Декоратор для проверки прав пользователя
@@ -202,47 +204,258 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @restricted
-async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик нажатия кнопки отмены планёрки"""
+async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик нажатия кнопки отмены планёрки - начало Conversation"""
     query = update.callback_query
     await query.answer()
+
+    # Сохраняем ID сообщения для редактирования
+    context.user_data["original_message_id"] = query.message.message_id
+    context.user_data["original_chat_id"] = query.message.chat_id
 
     keyboard = [
         [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
         for i, option in enumerate(CANCELLATION_OPTIONS)
     ]
-    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back_to_main")])
 
     await query.edit_message_text(
         text="📝 Выберите причину отмены планёрки:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+    return SELECTING_REASON
 
-@restricted
-async def reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик выбора причины отмены"""
+
+async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик выбора причины"""
     query = update.callback_query
     await query.answer()
     
-    if query.data == "back_to_main":
-        keyboard = [[InlineKeyboardButton("Отменить планёрку", callback_data="cancel_meeting")]]
-        await query.edit_message_text(
-            text="👋 Коллеги, доброе утро!\n\n📋 Напоминаю о ежедневной планёрке в 9:15 по МСК.\nПрисоединяйтесь к звонку!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
     reason_index = int(query.data.split("_")[1])
     reason = CANCELLATION_OPTIONS[reason_index]
-    username = query.from_user.username
+    
+    # Сохраняем выбранную причину
+    context.user_data["selected_reason"] = reason
+    context.user_data["reason_index"] = reason_index
+    
+    if reason_index == 2:  # "Перенесём на другой день"
+        # Показываем выбор даты
+        return await show_date_selection(update, context)
+    else:
+        # Автоматические причины - сразу подтверждаем
+        return await confirm_cancellation(update, context)
 
-    # Удаляем задание из планировщика
+
+async def show_date_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показать выбор даты для переноса"""
+    query = update.callback_query
+    
+    # Создаем клавиатуру с датами на ближайшую неделю
+    keyboard = []
+    today = datetime.now(TIMEZONE)
+    
+    # Добавляем ближайшие дни планёрок
+    for i in range(1, 14):  # 2 недели вперед
+        next_day = today + timedelta(days=i)
+        if next_day.weekday() in MEETING_DAYS:
+            date_str = next_day.strftime("%d.%m.%Y (%A)")
+            callback_data = f"date_{next_day.strftime('%Y-%m-%d')}"
+            keyboard.append([InlineKeyboardButton(date_str, callback_data=callback_data)])
+    
+    # Добавляем кнопки быстрого выбора
+    quick_dates = []
+    for i in range(1, 4):
+        quick_day = today + timedelta(days=i)
+        if quick_day.weekday() in MEETING_DAYS:
+            date_str = f"Через {i} день" if i == 1 else f"Через {i} дня"
+            callback_data = f"date_{quick_day.strftime('%Y-%m-%d')}"
+            quick_dates.append(InlineKeyboardButton(date_str, callback_data=callback_data))
+    
+    if quick_dates:
+        keyboard.insert(0, quick_dates)
+    
+    # Кнопка для ввода своей даты
+    keyboard.append([InlineKeyboardButton("✏️ Ввести свою дату", callback_data="custom_date")])
+    keyboard.append([InlineKeyboardButton("↩️ Назад к причинам", callback_data="back_to_reasons")])
+    
+    await query.edit_message_text(
+        text="📅 Выберите дату для переноса планёрки:\n\n"
+             "*Ближайшие дни планёрок:*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    return SELECTING_DATE
+
+
+async def date_selected_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик выбора даты"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "custom_date":
+        await query.edit_message_text(
+            text="✏️ Введите дату в формате ДД.ММ.ГГГГ\n"
+                 "Например: 15.12.2024\n\n"
+                 "Или отправьте 'отмена' для возврата."
+        )
+        return CONFIRMING_DATE
+    
+    if query.data == "back_to_reasons":
+        keyboard = [
+            [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
+            for i, option in enumerate(CANCELLATION_OPTIONS)
+        ]
+        
+        await query.edit_message_text(
+            text="📝 Выберите причину отмены планёрки:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_REASON
+    
+    # Обработка выбранной даты
+    selected_date_str = query.data.split("_")[1]
+    selected_date = datetime.strptime(selected_date_str, "%Y-%m-%d")
+    
+    # Сохраняем выбранную дату
+    context.user_data["selected_date"] = selected_date_str
+    context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
+    
+    # Переходим к подтверждению
+    return await confirm_cancellation(update, context)
+
+
+async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка ввода пользовательской даты"""
+    user_input = update.message.text.strip().lower()
+    
+    if user_input == 'отмена':
+        keyboard = [
+            [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
+            for i, option in enumerate(CANCELLATION_OPTIONS)
+        ]
+        
+        await update.message.reply_text(
+            "Возвращаюсь к выбору причины...",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_REASON
+    
+    try:
+        # Пробуем разные форматы дат
+        formats = ["%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%d %m %Y"]
+        selected_date = None
+        
+        for fmt in formats:
+            try:
+                selected_date = datetime.strptime(user_input, fmt)
+                break
+            except ValueError:
+                continue
+        
+        if not selected_date:
+            raise ValueError("Неверный формат даты")
+        
+        # Проверяем, что дата в будущем
+        today = datetime.now(TIMEZONE).date()
+        if selected_date.date() <= today:
+            await update.message.reply_text(
+                "❌ Дата должна быть в будущем! Попробуйте снова:"
+            )
+            return CONFIRMING_DATE
+        
+        # Проверяем, что это день планёрки
+        if selected_date.weekday() not in MEETING_DAYS:
+            days_names = ["понедельник", "среду", "пятницу"]
+            meeting_days_names = [days_names[i] for i in MEETING_DAYS]
+            
+            await update.message.reply_text(
+                f"❌ В эту дату нет планёрок! Планёрки бывают по {', '.join(meeting_days_names)}.\n"
+                "Попробуйте снова:"
+            )
+            return CONFIRMING_DATE
+        
+        # Сохраняем дату
+        context.user_data["selected_date"] = selected_date.strftime("%Y-%m-%d")
+        context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
+        
+        # Переходим к подтверждению через inline-клавиатуру
+        return await show_confirmation(update, context)
+        
+    except ValueError as e:
+        await update.message.reply_text(
+            "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ\n"
+            "Например: 15.12.2024\n\n"
+            "Попробуйте снова или отправьте 'отмена':"
+        )
+        return CONFIRMING_DATE
+
+
+async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показать подтверждение отмены"""
+    reason = context.user_data.get("selected_reason", "")
+    selected_date = context.user_data.get("selected_date_display", "")
+    
+    message = f"📋 Подтверждение отмены планёрки:\n\n"
+    
+    if "Перенесём" in reason:
+        message += f"❌ Отмена планёрки\n"
+        message += f"📅 Перенос на {selected_date}\n\n"
+        message += "✅ Подтвердить отмену?"
+    else:
+        message += f"❌ Отмена планёрки\n"
+        message += f"📝 Причина: {reason}\n\n"
+        message += "✅ Подтвердить отмену?"
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
+            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons")
+        ]
+    ]
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text=message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(
+            text=message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    return CONFIRMING_DATE
+
+
+async def confirm_cancellation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показать подтверждение отмены после выбора причины/даты"""
+    return await show_confirmation(update, context)
+
+
+async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Выполнить отмену планёрки"""
+    query = update.callback_query
+    await query.answer()
+    
     config = BotConfig()
+    reason = context.user_data.get("selected_reason", "")
+    reason_index = context.user_data.get("reason_index", -1)
+    username = query.from_user.username
+    
+    # Формируем финальное сообщение
+    if reason_index == 2:  # "Перенесём на другой день"
+        selected_date = context.user_data.get("selected_date_display", "")
+        final_message = f"❌ @{username} отменил планёрку\n\n📅 Перенос на {selected_date}"
+    else:
+        final_message = f"❌ @{username} отменил планёрку\n\n📝 Причина: {reason}"
+    
+    # Удаляем задание из планировщика
+    original_message_id = context.user_data.get("original_message_id")
     job_name_to_remove = None
     
     for job_name, reminder_data in config.active_reminders.items():
-        if reminder_data.get("message_id") == query.message.message_id:
+        if reminder_data.get("message_id") == original_message_id:
             # Ищем задание в планировщике
             for job in context.application.job_queue.jobs():
                 if job.name == job_name:
@@ -253,12 +466,23 @@ async def reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Удаляем из конфига
     if job_name_to_remove:
         config.remove_active_reminder(job_name_to_remove)
-
-    await query.edit_message_text(
-        text=f"❌ @{username} отменил планёрку\n\nПричина: {reason}"
-    )
-
+    
+    # Отправляем финальное сообщение
+    await query.edit_message_text(text=final_message)
+    
     logger.info(f"Планёрка отменена @{username} — {reason}")
+    
+    # Очищаем user_data
+    context.user_data.clear()
+    
+    return ConversationHandler.END
+
+
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отмена диалога"""
+    await update.message.reply_text("❌ Диалог отменен.")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -610,6 +834,30 @@ def main() -> None:
     try:
         application = Application.builder().token(TOKEN).build()
 
+        # Создаем ConversationHandler для отмены планёрки
+        conv_handler = ConversationHandler(
+            entry_points=[CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$")],
+            states={
+                SELECTING_REASON: [
+                    CallbackQueryHandler(select_reason_callback, pattern="^reason_[0-9]+$"),
+                ],
+                SELECTING_DATE: [
+                    CallbackQueryHandler(date_selected_callback, pattern="^date_.+$"),
+                    CallbackQueryHandler(date_selected_callback, pattern="^custom_date$"),
+                    CallbackQueryHandler(date_selected_callback, pattern="^back_to_reasons$"),
+                ],
+                CONFIRMING_DATE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_date),
+                    CallbackQueryHandler(execute_cancellation, pattern="^confirm_cancel$"),
+                    CallbackQueryHandler(cancel_meeting_callback, pattern="^back_to_reasons$"),
+                ],
+            },
+            fallbacks=[
+                CommandHandler("cancel", cancel_conversation),
+                CallbackQueryHandler(cancel_conversation, pattern="^cancel$"),
+            ],
+        )
+
         # Обработчики команд
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("setchat", set_chat))
@@ -622,10 +870,8 @@ def main() -> None:
         application.add_handler(CommandHandler("users", list_users))
         application.add_handler(CommandHandler("cancelall", cancel_all))
 
-        # Обработчики callback-запросов
-        application.add_handler(CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$"))
-        application.add_handler(CallbackQueryHandler(reason_callback, pattern="^reason_"))
-        application.add_handler(CallbackQueryHandler(reason_callback, pattern="^back_to_main$"))
+        # Добавляем ConversationHandler
+        application.add_handler(conv_handler)
 
         # Очистка старых задач при запуске
         cleanup_old_jobs(application.job_queue)
