@@ -393,7 +393,7 @@ async def date_selected_callback(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
     
     # Переходим к подтверждению
-    return await confirm_cancellation(update, context)
+    return await show_confirmation(update, context)
 
 
 async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -451,7 +451,7 @@ async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
         
         # Переходим к подтверждению
-        return await show_confirmation(update, context)
+        return await show_confirmation_text(update, context)
         
     except ValueError as e:
         await update.message.reply_text(
@@ -462,8 +462,8 @@ async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return CONFIRMING_DATE
 
 
-async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Показать подтверждение отмены"""
+async def show_confirmation_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показать подтверждение отмены для текстового ввода"""
     reason = context.user_data.get("selected_reason", "")
     selected_date = context.user_data.get("selected_date_display", "")
     
@@ -481,22 +481,48 @@ async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     keyboard = [
         [
             InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
-            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons")
+            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
         ]
     ]
     
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text=message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
+    await update.message.reply_text(
+        text=message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    
+    return CONFIRMING_DATE
+
+
+async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показать подтверждение отмены для callback"""
+    query = update.callback_query
+    reason = context.user_data.get("selected_reason", "")
+    selected_date = context.user_data.get("selected_date_display", "")
+    
+    message = f"📋 *Подтверждение отмены планёрки:*\n\n"
+    
+    if "Перенесём" in reason:
+        message += f"❌ *Отмена сегодняшней планёрки*\n"
+        message += f"📅 *Перенос на {selected_date}*\n\n"
+        message += "*Подтвердить отмену?*"
     else:
-        await update.message.reply_text(
-            text=message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
+        message += f"❌ *Отмена планёрки*\n"
+        message += f"📝 *Причина:* {reason}\n\n"
+        message += "*Подтвердить отмену?*"
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
+            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
+        ]
+    ]
+    
+    await query.edit_message_text(
+        text=message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
     
     return CONFIRMING_DATE
 
@@ -506,19 +532,37 @@ async def confirm_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
     return await show_confirmation(update, context)
 
 
+async def back_to_reasons_from_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Вернуться к выбору причины из подтверждения"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
+        for i, option in enumerate(CANCELLATION_OPTIONS)
+    ]
+    
+    await query.edit_message_text(
+        text="📝 Выберите причину отмены планёрки:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return SELECTING_REASON
+
+
 async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Выполнить отмену планёрки"""
     query = update.callback_query
     await query.answer()
     
     config = BotConfig()
-    reason = context.user_data.get("selected_reason", "")
+    reason = context.user_data.get("selected_reason", "Причина не указана")
     reason_index = context.user_data.get("reason_index", -1)
-    username = query.from_user.username
+    username = query.from_user.username or "Неизвестный пользователь"
     
     # Формируем финальное сообщение
     if reason_index == 2:  # "Перенесём на другой день"
-        selected_date = context.user_data.get("selected_date_display", "")
+        selected_date = context.user_data.get("selected_date_display", "дата не указана")
         final_message = f"❌ @{username} отменил сегодняшнюю планёрку\n\n📅 *Перенос на {selected_date}*"
     else:
         final_message = f"❌ @{username} отменил планёрку\n\n📝 *Причина:* {reason}"
@@ -527,18 +571,22 @@ async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
     original_message_id = context.user_data.get("original_message_id")
     job_name_to_remove = None
     
-    for job_name, reminder_data in config.active_reminders.items():
-        if reminder_data.get("message_id") == original_message_id:
-            # Ищем задание в планировщике
-            for job in context.application.job_queue.jobs():
-                if job.name == job_name:
-                    job.schedule_removal()
-                    job_name_to_remove = job_name
-                    break
-    
-    # Удаляем из конфига
-    if job_name_to_remove:
-        config.remove_active_reminder(job_name_to_remove)
+    # Ищем и удаляем соответствующие задания
+    if original_message_id:
+        for job_name, reminder_data in config.active_reminders.items():
+            if str(reminder_data.get("message_id")) == str(original_message_id):
+                # Ищем задание в планировщике
+                for job in context.application.job_queue.jobs():
+                    if job.name == job_name:
+                        job.schedule_removal()
+                        job_name_to_remove = job_name
+                        logger.info(f"Задание {job_name} удалено из планировщика")
+                        break
+        
+        # Удаляем из конфига
+        if job_name_to_remove:
+            config.remove_active_reminder(job_name_to_remove)
+            logger.info(f"Задание {job_name_to_remove} удалено из конфига")
     
     # Отправляем финальное сообщение
     await query.edit_message_text(
@@ -556,7 +604,12 @@ async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Отмена диалога"""
-    await update.message.reply_text("❌ Диалог отменен.")
+    if update.message:
+        await update.message.reply_text("❌ Диалог отменен.")
+    elif update.callback_query:
+        await update.callback_query.answer("Диалог отменен", show_alert=True)
+        await update.callback_query.edit_message_text("❌ Диалог отменен.")
+    
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1004,13 +1057,14 @@ def main() -> None:
                 CONFIRMING_DATE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_date),
                     CallbackQueryHandler(execute_cancellation, pattern="^confirm_cancel$"),
-                    CallbackQueryHandler(cancel_meeting_callback, pattern="^back_to_reasons$"),
+                    CallbackQueryHandler(back_to_reasons_from_confirm, pattern="^back_to_reasons_from_confirm$"),
                 ],
             },
             fallbacks=[
                 CommandHandler("cancel", cancel_conversation),
-                CallbackQueryHandler(cancel_conversation, pattern="^cancel$"),
+                CallbackQueryHandler(cancel_conversation, pattern="^cancel_conversation$"),
             ],
+            allow_reentry=True,
         )
 
         # Обработчики команд
