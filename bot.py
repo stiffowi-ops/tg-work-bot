@@ -49,14 +49,18 @@ CANCELLATION_OPTIONS = [
 ]
 
 # Вспомогательная функция для совместимости версий PTB
-def get_jobs(job_queue: JobQueue):
+def get_jobs_from_queue(job_queue: JobQueue):
     """Получить список задач с поддержкой разных версий PTB"""
     try:
         # Пробуем новый метод (PTB >= 20)
         return job_queue.get_jobs()
     except AttributeError:
-        # Используем старый метод (PTB < 20)
-        return job_queue.jobs()
+        try:
+            # Используем старый метод (PTB < 20)
+            return job_queue.jobs()
+        except AttributeError as e:
+            logger.error(f"Не удалось получить задачи из JobQueue: {e}")
+            return []
 
 
 # Декоратор для проверки прав пользователя
@@ -605,7 +609,7 @@ async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
     # Ищем и удаляем соответствующие задания
     if original_message_id:
         # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-        for job in get_jobs(context.application.job_queue):
+        for job in get_jobs_from_queue(context.application.job_queue):
             if job.name in config.active_reminders:
                 reminder_data = config.active_reminders[job.name]
                 if str(reminder_data.get("message_id")) == str(original_message_id):
@@ -699,7 +703,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Подсчет запланированных задач
     # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-    all_jobs = get_jobs(context.application.job_queue)
+    all_jobs = get_jobs_from_queue(context.application.job_queue)
     job_count = len([j for j in all_jobs 
                     if j.name and j.name.startswith("meeting_reminder_")])
     
@@ -837,7 +841,7 @@ async def test_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показать список запланированных задач"""
     # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-    jobs = get_jobs(context.application.job_queue)
+    jobs = get_jobs_from_queue(context.application.job_queue)
     
     if not jobs:
         await update.message.reply_text("📭 <b>Нет запланированных задач.</b>", parse_mode=ParseMode.HTML)
@@ -920,7 +924,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отменить все запланированные напоминания"""
     # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-    jobs = get_jobs(context.application.job_queue)
+    jobs = get_jobs_from_queue(context.application.job_queue)
     canceled_count = 0
     
     for job in jobs[:]:  # Копируем список для безопасного удаления
@@ -991,7 +995,7 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         
         # Проверяем, нет ли уже такой задачи
         # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-        existing_jobs = [j for j in get_jobs(context.application.job_queue) 
+        existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
                         if j.name == job_name]
         
         if not existing_jobs:
@@ -1018,7 +1022,7 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 def cleanup_old_jobs(job_queue: JobQueue) -> None:
     """Очистка старых и дублирующих задач"""
     # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-    jobs = get_jobs(job_queue)
+    jobs = get_jobs_from_queue(job_queue)
     jobs_by_name = {}
     jobs_to_remove = []
     
