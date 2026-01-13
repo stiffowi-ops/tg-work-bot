@@ -2,6 +2,8 @@ import os
 import logging
 import json
 import random
+import aiohttp
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from functools import wraps
@@ -34,9 +36,19 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Токен бота из переме
 ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", "https://us04web.zoom.us/j/1234567890?pwd=example")  # Ссылка на Zoom
 CONFIG_FILE = "bot_config.json"  # Файл для хранения настроек
 
-# Время планёрки (9:15 по Москве)
+# Время планёрки (9:15 по Москве) и время отправки фактов (10:00 по Москве)
 MEETING_TIME = {"hour": 9, "minute": 15}
+FACTS_TIME = {"hour": 10, "minute": 0}
 TIMEZONE = pytz.timezone("Europe/Moscow")
+
+# Категории фактов
+FACT_CATEGORIES = {
+    "Наука": "science",
+    "Технологии": "technology", 
+    "Кино": "movies",
+    "Музыка": "music",
+    "Игры": "games"
+}
 
 # Дни недели для планёрки (понедельник=0, среда=2, пятница=4)
 MEETING_DAYS = [0, 2, 4]
@@ -47,6 +59,188 @@ CANCELLATION_OPTIONS = [
     "Ключевые участники отсутствуют",
     "Перенесём на другой день",
 ]
+
+# API источники для разных категорий фактов (ВСЕ БЕСПЛАТНЫЕ, БЕЗ API КЛЮЧЕЙ)
+FACT_APIS = {
+    "Наука": [
+        {
+            "name": "Useless Facts",
+            "url": "https://uselessfacts.jsph.pl/api/v2/facts/random",
+            "params": {"language": "ru"},
+            "parser": lambda data: data["text"] if "text" in data else None,
+            "priority": 1
+        },
+        {
+            "name": "Wikipedia Random",
+            "url": "https://ru.wikipedia.org/api/rest_v1/page/random/summary",
+            "params": {},
+            "parser": lambda data: f"{data.get('title', 'Факт')}: {data.get('extract', 'Интересная информация')[:200]}..." if data and 'extract' in data else None,
+            "priority": 2
+        },
+        {
+            "name": "Numbers API",
+            "url": "http://numbersapi.com/random/trivia",
+            "params": {},
+            "parser": lambda data: f"Числовой факт: {data}" if data else None,
+            "priority": 3
+        }
+    ],
+    "Технологии": [
+        {
+            "name": "Useless Facts",
+            "url": "https://uselessfacts.jsph.pl/api/v2/facts/random",
+            "params": {"language": "ru"},
+            "parser": lambda data: data["text"] if "text" in data else None,
+            "priority": 1
+        },
+        {
+            "name": "Tech Wikipedia",
+            "url": "https://ru.wikipedia.org/w/api.php",
+            "params": {
+                "action": "query",
+                "format": "json",
+                "list": "random",
+                "rnnamespace": 0,
+                "rnlimit": 1
+            },
+            "parser": lambda data: f"Технологический факт: {data['query']['random'][0]['title']}" if data and 'query' in data and 'random' in data['query'] and data['query']['random'] else None,
+            "priority": 2
+        },
+        {
+            "name": "Numbers Math",
+            "url": "http://numbersapi.com/random/math",
+            "params": {},
+            "parser": lambda data: f"Математический факт: {data}" if data else None,
+            "priority": 3
+        }
+    ],
+    "Кино": [
+        {
+            "name": "Useless Facts",
+            "url": "https://uselessfacts.jsph.pl/api/v2/facts/random",
+            "params": {"language": "ru"},
+            "parser": lambda data: data["text"] if "text" in data else None,
+            "priority": 1
+        },
+        {
+            "name": "Movie Quotes",
+            "url": "https://movie-quote-api.vercel.app/v1/quote/random",
+            "params": {},
+            "parser": lambda data: f"Кинофакт: \"{data.get('quote', '')}\" - {data.get('show', 'Неизвестный фильм/сериал')}" if data else None,
+            "priority": 2
+        },
+        {
+            "name": "Wikipedia Films",
+            "url": "https://ru.wikipedia.org/w/api.php",
+            "params": {
+                "action": "query",
+                "format": "json",
+                "list": "random",
+                "rnnamespace": 0,
+                "rnlimit": 1
+            },
+            "parser": lambda data: f"Кинофакт о: {data['query']['random'][0]['title']}" if data and 'query' in data and 'random' in data['query'] and data['query']['random'] else None,
+            "priority": 3
+        }
+    ],
+    "Музыка": [
+        {
+            "name": "Useless Facts",
+            "url": "https://uselessfacts.jsph.pl/api/v2/facts/random",
+            "params": {"language": "ru"},
+            "parser": lambda data: data["text"] if "text" in data else None,
+            "priority": 1
+        },
+        {
+            "name": "Genrenator",
+            "url": "https://binaryjazz.us/wp-json/genrenator/v1/story/",
+            "params": {},
+            "parser": lambda data: f"Музыкальный факт: {data}" if data else None,
+            "priority": 2
+        },
+        {
+            "name": "Wikipedia Music",
+            "url": "https://ru.wikipedia.org/w/api.php",
+            "params": {
+                "action": "query",
+                "format": "json",
+                "list": "random",
+                "rnnamespace": 0,
+                "rnlimit": 1
+            },
+            "parser": lambda data: f"Музыкальный факт о: {data['query']['random'][0]['title']}" if data and 'query' in data and 'random' in data['query'] and data['query']['random'] else None,
+            "priority": 3
+        }
+    ],
+    "Игры": [
+        {
+            "name": "Useless Facts",
+            "url": "https://uselessfacts.jsph.pl/api/v2/facts/random",
+            "params": {"language": "ru"},
+            "parser": lambda data: data["text"] if "text" in data else None,
+            "priority": 1
+        },
+        {
+            "name": "GamerPower",
+            "url": "https://www.gamerpower.com/api/giveaways",
+            "params": {"platform": "pc", "type": "game"},
+            "parser": lambda data: f"Игровой факт: Сейчас на GamerPower доступно {len(data) if isinstance(data, list) else 'несколько'} игровых раздач для PC!" if data else None,
+            "priority": 2
+        },
+        {
+            "name": "Wikipedia Games",
+            "url": "https://ru.wikipedia.org/w/api.php",
+            "params": {
+                "action": "query",
+                "format": "json",
+                "list": "random",
+                "rnnamespace": 0,
+                "rnlimit": 1
+            },
+            "parser": lambda data: f"Игровой факт о: {data['query']['random'][0]['title']}" if data and 'query' in data and 'random' in data['query'] and data['query']['random'] else None,
+            "priority": 3
+        }
+    ]
+}
+
+# Резервные факты на случай недоступности API
+BACKUP_FACTS = {
+    "Наука": [
+        "Среднее человеческое тело содержит достаточно углерода, чтобы изготовить 9000 карандашей.",
+        "Осьминоги имеют три сердца: два перекачивают кровь через жабры, а одно через тело.",
+        "Свету от Солнца требуется около 8 минут и 20 секунд, чтобы достичь Земли.",
+        "Человеческий мозг на 60% состоит из жира, что делает его самым жирным органом в теле.",
+        "Венера - единственная планета в Солнечной системе, которая вращается в обратном направлении."
+    ],
+    "Технологии": [
+        "Первый компьютерный вирус был создан в 1983 году и назывался 'Brain'.",
+        "Первое сообщение электронной почты было отправлено в 1971 году Рэем Томлинсоном.",
+        "Средний человек проверяет свой телефон около 150 раз в день.",
+        "Первый веб-сайт до сих пор работает: http://info.cern.ch",
+        "Изначально у Google было название 'Backrub'."
+    ],
+    "Кино": [
+        "В фильме 'Криминальное чтиво' использована не настоящая кровь, а смесь сиропа и пищевого красителя.",
+        "Актёру Джонни Деппу заплатили $3 миллиона за роль в 'Пиратах Карибского моря', что составило около $60,000 за каждую минуту экранного времени.",
+        "Фильм 'Аватар' является самым кассовым фильмом в истории, собрав более $2.8 миллиардов.",
+        "Сцена с зеркалом в 'Контакт' была снята без CGI - использовалось настоящее зеркало длиной 12 метров.",
+        "В 'Звёздных войнах' звук светового меча создан комбинацией жужжания проектора и помех от телевизора."
+    ],
+    "Музыка": [
+        "Бетховен был почти полностью глухим, когда написал свою Девятую симфонию.",
+        "Самая длинная песня в мире - 'The Rise and Fall of Bossanova' длительностью 13 часов 23 минуты 32 секунды.",
+        "Гитара Fender Stratocaster - самая копируемая модель гитары в мире.",
+        "Моцарт начал сочинять музыку в возрасте 5 лет.",
+        "Битлз первоначально назывались 'The Quarrymen'."
+    ],
+    "Игры": [
+        "Minecraft - самая продаваемая игра в истории с более чем 238 миллионами проданных копий.",
+        "Первая в мире компьютерная игра 'Spacewar!' была создана в 1962 году.",
+        "Создание The Legend of Zelda: Ocarina of Time заняло 5 лет и участие более 100 человек.",
+        "В Tetris нет конца - игра продолжается до тех пор, пока игрок не проиграет.",
+        "Персонаж Марио изначально назывался 'Прыгун' и появился в игре Donkey Kong."
+    ]
+}
 
 # Вспомогательная функция для совместимости версий PTB
 def get_jobs_from_queue(job_queue: JobQueue):
@@ -79,6 +273,129 @@ def restricted(func):
             return None
         return await func(update, context, *args, **kwargs)
     return wrapped
+
+
+async def get_daily_fact(category: str) -> str:
+    """Получить факт дня для указанной категории"""
+    try:
+        # Сортируем API по приоритету (от наивысшего к наименьшему)
+        if category in FACT_APIS:
+            api_configs = sorted(FACT_APIS[category], key=lambda x: x.get("priority", 10))
+            
+            async with aiohttp.ClientSession() as session:
+                for api_config in api_configs:
+                    try:
+                        url = api_config["url"]
+                        params = api_config.get("params", {})
+                        
+                        # Для Wikipedia API добавляем заголовки
+                        headers = {}
+                        if "wikipedia.org" in url:
+                            headers = {"User-Agent": "TelegramFactsBot/1.0"}
+                        
+                        async with session.get(url, params=params, headers=headers, timeout=10) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                fact = api_config["parser"](data)
+                                if fact:
+                                    logger.info(f"Успешно получен факт из {api_config['name']} для категории {category}")
+                                    return fact
+                    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+                        logger.warning(f"Ошибка при запросе к API {api_config['name']} ({url}): {e}")
+                        continue
+        
+        # Если все API не сработали, используем резервные факты
+        if category in BACKUP_FACTS:
+            logger.info(f"Используем резервный факт для категории {category}")
+            return random.choice(BACKUP_FACTS[category])
+            
+    except Exception as e:
+        logger.error(f"Ошибка при получении факта для категории {category}: {e}")
+    
+    # Факт по умолчанию
+    return "Сегодняшний факт временно недоступен. Попробуйте позже!"
+
+
+async def send_daily_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправка факта дня"""
+    config = BotConfig()
+    chat_id = config.chat_id
+
+    if not chat_id:
+        logger.error("Chat ID не установлен для отправки факта!")
+        return
+
+    try:
+        # Выбираем случайную категорию
+        category = random.choice(list(FACT_CATEGORIES.keys()))
+        
+        # Получаем факт
+        fact = await get_daily_fact(category)
+        
+        # Форматируем сообщение
+        message_text = (
+            f"<b>📊 Факт дня из мира {category}</b>\n\n"
+            f"{fact}\n\n"
+            f"#фактдня #{FACT_CATEGORIES[category]}"
+        )
+        
+        # Создаем клавиатуру с реакциями
+        keyboard = [
+            [
+                InlineKeyboardButton("👍", callback_data=f"fact_like_{category}"),
+                InlineKeyboardButton("👎", callback_data=f"fact_dislike_{category}"),
+                InlineKeyboardButton("💩", callback_data=f"fact_poop_{category}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Отправляем сообщение
+        message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=message_text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+        
+        # Сохраняем информацию о факте
+        job_name = context.job.name if hasattr(context, 'job') and context.job else f"fact_{datetime.now().timestamp()}"
+        config.add_active_fact(message.message_id, chat_id, job_name, category)
+        
+        logger.info(f"Отправлен факт дня категории '{category}' в чат {chat_id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при отправке факта дня: {e}")
+
+
+async def fact_reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик реакций на факты"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем данные из callback_data
+    data_parts = query.data.split('_')
+    if len(data_parts) != 3:
+        return
+    
+    reaction_type = data_parts[1]
+    category = data_parts[2]
+    
+    # Определяем текст реакции
+    reaction_texts = {
+        "like": "👍 Спасибо за лайк!",
+        "dislike": "👎 Ваше мнение учтено!",
+        "poop": "💩 Хм... интересная реакция!"
+    }
+    
+    reaction_text = reaction_texts.get(reaction_type, "Реакция получена!")
+    
+    # Отвечаем пользователю
+    await query.answer(reaction_text, show_alert=True)
+    
+    # Логируем реакцию
+    username = query.from_user.username or query.from_user.first_name
+    logger.info(f"Реакция на факт: @{username} - {reaction_type} для категории {category}")
 
 
 def get_greeting_by_meeting_day() -> str:
@@ -156,13 +473,22 @@ class BotConfig:
                         data["allowed_users"] = ["Stiff_OWi", "gshabanov"]
                     if "active_reminders" not in data:
                         data["active_reminders"] = {}
+                    if "daily_facts_enabled" not in data:
+                        data["daily_facts_enabled"] = True
+                    if "last_fact_date" not in data:
+                        data["last_fact_date"] = None
+                    if "active_facts" not in data:
+                        data["active_facts"] = {}
                     return data
             except Exception as e:
                 logger.error(f"Ошибка загрузки конфига: {e}")
         return {
             "chat_id": None,
             "allowed_users": ["Stiff_OWi", "gshabanov"],
-            "active_reminders": {}
+            "active_reminders": {},
+            "daily_facts_enabled": True,
+            "last_fact_date": None,
+            "active_facts": {}
         }
     
     def save(self) -> None:
@@ -227,6 +553,46 @@ class BotConfig:
         """Очистить все активные напоминания"""
         self.data["active_reminders"] = {}
         self.save()
+    
+    @property
+    def daily_facts_enabled(self) -> bool:
+        return self.data.get("daily_facts_enabled", True)
+    
+    @daily_facts_enabled.setter
+    def daily_facts_enabled(self, value: bool) -> None:
+        self.data["daily_facts_enabled"] = value
+        self.save()
+    
+    @property
+    def last_fact_date(self) -> Optional[str]:
+        return self.data.get("last_fact_date")
+    
+    @last_fact_date.setter
+    def last_fact_date(self, value: str) -> None:
+        self.data["last_fact_date"] = value
+        self.save()
+    
+    @property
+    def active_facts(self) -> Dict[str, Any]:
+        return self.data.get("active_facts", {})
+    
+    def add_active_fact(self, message_id: int, chat_id: int, job_name: str, category: str) -> None:
+        """Добавить активный факт"""
+        self.data["active_facts"][job_name] = {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "category": category,
+            "created_at": datetime.now(TIMEZONE).isoformat()
+        }
+        self.save()
+    
+    def remove_active_fact(self, job_name: str) -> bool:
+        """Удалить активный факт"""
+        if job_name in self.data["active_facts"]:
+            del self.data["active_facts"][job_name]
+            self.save()
+            return True
+        return False
 
 
 def load_config() -> Dict[str, Any]:
@@ -656,16 +1022,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📅 <b>Напоминания отправляются:</b>\n"
         f"• Понедельник\n• Среда\n• Пятница\n"
         f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
+        f"📊 <b>Факты дня отправляются:</b> каждый день в {FACTS_TIME['hour']:02d}:{FACTS_TIME['minute']:02d} по МСК\n"
+        f"📚 <b>Категории:</b> Наука, Технологии, Кино, Музыка, Игры\n\n"
         "🔧 <b>Доступные команды:</b>\n"
         "/info - информация о боте\n"
         "/jobs - список запланированных задач\n"
         "/test - тестовое напоминание (через 5 сек)\n"
-        "/testnow - мгновенное тестовое напоминание\n\n"
+        "/testnow - мгновенное тестовое напоминание\n"
+        "/testfact - тестовый факт (сейчас)\n\n"
         "👮‍♂️ <b>Команды для администраторов:</b>\n"
         "/setchat - установить чат для уведомлений\n"
         "/adduser @username - добавить пользователя\n"
         "/removeuser @username - удалить пользователя\n"
         "/users - список пользователей\n"
+        "/togglefacts - вкл/выкл отправку фактов\n"
         "/cancelall - отменить все напоминания",
         parse_mode=ParseMode.HTML
     )
@@ -691,6 +1061,63 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @restricted
+async def test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправка тестового факта"""
+    config = BotConfig()
+    if not config.chat_id:
+        await update.message.reply_text("❌ Сначала установите чат командой /setchat")
+        return
+
+    # Получаем тестовый факт
+    category = "Наука"  # Можно изменить на другую категорию для теста
+    fact = await get_daily_fact(category)
+    
+    # Форматируем сообщение
+    message_text = (
+        f"<b>🧪 Тестовый факт из мира {category}</b>\n\n"
+        f"{fact}\n\n"
+        f"#тест #фактдня #{FACT_CATEGORIES[category]}"
+    )
+    
+    # Создаем клавиатуру с реакциями
+    keyboard = [
+        [
+            InlineKeyboardButton("👍", callback_data=f"fact_like_{category}"),
+            InlineKeyboardButton("👎", callback_data=f"fact_dislike_{category}"),
+            InlineKeyboardButton("💩", callback_data=f"fact_poop_{category}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        text=message_text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+    
+    logger.info(f"Отправлен тестовый факт категории '{category}'")
+
+
+@restricted
+async def toggle_facts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Включить/выключить отправку фактов"""
+    config = BotConfig()
+    config.daily_facts_enabled = not config.daily_facts_enabled
+    
+    status = "✅ включена" if config.daily_facts_enabled else "❌ отключена"
+    
+    await update.message.reply_text(
+        f"📊 <b>Отправка фактов дня {status}</b>\n\n"
+        f"⏰ Время отправки: {FACTS_TIME['hour']:02d}:{FACTS_TIME['minute']:02d} по МСК\n"
+        f"📚 Категории: {', '.join(FACT_CATEGORIES.keys())}",
+        parse_mode=ParseMode.HTML
+    )
+    
+    logger.info(f"Отправка фактов дня {status}")
+
+
+@restricted
 async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показать информацию о боте"""
     config = BotConfig()
@@ -702,44 +1129,31 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         status = "❌ <b>Чат не установлен</b>. Используйте /setchat"
 
     # Подсчет запланированных задач
-    # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
     all_jobs = get_jobs_from_queue(context.application.job_queue)
-    job_count = len([j for j in all_jobs 
-                    if j.name and j.name.startswith("meeting_reminder_")])
+    meeting_job_count = len([j for j in all_jobs 
+                           if j.name and j.name.startswith("meeting_reminder_")])
+    fact_job_count = len([j for j in all_jobs 
+                         if j.name and j.name.startswith("daily_fact_")])
     
-    # Следующее напоминание
-    next_job = None
-    for job in all_jobs:
-        if job.name and job.name.startswith("meeting_reminder_"):
-            if not next_job or job.next_t < next_job.next_t:
-                next_job = job
+    # Статус отправки фактов
+    facts_status = "✅ включена" if config.daily_facts_enabled else "❌ отключена"
     
-    next_time = next_job.next_t.astimezone(TIMEZONE) if next_job else "не запланировано"
-    
-    # Ближайшие дни планёрок
-    today = datetime.now(TIMEZONE)
-    upcoming_meetings = []
-    for i in range(1, 8):
-        next_day = today + timedelta(days=i)
-        if next_day.weekday() in MEETING_DAYS:
-            upcoming_meetings.append(next_day.strftime("%d.%m.%Y"))
-
-    # Показываем текущую Zoom-ссылка (без полного URL)
-    zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != 'https://us04web.zoom.us/j/1234567890?pwd=example' else 'не установлена ⚠️ (используйте переменную ZOOM_MEETING_LINK)'}"
-
     await update.message.reply_text(
         f"📊 <b>Информация о боте:</b>\n\n"
         f"{status}\n"
         f"📅 <b>Дни планёрок:</b> понедельник, среда, пятница\n"
-        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
+        f"⏰ <b>Время планёрок:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
+        f"📚 <b>Факты дня:</b> {facts_status}\n"
+        f"⏰ <b>Время фактов:</b> {FACTS_TIME['hour']:02d}:{FACTS_TIME['minute']:02d} по МСК\n"
         f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
         f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
-        f"⏳ <b>Запланировано задач:</b> {job_count}\n"
-        f"➡️ <b>Следующее напоминание:</b> {next_time}\n"
-        f"📈 <b>Ближайшие планёрки:</b> {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}"
-        f"{zoom_info}\n\n"
+        f"⏳ <b>Запланировано напоминаний:</b> {meeting_job_count}\n"
+        f"📝 <b>Запланировано фактов:</b> {fact_job_count}\n\n"
+        f"<b>Категории фактов:</b>\n"
+        f"{', '.join(FACT_CATEGORIES.keys())}\n\n"
         f"Используйте /users для списка пользователей\n"
-        f"Используйте /jobs для списка задач",
+        f"Используйте /jobs для списка задач\n"
+        f"Используйте /togglefacts для управления фактами",
         parse_mode=ParseMode.HTML
     )
 
@@ -848,13 +1262,20 @@ async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     
     meeting_jobs = [j for j in jobs if j.name and j.name.startswith("meeting_reminder_")]
-    other_jobs = [j for j in jobs if j not in meeting_jobs]
+    fact_jobs = [j for j in jobs if j.name and j.name.startswith("daily_fact_")]
+    other_jobs = [j for j in jobs if j not in meeting_jobs and j not in fact_jobs]
     
     message = "📋 <b>Запланированные задачи:</b>\n\n"
     
     if meeting_jobs:
         message += "🔔 <b>Напоминания о планёрках:</b>\n"
         for job in sorted(meeting_jobs, key=lambda j: j.next_t):
+            next_time = job.next_t.astimezone(TIMEZONE)
+            message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name})\n"
+    
+    if fact_jobs:
+        message += "\n📊 <b>Факты дня:</b>\n"
+        for job in sorted(fact_jobs, key=lambda j: j.next_t):
             next_time = job.next_t.astimezone(TIMEZONE)
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name})\n"
     
@@ -928,7 +1349,7 @@ async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     canceled_count = 0
     
     for job in jobs[:]:  # Копируем список для безопасного удаления
-        if job.name and job.name.startswith("meeting_reminder_"):
+        if job.name and (job.name.startswith("meeting_reminder_") or job.name.startswith("daily_fact_")):
             job.schedule_removal()
             canceled_count += 1
     
@@ -938,7 +1359,7 @@ async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     
     await update.message.reply_text(
         f"✅ <b>Отменено {canceled_count} напоминаний(я)</b>\n"
-        f"Очищено {len(config.active_reminders)} активных напоминаний в конфиге",
+        f"Очищены активные напоминания в конфиге",
         parse_mode=ParseMode.HTML
     )
     logger.info(f"Отменено {canceled_count} напоминаний")
@@ -972,6 +1393,82 @@ def calculate_next_reminder() -> datetime:
         days_ahead += 1
 
 
+def calculate_next_fact() -> datetime:
+    """Рассчитать время следующей отправки факта"""
+    now = datetime.now(TIMEZONE)
+    
+    # Время отправки сегодня
+    fact_time = now.replace(
+        hour=FACTS_TIME['hour'],
+        minute=FACTS_TIME['minute'],
+        second=0,
+        microsecond=0
+    )
+    
+    if now < fact_time:
+        return fact_time
+    
+    # Если время уже прошло, планируем на завтра
+    return fact_time + timedelta(days=1)
+
+
+async def schedule_daily_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запланировать отправку следующего факта"""
+    config = BotConfig()
+    
+    # Проверяем, включены ли факты
+    if not config.daily_facts_enabled:
+        logger.info("Отправка фактов отключена, планирование пропущено")
+        # Пробуем снова через 24 часа
+        context.application.job_queue.run_once(
+            schedule_daily_fact,
+            86400  # 24 часа
+        )
+        return
+    
+    next_time = calculate_next_fact()
+    chat_id = config.chat_id
+
+    if not chat_id:
+        logger.warning("Chat ID не установлен, планирование фактов отложено")
+        # Пробуем снова через час
+        context.application.job_queue.run_once(
+            schedule_daily_fact,
+            3600
+        )
+        return
+
+    now = datetime.now(TIMEZONE)
+    delay = (next_time - now).total_seconds()
+
+    if delay > 0:
+        job_name = f"daily_fact_{next_time.strftime('%Y%m%d_%H%M')}"
+        
+        # Проверяем, нет ли уже такой задачи
+        existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
+                        if j.name == job_name]
+        
+        if not existing_jobs:
+            context.application.job_queue.run_once(
+                send_daily_fact,
+                delay,
+                chat_id=chat_id,
+                name=job_name
+            )
+
+            # Планируем следующий факт после отправки текущего
+            context.application.job_queue.run_once(
+                schedule_daily_fact,
+                delay + 60,
+                chat_id=chat_id,
+                name=f"fact_scheduler_{next_time.strftime('%Y%m%d_%H%M')}"
+            )
+
+            logger.info(f"Следующий факт запланирован на {next_time}")
+        else:
+            logger.info(f"Факт на {next_time} уже запланирован")
+
+
 async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запланировать следующее напоминание"""
     next_time = calculate_next_reminder()
@@ -994,7 +1491,6 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         job_name = f"meeting_reminder_{next_time.strftime('%Y%m%d_%H%M')}"
         
         # Проверяем, нет ли уже такой задачи
-        # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
         existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
                         if j.name == job_name]
         
@@ -1080,6 +1576,8 @@ def main() -> None:
         logger.warning("   Пример: export ZOOM_MEETING_LINK='https://zoom.us/j/your-meeting-id?pwd=your-password'")
     else:
         logger.info(f"✅ Zoom-ссылка загружена (первые 50 символов): {ZOOM_LINK[:50]}...")
+    
+    logger.info("✅ Все API для фактов бесплатные и не требуют API ключей!")
 
     try:
         application = Application.builder().token(TOKEN).build()
@@ -1115,6 +1613,8 @@ def main() -> None:
         application.add_handler(CommandHandler("info", show_info))
         application.add_handler(CommandHandler("test", test_reminder))
         application.add_handler(CommandHandler("testnow", test_now))
+        application.add_handler(CommandHandler("testfact", test_fact))
+        application.add_handler(CommandHandler("togglefacts", toggle_facts))
         application.add_handler(CommandHandler("jobs", list_jobs))
         application.add_handler(CommandHandler("adduser", add_user))
         application.add_handler(CommandHandler("removeuser", remove_user))
@@ -1124,21 +1624,31 @@ def main() -> None:
         # Добавляем ConversationHandler
         application.add_handler(conv_handler)
 
+        # Обработчик реакций на факты
+        application.add_handler(CallbackQueryHandler(fact_reaction_callback, pattern="^fact_"))
+
         # Очистка старых задач при запуске
         cleanup_old_jobs(application.job_queue)
         
         # Восстановление напоминаний
         restore_reminders(application)
 
-        # Запуск планировщика
+        # Запуск планировщиков
         application.job_queue.run_once(
             lambda context: schedule_next_reminder(context),
             3
         )
+        
+        application.job_queue.run_once(
+            lambda context: schedule_daily_fact(context),
+            5
+        )
 
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d}")
-        logger.info(f"🔗 Текст ссылки: 'Присоединиться к Zoom'")
+        logger.info(f"📊 Факты дня: ежедневно в {FACTS_TIME['hour']:02d}:{FACTS_TIME['minute']:02d}")
+        logger.info(f"📚 Категории фактов: {', '.join(FACT_CATEGORIES.keys())}")
+        logger.info(f"🌐 Используемые API: Useless Facts, Wikipedia, Numbers API, Movie Quotes, Genrenator, GamerPower")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
