@@ -3,9 +3,7 @@ import json
 import random
 import logging
 import requests
-import threading
-import schedule
-import time
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from functools import wraps
@@ -39,8 +37,8 @@ MEETING_DAYS = [0, 2, 4]
 # ========== НАСТРОЙКИ ФАКТОВ ==========
 # Категории фактов
 FACT_CATEGORIES = ['музыка', 'фильмы', 'технологии', 'игры']
-# Время отправки фактов (10:00 по Москве)
-FACT_SEND_TIME = {"hour": 10, "minute": 0}
+# Время отправки фактов (10:00 по Москве = 7:00 UTC)
+FACT_SEND_TIME = {"hour": 7, "minute": 0, "timezone": "UTC"}  # 7:00 UTC = 10:00 МСК
 # Реакции под фактами
 FACT_REACTIONS = ['👍', '👎', '💩', '🔥', '🧠💥']
 
@@ -367,7 +365,7 @@ def save_config(config: Dict[str, Any]) -> None:
     bot_config.data = config
     bot_config.save()
 
-# ========== НОВЫЕ ФУНКЦИИ ДЛЯ ФАКТОВ ==========
+# ========== НОВЫЕ ФУНКЦИИ ДЛЯ ФАКТОВ (БЕЗ SCHEDULE) ==========
 
 async def send_daily_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправка ежедневного факта"""
@@ -487,46 +485,86 @@ async def show_next_fact_category(update: Update, context: ContextTypes.DEFAULT_
     category_emoji = emoji_map.get(category, '📌')
     
     response = f"{category_emoji} *Следующая категория фактов:* {category.upper()}\n\n"
-    response += f"📅 Будет отправлена сегодня в {FACT_SEND_TIME['hour']:02d}:{FACT_SEND_TIME['minute']:02d} по МСК"
+    response += f"📅 Будет отправлена сегодня в 10:00 по МСК"
     
     await update.message.reply_text(response, parse_mode=ParseMode.HTML)
 
-def run_fact_scheduler(application: Application) -> None:
-    """Запустить планировщик для отправки фактов"""
-    def scheduler_thread():
-        # Настройка времени (10:00 МСК = 07:00 UTC)
-        schedule.every().monday.at("07:00").do(
-            lambda: application.create_task(send_daily_fact_wrapper(application))
-        )
-        schedule.every().tuesday.at("07:00").do(
-            lambda: application.create_task(send_daily_fact_wrapper(application))
-        )
-        schedule.every().wednesday.at("07:00").do(
-            lambda: application.create_task(send_daily_fact_wrapper(application))
-        )
-        schedule.every().thursday.at("07:00").do(
-            lambda: application.create_task(send_daily_fact_wrapper(application))
-        )
-        schedule.every().friday.at("07:00").do(
-            lambda: application.create_task(send_daily_fact_wrapper(application))
-        )
-        
-        logger.info("⏰ Планировщик фактов запущен!")
-        logger.info(f"📅 Отправка: Пн-Пт в {FACT_SEND_TIME['hour']:02d}:{FACT_SEND_TIME['minute']:02d} по МСК")
-        logger.info(f"🔄 Категории: {' → '.join(FACT_CATEGORIES)}")
-        
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
+def calculate_next_fact_time() -> datetime:
+    """Рассчитать время следующей отправки факта"""
+    now = datetime.now(pytz.UTC)  # Используем UTC для планирования
     
-    async def send_daily_fact_wrapper(app: Application):
-        """Обертка для отправки фактов через Application"""
-        context = ContextTypes.DEFAULT_TYPE(app)
-        await send_daily_fact(context)
+    # Дни отправки фактов (понедельник=0 ... пятница=4)
+    FACT_DAYS = [0, 1, 2, 3, 4]  # Пн-Пт
     
-    # Запускаем планировщик в отдельном потоке
-    thread = threading.Thread(target=scheduler_thread, daemon=True)
-    thread.start()
+    # Проверяем, сегодня ли нужный день и время
+    if now.weekday() in FACT_DAYS:
+        reminder_time = now.replace(
+            hour=FACT_SEND_TIME["hour"],
+            minute=FACT_SEND_TIME["minute"],
+            second=0,
+            microsecond=0
+        )
+        if now < reminder_time:
+            return reminder_time
+
+    # Ищем следующий рабочий день
+    days_ahead = 1
+    while True:
+        next_day = now + timedelta(days=days_ahead)
+        if next_day.weekday() in FACT_DAYS:
+            return next_day.replace(
+                hour=FACT_SEND_TIME["hour"],
+                minute=FACT_SEND_TIME["minute"],
+                second=0,
+                microsecond=0
+            )
+        days_ahead += 1
+
+async def schedule_next_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запланировать следующую отправку факта"""
+    next_time = calculate_next_fact_time()
+    config = BotConfig()
+    chat_id = config.chat_id
+
+    if not chat_id:
+        logger.warning("Chat ID не установлен, планирование фактов отложено")
+        # Пробуем снова через час
+        context.application.job_queue.run_once(
+            schedule_next_fact,
+            3600
+        )
+        return
+
+    now = datetime.now(pytz.UTC)
+    delay = (next_time - now).total_seconds()
+
+    if delay > 0:
+        job_name = f"daily_fact_{next_time.strftime('%Y%m%d_%H%M')}"
+        
+        # Проверяем, нет ли уже такой задачи
+        existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
+                        if j.name == job_name]
+        
+        if not existing_jobs:
+            context.application.job_queue.run_once(
+                send_daily_fact,
+                delay,
+                chat_id=chat_id,
+                name=job_name
+            )
+
+            # Планируем следующую отправку после текущей
+            context.application.job_queue.run_once(
+                schedule_next_fact,
+                delay + 60,  # Через минуту после отправки
+                chat_id=chat_id,
+                name=f"fact_scheduler_{next_time.strftime('%Y%m%d_%H%M')}"
+            )
+
+            logger.info(f"Следующая отправка факта запланирована на {next_time} UTC")
+            logger.info(f"Это будет в {(next_time + timedelta(hours=3)).strftime('%H:%M')} по МСК")
+        else:
+            logger.info(f"Отправка факта на {next_time} уже запланирована")
 
 # ========== ОСТАЛЬНЫЕ ФУНКЦИИ ВАШЕГО БОТА (БЕЗ ИЗМЕНЕНИЙ) ==========
 
@@ -893,7 +931,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Понедельник\n• Среда\n• Пятница\n"
         f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
         "📚 <b>Ежедневные факты из Википедии:</b>\n"
-        f"• Отправляются: Пн-Пт в {FACT_SEND_TIME['hour']:02d}:{FACT_SEND_TIME['minute']:02d} по МСК\n"
+        f"• Отправляются: Пн-Пт в 10:00 по МСК\n"
         f"• Категории: {', '.join([c.capitalize() for c in FACT_CATEGORIES])}\n\n"
         "🔧 <b>Доступные команды:</b>\n"
         "/info - информация о боте\n"
@@ -940,16 +978,32 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         status = "❌ <b>Чат не установлен</b>. Используйте /setchat"
 
     all_jobs = get_jobs_from_queue(context.application.job_queue)
-    job_count = len([j for j in all_jobs 
+    
+    # Считаем задачи планёрок
+    meeting_job_count = len([j for j in all_jobs 
                     if j.name and j.name.startswith("meeting_reminder_")])
     
-    next_job = None
+    # Считаем задачи фактов
+    fact_job_count = len([j for j in all_jobs 
+                    if j.name and j.name.startswith("daily_fact_")])
+    
+    # Следующее напоминание о планёрке
+    next_meeting_job = None
     for job in all_jobs:
         if job.name and job.name.startswith("meeting_reminder_"):
-            if not next_job or job.next_t < next_job.next_t:
-                next_job = job
+            if not next_meeting_job or job.next_t < next_meeting_job.next_t:
+                next_meeting_job = job
     
-    next_time = next_job.next_t.astimezone(TIMEZONE) if next_job else "не запланировано"
+    # Следующая отправка факта
+    next_fact_job = None
+    for job in all_jobs:
+        if job.name and j.name.startswith("daily_fact_"):
+            if not next_fact_job or job.next_t < next_fact_job.next_t:
+                next_fact_job = job
+    
+    next_meeting_time = next_meeting_job.next_t.astimezone(TIMEZONE) if next_meeting_job else "не запланировано"
+    next_fact_time_utc = next_fact_job.next_t if next_fact_job else None
+    next_fact_time = next_fact_time_utc.astimezone(TIMEZONE) if next_fact_time_utc else "не запланировано"
     
     today = datetime.now(TIMEZONE)
     upcoming_meetings = []
@@ -970,12 +1024,14 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{status}\n"
         f"📅 <b>Дни планёрок:</b> понедельник, среда, пятница\n"
         f"⏰ <b>Время планёрок:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"📚 <b>Факты из Википедии:</b> Пн-Пт в {FACT_SEND_TIME['hour']:02d}:{FACT_SEND_TIME['minute']:02d} по МСК\n"
+        f"📚 <b>Факты из Википедии:</b> Пн-Пт в 10:00 по МСК\n"
         f"🎯 <b>Категории фактов:</b> {', '.join(FACT_CATEGORIES)}\n"
         f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
         f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
-        f"⏳ <b>Запланировано задач:</b> {job_count}\n"
-        f"➡️ <b>Следующее напоминание:</b> {next_time}\n"
+        f"⏳ <b>Задачи планёрок:</b> {meeting_job_count}\n"
+        f"📖 <b>Задачи фактов:</b> {fact_job_count}\n"
+        f"➡️ <b>Следующая планёрка:</b> {next_meeting_time}\n"
+        f"➡️ <b>Следующий факт:</b> {next_fact_time}\n"
         f"📈 <b>Ближайшие планёрки:</b> {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}"
         f"{zoom_info}"
         f"{fact_info}\n\n"
@@ -1075,13 +1131,20 @@ async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     
     meeting_jobs = [j for j in jobs if j.name and j.name.startswith("meeting_reminder_")]
-    other_jobs = [j for j in jobs if j not in meeting_jobs]
+    fact_jobs = [j for j in jobs if j.name and j.name.startswith("daily_fact_")]
+    other_jobs = [j for j in jobs if j not in meeting_jobs + fact_jobs]
     
     message = "📋 <b>Запланированные задачи:</b>\n\n"
     
     if meeting_jobs:
         message += "🔔 <b>Напоминания о планёрках:</b>\n"
         for job in sorted(meeting_jobs, key=lambda j: j.next_t):
+            next_time = job.next_t.astimezone(TIMEZONE)
+            message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name})\n"
+    
+    if fact_jobs:
+        message += "\n📚 <b>Факты из Википедии:</b>\n"
+        for job in sorted(fact_jobs, key=lambda j: j.next_t):
             next_time = job.next_t.astimezone(TIMEZONE)
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name})\n"
     
@@ -1143,22 +1206,28 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 @restricted
 async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     jobs = get_jobs_from_queue(context.application.job_queue)
-    canceled_count = 0
+    canceled_meetings = 0
+    canceled_facts = 0
     
     for job in jobs[:]:
         if job.name and job.name.startswith("meeting_reminder_"):
             job.schedule_removal()
-            canceled_count += 1
+            canceled_meetings += 1
+        elif job.name and job.name.startswith("daily_fact_"):
+            job.schedule_removal()
+            canceled_facts += 1
     
     config = BotConfig()
     config.clear_active_reminders()
     
     await update.message.reply_text(
-        f"✅ <b>Отменено {canceled_count} напоминаний(я)</b>\n"
+        f"✅ <b>Отменено:</b>\n"
+        f"• {canceled_meetings} напоминаний о планёрках\n"
+        f"• {canceled_facts} отправок фактов\n"
         f"Очищено {len(config.active_reminders)} активных напоминаний в конфиге",
         parse_mode=ParseMode.HTML
     )
-    logger.info(f"Отменено {canceled_count} напоминаний")
+    logger.info(f"Отменено {canceled_meetings} напоминаний и {canceled_facts} фактов")
 
 def calculate_next_reminder() -> datetime:
     now = datetime.now(TIMEZONE)
@@ -1339,11 +1408,14 @@ def main() -> None:
         )
 
         # Запуск планировщика фактов
-        run_fact_scheduler(application)
+        application.job_queue.run_once(
+            lambda context: schedule_next_fact(context),
+            5
+        )
 
         logger.info("🤖 Бот запущен и готов к работе!")
-        logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d}")
-        logger.info(f"📚 Факты: Пн-Пт в {FACT_SEND_TIME['hour']:02d}:{FACT_SEND_TIME['minute']:02d}")
+        logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК")
+        logger.info(f"📚 Факты: Пн-Пт в 10:00 по МСК (07:00 UTC)")
         logger.info(f"🎯 Категории фактов: {', '.join(FACT_CATEGORIES)}")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
