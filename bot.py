@@ -62,91 +62,56 @@ CANCELLATION_OPTIONS = [
     "Перенесём на другой день",
 ]
 
-# API источники для разных категорий фактов (ВСЕ БЕСПЛАТНЫЕ, БЕЗ API КЛЮЧЕЙ)
+# API источники для разных категорий фактов (ТОЛЬКО РУССКИЕ)
 FACT_APIS = {
     "Наука": [
         {
-            "name": "Useless Facts",
+            "name": "Useless Facts RU",
             "url": "https://uselessfacts.jsph.pl/api/v2/facts/random",
             "params": {"language": "ru"},
             "parser": lambda data: data["text"] if "text" in data else None,
             "priority": 1
-        },
-        {
-            "name": "Numbers API",
-            "url": "http://numbersapi.com/random/trivia",
-            "params": {},
-            "parser": lambda data: f"Числовой факт: {data}" if data else None,
-            "priority": 2
         }
     ],
     "Технологии": [
         {
-            "name": "Useless Facts",
+            "name": "Useless Facts RU",
             "url": "https://uselessfacts.jsph.pl/api/v2/facts/random",
             "params": {"language": "ru"},
             "parser": lambda data: data["text"] if "text" in data else None,
             "priority": 1
-        },
-        {
-            "name": "Numbers Math",
-            "url": "http://numbersapi.com/random/math",
-            "params": {},
-            "parser": lambda data: f"Математический факт: {data}" if data else None,
-            "priority": 2
         }
     ],
     "Кино": [
         {
-            "name": "Useless Facts",
+            "name": "Useless Facts RU",
             "url": "https://uselessfacts.jsph.pl/api/v2/facts/random",
             "params": {"language": "ru"},
             "parser": lambda data: data["text"] if "text" in data else None,
             "priority": 1
-        },
-        {
-            "name": "Movie Quotes",
-            "url": "https://movie-quote-api.vercel.app/v1/quote/random",
-            "params": {},
-            "parser": lambda data: f"Кинофакт: \"{data.get('quote', '')}\" - {data.get('show', 'Неизвестный фильм/сериал')}" if data else None,
-            "priority": 2
         }
     ],
     "Музыка": [
         {
-            "name": "Useless Facts",
+            "name": "Useless Facts RU",
             "url": "https://uselessfacts.jsph.pl/api/v2/facts/random",
             "params": {"language": "ru"},
             "parser": lambda data: data["text"] if "text" in data else None,
             "priority": 1
-        },
-        {
-            "name": "Genrenator",
-            "url": "https://binaryjazz.us/wp-json/genrenator/v1/story/",
-            "params": {},
-            "parser": lambda data: f"Музыкальный факт: {data}" if data else None,
-            "priority": 2
         }
     ],
     "Игры": [
         {
-            "name": "Useless Facts",
+            "name": "Useless Facts RU",
             "url": "https://uselessfacts.jsph.pl/api/v2/facts/random",
             "params": {"language": "ru"},
             "parser": lambda data: data["text"] if "text" in data else None,
             "priority": 1
-        },
-        {
-            "name": "GamerPower",
-            "url": "https://www.gamerpower.com/api/giveaways",
-            "params": {"platform": "pc", "type": "game"},
-            "parser": lambda data: f"Игровой факт: Сейчас на GamerPower доступно {len(data) if isinstance(data, list) else 'несколько'} игровых раздач для PC!" if data else None,
-            "priority": 2
         }
     ]
 }
 
-# Резервные факты на случай недоступности API
+# Резервные факты на случай недоступности API (ВСЕ НА РУССКОМ)
 BACKUP_FACTS = {
     "Наука": [
         "Среднее человеческое тело содержит достаточно углерода, чтобы изготовить 9000 карандашей.",
@@ -219,7 +184,7 @@ def restricted(func):
 
 
 def get_daily_fact_sync(category: str) -> str:
-    """Синхронная версия получения факта дня"""
+    """Синхронная версия получения факта дня (только русские)"""
     try:
         # Сортируем API по приоритету (от наивысшего к наименьшему)
         if category in FACT_APIS:
@@ -290,11 +255,10 @@ async def send_daily_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Получаем факт
         fact = await get_daily_fact(category)
         
-        # Форматируем сообщение
+        # Форматируем сообщение БЕЗ ХЕШТЕГОВ
         message_text = (
             f"<b>📊 Факт дня из мира {category}</b>\n\n"
-            f"{fact}\n\n"
-            f"#фактдня #{FACT_CATEGORIES[category]}"
+            f"{fact}"
         )
         
         # Создаем клавиатуру с реакциями
@@ -391,19 +355,19 @@ def get_greeting_by_meeting_day() -> str:
         
         greetings = {
             0: [
-                f"🚀 <b>{day_names[0]}</b> - старт новой недели!\n\n📋 <i>Планёрка в 9:30 по МСК</i>.\nДавайте обсудим планы на неделю! 🌟{zoom_note}",
-                f"🌞 Доброе утро! Сегодня <b>{day_names[0]}</b>!\n\n🤝 <i>Планёрка в 9:30 по МСК</i>.\nНачинаем неделю продуктивно! 💪{zoom_note}",
-                f"⚡ <b>{day_names[0]}</b>, время действовать!\n\n🎯 <i>Утренняя планёрка в 9:30 по МСК</i>.\nПодготовьте ваши вопросы! 📊{zoom_note}"
+                f"🚀 <b>{day_names[0]}</b> - старт новой недели!\n\n📋 <i>Планёрка в 9:15 по МСК</i>.\nДавайте обсудим планы на неделю! 🌟{zoom_note}",
+                f"🌞 Доброе утро! Сегодня <b>{day_names[0]}</b>!\n\n🤝 <i>Планёрка в 9:15 по МСК</i>.\nНачинаем неделю продуктивно! 💪{zoom_note}",
+                f"⚡ <b>{day_names[0]}</b>, время действовать!\n\n🎯 <i>Утренняя планёрка в 9:15 по МСК</i>.\nПодготовьте ваши вопросы! 📊{zoom_note}"
             ],
             2: [
-                f"⚡ <b>{day_names[2]}</b> - середина недели!\n\n📋 <i>Планёрка в 9:30 по МСК</i>.\nВремя для корректировок и обновлений! 🔄{zoom_note}",
-                f"🌞 <b>{day_names[2]}</b>, доброе утро!\n\n🤝 <i>Планёрка в 9:30 по МСК</i>.\nКак продвигаются задачи? 📈{zoom_note}",
-                f"💪 <b>{day_names[2]}</b> - день прорыва!\n\n🎯 <i>Планёрка в 9:30 по МСК</i>.\nДелитесь прогрессом! 🚀{zoom_note}"
+                f"⚡ <b>{day_names[2]}</b> - середина недели!\n\n📋 <i>Планёрка в 9:15 по МСК</i>.\nВремя для корректировок и обновлений! 🔄{zoom_note}",
+                f"🌞 <b>{day_names[2]}</b>, доброе утро!\n\n🤝 <i>Планёрка в 9:15 по МСК</i>.\nКак продвигаются задачи? 📈{zoom_note}",
+                f"💪 <b>{day_names[2]}</b> - день прорыва!\n\n🎯 <i>Планёрка в 9:15 по МСК</i>.\nДелитесь прогрессом! 🚀{zoom_note}"
             ],
             4: [
-                f"🎉 <b>{day_names[4]}</b> - завершаем неделю!\n\n📋 <i>Планёрка в 9:30 по МСК</i>.\nДавайте подведем итоги недели! 🏆{zoom_note}",
-                f"🌞 Пятничное утро! 🎊\n\n🤝 <b>{day_names[4]}</b>, <i>планёрка в 9:30 по МСК</i>.\nКак прошла неделя? 📊{zoom_note}",
-                f"✨ <b>{day_names[4]}</b> - время подводить итоги!\n\n🎯 <i>Планёрка в 9:30 по МСК</i>.\nЧто успели за неделю? 📈{zoom_note}"
+                f"🎉 <b>{day_names[4]}</b> - завершаем неделю!\n\n📋 <i>Планёрка в 9:15 по МСК</i>.\nДавайте подведем итоги недели! 🏆{zoom_note}",
+                f"🌞 Пятничное утро! 🎊\n\n🤝 <b>{day_names[4]}</b>, <i>планёрка в 9:15 по МСК</i>.\nКак прошла неделя? 📊{zoom_note}",
+                f"✨ <b>{day_names[4]}</b> - время подводить итоги!\n\n🎯 <i>Планёрка в 9:15 по МСК</i>.\nЧто успели за неделю? 📈{zoom_note}"
             ]
         }
         
@@ -411,7 +375,7 @@ def get_greeting_by_meeting_day() -> str:
     else:
         # Если почему-то напоминание отправлено не в день планёрки
         zoom_link_formatted = f'<a href="{ZOOM_LINK}">Присоединиться к Zoom</a>'
-        return f"👋 Доброе утро! Сегодня <i>{current_day}</i>.\n\n📋 <i>Напоминаю о планёрке в 9:30 по МСК</i>.\n🎥 {zoom_link_formatted} | Присоединяйтесь к встрече"
+        return f"👋 Доброе утро! Сегодня <i>{current_day}</i>.\n\n📋 <i>Напоминаю о планёрке в 9:15 по МСК</i>.\n🎥 {zoom_link_formatted} | Присоединяйтесь к встрече"
 
 
 class BotConfig:
@@ -1020,7 +984,7 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка тестового факта"""
+    """Отправка тестового факта (БЕЗ ХЕШТЕГОВ)"""
     config = BotConfig()
     if not config.chat_id:
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
@@ -1030,11 +994,10 @@ async def test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     category = random.choice(list(FACT_CATEGORIES.keys()))
     fact = await get_daily_fact(category)
     
-    # Форматируем сообщение
+    # Форматируем сообщение БЕЗ ХЕШТЕГОВ
     message_text = (
         f"<b>🧪 Тестовый факт из мира {category}</b>\n\n"
-        f"{fact}\n\n"
-        f"#тест #фактдня #{FACT_CATEGORIES[category]}"
+        f"{fact}"
     )
     
     # Создаем клавиатуру с реакциями
@@ -1535,7 +1498,8 @@ def main() -> None:
     else:
         logger.info(f"✅ Zoom-ссылка загружена (первые 50 символов): {ZOOM_LINK[:50]}...")
     
-    logger.info("✅ Все API для фактов бесплатные и не требуют API ключей!")
+    logger.info("✅ Все факты на 100% на русском языке!")
+    logger.info("✅ Хештеги убраны из сообщений с фактами!")
 
     try:
         application = Application.builder().token(TOKEN).build()
@@ -1606,7 +1570,7 @@ def main() -> None:
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d}")
         logger.info(f"📊 Факты дня: ежедневно в {FACTS_TIME['hour']:02d}:{FACTS_TIME['minute']:02d}")
         logger.info(f"📚 Категории фактов: {', '.join(FACT_CATEGORIES.keys())}")
-        logger.info(f"🌐 Используемые API: Useless Facts, Numbers API, Movie Quotes, Genrenator, GamerPower")
+        logger.info(f"🌐 Источник фактов: Useless Facts API на русском языке")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
