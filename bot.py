@@ -2,7 +2,8 @@ import logging
 import os
 import json
 import random
-from datetime import datetime, timedelta
+import requests
+from datetime import datetime, timedelta, time
 from typing import Optional, Dict, Any, List
 from functools import wraps
 import pytz
@@ -36,10 +37,65 @@ CONFIG_FILE = "bot_config.json"  # Файл для хранения настро
 
 # Время планёрки (9:15 по Москве)
 MEETING_TIME = {"hour": 9, "minute": 15}
+# Время отправки факта (10:00 по Москве)
+FACT_TIME = {"hour": 10, "minute": 0}
 TIMEZONE = pytz.timezone("Europe/Moscow")
 
 # Дни недели для планёрки (понедельник=0, среда=2, пятница=4)
 MEETING_DAYS = [0, 2, 4]
+
+# Категории для фактов
+CATEGORIES = {
+    'музыка': '🎵 Музыка',
+    'кино': '🎬 Кино', 
+    'технологии': '💻 Технологии',
+    'игры': '🎮 Игры'
+}
+
+# Смайлики для реакций
+REACTIONS = {
+    'like': '👍',
+    'dislike': '👎',
+    'poop': '💩',
+    'fire': '🔥',
+    'laugh': '😂',
+    'mind_blown': '🤯'
+}
+
+# Файл для хранения последней отправленной категории
+LAST_CATEGORY_FILE = "last_category.json"
+
+# База фактов (запасной вариант, если API не работает)
+BACKUP_FACTS = {
+    'музыка': [
+        "Битлз первоначально назывались The Quarrymen.",
+        "У Моцарта была кошка, которая любила слушать его игру на фортепиано.",
+        "Гитара Fender Stratocaster была изобретена в 1954 году.",
+        "Виниловые пластинки переживают ренессанс - продажи растут каждый год.",
+        "Первая коммерческая запись была сделана в 1888 году.",
+    ],
+    'кино': [
+        "В фильме 'Матрица' все сцены с зеленым оттенком были отсняты на пленку с зеленым фильтром.",
+        "Актеру Джону Хёрту на съемках 'Чужого' было действительно плохо, когда пришелец вырывался из груди.",
+        "Самый кассовый фильм в истории - 'Аватар' Джеймса Кэмерона.",
+        "Для съемок 'Властелина колец' было создано более 48 000 предметов реквизита.",
+        "Фильм 'Паразиты' - первый неанглоязычный фильм, получивший Оскар за лучший фильм.",
+    ],
+    'технологии': [
+        "Первый компьютерный вирус был создан в 1983 году.",
+        "Средний человек проверяет свой телефон 150 раз в день.",
+        "Пароль '123456' до сих пор остается одним из самых популярных в мире.",
+        "Первая веб-камера была создана для отслеживания кофеварки в Кембридже.",
+        "ИИ уже обыгрывает людей в сложных играх вроде Go и покера.",
+    ],
+    'игры': [
+        "Первая коммерческая видеоигра - Computer Space (1971).",
+        "Марио изначально назывался 'Прыгающий человек' (Jumpman).",
+        "Самый продаваемый игровой персонаж - Пикачу.",
+        "Minecraft - самая продаваемая игра в истории.",
+        "Первая игра с трехмерной графикой была выпущена в 1980 году.",
+    ]
+}
 
 # Варианты отмены планёрки
 CANCELLATION_OPTIONS = [
@@ -63,81 +119,318 @@ def get_jobs_from_queue(job_queue: JobQueue):
             return []
 
 
-# Декоратор для проверки прав пользователя
-def restricted(func):
-    @wraps(func)
-    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        username = update.effective_user.username
-        config = load_config()
-        allowed_users = config.get("allowed_users", [])
-        
-        if username not in allowed_users:
-            if update.callback_query:
-                await update.callback_query.answer("❌ У вас нет прав для этой операции", show_alert=True)
-            else:
-                await update.message.reply_text("❌ У вас нет прав для этой команды")
-            return None
-        return await func(update, context, *args, **kwargs)
-    return wrapped
+# ========== ФУНКЦИИ ДЛЯ ФАКТОВ ==========
 
+def get_last_category() -> Optional[str]:
+    """Получить последнюю отправленную категорию"""
+    try:
+        if os.path.exists(LAST_CATEGORY_FILE):
+            with open(LAST_CATEGORY_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get('last_category')
+    except Exception as e:
+        logger.error(f"Ошибка чтения last_category: {e}")
+    return None
 
-def get_greeting_by_meeting_day() -> str:
-    """Специальные приветствия для дней планёрок со ссылкой на Zoom"""
-    weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    current_day = day_names_ru[weekday]
+def save_last_category(category: str):
+    """Сохранить последнюю отправленную категорию"""
+    try:
+        with open(LAST_CATEGORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'last_category': category}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения last_category: {e}")
+
+def get_random_category() -> str:
+    """Получить случайную категорию, исключая последнюю"""
+    last_category = get_last_category()
+    available_categories = [cat for cat in CATEGORIES.keys() if cat != last_category]
     
-    # Только для дней планёрок (пн/ср/пт)
-    if weekday in MEETING_DAYS:
-        day_names = {
-            0: "ПОНЕДЕЛЬНИК",
-            2: "СРЕДА", 
-            4: "ПЯТНИЦА"
-        }
-        
-        # Форматируем ссылку на Zoom для HTML
-        zoom_link_formatted = f'<a href="{ZOOM_LINK}">Присоединиться к Zoom</a>'
-        
-        # Формулировки с новой ссылкой
-        zoom_notes = [
-            f"\n\n🎥 {zoom_link_formatted} | 👈",
-            f"\n\n👨‍💻 {zoom_link_formatted} | 👈",
-            f"\n\n💻 {zoom_link_formatted} | 👈",
-            f"\n\n🔗 {zoom_link_formatted} | 👈",
-            f"\n\n📅 {zoom_link_formatted} | 👈",
-            f"\n\n✉️ {zoom_link_formatted} | 👈",
-            f"\n\n🎯 {zoom_link_formatted} | 👈",
-            f"\n\n🤝 {zoom_link_formatted} | 👈",
-            f"\n\n🚀 {zoom_link_formatted} | 👈",
-            f"\n\n⚡ {zoom_link_formatted} | 👈",
-        ]
-        
-        zoom_note = random.choice(zoom_notes)
-        
-        greetings = {
-            0: [
-                f"🚀 <b>{day_names[0]}</b> - старт новой недели!\n\n📋 <i>Планёрка в 9:30 по МСК</i>.\nДавайте обсудим планы на неделю! 🌟{zoom_note}",
-                f"🌞 Доброе утро! Сегодня <b>{day_names[0]}</b>!\n\n🤝 <i>Планёрка в 9:30 по МСК</i>.\nНачинаем неделю продуктивно! 💪{zoom_note}",
-                f"⚡ <b>{day_names[0]}</b>, время действовать!\n\n🎯 <i>Утренняя планёрка в 9:30 по МСК</i>.\nПодготовьте ваши вопросы! 📊{zoom_note}"
-            ],
-            2: [
-                f"⚡ <b>{day_names[2]}</b> - середина недели!\n\n📋 <i>Планёрка в 9:30 по МСК</i>.\nВремя для корректировок и обновлений! 🔄{zoom_note}",
-                f"🌞 <b>{day_names[2]}</b>, доброе утро!\n\n🤝 <i>Планёрка в 9:30 по МСК</i>.\nКак продвигаются задачи? 📈{zoom_note}",
-                f"💪 <b>{day_names[2]}</b> - день прорыва!\n\n🎯 <i>Планёрка в 9:30 по МСК</i>.\nДелитесь прогрессом! 🚀{zoom_note}"
-            ],
-            4: [
-                f"🎉 <b>{day_names[4]}</b> - завершаем неделю!\n\n📋 <i>Планёрка в 9:30 по МСК</i>.\nДавайте подведем итоги недели! 🏆{zoom_note}",
-                f"🌞 Пятничное утро! 🎊\n\n🤝 <b>{day_names[4]}</b>, <i>планёрка в 9:30 по МСК</i>.\nКак прошла неделя? 📊{zoom_note}",
-                f"✨ <b>{day_names[4]}</b> - время подводить итоги!\n\n🎯 <i>Планёрка в 9:30 по МСК</i>.\nЧто успели за неделю? 📈{zoom_note}"
-            ]
-        }
-        
-        return random.choice(greetings[weekday])
-    else:
-        # Если почему-то напоминание отправлено не в день планёрки
-        zoom_link_formatted = f'<a href="{ZOOM_LINK}">Присоединиться к Zoom</a>'
-        return f"👋 Доброе утро! Сегодня <i>{current_day}</i>.\n\n📋 <i>Напоминаю о планёрке в 9:30 по МСК</i>.\n🎥 {zoom_link_formatted} | Присоединяйтесь к встрече"
+    if not available_categories:
+        available_categories = list(CATEGORIES.keys())
+    
+    return random.choice(available_categories)
 
+def get_fact_from_api(category: str) -> Optional[str]:
+    """Получить факт из API (заглушка - можно подключить реальное API)"""
+    try:
+        # Здесь можно подключить реальное API, например:
+        # response = requests.get(f"https://api.example.com/facts/{category}")
+        # return response.json()['fact']
+        
+        # Пока используем локальную базу
+        facts = BACKUP_FACTS.get(category, [])
+        if facts:
+            return random.choice(facts)
+        
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка получения факта из API: {e}")
+        return None
+
+def create_fact_message(category: str, fact: str) -> str:
+    """Создать сообщение с фактом"""
+    category_emoji = CATEGORIES[category]
+    return f"{category_emoji}\n\n📚 <b>Факт дня:</b>\n\n{fact}\n\n#факт #{category}"
+
+def create_reactions_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    """Создать клавиатуру с реакциями"""
+    keyboard = []
+    row = []
+    
+    for i, (reaction_id, emoji) in enumerate(REACTIONS.items()):
+        row.append(InlineKeyboardButton(
+            f"{emoji} 0",  # Начинаем с 0 реакций
+            callback_data=f"fact_react_{reaction_id}_{message_id}"
+        ))
+        
+        # Размещаем по 3 кнопки в строке
+        if (i + 1) % 3 == 0:
+            keyboard.append(row)
+            row = []
+    
+    if row:  # Добавляем последнюю строку, если она не полная
+        keyboard.append(row)
+    
+    # Кнопка для получения нового факта
+    keyboard.append([
+        InlineKeyboardButton("🎲 Новый факт", callback_data="new_fact_random"),
+        InlineKeyboardButton("📊 Статистика", callback_data="facts_stats")
+    ])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+async def send_daily_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправка ежедневного факта"""
+    config = BotConfig()
+    chat_id = config.chat_id
+
+    if not chat_id:
+        logger.warning("Chat ID не установлен для отправки факта")
+        return
+
+    # Выбираем категорию (исключая вчерашнюю)
+    category = get_random_category()
+    
+    # Получаем факт
+    fact_text = get_fact_from_api(category)
+    
+    if not fact_text:
+        fact_text = random.choice(BACKUP_FACTS.get(category, ["Интересный факт скоро появится!"]))
+    
+    # Создаем сообщение
+    message = create_fact_message(category, fact_text)
+    
+    try:
+        # Отправляем сообщение с кнопками реакций
+        sent_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=message,
+            parse_mode=ParseMode.HTML,
+            reply_markup=create_reactions_keyboard(0)  # 0 - временный ID
+        )
+        
+        # Обновляем клавиатуру с реальным ID сообщения
+        await sent_message.edit_reply_markup(
+            reply_markup=create_reactions_keyboard(sent_message.message_id)
+        )
+        
+        # Сохраняем категорию
+        save_last_category(category)
+        
+        logger.info(f"Отправлен факт категории '{category}' в чат {chat_id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки факта: {e}")
+
+async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик реакций на факты"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Парсим callback_data: fact_react_{reaction}_{message_id}
+    parts = query.data.split('_')
+    if len(parts) != 4:
+        return
+    
+    reaction_type = parts[2]
+    message_id = int(parts[3])
+    
+    # Здесь можно добавить логику подсчета реакций
+    # Пока просто показываем всплывающее уведомление
+    emoji = REACTIONS.get(reaction_type, '👍')
+    await query.answer(f"Вы поставили {emoji} этому факту!", show_alert=False)
+
+async def send_new_fact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправить новый случайный факт по запросу"""
+    query = update.callback_query
+    await query.answer()
+    
+    config = BotConfig()
+    chat_id = config.chat_id or query.message.chat_id
+    
+    # Выбираем случайную категорию
+    category = random.choice(list(CATEGORIES.keys()))
+    fact_text = get_fact_from_api(category)
+    
+    if not fact_text:
+        fact_text = random.choice(BACKUP_FACTS.get(category, ["Интересный факт скоро появится!"]))
+    
+    # Создаем сообщение
+    message = create_fact_message(category, fact_text)
+    
+    try:
+        # Отправляем как новое сообщение или редактируем текущее
+        if query.message:
+            await query.message.edit_text(
+                text=message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=create_reactions_keyboard(query.message.message_id)
+            )
+        else:
+            sent_message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=create_reactions_keyboard(0)
+            )
+            await sent_message.edit_reply_markup(
+                reply_markup=create_reactions_keyboard(sent_message.message_id)
+            )
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки нового факта: {e}")
+        await query.answer("❌ Ошибка при отправке факта", show_alert=True)
+
+async def show_facts_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать статистику по фактам"""
+    query = update.callback_query
+    await query.answer("📊 Статистика скоро появится!", show_alert=True)
+
+# ========== КОМАНДЫ ДЛЯ ФАКТОВ ==========
+
+async def fact_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда для получения факта по категории"""
+    if not context.args:
+        # Показываем список категорий
+        keyboard = []
+        row = []
+        
+        for i, (category_key, category_name) in enumerate(CATEGORIES.items()):
+            row.append(InlineKeyboardButton(
+                category_name,
+                callback_data=f"fact_category_{category_key}"
+            ))
+            
+            if (i + 1) % 2 == 0:
+                keyboard.append(row)
+                row = []
+        
+        if row:
+            keyboard.append(row)
+        
+        keyboard.append([InlineKeyboardButton("🎲 Случайная категория", callback_data="fact_random")])
+        
+        await update.message.reply_text(
+            "📚 <b>Выберите категорию факта:</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    # Если указана категория
+    category_input = context.args[0].lower()
+    category_key = None
+    
+    for key, name in CATEGORIES.items():
+        if key in category_input or name.lower() in category_input:
+            category_key = key
+            break
+    
+    if not category_key:
+        await update.message.reply_text(
+            "❌ <b>Категория не найдена!</b>\n\n"
+            f"Доступные категории: {', '.join(CATEGORIES.values())}",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    # Получаем факт
+    fact_text = get_fact_from_api(category_key)
+    
+    if not fact_text:
+        fact_text = random.choice(BACKUP_FACTS.get(category_key, ["Интересный факт скоро появится!"]))
+    
+    # Отправляем факт
+    message = create_fact_message(category_key, fact_text)
+    sent_message = await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_reactions_keyboard(0)
+    )
+    
+    # Обновляем с реальным ID сообщения
+    await sent_message.edit_reply_markup(
+        reply_markup=create_reactions_keyboard(sent_message.message_id)
+    )
+
+async def fact_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик выбора категории из inline-кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "fact_random":
+        category_key = random.choice(list(CATEGORIES.keys()))
+    else:
+        # fact_category_{category}
+        category_key = query.data.split('_')[2]
+    
+    if category_key not in CATEGORIES:
+        await query.answer("❌ Категория не найдена", show_alert=True)
+        return
+    
+    # Получаем факт
+    fact_text = get_fact_from_api(category_key)
+    
+    if not fact_text:
+        fact_text = random.choice(BACKUP_FACTS.get(category_key, ["Интересный факт скоро появится!"]))
+    
+    # Отправляем факт
+    message = create_fact_message(category_key, fact_text)
+    
+    try:
+        await query.edit_message_text(
+            text=message,
+            parse_mode=ParseMode.HTML,
+            reply_markup=create_reactions_keyboard(query.message.message_id)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка редактирования сообщения: {e}")
+        # Если не получилось отредактировать, отправляем новое
+        await query.message.reply_text(
+            message,
+            parse_mode=ParseMode.HTML,
+            reply_markup=create_reactions_keyboard(0)
+        )
+
+# ========== ПЛАНИРОВАНИЕ ФАКТОВ ==========
+
+def schedule_daily_fact(application: Application, chat_id: int) -> None:
+    """Запланировать ежедневную отправку факта"""
+    # Устанавливаем время отправки (10:00 по Москве)
+    fact_time = time(hour=FACT_TIME['hour'], minute=FACT_TIME['minute'])
+    
+    # Создаем job для ежедневной отправки
+    application.job_queue.run_daily(
+        send_daily_fact,
+        time=fact_time,
+        days=(0, 1, 2, 3, 4, 5, 6),  # Все дни недели
+        chat_id=chat_id,
+        name="daily_fact_10am"
+    )
+    
+    logger.info(f"Ежедневная отправка факта запланирована на {FACT_TIME['hour']:02d}:{FACT_TIME['minute']:02d}")
+
+# ========== ОБНОВЛЕННЫЙ КЛАСС BotConfig ==========
 
 class BotConfig:
     """Класс для управления конфигурацией бота"""
@@ -156,13 +449,19 @@ class BotConfig:
                         data["allowed_users"] = ["Stiff_OWi", "gshabanov"]
                     if "active_reminders" not in data:
                         data["active_reminders"] = {}
+                    if "fact_reactions" not in data:
+                        data["fact_reactions"] = {}
+                    if "sent_facts_count" not in data:
+                        data["sent_facts_count"] = 0
                     return data
             except Exception as e:
                 logger.error(f"Ошибка загрузки конфига: {e}")
         return {
             "chat_id": None,
             "allowed_users": ["Stiff_OWi", "gshabanov"],
-            "active_reminders": {}
+            "active_reminders": {},
+            "fact_reactions": {},
+            "sent_facts_count": 0
         }
     
     def save(self) -> None:
@@ -202,870 +501,143 @@ class BotConfig:
             return True
         return False
     
-    @property
-    def active_reminders(self) -> Dict[str, Any]:
-        return self.data.get("active_reminders", {})
-    
-    def add_active_reminder(self, message_id: int, chat_id: int, job_name: str) -> None:
-        """Добавить активное напоминание"""
-        self.data["active_reminders"][job_name] = {
-            "message_id": message_id,
-            "chat_id": chat_id,
-            "created_at": datetime.now(TIMEZONE).isoformat()
-        }
+    def increment_fact_count(self) -> None:
+        """Увеличить счетчик отправленных фактов"""
+        self.data["sent_facts_count"] = self.data.get("sent_facts_count", 0) + 1
         self.save()
     
-    def remove_active_reminder(self, job_name: str) -> bool:
-        """Удалить активное напоминание"""
-        if job_name in self.data["active_reminders"]:
-            del self.data["active_reminders"][job_name]
-            self.save()
-            return True
-        return False
-    
-    def clear_active_reminders(self) -> None:
-        """Очистить все активные напоминания"""
-        self.data["active_reminders"] = {}
+    def add_reaction(self, message_id: int, reaction_type: str) -> None:
+        """Добавить реакцию к факту"""
+        if "fact_reactions" not in self.data:
+            self.data["fact_reactions"] = {}
+        
+        if str(message_id) not in self.data["fact_reactions"]:
+            self.data["fact_reactions"][str(message_id)] = {}
+        
+        if reaction_type not in self.data["fact_reactions"][str(message_id)]:
+            self.data["fact_reactions"][str(message_id)][reaction_type] = 0
+        
+        self.data["fact_reactions"][str(message_id)][reaction_type] += 1
         self.save()
+    
+    # ... остальные методы класса остаются без изменений ...
 
+# ========== ОБНОВЛЕННАЯ ФУНКЦИЯ send_daily_fact ==========
 
-def load_config() -> Dict[str, Any]:
-    """Утилитарная функция для обратной совместимости"""
-    config = BotConfig()
-    return config.data
-
-
-def save_config(config: Dict[str, Any]) -> None:
-    """Утилитарная функция для обратной совместимости"""
-    bot_config = BotConfig()
-    bot_config.data = config
-    bot_config.save()
-
-
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка напоминания о планёрке"""
+async def send_daily_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправка ежедневного факта"""
     config = BotConfig()
     chat_id = config.chat_id
 
     if not chat_id:
-        logger.error("Chat ID не установлен!")
+        logger.warning("Chat ID не установлен для отправки факта")
         return
 
-    keyboard = [
-        [InlineKeyboardButton("Отменить планёрку", callback_data="cancel_meeting")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Используем наше улучшенное приветствие с Zoom-ссылкой
-    message_text = get_greeting_by_meeting_day()
-
+    # Выбираем категорию (исключая вчерашнюю)
+    category = get_random_category()
+    
+    # Получаем факт
+    fact_text = get_fact_from_api(category)
+    
+    if not fact_text:
+        fact_text = random.choice(BACKUP_FACTS.get(category, ["Интересный факт скоро появится!"]))
+    
+    # Создаем сообщение
+    message = create_fact_message(category, fact_text)
+    
     try:
-        message = await context.bot.send_message(
+        # Отправляем сообщение с кнопками реакций
+        sent_message = await context.bot.send_message(
             chat_id=chat_id,
-            text=message_text,
-            reply_markup=reply_markup,
+            text=message,
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False  # Показываем превью для Zoom-ссылки
+            reply_markup=create_reactions_keyboard(0)  # 0 - временный ID
         )
-
-        # Сохраняем информацию о напоминании
-        job_name = context.job.name if hasattr(context, 'job') and context.job else f"manual_{datetime.now().timestamp()}"
-        config.add_active_reminder(message.message_id, chat_id, job_name)
-
-        logger.info(f"Отправлено напоминание в чат {chat_id}, сообщение {message.message_id}")
-
+        
+        # Обновляем клавиатуру с реальным ID сообщения
+        await sent_message.edit_reply_markup(
+            reply_markup=create_reactions_keyboard(sent_message.message_id)
+        )
+        
+        # Сохраняем категорию
+        save_last_category(category)
+        
+        # Увеличиваем счетчик
+        config.increment_fact_count()
+        
+        logger.info(f"Отправлен факт категории '{category}' в чат {chat_id}, всего фактов: {config.data.get('sent_facts_count', 0)}")
+        
     except Exception as e:
-        logger.error(f"Ошибка при отправке напоминания: {e}")
+        logger.error(f"Ошибка отправки факта: {e}")
 
+# ========== ОБНОВЛЕННЫЙ ОБРАБОТЧИК РЕАКЦИЙ ==========
 
-@restricted
-async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик нажатия кнопки отмены планёрки - начало Conversation"""
-    query = update.callback_query
-    await query.answer()
-
-    # Сохраняем ID сообщения для редактирования
-    context.user_data["original_message_id"] = query.message.message_id
-    context.user_data["original_chat_id"] = query.message.chat_id
-
-    keyboard = [
-        [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
-        for i, option in enumerate(CANCELLATION_OPTIONS)
-    ]
-
-    await query.edit_message_text(
-        text="📝 Выберите причину отмены планёрки:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-    return SELECTING_REASON
-
-
-async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик выбора причины"""
+async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик реакций на факты"""
     query = update.callback_query
     await query.answer()
     
-    # Добавляем проверку на корректность данных
-    if not query.data or not query.data.startswith("reason_"):
-        logger.warning(f"Некорректный callback data: {query.data}")
-        await query.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
-        return ConversationHandler.END
+    # Парсим callback_data: fact_react_{reaction}_{message_id}
+    parts = query.data.split('_')
+    if len(parts) != 4:
+        return
     
-    try:
-        reason_index = int(query.data.split("_")[1])
-        if reason_index < 0 or reason_index >= len(CANCELLATION_OPTIONS):
-            raise ValueError("Некорректный индекс причины")
-    except (ValueError, IndexError) as e:
-        logger.warning(f"Ошибка парсинга callback data: {e}, data: {query.data}")
-        await query.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
-        return ConversationHandler.END
+    reaction_type = parts[2]
+    message_id = int(parts[3])
     
-    reason = CANCELLATION_OPTIONS[reason_index]
+    # Добавляем реакцию в статистику
+    config = BotConfig()
+    config.add_reaction(message_id, reaction_type)
     
-    # Сохраняем выбранную причину
-    context.user_data["selected_reason"] = reason
-    context.user_data["reason_index"] = reason_index
+    # Получаем текущие реакции для этого сообщения
+    message_reactions = config.data.get("fact_reactions", {}).get(str(message_id), {})
     
-    if reason_index == 2:  # "Перенесём на другой день"
-        # Показываем выбор даты
-        return await show_date_selection(update, context)
-    else:
-        # Автоматические причины - сразу подтверждаем
-        return await confirm_cancellation(update, context)
-
-
-async def show_date_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Показать выбор даты для переноса"""
-    query = update.callback_query
+    # Обновляем кнопки
+    keyboard = query.message.reply_markup.inline_keyboard
+    new_keyboard = []
     
-    # Создаем клавиатуру с датами на ближайшие 2 недели
-    keyboard = []
-    today = datetime.now(TIMEZONE)
-    
-    # Добавляем ближайшие дни планёрок
-    meeting_dates = []
-    for i in range(1, 15):  # 2 недели вперед
-        next_day = today + timedelta(days=i)
-        if next_day.weekday() in MEETING_DAYS:
-            date_str = next_day.strftime("%d.%m.%Y (%A)")
-            callback_data = f"date_{next_day.strftime('%Y-%m-%d')}"
-            meeting_dates.append((next_day, date_str, callback_data))
-    
-    # Группируем по неделям
-    current_week = []
-    for date_obj, date_str, callback_data in meeting_dates:
-        week_num = date_obj.isocalendar()[1]
-        
-        # Начинаем новую неделю
-        if not current_week or week_num != current_week[0][0]:
-            if current_week:
-                # Добавляем предыдущую неделю как строку кнопок
-                week_buttons = [InlineKeyboardButton(date_str, callback_data=cb) for _, date_str, cb in current_week]
-                keyboard.append(week_buttons)
+    for row in keyboard:
+        new_row = []
+        for button in row:
+            # Проверяем, является ли это кнопкой реакции
+            btn_data = button.callback_data
+            if btn_data and btn_data.startswith('fact_react_'):
+                btn_parts = btn_data.split('_')
+                if len(btn_parts) == 4:
+                    btn_reaction = btn_parts[2]
+                    btn_msg_id = btn_parts[3]
+                    
+                    if int(btn_msg_id) == message_id:
+                        # Обновляем счетчик
+                        count = message_reactions.get(btn_reaction, 0)
+                        emoji = REACTIONS.get(btn_reaction, '👍')
+                        new_text = f"{emoji} {count}"
+                        
+                        # Создаем новую кнопку
+                        new_row.append(InlineKeyboardButton(
+                            new_text,
+                            callback_data=btn_data
+                        ))
+                        continue
             
-            current_week = [(week_num, date_str, callback_data)]
-        else:
-            current_week.append((week_num, date_str, callback_data))
-    
-    # Добавляем последнюю неделю
-    if current_week:
-        week_buttons = [InlineKeyboardButton(date_str, callback_data=cb) for _, date_str, cb in current_week]
-        keyboard.append(week_buttons)
-    
-    # Кнопка для ввода своей даты
-    keyboard.append([InlineKeyboardButton("✏️ Ввести свою дату", callback_data="custom_date")])
-    keyboard.append([InlineKeyboardButton("↩️ Назад к причинам", callback_data="back_to_reasons")])
-    
-    await query.edit_message_text(
-        text="📅 Выберите дату для переноса планёрки:\n\n"
-             "<b>Ближайшие дни планёрок (Пн/Ср/Пт):</b>",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
-    )
-    
-    return SELECTING_DATE
-
-
-async def date_selected_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик выбора даты"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "custom_date":
-        await query.edit_message_text(
-            text="✏️ Введите дату в формате ДД.ММ.ГГГГ\n"
-                 "Например: 15.12.2024\n\n"
-                 "<b>Важно:</b> выбирайте только дни планёрок (понедельник, среда, пятница)\n\n"
-                 "Или отправьте 'отмена' для возврата.",
-            parse_mode=ParseMode.HTML
-        )
-        return CONFIRMING_DATE
-    
-    if query.data == "back_to_reasons":
-        keyboard = [
-            [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
-            for i, option in enumerate(CANCELLATION_OPTIONS)
-        ]
+            # Для остальных кнопок оставляем как есть
+            new_row.append(button)
         
-        await query.edit_message_text(
-            text="📝 Выберите причину отмены планёрки:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return SELECTING_REASON
+        new_keyboard.append(new_row)
     
-    # Обработка выбранной даты
+    # Применяем обновленную клавиатуру
     try:
-        selected_date_str = query.data.split("_")[1]
-        selected_date = datetime.strptime(selected_date_str, "%Y-%m-%d")
-        
-        # Сохраняем выбранную дату
-        context.user_data["selected_date"] = selected_date_str
-        context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
-        
-        # Переходим к подтверждению
-        return await show_confirmation(update, context)
-    except (IndexError, ValueError) as e:
-        logger.error(f"Ошибка обработки выбора даты: {e}, data: {query.data}")
-        await query.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
-        return ConversationHandler.END
-
-
-async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка ввода пользовательской даты"""
-    user_input = update.message.text.strip().lower()
-    
-    if user_input == 'отмена':
-        keyboard = [
-            [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
-            for i, option in enumerate(CANCELLATION_OPTIONS)
-        ]
-        
-        await update.message.reply_text(
-            "Возвращаюсь к выбору причины...",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(new_keyboard)
         )
-        return SELECTING_REASON
+    except Exception as e:
+        logger.error(f"Ошибка обновления клавиатуры: {e}")
     
-    try:
-        # Пробуем разные форматы дат
-        formats = ["%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%d %m %Y"]
-        selected_date = None
-        
-        for fmt in formats:
-            try:
-                selected_date = datetime.strptime(user_input, fmt)
-                break
-            except ValueError:
-                continue
-        
-        if not selected_date:
-            raise ValueError("Неверный формат даты")
-        
-        # Проверяем, что дата в будущем
-        today = datetime.now(TIMEZONE).date()
-        if selected_date.date() <= today:
-            await update.message.reply_text(
-                "❌ Дата должна быть в будущем! Попробуйте снова:"
-            )
-            return CONFIRMING_DATE
-        
-        # Проверяем, что это день планёрки
-        if selected_date.weekday() not in MEETING_DAYS:
-            days_names = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
-            meeting_days_names = [days_names[i] for i in MEETING_DAYS]
-            
-            await update.message.reply_text(
-                f"❌ В эту дату нет планёрок! Планёрки бывают по {', '.join(meeting_days_names)}.\n"
-                "Попробуйте снова или отправьте 'отмена':"
-            )
-            return CONFIRMING_DATE
-        
-        # Сохраняем дату
-        context.user_data["selected_date"] = selected_date.strftime("%Y-%m-%d")
-        context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
-        
-        # Переходим к подтверждению
-        return await show_confirmation_text(update, context)
-        
-    except ValueError as e:
-        await update.message.reply_text(
-            "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ\n"
-            "Например: 15.12.2024\n\n"
-            "Попробуйте снова или отправьте 'отмена':"
-        )
-        return CONFIRMING_DATE
+    # Показываем уведомление
+    emoji = REACTIONS.get(reaction_type, '👍')
+    await query.answer(f"Вы поставили {emoji} этому факту!", show_alert=False)
 
-
-async def show_confirmation_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Показать подтверждение отмены для текстового ввода"""
-    reason = context.user_data.get("selected_reason", "")
-    selected_date = context.user_data.get("selected_date_display", "")
-    
-    message = f"📋 <b>Подтверждение отмены планёрки:</b>\n\n"
-    
-    if "Перенесём" in reason:
-        message += f"❌ <b>Отмена сегодняшней планёрки</b>\n"
-        message += f"📅 <b>Перенос на {selected_date}</b>\n\n"
-        message += "<b>Подтвердить отмену?</b>"
-    else:
-        message += f"❌ <b>Отмена планёрки</b>\n"
-        message += f"📝 <b>Причина:</b> {reason}\n\n"
-        message += "<b>Подтвердить отмену?</b>"
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
-            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
-        ]
-    ]
-    
-    await update.message.reply_text(
-        text=message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
-    )
-    
-    return CONFIRMING_DATE
-
-
-async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Показать подтверждение отмены для callback"""
-    query = update.callback_query
-    reason = context.user_data.get("selected_reason", "")
-    selected_date = context.user_data.get("selected_date_display", "")
-    
-    message = f"📋 <b>Подтверждение отмены планёрки:</b>\n\n"
-    
-    if "Перенесём" in reason:
-        message += f"❌ <b>Отмена сегодняшней планёрки</b>\n"
-        message += f"📅 <b>Перенос на {selected_date}</b>\n\n"
-        message += "<b>Подтвердить отмену?</b>"
-    else:
-        message += f"❌ <b>Отмена планёрки</b>\n"
-        message += f"📝 <b>Причина:</b> {reason}\n\n"
-        message += "<b>Подтвердить отмену?</b>"
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
-            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
-        ]
-    ]
-    
-    await query.edit_message_text(
-        text=message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
-    )
-    
-    return CONFIRMING_DATE
-
-
-async def confirm_cancellation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Показать подтверждение отмены после выбора причины/даты"""
-    return await show_confirmation(update, context)
-
-
-async def back_to_reasons_from_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Вернуться к выбору причины из подтверждения"""
-    query = update.callback_query
-    await query.answer()
-    
-    keyboard = [
-        [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
-        for i, option in enumerate(CANCELLATION_OPTIONS)
-    ]
-    
-    await query.edit_message_text(
-        text="📝 Выберите причину отмены планёрки:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    
-    return SELECTING_REASON
-
-
-async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Выполнить отмену планёрки"""
-    query = update.callback_query
-    await query.answer()
-    
-    config = BotConfig()
-    reason = context.user_data.get("selected_reason", "Причина не указана")
-    reason_index = context.user_data.get("reason_index", -1)
-    username = query.from_user.username or "Неизвестный пользователь"
-    
-    # Формируем финальное сообщение
-    if reason_index == 2:  # "Перенесём на другой день"
-        selected_date = context.user_data.get("selected_date_display", "дата не указана")
-        final_message = f"❌ @{username} отменил сегодняшнюю планёрку\n\n📅 <b>Перенос на {selected_date}</b>"
-    else:
-        final_message = f"❌ @{username} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
-    
-    # Удаляем задание из планировщика
-    original_message_id = context.user_data.get("original_message_id")
-    job_name_to_remove = None
-    
-    # Ищем и удаляем соответствующие задания
-    if original_message_id:
-        # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-        for job in get_jobs_from_queue(context.application.job_queue):
-            if job.name in config.active_reminders:
-                reminder_data = config.active_reminders[job.name]
-                if str(reminder_data.get("message_id")) == str(original_message_id):
-                    job.schedule_removal()
-                    job_name_to_remove = job.name
-                    logger.info(f"Задание {job.name} удалено из планировщика")
-                    break
-        
-        # Удаляем из конфига
-        if job_name_to_remove:
-            config.remove_active_reminder(job_name_to_remove)
-            logger.info(f"Задание {job_name_to_remove} удалено из конфига")
-    
-    # Отправляем финальное сообщение
-    await query.edit_message_text(
-        text=final_message,
-        parse_mode=ParseMode.HTML
-    )
-    
-    logger.info(f"Планёрка отменена @{username} — {reason}")
-    
-    # Очищаем user_data
-    context.user_data.clear()
-    
-    return ConversationHandler.END
-
-
-async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отмена диалога"""
-    if update.message:
-        await update.message.reply_text("❌ Диалог отменен.")
-    elif update.callback_query:
-        await update.callback_query.answer("Диалог отменен", show_alert=True)
-        await update.callback_query.edit_message_text("❌ Диалог отменен.")
-    
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /start"""
-    await update.message.reply_text(
-        "🤖 <b>Бот для напоминаний о планёрке активен!</b>\n\n"
-        f"📅 <b>Напоминания отправляются:</b>\n"
-        f"• Понедельник\n• Среда\n• Пятница\n"
-        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
-        "🔧 <b>Доступные команды:</b>\n"
-        "/info - информация о боте\n"
-        "/jobs - список запланированных задач\n"
-        "/test - тестовое напоминание (через 5 сек)\n"
-        "/testnow - мгновенное тестовое напоминание\n\n"
-        "👮‍♂️ <b>Команды для администраторов:</b>\n"
-        "/setchat - установить чат для уведомлений\n"
-        "/adduser @username - добавить пользователя\n"
-        "/removeuser @username - удалить пользователя\n"
-        "/users - список пользователей\n"
-        "/cancelall - отменить все напоминания",
-        parse_mode=ParseMode.HTML
-    )
-
-
-@restricted
-async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Установка чата для уведомлений"""
-    chat_id = update.effective_chat.id
-    chat_title = update.effective_chat.title or "личный чат"
-
-    config = BotConfig()
-    config.chat_id = chat_id
-
-    await update.message.reply_text(
-        f"✅ <b>Чат установлен:</b> {chat_title}\n"
-        f"<b>Chat ID:</b> {chat_id}\n\n"
-        "Напоминания будут отправляться в этот чат.",
-        parse_mode=ParseMode.HTML
-    )
-
-    logger.info(f"Установлен чат {chat_title} ({chat_id})")
-
-
-@restricted
-async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показать информацию о боте"""
-    config = BotConfig()
-    chat_id = config.chat_id
-
-    if chat_id:
-        status = f"✅ <b>Чат установлен</b> (ID: {chat_id})"
-    else:
-        status = "❌ <b>Чат не установлен</b>. Используйте /setchat"
-
-    # Подсчет запланированных задач
-    # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-    all_jobs = get_jobs_from_queue(context.application.job_queue)
-    job_count = len([j for j in all_jobs 
-                    if j.name and j.name.startswith("meeting_reminder_")])
-    
-    # Следующее напоминание
-    next_job = None
-    for job in all_jobs:
-        if job.name and job.name.startswith("meeting_reminder_"):
-            if not next_job or job.next_t < next_job.next_t:
-                next_job = job
-    
-    next_time = next_job.next_t.astimezone(TIMEZONE) if next_job else "не запланировано"
-    
-    # Ближайшие дни планёрок
-    today = datetime.now(TIMEZONE)
-    upcoming_meetings = []
-    for i in range(1, 8):
-        next_day = today + timedelta(days=i)
-        if next_day.weekday() in MEETING_DAYS:
-            upcoming_meetings.append(next_day.strftime("%d.%m.%Y"))
-
-    # Показываем текущую Zoom-ссылка (без полного URL)
-    zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != 'https://us04web.zoom.us/j/1234567890?pwd=example' else 'не установлена ⚠️ (используйте переменную ZOOM_MEETING_LINK)'}"
-
-    await update.message.reply_text(
-        f"📊 <b>Информация о боте:</b>\n\n"
-        f"{status}\n"
-        f"📅 <b>Дни планёрок:</b> понедельник, среда, пятница\n"
-        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
-        f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
-        f"⏳ <b>Запланировано задач:</b> {job_count}\n"
-        f"➡️ <b>Следующее напоминание:</b> {next_time}\n"
-        f"📈 <b>Ближайшие планёрки:</b> {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}"
-        f"{zoom_info}\n\n"
-        f"Используйте /users для списка пользователей\n"
-        f"Используйте /jobs для списка задач",
-        parse_mode=ParseMode.HTML
-    )
-
-
-@restricted
-async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка тестового напоминания через 5 секунд"""
-    config = BotConfig()
-    if not config.chat_id:
-        await update.message.reply_text("❌ Сначала установите чат командой /setchat")
-        return
-
-    # Создаем задачу, которая вызовет send_reminder через 5 секунд
-    context.application.job_queue.run_once(
-        send_reminder, 
-        5, 
-        chat_id=config.chat_id,
-        name=f"test_reminder_{datetime.now().timestamp()}"
-    )
-
-    # Получаем информацию о текущем дне
-    weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    current_day = day_names_ru[weekday]
-    
-    # Проверяем, является ли сегодня день планёрки
-    if weekday in MEETING_DAYS:
-        day_type = "день планёрки ✅"
-        day_emoji = "📋"
-    else:
-        day_type = "не день планёрки ⚠️"
-        day_emoji = "⏸️"
-    
-    # Форматируем Zoom-ссылку для предпросмотра
-    zoom_preview = ZOOM_LINK[:50] + "..." if len(ZOOM_LINK) > 50 else ZOOM_LINK
-    zoom_status = "установлена ✅" if ZOOM_LINK and ZOOM_LINK != "https://us04web.zoom.us/j/1234567890?pwd=example" else "не установлена ⚠️"
-    
-    # Показываем пример сообщения
-    example_text = get_greeting_by_meeting_day()
-    example_preview = example_text[:200] + "..." if len(example_text) > 200 else example_text
-    
-    await update.message.reply_text(
-        f"⏳ <b>Тестовое напоминание будет отправлено через 5 секунд...</b>\n\n"
-        f"{day_emoji} <b>Сегодня:</b> {current_day} ({day_type})\n"
-        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"🎥 <b>Zoom-ссылка:</b> {zoom_status}\n"
-        f"🔗 <b>Предпросмотр:</b> {zoom_preview}\n\n"
-        f"<b>Пример сообщения:</b>\n"
-        f"<code>{example_preview}</code>\n\n"
-        f"<b>Сообщение будет содержать:</b>\n"
-        f"• Приветствие для {current_day.lower()}\n"
-        f"• Время планёрки\n"
-        f"• Кликабельную ссылку 'Присоединиться к Zoom'\n"
-        f"• Кнопку для отмены планёрки",
-        parse_mode=ParseMode.HTML
-    )
-
-
-@restricted
-async def test_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Мгновенная отправка тестового уведомления"""
-    config = BotConfig()
-    if not config.chat_id:
-        await update.message.reply_text("❌ Сначала установите чат командой /setchat")
-        return
-
-    # Получаем информацию о текущем дне
-    weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    current_day = day_names_ru[weekday]
-    
-    # Проверяем, является ли сегодня день планёрки
-    if weekday in MEETING_DAYS:
-        day_type = "день планёрки ✅"
-    else:
-        day_type = "не день планёрки ⚠️"
-    
-    await update.message.reply_text(
-        f"🚀 <b>Отправляю тестовое напоминание прямо сейчас...</b>\n\n"
-        f"📅 <b>Сегодня:</b> {current_day} ({day_type})\n"
-        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
-        f"<b>Ссылка в сообщении:</b> <a href=\"{ZOOM_LINK}\">Присоединиться к Zoom</a>",
-        parse_mode=ParseMode.HTML
-    )
-    
-    # Создаем контекст для отправки
-    class DummyJob:
-        def __init__(self):
-            self.name = f"manual_test_{datetime.now().timestamp()}"
-    
-    dummy_context = ContextTypes.DEFAULT_TYPE(context.application)
-    dummy_context.job = DummyJob()
-    dummy_context.bot = context.bot
-    
-    await send_reminder(dummy_context)
-
-
-@restricted
-async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показать список запланированных задач"""
-    # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-    jobs = get_jobs_from_queue(context.application.job_queue)
-    
-    if not jobs:
-        await update.message.reply_text("📭 <b>Нет запланированных задач.</b>", parse_mode=ParseMode.HTML)
-        return
-    
-    meeting_jobs = [j for j in jobs if j.name and j.name.startswith("meeting_reminder_")]
-    other_jobs = [j for j in jobs if j not in meeting_jobs]
-    
-    message = "📋 <b>Запланированные задачи:</b>\n\n"
-    
-    if meeting_jobs:
-        message += "🔔 <b>Напоминания о планёрках:</b>\n"
-        for job in sorted(meeting_jobs, key=lambda j: j.next_t):
-            next_time = job.next_t.astimezone(TIMEZONE)
-            message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name})\n"
-    
-    if other_jobs:
-        message += "\n🔧 <b>Другие задачи:</b>\n"
-        for job in other_jobs:
-            next_time = job.next_t.astimezone(TIMEZONE)
-            job_name = job.name or "Без имени"
-            message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job_name})\n"
-    
-    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-
-
-@restricted
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Добавить пользователя в список разрешенных"""
-    if not context.args:
-        await update.message.reply_text("❌ <b>Используйте:</b> /adduser @username", parse_mode=ParseMode.HTML)
-        return
-    
-    username = context.args[0].lstrip('@')
-    config = BotConfig()
-    
-    if config.add_allowed_user(username):
-        await update.message.reply_text(f"✅ <b>Пользователь @{username} добавлен</b>", parse_mode=ParseMode.HTML)
-        logger.info(f"Добавлен пользователь @{username}")
-    else:
-        await update.message.reply_text(f"ℹ️ <b>Пользователь @{username} уже есть в списке</b>", parse_mode=ParseMode.HTML)
-
-
-@restricted
-async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Удалить пользователя из списка разрешенных"""
-    if not context.args:
-        await update.message.reply_text("❌ <b>Используйте:</b> /removeuser @username", parse_mode=ParseMode.HTML)
-        return
-    
-    username = context.args[0].lstrip('@')
-    config = BotConfig()
-    
-    if config.remove_allowed_user(username):
-        await update.message.reply_text(f"✅ <b>Пользователь @{username} удален</b>", parse_mode=ParseMode.HTML)
-        logger.info(f"Удален пользователь @{username}")
-    else:
-        await update.message.reply_text(f"❌ <b>Пользователь @{username} не найден</b>", parse_mode=ParseMode.HTML)
-
-
-@restricted
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показать список разрешенных пользователей"""
-    config = BotConfig()
-    users = config.allowed_users
-    
-    if not users:
-        await update.message.reply_text("📭 <b>Список пользователей пуст</b>", parse_mode=ParseMode.HTML)
-        return
-    
-    message = "👥 <b>Разрешенные пользователи:</b>\n\n"
-    for i, user in enumerate(users, 1):
-        message += f"{i}. @{user}\n"
-    
-    message += f"\n<b>Всего:</b> {len(users)} пользователь(ей)"
-    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-
-
-@restricted
-async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отменить все запланированные напоминания"""
-    # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-    jobs = get_jobs_from_queue(context.application.job_queue)
-    canceled_count = 0
-    
-    for job in jobs[:]:  # Копируем список для безопасного удаления
-        if job.name and job.name.startswith("meeting_reminder_"):
-            job.schedule_removal()
-            canceled_count += 1
-    
-    # Очищаем активные напоминания в конфиге
-    config = BotConfig()
-    config.clear_active_reminders()
-    
-    await update.message.reply_text(
-        f"✅ <b>Отменено {canceled_count} напоминаний(я)</b>\n"
-        f"Очищено {len(config.active_reminders)} активных напоминаний в конфиге",
-        parse_mode=ParseMode.HTML
-    )
-    logger.info(f"Отменено {canceled_count} напоминаний")
-
-
-def calculate_next_reminder() -> datetime:
-    """Рассчитать время следующего напоминания"""
-    now = datetime.now(TIMEZONE)
-    current_weekday = now.weekday()
-
-    if current_weekday in MEETING_DAYS:
-        reminder_time = now.replace(
-            hour=MEETING_TIME['hour'],
-            minute=MEETING_TIME['minute'],
-            second=0,
-            microsecond=0
-        )
-        if now < reminder_time:
-            return reminder_time
-
-    days_ahead = 1
-    while True:
-        next_day = now + timedelta(days=days_ahead)
-        if next_day.weekday() in MEETING_DAYS:
-            return next_day.replace(
-                hour=MEETING_TIME['hour'],
-                minute=MEETING_TIME['minute'],
-                second=0,
-                microsecond=0
-            )
-        days_ahead += 1
-
-
-async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запланировать следующее напоминание"""
-    next_time = calculate_next_reminder()
-    config = BotConfig()
-    chat_id = config.chat_id
-
-    if not chat_id:
-        logger.warning("Chat ID не установлен, планирование отложено")
-        # Пробуем снова через час
-        context.application.job_queue.run_once(
-            schedule_next_reminder,
-            3600
-        )
-        return
-
-    now = datetime.now(TIMEZONE)
-    delay = (next_time - now).total_seconds()
-
-    if delay > 0:
-        job_name = f"meeting_reminder_{next_time.strftime('%Y%m%d_%H%M')}"
-        
-        # Проверяем, нет ли уже такой задачи
-        # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-        existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
-                        if j.name == job_name]
-        
-        if not existing_jobs:
-            context.application.job_queue.run_once(
-                send_reminder,
-                delay,
-                chat_id=chat_id,
-                name=job_name
-            )
-
-            # Планируем следующее напоминание после отправки текущего
-            context.application.job_queue.run_once(
-                schedule_next_reminder,
-                delay + 60,
-                chat_id=chat_id,
-                name=f"scheduler_{next_time.strftime('%Y%m%d_%H%M')}"
-            )
-
-            logger.info(f"Следующее напоминание запланировано на {next_time}")
-        else:
-            logger.info(f"Напоминание на {next_time} уже запланировано")
-
-
-def cleanup_old_jobs(job_queue: JobQueue) -> None:
-    """Очистка старых и дублирующих задач"""
-    # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
-    jobs = get_jobs_from_queue(job_queue)
-    jobs_by_name = {}
-    jobs_to_remove = []
-    
-    for job in jobs:
-        if job.name:
-            if job.name in jobs_by_name:
-                # Дубликат - удаляем старую задачу
-                jobs_to_remove.append(jobs_by_name[job.name])
-            jobs_by_name[job.name] = job
-    
-    # Удаляем просроченные задачи
-    now = datetime.now(TIMEZONE)
-    for job in jobs:
-        if job.next_t and job.next_t < now:
-            jobs_to_remove.append(job)
-    
-    # Удаляем найденные задачи
-    for job in jobs_to_remove:
-        job.schedule_removal()
-    
-    if jobs_to_remove:
-        logger.info(f"Очищено {len(jobs_to_remove)} старых/дублирующих задач")
-
-
-def restore_reminders(application: Application) -> None:
-    """Восстановить активные напоминания после перезапуска"""
-    config = BotConfig()
-    now = datetime.now(TIMEZONE)
-    
-    for job_name, reminder_data in config.active_reminders.items():
-        try:
-            # Проверяем, актуально ли еще напоминание
-            created_at = datetime.fromisoformat(reminder_data["created_at"])
-            if (now - created_at).days < 1:  # Напоминание не старше суток
-                # Запланируем отправку отмены (имитация)
-                application.job_queue.run_once(
-                    lambda ctx: logger.info(f"Восстановлено напоминание {job_name}"),
-                    1,
-                    name=f"restored_{job_name}"
-                )
-        except Exception as e:
-            logger.error(f"Ошибка восстановления напоминания {job_name}: {e}")
-
+# ========== ОБНОВЛЕННАЯ ФУНКЦИЯ main ==========
 
 def main() -> None:
     """Основная функция запуска бота"""
@@ -1120,6 +692,17 @@ def main() -> None:
         application.add_handler(CommandHandler("removeuser", remove_user))
         application.add_handler(CommandHandler("users", list_users))
         application.add_handler(CommandHandler("cancelall", cancel_all))
+        
+        # Новые команды для фактов
+        application.add_handler(CommandHandler("fact", fact_command))
+        application.add_handler(CommandHandler("факт", fact_command))
+
+        # Обработчики callback-ов для фактов
+        application.add_handler(CallbackQueryHandler(fact_category_callback, pattern="^fact_category_"))
+        application.add_handler(CallbackQueryHandler(fact_category_callback, pattern="^fact_random$"))
+        application.add_handler(CallbackQueryHandler(handle_reaction, pattern="^fact_react_"))
+        application.add_handler(CallbackQueryHandler(send_new_fact, pattern="^new_fact_random$"))
+        application.add_handler(CallbackQueryHandler(show_facts_stats, pattern="^facts_stats$"))
 
         # Добавляем ConversationHandler
         application.add_handler(conv_handler)
@@ -1135,16 +718,126 @@ def main() -> None:
             lambda context: schedule_next_reminder(context),
             3
         )
+        
+        # Планирование ежедневного факта после установки чата
+        config = BotConfig()
+        if config.chat_id:
+            schedule_daily_fact(application, config.chat_id)
+            logger.info(f"✅ Ежедневные факты запланированы на 10:00 по МСК")
+        else:
+            logger.warning("⚠️  Chat ID не установлен, факты не запланированы")
 
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d}")
-        logger.info(f"🔗 Текст ссылки: 'Присоединиться к Zoom'")
+        logger.info(f"📚 Факты: ежедневно в {FACT_TIME['hour']:02d}:{FACT_TIME['minute']:02d}")
+        logger.info(f"🎲 Категории: {', '.join(CATEGORIES.values())}")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
     except Exception as e:
         logger.error(f"❌ Критическая ошибка при запуске бота: {e}")
         raise
+
+
+# ========== ОБНОВЛЕННАЯ КОМАНДА start ==========
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /start"""
+    await update.message.reply_text(
+        "🤖 <b>Бот для напоминаний о планёрке и интересных фактов!</b>\n\n"
+        f"📅 <b>Напоминания отправляются:</b>\n"
+        f"• Понедельник\n• Среда\n• Пятница\n"
+        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
+        f"📚 <b>Интересные факты:</b>\n"
+        f"• Каждый день в {FACT_TIME['hour']:02d}:{FACT_TIME['minute']:02d} по МСК\n"
+        f"• Категории: {', '.join(CATEGORIES.values())}\n\n"
+        "🔧 <b>Доступные команды:</b>\n"
+        "/fact или /факт - получить интересный факт\n"
+        "/info - информация о боте\n"
+        "/jobs - список запланированных задач\n"
+        "/test - тестовое напоминание (через 5 сек)\n"
+        "/testnow - мгновенное тестовое напоминание\n\n"
+        "👮‍♂️ <b>Команды для администраторов:</b>\n"
+        "/setchat - установить чат для уведомлений\n"
+        "/adduser @username - добавить пользователя\n"
+        "/removeuser @username - удалить пользователя\n"
+        "/users - список пользователей\n"
+        "/cancelall - отменить все напоминания",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ========== ОБНОВЛЕННАЯ КОМАНДА info ==========
+
+@restricted
+async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать информацию о боте"""
+    config = BotConfig()
+    chat_id = config.chat_id
+
+    if chat_id:
+        status = f"✅ <b>Чат установлен</b> (ID: {chat_id})"
+    else:
+        status = "❌ <b>Чат не установлен</b>. Используйте /setchat"
+
+    # Подсчет запланированных задач
+    all_jobs = get_jobs_from_queue(context.application.job_queue)
+    meeting_job_count = len([j for j in all_jobs 
+                    if j.name and j.name.startswith("meeting_reminder_")])
+    fact_job_count = len([j for j in all_jobs 
+                     if j.name and "daily_fact" in j.name])
+    
+    # Следующее напоминание о планёрке
+    next_meeting_job = None
+    next_fact_job = None
+    
+    for job in all_jobs:
+        if job.name and job.name.startswith("meeting_reminder_"):
+            if not next_meeting_job or job.next_t < next_meeting_job.next_t:
+                next_meeting_job = job
+        elif job.name and "daily_fact" in job.name:
+            if not next_fact_job or job.next_t < next_fact_job.next_t:
+                next_fact_job = job
+    
+    next_meeting_time = next_meeting_job.next_t.astimezone(TIMEZONE) if next_meeting_job else "не запланировано"
+    next_fact_time = next_fact_job.next_t.astimezone(TIMEZONE) if next_fact_job else "не запланировано"
+    
+    # Статистика фактов
+    sent_facts_count = config.data.get("sent_facts_count", 0)
+    
+    # Показываем текущую Zoom-ссылка (без полного URL)
+    zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != 'https://us04web.zoom.us/j/1234567890?pwd=example' else 'не установлена ⚠️'}"
+    
+    # Статистика реакций
+    total_reactions = 0
+    reaction_stats = config.data.get("fact_reactions", {})
+    for msg_reactions in reaction_stats.values():
+        total_reactions += sum(msg_reactions.values())
+
+    await update.message.reply_text(
+        f"📊 <b>Информация о боте:</b>\n\n"
+        f"{status}\n\n"
+        f"📅 <b>Планёрки:</b>\n"
+        f"• Дни: понедельник, среда, пятница\n"
+        f"• Время: {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
+        f"• Следующая: {next_meeting_time}\n\n"
+        f"📚 <b>Факты:</b>\n"
+        f"• Время: {FACT_TIME['hour']:02d}:{FACT_TIME['minute']:02d} по МСК\n"
+        f"• Категории: {', '.join(CATEGORIES.values())}\n"
+        f"• Отправлено: {sent_facts_count} фактов\n"
+        f"• Реакций: {total_reactions}\n"
+        f"• Следующий: {next_fact_time}\n\n"
+        f"👥 <b>Пользователи:</b>\n"
+        f"• Разрешённые: {len(config.allowed_users)}\n"
+        f"• Активные напоминания: {len(config.active_reminders)}\n"
+        f"• Запланировано задач: {meeting_job_count + fact_job_count}\n"
+        f"{zoom_info}\n\n"
+        f"<b>Используйте:</b>\n"
+        f"/users - список пользователей\n"
+        f"/jobs - список задач\n"
+        f"/fact - получить факт",
+        parse_mode=ParseMode.HTML
+    )
 
 
 if __name__ == "__main__":
