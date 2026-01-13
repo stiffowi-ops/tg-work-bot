@@ -57,12 +57,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== КЛАСС ДЛЯ ФАКТОВ ИЗ ВИКИПЕДИИ ==========
+# ========== КЛАСС ДЛЯ ФАКТОВ ИЗ ВИКИПЕДИИ (ИСПРАВЛЕННЫЙ) ==========
 class FactScheduler:
     """Класс для управления отправкой фактов из Википедии"""
     
     def __init__(self):
         self.current_index = 0
+        self.last_fact_data = {}  # Кэш последних фактов
         logger.info("Инициализирован планировщик фактов")
     
     def get_next_category(self) -> str:
@@ -83,36 +84,50 @@ class FactScheduler:
             
             # Шаг 1: Получаем статьи из категории
             url = f"https://{lang}.wikipedia.org/w/api.php"
+            
+            # Ключевые слова для поиска по категориям
+            category_keywords = {
+                'музыка': ['музыка', 'песня', 'альбом', 'исполнитель', 'группа'],
+                'фильмы': ['фильм', 'кинематограф', 'режиссёр', 'актёр', 'кино'],
+                'технологии': ['технология', 'компьютер', 'программа', 'интернет', 'наука'],
+                'игры': ['игра', 'видеоигра', 'компьютерная игра', 'разработчик', 'игрок']
+            }
+            
+            # Используем более простой запрос для поиска статей
+            search_keyword = random.choice(category_keywords.get(category, [category]))
+            
             params = {
                 'action': 'query',
                 'format': 'json',
-                'list': 'categorymembers',
-                'cmtitle': f'Категория:{category}',
-                'cmlimit': 100,
-                'cmtype': 'page'
+                'list': 'search',
+                'srsearch': search_keyword,
+                'srlimit': 50,
+                'srwhat': 'text',
+                'srinfo': 'totalhits',
+                'srprop': 'snippet'
             }
             
             response = requests.get(url, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
             
-            if 'query' not in data or not data['query']['categorymembers']:
-                logger.warning(f"Не найдено статей для категории: {category}")
+            if 'query' not in data or not data['query']['search']:
+                logger.warning(f"Не найдено статей для поиска: {search_keyword}")
                 return self._get_fallback_fact(category), "", "Статья не найдена"
             
-            # Выбираем случайную статью
-            articles = data['query']['categorymembers']
+            # Выбираем случайную статью из результатов поиска
+            articles = data['query']['search']
             article = random.choice(articles)
             title = article['title']
             logger.debug(f"Выбрана статья: {title}")
             
-            # Шаг 2: Получаем содержание статьи
+            # Шаг 2: Получаем содержание статьи (только первые 500 символов для краткости)
             params = {
                 'action': 'query',
                 'format': 'json',
                 'prop': 'extracts|info',
                 'inprop': 'url',
-                'exintro': True,
+                'exchars': 500,  # Ограничиваем количество символов
                 'explaintext': True,
                 'titles': title
             }
@@ -132,42 +147,89 @@ class FactScheduler:
             # Извлекаем факт
             fact = page.get('extract', 'Нет описания')
             
-            # Обрезаем слишком длинные факты
-            if len(fact) > 1200:
-                sentences = fact.split('. ')
-                fact = ''
-                for sentence in sentences:
-                    if len(fact + sentence) < 1100:
-                        fact += sentence + '. '
-                    else:
-                        break
-                fact = fact.strip() + '..'
+            # Если факт слишком короткий, добавляем больше информации
+            if len(fact) < 100:
+                # Пробуем получить больше текста
+                params['exchars'] = 1000
+                response = requests.get(url, params=params, timeout=15)
+                if response.status_code == 200:
+                    data = response.json()
+                    pages = data['query']['pages']
+                    page_id = list(pages.keys())[0]
+                    page = pages[page_id]
+                    fact = page.get('extract', fact)
             
-            # Формируем URL
-            article_url = f"https://{lang}.wikipedia.org/wiki/{title.replace(' ', '_')}"
+            # Формируем URL (заменяем пробелы на подчеркивания и кодируем)
+            encoded_title = title.replace(' ', '_')
+            article_url = f"https://{lang}.wikipedia.org/wiki/{encoded_title}"
             
             logger.info(f"Успешно получен факт: {title}")
+            
+            # Кэшируем факт
+            self.last_fact_data[category] = {
+                'title': title,
+                'fact': fact,
+                'url': article_url,
+                'timestamp': datetime.now().isoformat()
+            }
+            
             return fact, article_url, title
             
         except requests.exceptions.Timeout:
             logger.error(f"Таймаут при запросе категории: {category}")
+            # Пробуем вернуть кэшированный факт
+            if category in self.last_fact_data:
+                data = self.last_fact_data[category]
+                return data['fact'], data['url'], data['title']
             return self._get_fallback_fact(category), "", "Ошибка загрузки"
         except requests.exceptions.RequestException as e:
             logger.error(f"Ошибка сети: {e}")
+            if category in self.last_fact_data:
+                data = self.last_fact_data[category]
+                return data['fact'], data['url'], data['title']
             return self._get_fallback_fact(category), "", "Ошибка сети"
         except Exception as e:
             logger.error(f"Неожиданная ошибка: {e}")
+            if category in self.last_fact_data:
+                data = self.last_fact_data[category]
+                return data['fact'], data['url'], data['title']
             return self._get_fallback_fact(category), "", "Ошибка"
     
     def _get_fallback_fact(self, category: str) -> str:
-        """Резервный факт, если Wikipedia недоступна"""
+        """Резервные факты на случай недоступности Wikipedia"""
         fallback_facts = {
-            'музыка': 'Музыка — вид искусства, в котором средством воплощения художественных образов служат звуки.',
-            'фильмы': 'Фильм — это произведение киноискусства, созданное с помощью киносъёмочного аппарата.',
-            'технологии': 'Технология — совокупность методов и инструментов для достижения желаемого результата.',
-            'игры': 'Игра — вид деятельности, целью которой является развлечение, отдых или соревнование.'
+            'музыка': [
+                "Бетховен продолжал сочинять музыку даже после того, как полностью потерял слух.",
+                "Группа The Beatles удерживает рекорд по количеству проданных альбомов в истории музыки.",
+                "Скрипка Страдивари может стоить более 15 миллионов долларов.",
+                "Песня 'Happy Birthday to You' изначально называлась 'Good Morning to All'.",
+                "В опере 'Волшебная флейта' Моцарта используется музыкальная тема, основанная на масонских символах."
+            ],
+            'фильмы': [
+                "Первый в истории полнометражный фильм был снят в 1906 году и длился около 60 минут.",
+                "Альфред Хичкок никогда не получал премию 'Оскар' за лучшую режиссуру.",
+                "Фильм 'Аватар' Джеймса Кэмерона является самым кассовым фильмом в истории кино.",
+                "Для съёмок 'Властелина колец' было изготовлено более 48 000 предметов реквизита.",
+                "Мэрилин Монро имела IQ 168, что считается уровнем гения."
+            ],
+            'технологии': [
+                "Первый компьютерный вирус был создан в 1983 году и назывался 'Elk Cloner'.",
+                "QR-коды были изобретены в Японии в 1994 году для отслеживания запчастей автомобилей.",
+                "Средний смартфон сегодня имеет больше вычислительной мощности, чем компьютеры NASA в 1969 году.",
+                "Первое в мире SMS было отправлено в 1992 году и содержало текст 'Счастливого Рождества!'",
+                "Искусственный интеллект впервые обыграл чемпиона мира по шахматам в 1997 году."
+            ],
+            'игры': [
+                "Первая в мире видеоигра была создана в 1958 году и называлась 'Tennis for Two'.",
+                "Персонаж Марио изначально назывался 'Прыгающий человек' и появился в игре 'Donkey Kong'.",
+                "Игра Minecraft является самой продаваемой видеоигрой в истории.",
+                "Разработчики игры The Legend of Zelda вдохновлялись детскими воспоминаниями о лесах Киото.",
+                "Самый дорогой предмет в истории игр - космический корабль в Eve Online, проданный за 330 тысяч долларов."
+            ]
         }
-        return fallback_facts.get(category, "Интересный факт будет скоро!")
+        
+        facts = fallback_facts.get(category, ["Интересный факт будет в следующий раз!"])
+        return random.choice(facts)
     
     def create_fact_message(self, category: str) -> Tuple[str, InlineKeyboardMarkup]:
         """Создаем сообщение с фактом и inline-кнопками"""
@@ -186,7 +248,7 @@ class FactScheduler:
         keyboard = []
         row = []
         for emoji in FACT_REACTIONS:
-            callback_data = f"fact_react_{emoji}_{category}"
+            callback_data = f"react_fact_{emoji}_{category}"
             row.append(
                 InlineKeyboardButton(text=emoji, callback_data=callback_data)
             )
@@ -199,7 +261,7 @@ class FactScheduler:
         
         return message, InlineKeyboardMarkup(keyboard)
 
-# ========== ОСТАЛЬНЫЙ ВАШ КОД (БЕЗ ИЗМЕНЕНИЙ) ==========
+# ========== ОСТАЛЬНЫЙ ВАШ КОД ==========
 
 # Вспомогательная функция для совместимости версий PTB
 def get_jobs_from_queue(job_queue: JobQueue):
@@ -365,7 +427,7 @@ def save_config(config: Dict[str, Any]) -> None:
     bot_config.data = config
     bot_config.save()
 
-# ========== НОВЫЕ ФУНКЦИИ ДЛЯ ФАКТОВ (БЕЗ SCHEDULE) ==========
+# ========== НОВЫЕ ФУНКЦИИ ДЛЯ ФАКТОВ (ИСПРАВЛЕННЫЕ) ==========
 
 async def send_daily_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправка ежедневного факта"""
@@ -402,7 +464,7 @@ async def handle_fact_reaction(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     
     try:
-        # Парсим callback_data: fact_react_🎵_музыка
+        # Парсим callback_data: react_fact_🎵_музыка
         parts = query.data.split('_')
         if len(parts) >= 4:
             emoji = parts[2]
@@ -455,6 +517,7 @@ async def send_fact_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         category = fact_scheduler.get_next_category()
         message, keyboard = fact_scheduler.create_fact_message(category)
         
+        # Отправляем факт в целевой чат
         await context.bot.send_message(
             chat_id=chat_id,
             text=message,
@@ -463,8 +526,8 @@ async def send_fact_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=keyboard
         )
         
-        await update.message.reply_text(f"✅ Факт отправлен! Категория: {category.upper()}")
         logger.info(f"Факт отправлен по команде: {category}")
+        # НЕ отправляем подтверждение пользователю
         
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при отправке факта: {str(e)}")
@@ -566,7 +629,7 @@ async def schedule_next_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             logger.info(f"Отправка факта на {next_time} уже запланирована")
 
-# ========== ОСТАЛЬНЫЕ ФУНКЦИИ ВАШЕГО БОТА (БЕЗ ИЗМЕНЕНИЙ) ==========
+# ========== ОСТАЛЬНЫЕ ФУНКЦИИ ВАШЕГО БОТА ==========
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправка напоминания о планёрке"""
@@ -997,7 +1060,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Следующая отправка факта
     next_fact_job = None
     for job in all_jobs:
-        if job.name and j.name.startswith("daily_fact_"):
+        if job.name and job.name.startswith("daily_fact_"):
             if not next_fact_job or job.next_t < next_fact_job.next_t:
                 next_fact_job = job
     
@@ -1390,9 +1453,9 @@ def main() -> None:
         # Добавляем ConversationHandler
         application.add_handler(conv_handler)
 
-        # Обработчик реакций на факты
+        # Обработчик реакций на факты (ИСПРАВЛЕННЫЙ PATTERN)
         application.add_handler(
-            CallbackQueryHandler(handle_fact_reaction, pattern="^fact_react_.+$")
+            CallbackQueryHandler(handle_fact_reaction, pattern="^react_fact_.+$")
         )
 
         # Очистка старых задач
