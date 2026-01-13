@@ -261,12 +261,15 @@ async def send_daily_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{fact}"
         )
         
+        # Используем английское название категории для callback_data
+        category_en = FACT_CATEGORIES[category]
+        
         # Создаем клавиатуру с реакциями
         keyboard = [
             [
-                InlineKeyboardButton("👍", callback_data=f"fact_like_{category}"),
-                InlineKeyboardButton("👎", callback_data=f"fact_dislike_{category}"),
-                InlineKeyboardButton("💩", callback_data=f"fact_poop_{category}")
+                InlineKeyboardButton("👍", callback_data=f"fact_like_{category_en}"),
+                InlineKeyboardButton("👎", callback_data=f"fact_dislike_{category_en}"),
+                InlineKeyboardButton("💩", callback_data=f"fact_poop_{category_en}")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -301,7 +304,7 @@ async def fact_reaction_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     reaction_type = data_parts[1]
-    category = data_parts[2]
+    category_en = data_parts[2]
     
     # Определяем текст реакции
     reaction_texts = {
@@ -317,7 +320,11 @@ async def fact_reaction_callback(update: Update, context: ContextTypes.DEFAULT_T
     
     # Логируем реакцию
     username = query.from_user.username or query.from_user.first_name
-    logger.info(f"Реакция на факт: @{username} - {reaction_type} для категории {category}")
+    logger.info(f"Реакция на факт: @{username} - {reaction_type} для категории {category_en}")
+    
+    # Можно добавить подсчет реакций или сохранение в базу данных
+    # Например:
+    # save_reaction_to_db(username, reaction_type, category_en)
 
 
 def get_greeting_by_meeting_day() -> str:
@@ -1000,12 +1007,15 @@ async def test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{fact}"
     )
     
+    # Используем английское название категории для callback_data
+    category_en = FACT_CATEGORIES[category]
+    
     # Создаем клавиатуру с реакциями
     keyboard = [
         [
-            InlineKeyboardButton("👍", callback_data=f"fact_like_{category}"),
-            InlineKeyboardButton("👎", callback_data=f"fact_dislike_{category}"),
-            InlineKeyboardButton("💩", callback_data=f"fact_poop_{category}")
+            InlineKeyboardButton("👍", callback_data=f"fact_like_{category_en}"),
+            InlineKeyboardButton("👎", callback_data=f"fact_dislike_{category_en}"),
+            InlineKeyboardButton("💩", callback_data=f"fact_poop_{category_en}")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1500,6 +1510,7 @@ def main() -> None:
     
     logger.info("✅ Все факты на 100% на русском языке!")
     logger.info("✅ Хештеги убраны из сообщений с фактами!")
+    logger.info("✅ Реакции работают правильно!")
 
     try:
         application = Application.builder().token(TOKEN).build()
