@@ -30,7 +30,6 @@ SELECTING_REASON, SELECTING_DATE, CONFIRMING_DATE = range(3)
 
 # Конфигурация
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Токен бота из переменных окружения
-ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", "https://us04web.zoom.us/j/1234567890?pwd=example")  # Ссылка на Zoom
 CONFIG_FILE = "bot_config.json"  # Файл для хранения настроек
 
 # Время планёрки (9:15 по Москве)
@@ -65,11 +64,9 @@ def restricted(func):
     return wrapped
 
 
-def get_greeting_by_meeting_day() -> str:
-    """Специальные приветствия для дней планёрок со ссылкой на Zoom"""
+def get_greeting_by_meeting_day():
+    """Специальные приветствия для дней планёрок"""
     weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    current_day = day_names_ru[weekday]
     
     # Только для дней планёрок (пн/ср/пт)
     if weekday in MEETING_DAYS:
@@ -79,48 +76,46 @@ def get_greeting_by_meeting_day() -> str:
             4: "ПЯТНИЦА"
         }
         
-        # Форматируем ссылку на Zoom для Markdown
-        zoom_link_formatted = f"[Присоединиться к Zoom]({ZOOM_LINK})"
-        
-        # Формулировки с новой ссылкой
-        zoom_notes = [
-            f"\n\n🎥 {zoom_link_formatted} | Присоединяйтесь к встрече",
-            f"\n\n👨‍💻 {zoom_link_formatted} | Нажмите для подключения",
-            f"\n\n💻 {zoom_link_formatted} | Перейдите по ссылке",
-            f"\n\n🔗 {zoom_link_formatted} | Подключиться к звонку",
-            f"\n\n📅 {zoom_link_formatted} | Переход на встречу",
-            f"\n\n✉️ {zoom_link_formatted} | Встреча доступна по ссылке",
-            f"\n\n🎯 {zoom_link_formatted} | Присоединяйтесь по ссылке",
-            f"\n\n🤝 {zoom_link_formatted} | Ждём всех на встрече",
-            f"\n\n🚀 {zoom_link_formatted} | Заходите на звонок",
-            f"\n\n⚡ {zoom_link_formatted} | Быстрый доступ к встрече",
+        # Варианты напоминания о календаре
+        calendar_reminders = [
+            "\n\n📅 *Ссылка на Zoom:* в календарном приглашении в почте",
+            "\n\n💌 *Присоединиться:* ссылка в календарном приглашении",
+            "\n\n👨💻 *Подключиться:* подробности в рабочем календаре в почте",
+            "\n\n🔗 *Zoom-ссылка:* как всегда, в календарном приглашении",
+            "\n\n📧 *Для подключения:* проверьте календарное приглашение в почте",
+            "\n\n🗓️ *Детали встречи:* в календарном приглашении у вас в почте",
+            "\n\n📨 *Ссылка на звонок:* как обычно, в календарном приглашении",
+            "\n\n✉️ *Подробности:* в приглашении в рабочем календаре",
         ]
         
-        zoom_note = random.choice(zoom_notes)
+        calendar_note = random.choice(calendar_reminders)
         
         greetings = {
             0: [
-                f"🚀 **{day_names[0]}** - старт новой недели!\n\n📋 *Планёрка в 9:15 по МСК*.\nДавайте обсудим планы на неделю! 🌟{zoom_note}",
-                f"🌞 Доброе утро! Сегодня **{day_names[0]}**!\n\n🤝 *Планёрка в 9:15 по МСК*.\nНачинаем неделю продуктивно! 💪{zoom_note}",
-                f"⚡ **{day_names[0]}**, время действовать!\n\n🎯 *Утренняя планёрка в 9:15 по МСК*.\nГотовьте вопросы и обновления! 📊{zoom_note}"
+                f"🚀 **{day_names[0]}** - старт новой недели!\n\n📋 Планёрка в 9:15 по МСК.\nДавайте обсудим планы на неделю! 🌟{calendar_note}",
+                f"🌞 Доброе утро! Сегодня **{day_names[0]}**!\n\n🤝 Планёрка в 9:15 по МСК.\nНачинаем неделю продуктивно! 💪{calendar_note}",
+                f"⚡ **{day_names[0]}**, время действовать!\n\n🎯 Утренняя планёрка в 9:15 по МСК.\nГотовьте вопросы и обновления! 📊{calendar_note}"
             ],
             2: [
-                f"⚡ **{day_names[2]}** - середина недели!\n\n📋 *Планёрка в 9:15 по МСК*.\nВремя для корректировок и обновлений! 🔄{zoom_note}",
-                f"🌞 **{day_names[2]}**, доброе утро!\n\n🤝 *Планёрка в 9:15 по МСК*.\nКак продвигаются задачи? 📈{zoom_note}",
-                f"💪 **{day_names[2]}** - день прорыва!\n\n🎯 *Планёрка в 9:15 по МСК*.\nДелитесь прогрессом! 🚀{zoom_note}"
+                f"⚡ **{day_names[2]}** - середина недели!\n\n📋 Планёрка в 9:15 по МСК.\nВремя для корректировок и обновлений! 🔄{calendar_note}",
+                f"🌞 **{day_names[2]}**, доброе утро!\n\n🤝 Планёрка в 9:15 по МСК.\nКак продвигаются задачи? 📈{calendar_note}",
+                f"💪 **{day_names[2]}** - день прорыва!\n\n🎯 Планёрка в 9:15 по МСК.\nДелитесь прогрессом! 🚀{calendar_note}"
             ],
             4: [
-                f"🎉 **{day_names[4]}** - завершаем неделю!\n\n📋 *Планёрка в 9:15 по МСК*.\nДавайте подведем итоги недели! 🏆{zoom_note}",
-                f"🌞 Пятничное утро! 🎊\n\n🤝 **{day_names[4]}**, *планёрка в 9:15 по МСК*.\nГотовьте отчеты о неделе! 📊{zoom_note}",
-                f"✨ **{day_names[4]}** - время подводить итоги!\n\n🎯 *Планёрка в 9:15 по МСК*.\nЧто успели за неделю? 📈{zoom_note}"
+                f"🎉 **{day_names[4]}** - завершаем неделю!\n\n📋 Планёрка в 9:15 по МСК.\nДавайте подведем итоги недели! 🏆{calendar_note}",
+                f"🌞 Пятничное утро! 🎊\n\n🤝 **{day_names[4]}**, планёрка в 9:15 по МСК.\nГотовьте отчеты о неделе! 📊{calendar_note}",
+                f"✨ **{day_names[4]}** - время подводить итоги!\n\n🎯 Планёрка в 9:15 по МСК.\nЧто успели за неделю? 📈{calendar_note}"
             ]
         }
         
         return random.choice(greetings[weekday])
     else:
         # Если почему-то напоминание отправлено не в день планёрки
-        zoom_link_formatted = f"[Присоединиться к Zoom]({ZOOM_LINK})"
-        return f"👋 Доброе утро! Сегодня *{current_day}*.\n\n📋 *Напоминаю о планёрке в 9:15 по МСК*.\nПрисоединяйтесь к звонку! 🤝\n\n🎥 {zoom_link_formatted} | Присоединяйтесь к встрече"
+        calendar_reminders = [
+            "\n\n📅 *Ссылка на Zoom:* в календарном приглашении в почте",
+            "\n\n💌 *Присоединиться:* ссылка в календарном приглашении",
+        ]
+        return f"👋 Доброе утро!\n\n📋 Напоминаю о планёрке в 9:15 по МСК.\nПрисоединяйтесь к звонку! 🤝{random.choice(calendar_reminders)}"
 
 
 class BotConfig:
@@ -240,7 +235,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Используем наше улучшенное приветствие с Zoom-ссылкой
+    # Используем наше улучшенное приветствие
     message_text = get_greeting_by_meeting_day()
 
     try:
@@ -248,8 +243,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             text=message_text,
             reply_markup=reply_markup,
-            parse_mode="Markdown",
-            disable_web_page_preview=False  # Показываем превью для Zoom-ссылки
+            parse_mode="Markdown"
         )
 
         # Сохраняем информацию о напоминании
@@ -393,7 +387,7 @@ async def date_selected_callback(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
     
     # Переходим к подтверждению
-    return await show_confirmation(update, context)
+    return await confirm_cancellation(update, context)
 
 
 async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -451,7 +445,7 @@ async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
         
         # Переходим к подтверждению
-        return await show_confirmation_text(update, context)
+        return await show_confirmation(update, context)
         
     except ValueError as e:
         await update.message.reply_text(
@@ -462,41 +456,8 @@ async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return CONFIRMING_DATE
 
 
-async def show_confirmation_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Показать подтверждение отмены для текстового ввода"""
-    reason = context.user_data.get("selected_reason", "")
-    selected_date = context.user_data.get("selected_date_display", "")
-    
-    message = f"📋 *Подтверждение отмены планёрки:*\n\n"
-    
-    if "Перенесём" in reason:
-        message += f"❌ *Отмена сегодняшней планёрки*\n"
-        message += f"📅 *Перенос на {selected_date}*\n\n"
-        message += "*Подтвердить отмену?*"
-    else:
-        message += f"❌ *Отмена планёрки*\n"
-        message += f"📝 *Причина:* {reason}\n\n"
-        message += "*Подтвердить отмену?*"
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
-            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
-        ]
-    ]
-    
-    await update.message.reply_text(
-        text=message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-    
-    return CONFIRMING_DATE
-
-
 async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Показать подтверждение отмены для callback"""
-    query = update.callback_query
+    """Показать подтверждение отмены"""
     reason = context.user_data.get("selected_reason", "")
     selected_date = context.user_data.get("selected_date_display", "")
     
@@ -514,15 +475,22 @@ async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     keyboard = [
         [
             InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
-            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
+            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons")
         ]
     ]
     
-    await query.edit_message_text(
-        text=message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text=message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            text=message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
     
     return CONFIRMING_DATE
 
@@ -532,37 +500,19 @@ async def confirm_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
     return await show_confirmation(update, context)
 
 
-async def back_to_reasons_from_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Вернуться к выбору причины из подтверждения"""
-    query = update.callback_query
-    await query.answer()
-    
-    keyboard = [
-        [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
-        for i, option in enumerate(CANCELLATION_OPTIONS)
-    ]
-    
-    await query.edit_message_text(
-        text="📝 Выберите причину отмены планёрки:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    
-    return SELECTING_REASON
-
-
 async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Выполнить отмену планёрки"""
     query = update.callback_query
     await query.answer()
     
     config = BotConfig()
-    reason = context.user_data.get("selected_reason", "Причина не указана")
+    reason = context.user_data.get("selected_reason", "")
     reason_index = context.user_data.get("reason_index", -1)
-    username = query.from_user.username or "Неизвестный пользователь"
+    username = query.from_user.username
     
     # Формируем финальное сообщение
     if reason_index == 2:  # "Перенесём на другой день"
-        selected_date = context.user_data.get("selected_date_display", "дата не указана")
+        selected_date = context.user_data.get("selected_date_display", "")
         final_message = f"❌ @{username} отменил сегодняшнюю планёрку\n\n📅 *Перенос на {selected_date}*"
     else:
         final_message = f"❌ @{username} отменил планёрку\n\n📝 *Причина:* {reason}"
@@ -571,22 +521,18 @@ async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
     original_message_id = context.user_data.get("original_message_id")
     job_name_to_remove = None
     
-    # Ищем и удаляем соответствующие задания
-    if original_message_id:
-        for job_name, reminder_data in config.active_reminders.items():
-            if str(reminder_data.get("message_id")) == str(original_message_id):
-                # Ищем задание в планировщике
-                for job in context.application.job_queue.jobs():
-                    if job.name == job_name:
-                        job.schedule_removal()
-                        job_name_to_remove = job_name
-                        logger.info(f"Задание {job_name} удалено из планировщика")
-                        break
-        
-        # Удаляем из конфига
-        if job_name_to_remove:
-            config.remove_active_reminder(job_name_to_remove)
-            logger.info(f"Задание {job_name_to_remove} удалено из конфига")
+    for job_name, reminder_data in config.active_reminders.items():
+        if reminder_data.get("message_id") == original_message_id:
+            # Ищем задание в планировщике
+            for job in context.application.job_queue.jobs():
+                if job.name == job_name:
+                    job.schedule_removal()
+                    job_name_to_remove = job_name
+                    break
+    
+    # Удаляем из конфига
+    if job_name_to_remove:
+        config.remove_active_reminder(job_name_to_remove)
     
     # Отправляем финальное сообщение
     await query.edit_message_text(
@@ -604,12 +550,7 @@ async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Отмена диалога"""
-    if update.message:
-        await update.message.reply_text("❌ Диалог отменен.")
-    elif update.callback_query:
-        await update.callback_query.answer("Диалог отменен", show_alert=True)
-        await update.callback_query.edit_message_text("❌ Диалог отменен.")
-    
+    await update.message.reply_text("❌ Диалог отменен.")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -626,7 +567,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/jobs - список запланированных задач\n"
         "/test - тестовое напоминание (через 5 сек)\n"
         "/testnow - мгновенное тестовое напоминание\n\n"
-        "👮‍♂️ *Команды для администраторов:*\n"
+        "👮♂️ *Команды для администраторов:*\n"
         "/setchat - установить чат для уведомлений\n"
         "/adduser @username - добавить пользователя\n"
         "/removeuser @username - удалить пользователя\n"
@@ -687,9 +628,6 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if next_day.weekday() in MEETING_DAYS:
             upcoming_meetings.append(next_day.strftime("%d.%m.%Y"))
 
-    # Показываем текущую Zoom-ссылку (без полного URL)
-    zoom_info = f"\n🎥 *Zoom-ссылка:* {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != 'https://us04web.zoom.us/j/1234567890?pwd=example' else 'не установлена ⚠️ (используйте переменную ZOOM_MEETING_LINK)'}"
-
     await update.message.reply_text(
         f"📊 *Информация о боте:*\n\n"
         f"{status}\n"
@@ -699,8 +637,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📋 *Активные напоминания:* {len(config.active_reminders)}\n"
         f"⏳ *Запланировано задач:* {job_count}\n"
         f"➡️ *Следующее напоминание:* {next_time}\n"
-        f"📈 *Ближайшие планёрки:* {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}"
-        f"{zoom_info}\n\n"
+        f"📈 *Ближайшие планёрки:* {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}\n\n"
         f"Используйте /users для списка пользователей\n"
         f"Используйте /jobs для списка задач",
         parse_mode="Markdown"
@@ -715,7 +652,6 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
         return
 
-    # Создаем задачу, которая вызовет send_reminder через 5 секунд
     context.application.job_queue.run_once(
         send_reminder, 
         5, 
@@ -723,42 +659,7 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         name=f"test_reminder_{datetime.now().timestamp()}"
     )
 
-    # Получаем информацию о текущем дне
-    weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    current_day = day_names_ru[weekday]
-    
-    # Проверяем, является ли сегодня день планёрки
-    if weekday in MEETING_DAYS:
-        day_type = "день планёрки ✅"
-        day_emoji = "📋"
-    else:
-        day_type = "не день планёрки ⚠️"
-        day_emoji = "⏸️"
-    
-    # Форматируем Zoom-ссылку для предпросмотра
-    zoom_preview = ZOOM_LINK[:50] + "..." if len(ZOOM_LINK) > 50 else ZOOM_LINK
-    zoom_status = "установлена ✅" if ZOOM_LINK and ZOOM_LINK != "https://us04web.zoom.us/j/1234567890?pwd=example" else "не установлена ⚠️"
-    
-    # Показываем пример сообщения
-    example_text = get_greeting_by_meeting_day()
-    example_preview = example_text[:200] + "..." if len(example_text) > 200 else example_text
-    
-    await update.message.reply_text(
-        f"⏳ *Тестовое напоминание будет отправлено через 5 секунд...*\n\n"
-        f"{day_emoji} *Сегодня:* {current_day} ({day_type})\n"
-        f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"🎥 *Zoom-ссылка:* {zoom_status}\n"
-        f"🔗 *Предпросмотр:* {zoom_preview}\n\n"
-        f"*Пример сообщения:*\n"
-        f"`{example_preview}`\n\n"
-        f"*Сообщение будет содержать:*\n"
-        f"• Приветствие для {current_day.lower()}\n"
-        f"• Время планёрки\n"
-        f"• Кликабельную ссылку 'Присоединиться к Zoom'\n"
-        f"• Кнопку для отмены планёрки",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("⏳ *Тестовое напоминание будет отправлено через 5 секунд...*", parse_mode="Markdown")
 
 
 @restricted
@@ -769,24 +670,7 @@ async def test_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
         return
 
-    # Получаем информацию о текущем дне
-    weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    current_day = day_names_ru[weekday]
-    
-    # Проверяем, является ли сегодня день планёрки
-    if weekday in MEETING_DAYS:
-        day_type = "день планёрки ✅"
-    else:
-        day_type = "не день планёрки ⚠️"
-    
-    await update.message.reply_text(
-        f"🚀 *Отправляю тестовое напоминание прямо сейчас...*\n\n"
-        f"📅 *Сегодня:* {current_day} ({day_type})\n"
-        f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
-        f"*Ссылка в сообщении:* [Присоединиться к Zoom]({ZOOM_LINK})",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("🚀 *Отправляю тестовое напоминание прямо сейчас...*", parse_mode="Markdown")
     
     # Создаем контекст для отправки
     class DummyJob:
@@ -1030,14 +914,6 @@ def main() -> None:
     if not TOKEN:
         logger.error("❌ Токен бота не найден! Установите переменную окружения TELEGRAM_BOT_TOKEN")
         return
-    
-    # Проверяем наличие Zoom-ссылки
-    if not ZOOM_LINK or ZOOM_LINK == "https://us04web.zoom.us/j/1234567890?pwd=example":
-        logger.warning("⚠️  Zoom-ссылка не установлена или используется значение по умолчанию!")
-        logger.warning("   Установите переменную окружения ZOOM_MEETING_LINK")
-        logger.warning("   Пример: export ZOOM_MEETING_LINK='https://zoom.us/j/your-meeting-id?pwd=your-password'")
-    else:
-        logger.info(f"✅ Zoom-ссылка загружена (первые 50 символов): {ZOOM_LINK[:50]}...")
 
     try:
         application = Application.builder().token(TOKEN).build()
@@ -1057,14 +933,13 @@ def main() -> None:
                 CONFIRMING_DATE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_date),
                     CallbackQueryHandler(execute_cancellation, pattern="^confirm_cancel$"),
-                    CallbackQueryHandler(back_to_reasons_from_confirm, pattern="^back_to_reasons_from_confirm$"),
+                    CallbackQueryHandler(cancel_meeting_callback, pattern="^back_to_reasons$"),
                 ],
             },
             fallbacks=[
                 CommandHandler("cancel", cancel_conversation),
-                CallbackQueryHandler(cancel_conversation, pattern="^cancel_conversation$"),
+                CallbackQueryHandler(cancel_conversation, pattern="^cancel$"),
             ],
-            allow_reentry=True,
         )
 
         # Обработчики команд
@@ -1096,7 +971,6 @@ def main() -> None:
 
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d}")
-        logger.info(f"🔗 Текст ссылки: 'Присоединиться к Zoom'")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
