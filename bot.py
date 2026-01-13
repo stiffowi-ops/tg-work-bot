@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-# Corrected version: fixed Wikipedia API facts retrieval (User-Agent, URL encoding, stable params)
-
 import os
 import json
 import random
