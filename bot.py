@@ -2,8 +2,10 @@ import os
 import logging
 import json
 import random
-import aiohttp
-import asyncio
+import urllib.request
+import urllib.parse
+import urllib.error
+import ssl
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from functools import wraps
@@ -71,18 +73,11 @@ FACT_APIS = {
             "priority": 1
         },
         {
-            "name": "Wikipedia Random",
-            "url": "https://ru.wikipedia.org/api/rest_v1/page/random/summary",
-            "params": {},
-            "parser": lambda data: f"{data.get('title', 'Факт')}: {data.get('extract', 'Интересная информация')[:200]}..." if data and 'extract' in data else None,
-            "priority": 2
-        },
-        {
             "name": "Numbers API",
             "url": "http://numbersapi.com/random/trivia",
             "params": {},
             "parser": lambda data: f"Числовой факт: {data}" if data else None,
-            "priority": 3
+            "priority": 2
         }
     ],
     "Технологии": [
@@ -94,24 +89,11 @@ FACT_APIS = {
             "priority": 1
         },
         {
-            "name": "Tech Wikipedia",
-            "url": "https://ru.wikipedia.org/w/api.php",
-            "params": {
-                "action": "query",
-                "format": "json",
-                "list": "random",
-                "rnnamespace": 0,
-                "rnlimit": 1
-            },
-            "parser": lambda data: f"Технологический факт: {data['query']['random'][0]['title']}" if data and 'query' in data and 'random' in data['query'] and data['query']['random'] else None,
-            "priority": 2
-        },
-        {
             "name": "Numbers Math",
             "url": "http://numbersapi.com/random/math",
             "params": {},
             "parser": lambda data: f"Математический факт: {data}" if data else None,
-            "priority": 3
+            "priority": 2
         }
     ],
     "Кино": [
@@ -128,19 +110,6 @@ FACT_APIS = {
             "params": {},
             "parser": lambda data: f"Кинофакт: \"{data.get('quote', '')}\" - {data.get('show', 'Неизвестный фильм/сериал')}" if data else None,
             "priority": 2
-        },
-        {
-            "name": "Wikipedia Films",
-            "url": "https://ru.wikipedia.org/w/api.php",
-            "params": {
-                "action": "query",
-                "format": "json",
-                "list": "random",
-                "rnnamespace": 0,
-                "rnlimit": 1
-            },
-            "parser": lambda data: f"Кинофакт о: {data['query']['random'][0]['title']}" if data and 'query' in data and 'random' in data['query'] and data['query']['random'] else None,
-            "priority": 3
         }
     ],
     "Музыка": [
@@ -157,19 +126,6 @@ FACT_APIS = {
             "params": {},
             "parser": lambda data: f"Музыкальный факт: {data}" if data else None,
             "priority": 2
-        },
-        {
-            "name": "Wikipedia Music",
-            "url": "https://ru.wikipedia.org/w/api.php",
-            "params": {
-                "action": "query",
-                "format": "json",
-                "list": "random",
-                "rnnamespace": 0,
-                "rnlimit": 1
-            },
-            "parser": lambda data: f"Музыкальный факт о: {data['query']['random'][0]['title']}" if data and 'query' in data and 'random' in data['query'] and data['query']['random'] else None,
-            "priority": 3
         }
     ],
     "Игры": [
@@ -186,19 +142,6 @@ FACT_APIS = {
             "params": {"platform": "pc", "type": "game"},
             "parser": lambda data: f"Игровой факт: Сейчас на GamerPower доступно {len(data) if isinstance(data, list) else 'несколько'} игровых раздач для PC!" if data else None,
             "priority": 2
-        },
-        {
-            "name": "Wikipedia Games",
-            "url": "https://ru.wikipedia.org/w/api.php",
-            "params": {
-                "action": "query",
-                "format": "json",
-                "list": "random",
-                "rnnamespace": 0,
-                "rnlimit": 1
-            },
-            "parser": lambda data: f"Игровой факт о: {data['query']['random'][0]['title']}" if data and 'query' in data and 'random' in data['query'] and data['query']['random'] else None,
-            "priority": 3
         }
     ]
 }
@@ -275,34 +218,41 @@ def restricted(func):
     return wrapped
 
 
-async def get_daily_fact(category: str) -> str:
-    """Получить факт дня для указанной категории"""
+def get_daily_fact_sync(category: str) -> str:
+    """Синхронная версия получения факта дня"""
     try:
         # Сортируем API по приоритету (от наивысшего к наименьшему)
         if category in FACT_APIS:
             api_configs = sorted(FACT_APIS[category], key=lambda x: x.get("priority", 10))
             
-            async with aiohttp.ClientSession() as session:
-                for api_config in api_configs:
-                    try:
-                        url = api_config["url"]
-                        params = api_config.get("params", {})
-                        
-                        # Для Wikipedia API добавляем заголовки
-                        headers = {}
-                        if "wikipedia.org" in url:
-                            headers = {"User-Agent": "TelegramFactsBot/1.0"}
-                        
-                        async with session.get(url, params=params, headers=headers, timeout=10) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                fact = api_config["parser"](data)
-                                if fact:
-                                    logger.info(f"Успешно получен факт из {api_config['name']} для категории {category}")
-                                    return fact
-                    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-                        logger.warning(f"Ошибка при запросе к API {api_config['name']} ({url}): {e}")
-                        continue
+            for api_config in api_configs:
+                try:
+                    url = api_config["url"]
+                    params = api_config.get("params", {})
+                    
+                    # Формируем URL с параметрами
+                    if params:
+                        query_string = urllib.parse.urlencode(params)
+                        url = f"{url}?{query_string}"
+                    
+                    # Создаем запрос
+                    req = urllib.request.Request(
+                        url,
+                        headers={"User-Agent": "TelegramFactsBot/1.0"}
+                    )
+                    
+                    # Отправляем запрос с обработкой SSL
+                    context = ssl._create_unverified_context()
+                    with urllib.request.urlopen(req, context=context, timeout=10) as response:
+                        if response.status == 200:
+                            data = json.loads(response.read().decode())
+                            fact = api_config["parser"](data)
+                            if fact:
+                                logger.info(f"Успешно получен факт из {api_config['name']} для категории {category}")
+                                return fact
+                except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+                    logger.warning(f"Ошибка при запросе к API {api_config['name']} ({url}): {e}")
+                    continue
         
         # Если все API не сработали, используем резервные факты
         if category in BACKUP_FACTS:
@@ -314,6 +264,14 @@ async def get_daily_fact(category: str) -> str:
     
     # Факт по умолчанию
     return "Сегодняшний факт временно недоступен. Попробуйте позже!"
+
+
+async def get_daily_fact(category: str) -> str:
+    """Асинхронная обертка для получения факта дня"""
+    # Используем синхронную версию в отдельном потоке
+    import asyncio
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, get_daily_fact_sync, category)
 
 
 async def send_daily_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1069,7 +1027,7 @@ async def test_fact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Получаем тестовый факт
-    category = "Наука"  # Можно изменить на другую категорию для теста
+    category = random.choice(list(FACT_CATEGORIES.keys()))
     fact = await get_daily_fact(category)
     
     # Форматируем сообщение
@@ -1648,7 +1606,7 @@ def main() -> None:
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d}")
         logger.info(f"📊 Факты дня: ежедневно в {FACTS_TIME['hour']:02d}:{FACTS_TIME['minute']:02d}")
         logger.info(f"📚 Категории фактов: {', '.join(FACT_CATEGORIES.keys())}")
-        logger.info(f"🌐 Используемые API: Useless Facts, Wikipedia, Numbers API, Movie Quotes, Genrenator, GamerPower")
+        logger.info(f"🌐 Используемые API: Useless Facts, Numbers API, Movie Quotes, Genrenator, GamerPower")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
