@@ -8,6 +8,7 @@ from functools import wraps
 import pytz
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -30,6 +31,7 @@ SELECTING_REASON, SELECTING_DATE, CONFIRMING_DATE = range(3)
 
 # Конфигурация
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Токен бота из переменных окружения
+ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", "https://us04web.zoom.us/j/1234567890?pwd=example")  # Ссылка на Zoom
 CONFIG_FILE = "bot_config.json"  # Файл для хранения настроек
 
 # Время планёрки (9:15 по Москве)
@@ -64,9 +66,11 @@ def restricted(func):
     return wrapped
 
 
-def get_greeting_by_meeting_day():
-    """Специальные приветствия для дней планёрок"""
+def get_greeting_by_meeting_day() -> str:
+    """Специальные приветствия для дней планёрок со ссылкой на Zoom"""
     weekday = datetime.now(TIMEZONE).weekday()
+    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    current_day = day_names_ru[weekday]
     
     # Только для дней планёрок (пн/ср/пт)
     if weekday in MEETING_DAYS:
@@ -76,46 +80,48 @@ def get_greeting_by_meeting_day():
             4: "ПЯТНИЦА"
         }
         
-        # Варианты напоминания о календаре
-        calendar_reminders = [
-            "\n\n📅 *Ссылка на Zoom:* в календарном приглашении в почте",
-            "\n\n💌 *Присоединиться:* ссылка в календарном приглашении",
-            "\n\n👨💻 *Подключиться:* подробности в рабочем календаре в почте",
-            "\n\n🔗 *Zoom-ссылка:* как всегда, в календарном приглашении",
-            "\n\n📧 *Для подключения:* проверьте календарное приглашение в почте",
-            "\n\n🗓️ *Детали встречи:* в календарном приглашении у вас в почте",
-            "\n\n📨 *Ссылка на звонок:* как обычно, в календарном приглашении",
-            "\n\n✉️ *Подробности:* в приглашении в рабочем календаре",
+        # Форматируем ссылку на Zoom для HTML
+        zoom_link_formatted = f'<a href="{ZOOM_LINK}">Присоединиться к Zoom</a>'
+        
+        # Формулировки с новой ссылкой
+        zoom_notes = [
+            f"\n\n🎥 {zoom_link_formatted} | Присоединяйтесь к встрече",
+            f"\n\n👨‍💻 {zoom_link_formatted} | Нажмите для подключения",
+            f"\n\n💻 {zoom_link_formatted} | Перейдите по ссылке",
+            f"\n\n🔗 {zoom_link_formatted} | Подключиться к звонку",
+            f"\n\n📅 {zoom_link_formatted} | Переход на встречу",
+            f"\n\n✉️ {zoom_link_formatted} | Встреча доступна по ссылке",
+            f"\n\n🎯 {zoom_link_formatted} | Присоединяйтесь по ссылке",
+            f"\n\n🤝 {zoom_link_formatted} | Ждём всех на встрече",
+            f"\n\n🚀 {zoom_link_formatted} | Заходите на звонок",
+            f"\n\n⚡ {zoom_link_formatted} | Быстрый доступ к встрече",
         ]
         
-        calendar_note = random.choice(calendar_reminders)
+        zoom_note = random.choice(zoom_notes)
         
         greetings = {
             0: [
-                f"🚀 **{day_names[0]}** - старт новой недели!\n\n📋 Планёрка в 9:15 по МСК.\nДавайте обсудим планы на неделю! 🌟{calendar_note}",
-                f"🌞 Доброе утро! Сегодня **{day_names[0]}**!\n\n🤝 Планёрка в 9:15 по МСК.\nНачинаем неделю продуктивно! 💪{calendar_note}",
-                f"⚡ **{day_names[0]}**, время действовать!\n\n🎯 Утренняя планёрка в 9:15 по МСК.\nГотовьте вопросы и обновления! 📊{calendar_note}"
+                f"🚀 <b>{day_names[0]}</b> - старт новой недели!\n\n📋 <i>Планёрка в 9:15 по МСК</i>.\nДавайте обсудим планы на неделю! 🌟{zoom_note}",
+                f"🌞 Доброе утро! Сегодня <b>{day_names[0]}</b>!\n\n🤝 <i>Планёрка в 9:15 по МСК</i>.\nНачинаем неделю продуктивно! 💪{zoom_note}",
+                f"⚡ <b>{day_names[0]}</b>, время действовать!\n\n🎯 <i>Утренняя планёрка в 9:15 по МСК</i>.\nГотовьте вопросы и обновления! 📊{zoom_note}"
             ],
             2: [
-                f"⚡ **{day_names[2]}** - середина недели!\n\n📋 Планёрка в 9:15 по МСК.\nВремя для корректировок и обновлений! 🔄{calendar_note}",
-                f"🌞 **{day_names[2]}**, доброе утро!\n\n🤝 Планёрка в 9:15 по МСК.\nКак продвигаются задачи? 📈{calendar_note}",
-                f"💪 **{day_names[2]}** - день прорыва!\n\n🎯 Планёрка в 9:15 по МСК.\nДелитесь прогрессом! 🚀{calendar_note}"
+                f"⚡ <b>{day_names[2]}</b> - середина недели!\n\n📋 <i>Планёрка в 9:15 по МСК</i>.\nВремя для корректировок и обновлений! 🔄{zoom_note}",
+                f"🌞 <b>{day_names[2]}</b>, доброе утро!\n\n🤝 <i>Планёрка в 9:15 по МСК</i>.\nКак продвигаются задачи? 📈{zoom_note}",
+                f"💪 <b>{day_names[2]}</b> - день прорыва!\n\n🎯 <i>Планёрка в 9:15 по МСК</i>.\nДелитесь прогрессом! 🚀{zoom_note}"
             ],
             4: [
-                f"🎉 **{day_names[4]}** - завершаем неделю!\n\n📋 Планёрка в 9:15 по МСК.\nДавайте подведем итоги недели! 🏆{calendar_note}",
-                f"🌞 Пятничное утро! 🎊\n\n🤝 **{day_names[4]}**, планёрка в 9:15 по МСК.\nГотовьте отчеты о неделе! 📊{calendar_note}",
-                f"✨ **{day_names[4]}** - время подводить итоги!\n\n🎯 Планёрка в 9:15 по МСК.\nЧто успели за неделю? 📈{calendar_note}"
+                f"🎉 <b>{day_names[4]}</b> - завершаем неделю!\n\n📋 <i>Планёрка в 9:15 по МСК</i>.\nДавайте подведем итоги недели! 🏆{zoom_note}",
+                f"🌞 Пятничное утро! 🎊\n\n🤝 <b>{day_names[4]}</b>, <i>планёрка в 9:15 по МСК</i>.\nГотовьте отчеты о неделе! 📊{zoom_note}",
+                f"✨ <b>{day_names[4]}</b> - время подводить итоги!\n\n🎯 <i>Планёрка в 9:15 по МСК</i>.\nЧто успели за неделю? 📈{zoom_note}"
             ]
         }
         
         return random.choice(greetings[weekday])
     else:
         # Если почему-то напоминание отправлено не в день планёрки
-        calendar_reminders = [
-            "\n\n📅 *Ссылка на Zoom:* в календарном приглашении в почте",
-            "\n\n💌 *Присоединиться:* ссылка в календарном приглашении",
-        ]
-        return f"👋 Доброе утро!\n\n📋 Напоминаю о планёрке в 9:15 по МСК.\nПрисоединяйтесь к звонку! 🤝{random.choice(calendar_reminders)}"
+        zoom_link_formatted = f'<a href="{ZOOM_LINK}">Присоединиться к Zoom</a>'
+        return f"👋 Доброе утро! Сегодня <i>{current_day}</i>.\n\n📋 <i>Напоминаю о планёрке в 9:15 по МСК</i>.\nПрисоединяйтесь к звонку! 🤝\n\n🎥 {zoom_link_formatted} | Присоединяйтесь к встрече"
 
 
 class BotConfig:
@@ -235,7 +241,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Используем наше улучшенное приветствие
+    # Используем наше улучшенное приветствие с Zoom-ссылкой
     message_text = get_greeting_by_meeting_day()
 
     try:
@@ -243,7 +249,8 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=chat_id,
             text=message_text,
             reply_markup=reply_markup,
-            parse_mode="Markdown"
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=False  # Показываем превью для Zoom-ссылки
         )
 
         # Сохраняем информацию о напоминании
@@ -284,7 +291,21 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     
-    reason_index = int(query.data.split("_")[1])
+    # Добавляем проверку на корректность данных
+    if not query.data or not query.data.startswith("reason_"):
+        logger.warning(f"Некорректный callback data: {query.data}")
+        await query.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
+        return ConversationHandler.END
+    
+    try:
+        reason_index = int(query.data.split("_")[1])
+        if reason_index < 0 or reason_index >= len(CANCELLATION_OPTIONS):
+            raise ValueError("Некорректный индекс причины")
+    except (ValueError, IndexError) as e:
+        logger.warning(f"Ошибка парсинга callback data: {e}, data: {query.data}")
+        await query.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
+        return ConversationHandler.END
+    
     reason = CANCELLATION_OPTIONS[reason_index]
     
     # Сохраняем выбранную причину
@@ -343,9 +364,9 @@ async def show_date_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await query.edit_message_text(
         text="📅 Выберите дату для переноса планёрки:\n\n"
-             "*Ближайшие дни планёрок (Пн/Ср/Пт):*",
+             "<b>Ближайшие дни планёрок (Пн/Ср/Пт):</b>",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+        parse_mode=ParseMode.HTML
     )
     
     return SELECTING_DATE
@@ -360,9 +381,9 @@ async def date_selected_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(
             text="✏️ Введите дату в формате ДД.ММ.ГГГГ\n"
                  "Например: 15.12.2024\n\n"
-                 "*Важно:* выбирайте только дни планёрок (понедельник, среда, пятница)\n\n"
+                 "<b>Важно:</b> выбирайте только дни планёрок (понедельник, среда, пятница)\n\n"
                  "Или отправьте 'отмена' для возврата.",
-            parse_mode="Markdown"
+            parse_mode=ParseMode.HTML
         )
         return CONFIRMING_DATE
     
@@ -379,15 +400,20 @@ async def date_selected_callback(update: Update, context: ContextTypes.DEFAULT_T
         return SELECTING_REASON
     
     # Обработка выбранной даты
-    selected_date_str = query.data.split("_")[1]
-    selected_date = datetime.strptime(selected_date_str, "%Y-%m-%d")
-    
-    # Сохраняем выбранную дату
-    context.user_data["selected_date"] = selected_date_str
-    context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
-    
-    # Переходим к подтверждению
-    return await confirm_cancellation(update, context)
+    try:
+        selected_date_str = query.data.split("_")[1]
+        selected_date = datetime.strptime(selected_date_str, "%Y-%m-%d")
+        
+        # Сохраняем выбранную дату
+        context.user_data["selected_date"] = selected_date_str
+        context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
+        
+        # Переходим к подтверждению
+        return await show_confirmation(update, context)
+    except (IndexError, ValueError) as e:
+        logger.error(f"Ошибка обработки выбора даты: {e}, data: {query.data}")
+        await query.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
+        return ConversationHandler.END
 
 
 async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -445,7 +471,7 @@ async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
         
         # Переходим к подтверждению
-        return await show_confirmation(update, context)
+        return await show_confirmation_text(update, context)
         
     except ValueError as e:
         await update.message.reply_text(
@@ -456,41 +482,67 @@ async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return CONFIRMING_DATE
 
 
-async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Показать подтверждение отмены"""
+async def show_confirmation_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показать подтверждение отмены для текстового ввода"""
     reason = context.user_data.get("selected_reason", "")
     selected_date = context.user_data.get("selected_date_display", "")
     
-    message = f"📋 *Подтверждение отмены планёрки:*\n\n"
+    message = f"📋 <b>Подтверждение отмены планёрки:</b>\n\n"
     
     if "Перенесём" in reason:
-        message += f"❌ *Отмена сегодняшней планёрки*\n"
-        message += f"📅 *Перенос на {selected_date}*\n\n"
-        message += "*Подтвердить отмену?*"
+        message += f"❌ <b>Отмена сегодняшней планёрки</b>\n"
+        message += f"📅 <b>Перенос на {selected_date}</b>\n\n"
+        message += "<b>Подтвердить отмену?</b>"
     else:
-        message += f"❌ *Отмена планёрки*\n"
-        message += f"📝 *Причина:* {reason}\n\n"
-        message += "*Подтвердить отмену?*"
+        message += f"❌ <b>Отмена планёрки</b>\n"
+        message += f"📝 <b>Причина:</b> {reason}\n\n"
+        message += "<b>Подтвердить отмену?</b>"
     
     keyboard = [
         [
             InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
-            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons")
+            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
         ]
     ]
     
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text=message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
+    await update.message.reply_text(
+        text=message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+    
+    return CONFIRMING_DATE
+
+
+async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показать подтверждение отмены для callback"""
+    query = update.callback_query
+    reason = context.user_data.get("selected_reason", "")
+    selected_date = context.user_data.get("selected_date_display", "")
+    
+    message = f"📋 <b>Подтверждение отмены планёрки:</b>\n\n"
+    
+    if "Перенесём" in reason:
+        message += f"❌ <b>Отмена сегодняшней планёрки</b>\n"
+        message += f"📅 <b>Перенос на {selected_date}</b>\n\n"
+        message += "<b>Подтвердить отмену?</b>"
     else:
-        await update.message.reply_text(
-            text=message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
+        message += f"❌ <b>Отмена планёрки</b>\n"
+        message += f"📝 <b>Причина:</b> {reason}\n\n"
+        message += "<b>Подтвердить отмену?</b>"
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
+            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
+        ]
+    ]
+    
+    await query.edit_message_text(
+        text=message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
     
     return CONFIRMING_DATE
 
@@ -500,44 +552,66 @@ async def confirm_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
     return await show_confirmation(update, context)
 
 
+async def back_to_reasons_from_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Вернуться к выбору причины из подтверждения"""
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = [
+        [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
+        for i, option in enumerate(CANCELLATION_OPTIONS)
+    ]
+    
+    await query.edit_message_text(
+        text="📝 Выберите причину отмены планёрки:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    return SELECTING_REASON
+
+
 async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Выполнить отмену планёрки"""
     query = update.callback_query
     await query.answer()
     
     config = BotConfig()
-    reason = context.user_data.get("selected_reason", "")
+    reason = context.user_data.get("selected_reason", "Причина не указана")
     reason_index = context.user_data.get("reason_index", -1)
-    username = query.from_user.username
+    username = query.from_user.username or "Неизвестный пользователь"
     
     # Формируем финальное сообщение
     if reason_index == 2:  # "Перенесём на другой день"
-        selected_date = context.user_data.get("selected_date_display", "")
-        final_message = f"❌ @{username} отменил сегодняшнюю планёрку\n\n📅 *Перенос на {selected_date}*"
+        selected_date = context.user_data.get("selected_date_display", "дата не указана")
+        final_message = f"❌ @{username} отменил сегодняшнюю планёрку\n\n📅 <b>Перенос на {selected_date}</b>"
     else:
-        final_message = f"❌ @{username} отменил планёрку\n\n📝 *Причина:* {reason}"
+        final_message = f"❌ @{username} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
     
     # Удаляем задание из планировщика
     original_message_id = context.user_data.get("original_message_id")
     job_name_to_remove = None
     
-    for job_name, reminder_data in config.active_reminders.items():
-        if reminder_data.get("message_id") == original_message_id:
-            # Ищем задание в планировщике
-            for job in context.application.job_queue.jobs():
-                if job.name == job_name:
+    # Ищем и удаляем соответствующие задания
+    if original_message_id:
+        # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
+        for job in context.application.job_queue.get_jobs():
+            if job.name in config.active_reminders:
+                reminder_data = config.active_reminders[job.name]
+                if str(reminder_data.get("message_id")) == str(original_message_id):
                     job.schedule_removal()
-                    job_name_to_remove = job_name
+                    job_name_to_remove = job.name
+                    logger.info(f"Задание {job.name} удалено из планировщика")
                     break
-    
-    # Удаляем из конфига
-    if job_name_to_remove:
-        config.remove_active_reminder(job_name_to_remove)
+        
+        # Удаляем из конфига
+        if job_name_to_remove:
+            config.remove_active_reminder(job_name_to_remove)
+            logger.info(f"Задание {job_name_to_remove} удалено из конфига")
     
     # Отправляем финальное сообщение
     await query.edit_message_text(
         text=final_message,
-        parse_mode="Markdown"
+        parse_mode=ParseMode.HTML
     )
     
     logger.info(f"Планёрка отменена @{username} — {reason}")
@@ -550,7 +624,12 @@ async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Отмена диалога"""
-    await update.message.reply_text("❌ Диалог отменен.")
+    if update.message:
+        await update.message.reply_text("❌ Диалог отменен.")
+    elif update.callback_query:
+        await update.callback_query.answer("Диалог отменен", show_alert=True)
+        await update.callback_query.edit_message_text("❌ Диалог отменен.")
+    
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -558,22 +637,22 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /start"""
     await update.message.reply_text(
-        "🤖 *Бот для напоминаний о планёрке активен!*\n\n"
-        f"📅 *Напоминания отправляются:*\n"
+        "🤖 <b>Бот для напоминаний о планёрке активен!</b>\n\n"
+        f"📅 <b>Напоминания отправляются:</b>\n"
         f"• Понедельник\n• Среда\n• Пятница\n"
-        f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
-        "🔧 *Доступные команды:*\n"
+        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
+        "🔧 <b>Доступные команды:</b>\n"
         "/info - информация о боте\n"
         "/jobs - список запланированных задач\n"
         "/test - тестовое напоминание (через 5 сек)\n"
         "/testnow - мгновенное тестовое напоминание\n\n"
-        "👮♂️ *Команды для администраторов:*\n"
+        "👮‍♂️ <b>Команды для администраторов:</b>\n"
         "/setchat - установить чат для уведомлений\n"
         "/adduser @username - добавить пользователя\n"
         "/removeuser @username - удалить пользователя\n"
         "/users - список пользователей\n"
         "/cancelall - отменить все напоминания",
-        parse_mode="Markdown"
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -587,10 +666,10 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config.chat_id = chat_id
 
     await update.message.reply_text(
-        f"✅ *Чат установлен:* {chat_title}\n"
-        f"*Chat ID:* {chat_id}\n\n"
+        f"✅ <b>Чат установлен:</b> {chat_title}\n"
+        f"<b>Chat ID:</b> {chat_id}\n\n"
         "Напоминания будут отправляться в этот чат.",
-        parse_mode="Markdown"
+        parse_mode=ParseMode.HTML
     )
 
     logger.info(f"Установлен чат {chat_title} ({chat_id})")
@@ -603,17 +682,19 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = config.chat_id
 
     if chat_id:
-        status = f"✅ *Чат установлен* (ID: {chat_id})"
+        status = f"✅ <b>Чат установлен</b> (ID: {chat_id})"
     else:
-        status = "❌ *Чат не установлен*. Используйте /setchat"
+        status = "❌ <b>Чат не установлен</b>. Используйте /setchat"
 
     # Подсчет запланированных задач
-    job_count = len([j for j in context.application.job_queue.jobs() 
+    # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
+    all_jobs = context.application.job_queue.get_jobs()
+    job_count = len([j for j in all_jobs 
                     if j.name and j.name.startswith("meeting_reminder_")])
     
     # Следующее напоминание
     next_job = None
-    for job in context.application.job_queue.jobs():
+    for job in all_jobs:
         if job.name and job.name.startswith("meeting_reminder_"):
             if not next_job or job.next_t < next_job.next_t:
                 next_job = job
@@ -628,19 +709,23 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if next_day.weekday() in MEETING_DAYS:
             upcoming_meetings.append(next_day.strftime("%d.%m.%Y"))
 
+    # Показываем текущую Zoom-ссылку (без полного URL)
+    zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != 'https://us04web.zoom.us/j/1234567890?pwd=example' else 'не установлена ⚠️ (используйте переменную ZOOM_MEETING_LINK)'}"
+
     await update.message.reply_text(
-        f"📊 *Информация о боте:*\n\n"
+        f"📊 <b>Информация о боте:</b>\n\n"
         f"{status}\n"
-        f"📅 *Дни планёрок:* понедельник, среда, пятница\n"
-        f"⏰ *Время:* {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"👥 *Разрешённые пользователи:* {len(config.allowed_users)}\n"
-        f"📋 *Активные напоминания:* {len(config.active_reminders)}\n"
-        f"⏳ *Запланировано задач:* {job_count}\n"
-        f"➡️ *Следующее напоминание:* {next_time}\n"
-        f"📈 *Ближайшие планёрки:* {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}\n\n"
+        f"📅 <b>Дни планёрок:</b> понедельник, среда, пятница\n"
+        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
+        f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
+        f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
+        f"⏳ <b>Запланировано задач:</b> {job_count}\n"
+        f"➡️ <b>Следующее напоминание:</b> {next_time}\n"
+        f"📈 <b>Ближайшие планёрки:</b> {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}"
+        f"{zoom_info}\n\n"
         f"Используйте /users для списка пользователей\n"
         f"Используйте /jobs для списка задач",
-        parse_mode="Markdown"
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -652,6 +737,7 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
         return
 
+    # Создаем задачу, которая вызовет send_reminder через 5 секунд
     context.application.job_queue.run_once(
         send_reminder, 
         5, 
@@ -659,7 +745,42 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         name=f"test_reminder_{datetime.now().timestamp()}"
     )
 
-    await update.message.reply_text("⏳ *Тестовое напоминание будет отправлено через 5 секунд...*", parse_mode="Markdown")
+    # Получаем информацию о текущем дне
+    weekday = datetime.now(TIMEZONE).weekday()
+    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    current_day = day_names_ru[weekday]
+    
+    # Проверяем, является ли сегодня день планёрки
+    if weekday in MEETING_DAYS:
+        day_type = "день планёрки ✅"
+        day_emoji = "📋"
+    else:
+        day_type = "не день планёрки ⚠️"
+        day_emoji = "⏸️"
+    
+    # Форматируем Zoom-ссылку для предпросмотра
+    zoom_preview = ZOOM_LINK[:50] + "..." if len(ZOOM_LINK) > 50 else ZOOM_LINK
+    zoom_status = "установлена ✅" if ZOOM_LINK and ZOOM_LINK != "https://us04web.zoom.us/j/1234567890?pwd=example" else "не установлена ⚠️"
+    
+    # Показываем пример сообщения
+    example_text = get_greeting_by_meeting_day()
+    example_preview = example_text[:200] + "..." if len(example_text) > 200 else example_text
+    
+    await update.message.reply_text(
+        f"⏳ <b>Тестовое напоминание будет отправлено через 5 секунд...</b>\n\n"
+        f"{day_emoji} <b>Сегодня:</b> {current_day} ({day_type})\n"
+        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
+        f"🎥 <b>Zoom-ссылка:</b> {zoom_status}\n"
+        f"🔗 <b>Предпросмотр:</b> {zoom_preview}\n\n"
+        f"<b>Пример сообщения:</b>\n"
+        f"<code>{example_preview}</code>\n\n"
+        f"<b>Сообщение будет содержать:</b>\n"
+        f"• Приветствие для {current_day.lower()}\n"
+        f"• Время планёрки\n"
+        f"• Кликабельную ссылку 'Присоединиться к Zoom'\n"
+        f"• Кнопку для отмены планёрки",
+        parse_mode=ParseMode.HTML
+    )
 
 
 @restricted
@@ -670,7 +791,24 @@ async def test_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
         return
 
-    await update.message.reply_text("🚀 *Отправляю тестовое напоминание прямо сейчас...*", parse_mode="Markdown")
+    # Получаем информацию о текущем дне
+    weekday = datetime.now(TIMEZONE).weekday()
+    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    current_day = day_names_ru[weekday]
+    
+    # Проверяем, является ли сегодня день планёрки
+    if weekday in MEETING_DAYS:
+        day_type = "день планёрки ✅"
+    else:
+        day_type = "не день планёрки ⚠️"
+    
+    await update.message.reply_text(
+        f"🚀 <b>Отправляю тестовое напоминание прямо сейчас...</b>\n\n"
+        f"📅 <b>Сегодня:</b> {current_day} ({day_type})\n"
+        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
+        f"<b>Ссылка в сообщении:</b> <a href=\"{ZOOM_LINK}\">Присоединиться к Zoom</a>",
+        parse_mode=ParseMode.HTML
+    )
     
     # Создаем контекст для отправки
     class DummyJob:
@@ -687,65 +825,66 @@ async def test_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @restricted
 async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показать список запланированных задач"""
-    jobs = context.application.job_queue.jobs()
+    # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
+    jobs = context.application.job_queue.get_jobs()
     
     if not jobs:
-        await update.message.reply_text("📭 *Нет запланированных задач.*", parse_mode="Markdown")
+        await update.message.reply_text("📭 <b>Нет запланированных задач.</b>", parse_mode=ParseMode.HTML)
         return
     
     meeting_jobs = [j for j in jobs if j.name and j.name.startswith("meeting_reminder_")]
     other_jobs = [j for j in jobs if j not in meeting_jobs]
     
-    message = "📋 *Запланированные задачи:*\n\n"
+    message = "📋 <b>Запланированные задачи:</b>\n\n"
     
     if meeting_jobs:
-        message += "🔔 *Напоминания о планёрках:*\n"
+        message += "🔔 <b>Напоминания о планёрках:</b>\n"
         for job in sorted(meeting_jobs, key=lambda j: j.next_t):
             next_time = job.next_t.astimezone(TIMEZONE)
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name})\n"
     
     if other_jobs:
-        message += "\n🔧 *Другие задачи:*\n"
+        message += "\n🔧 <b>Другие задачи:</b>\n"
         for job in other_jobs:
             next_time = job.next_t.astimezone(TIMEZONE)
             job_name = job.name or "Без имени"
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job_name})\n"
     
-    await update.message.reply_text(message, parse_mode="Markdown")
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
 
 @restricted
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Добавить пользователя в список разрешенных"""
     if not context.args:
-        await update.message.reply_text("❌ *Используйте:* /adduser @username", parse_mode="Markdown")
+        await update.message.reply_text("❌ <b>Используйте:</b> /adduser @username", parse_mode=ParseMode.HTML)
         return
     
     username = context.args[0].lstrip('@')
     config = BotConfig()
     
     if config.add_allowed_user(username):
-        await update.message.reply_text(f"✅ *Пользователь @{username} добавлен*", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ <b>Пользователь @{username} добавлен</b>", parse_mode=ParseMode.HTML)
         logger.info(f"Добавлен пользователь @{username}")
     else:
-        await update.message.reply_text(f"ℹ️ *Пользователь @{username} уже есть в списке*", parse_mode="Markdown")
+        await update.message.reply_text(f"ℹ️ <b>Пользователь @{username} уже есть в списке</b>", parse_mode=ParseMode.HTML)
 
 
 @restricted
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Удалить пользователя из списка разрешенных"""
     if not context.args:
-        await update.message.reply_text("❌ *Используйте:* /removeuser @username", parse_mode="Markdown")
+        await update.message.reply_text("❌ <b>Используйте:</b> /removeuser @username", parse_mode=ParseMode.HTML)
         return
     
     username = context.args[0].lstrip('@')
     config = BotConfig()
     
     if config.remove_allowed_user(username):
-        await update.message.reply_text(f"✅ *Пользователь @{username} удален*", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ <b>Пользователь @{username} удален</b>", parse_mode=ParseMode.HTML)
         logger.info(f"Удален пользователь @{username}")
     else:
-        await update.message.reply_text(f"❌ *Пользователь @{username} не найден*", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ <b>Пользователь @{username} не найден</b>", parse_mode=ParseMode.HTML)
 
 
 @restricted
@@ -755,21 +894,22 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     users = config.allowed_users
     
     if not users:
-        await update.message.reply_text("📭 *Список пользователей пуст*", parse_mode="Markdown")
+        await update.message.reply_text("📭 <b>Список пользователей пуст</b>", parse_mode=ParseMode.HTML)
         return
     
-    message = "👥 *Разрешенные пользователи:*\n\n"
+    message = "👥 <b>Разрешенные пользователи:</b>\n\n"
     for i, user in enumerate(users, 1):
         message += f"{i}. @{user}\n"
     
-    message += f"\n*Всего:* {len(users)} пользователь(ей)"
-    await update.message.reply_text(message, parse_mode="Markdown")
+    message += f"\n<b>Всего:</b> {len(users)} пользователь(ей)"
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
 
 @restricted
 async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отменить все запланированные напоминания"""
-    jobs = context.application.job_queue.jobs()
+    # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
+    jobs = context.application.job_queue.get_jobs()
     canceled_count = 0
     
     for job in jobs[:]:  # Копируем список для безопасного удаления
@@ -782,9 +922,9 @@ async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     config.clear_active_reminders()
     
     await update.message.reply_text(
-        f"✅ *Отменено {canceled_count} напоминаний(я)*\n"
+        f"✅ <b>Отменено {canceled_count} напоминаний(я)</b>\n"
         f"Очищено {len(config.active_reminders)} активных напоминаний в конфиге",
-        parse_mode="Markdown"
+        parse_mode=ParseMode.HTML
     )
     logger.info(f"Отменено {canceled_count} напоминаний")
 
@@ -839,7 +979,8 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         job_name = f"meeting_reminder_{next_time.strftime('%Y%m%d_%H%M')}"
         
         # Проверяем, нет ли уже такой задачи
-        existing_jobs = [j for j in context.application.job_queue.jobs() 
+        # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
+        existing_jobs = [j for j in context.application.job_queue.get_jobs() 
                         if j.name == job_name]
         
         if not existing_jobs:
@@ -865,10 +1006,12 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def cleanup_old_jobs(job_queue: JobQueue) -> None:
     """Очистка старых и дублирующих задач"""
+    # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
+    jobs = job_queue.get_jobs()
     jobs_by_name = {}
     jobs_to_remove = []
     
-    for job in job_queue.jobs():
+    for job in jobs:
         if job.name:
             if job.name in jobs_by_name:
                 # Дубликат - удаляем старую задачу
@@ -877,7 +1020,7 @@ def cleanup_old_jobs(job_queue: JobQueue) -> None:
     
     # Удаляем просроченные задачи
     now = datetime.now(TIMEZONE)
-    for job in job_queue.jobs():
+    for job in jobs:
         if job.next_t and job.next_t < now:
             jobs_to_remove.append(job)
     
@@ -914,6 +1057,14 @@ def main() -> None:
     if not TOKEN:
         logger.error("❌ Токен бота не найден! Установите переменную окружения TELEGRAM_BOT_TOKEN")
         return
+    
+    # Проверяем наличие Zoom-ссылки
+    if not ZOOM_LINK or ZOOM_LINK == "https://us04web.zoom.us/j/1234567890?pwd=example":
+        logger.warning("⚠️  Zoom-ссылка не установлена или используется значение по умолчанию!")
+        logger.warning("   Установите переменную окружения ZOOM_MEETING_LINK")
+        logger.warning("   Пример: export ZOOM_MEETING_LINK='https://zoom.us/j/your-meeting-id?pwd=your-password'")
+    else:
+        logger.info(f"✅ Zoom-ссылка загружена (первые 50 символов): {ZOOM_LINK[:50]}...")
 
     try:
         application = Application.builder().token(TOKEN).build()
@@ -933,13 +1084,14 @@ def main() -> None:
                 CONFIRMING_DATE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_date),
                     CallbackQueryHandler(execute_cancellation, pattern="^confirm_cancel$"),
-                    CallbackQueryHandler(cancel_meeting_callback, pattern="^back_to_reasons$"),
+                    CallbackQueryHandler(back_to_reasons_from_confirm, pattern="^back_to_reasons_from_confirm$"),
                 ],
             },
             fallbacks=[
                 CommandHandler("cancel", cancel_conversation),
-                CallbackQueryHandler(cancel_conversation, pattern="^cancel$"),
+                CallbackQueryHandler(cancel_conversation, pattern="^cancel_conversation$"),
             ],
+            allow_reentry=True,
         )
 
         # Обработчики команд
@@ -971,6 +1123,7 @@ def main() -> None:
 
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d}")
+        logger.info(f"🔗 Текст ссылки: 'Присоединиться к Zoom'")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
