@@ -48,6 +48,17 @@ CANCELLATION_OPTIONS = [
     "Перенесём на другой день",
 ]
 
+# Вспомогательная функция для совместимости версий PTB
+def get_jobs(job_queue: JobQueue):
+    """Получить список задач с поддержкой разных версий PTB"""
+    try:
+        # Пробуем новый метод (PTB >= 20)
+        return job_queue.get_jobs()
+    except AttributeError:
+        # Используем старый метод (PTB < 20)
+        return job_queue.jobs()
+
+
 # Декоратор для проверки прав пользователя
 def restricted(func):
     @wraps(func)
@@ -593,8 +604,8 @@ async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Ищем и удаляем соответствующие задания
     if original_message_id:
-        # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
-        for job in context.application.job_queue.get_jobs():
+        # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
+        for job in get_jobs(context.application.job_queue):
             if job.name in config.active_reminders:
                 reminder_data = config.active_reminders[job.name]
                 if str(reminder_data.get("message_id")) == str(original_message_id):
@@ -687,8 +698,8 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         status = "❌ <b>Чат не установлен</b>. Используйте /setchat"
 
     # Подсчет запланированных задач
-    # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
-    all_jobs = context.application.job_queue.get_jobs()
+    # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
+    all_jobs = get_jobs(context.application.job_queue)
     job_count = len([j for j in all_jobs 
                     if j.name and j.name.startswith("meeting_reminder_")])
     
@@ -709,7 +720,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if next_day.weekday() in MEETING_DAYS:
             upcoming_meetings.append(next_day.strftime("%d.%m.%Y"))
 
-    # Показываем текущую Zoom-ссылку (без полного URL)
+    # Показываем текущую Zoom-ссылка (без полного URL)
     zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != 'https://us04web.zoom.us/j/1234567890?pwd=example' else 'не установлена ⚠️ (используйте переменную ZOOM_MEETING_LINK)'}"
 
     await update.message.reply_text(
@@ -825,8 +836,8 @@ async def test_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @restricted
 async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показать список запланированных задач"""
-    # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
-    jobs = context.application.job_queue.get_jobs()
+    # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
+    jobs = get_jobs(context.application.job_queue)
     
     if not jobs:
         await update.message.reply_text("📭 <b>Нет запланированных задач.</b>", parse_mode=ParseMode.HTML)
@@ -908,8 +919,8 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 @restricted
 async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отменить все запланированные напоминания"""
-    # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
-    jobs = context.application.job_queue.get_jobs()
+    # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
+    jobs = get_jobs(context.application.job_queue)
     canceled_count = 0
     
     for job in jobs[:]:  # Копируем список для безопасного удаления
@@ -979,8 +990,8 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         job_name = f"meeting_reminder_{next_time.strftime('%Y%m%d_%H%M')}"
         
         # Проверяем, нет ли уже такой задачи
-        # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
-        existing_jobs = [j for j in context.application.job_queue.get_jobs() 
+        # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
+        existing_jobs = [j for j in get_jobs(context.application.job_queue) 
                         if j.name == job_name]
         
         if not existing_jobs:
@@ -1006,8 +1017,8 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def cleanup_old_jobs(job_queue: JobQueue) -> None:
     """Очистка старых и дублирующих задач"""
-    # ИСПРАВЛЕНО: Используем get_jobs() вместо jobs()
-    jobs = job_queue.get_jobs()
+    # ИСПРАВЛЕНО: Используем нашу вспомогательную функцию
+    jobs = get_jobs(job_queue)
     jobs_by_name = {}
     jobs_to_remove = []
     
