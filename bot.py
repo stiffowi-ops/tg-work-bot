@@ -331,7 +331,7 @@ class FactScheduler:
         fact, url, title = self.get_wikipedia_fact(category)
         
         # Форматируем сообщение
-        message = f"📚 *ИНТЕРЕСНЫЙ ФАКТ* • {category.upper()}\n\n"
+        message = f"📚 *СТАТЬЯ ДНЯ* • {category.upper()}\n\n"
         message += f"*{title}*\n\n"
         message += f"{fact}\n\n"
         
