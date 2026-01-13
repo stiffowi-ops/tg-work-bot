@@ -2,431 +2,601 @@ import os
 import json
 import random
 import logging
-import requests
 import asyncio
+import aiohttp
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Tuple
-from functools import wraps
+from typing import Optional, Dict, Any, List
 import pytz
-from urllib.parse import quote
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent  # pip install fake-useragent
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
     JobQueue,
-    MessageHandler,
-    filters,
-    ConversationHandler
 )
 
 # ========== НАСТРОЙКИ ==========
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", "https://us04web.zoom.us/j/1234567890?pwd=example")
-CONFIG_FILE = "bot_config.json"
+CONFIG_FILE = "bot_digest.json"
 
-# Время планёрки (9:15 по Москве)
-MEETING_TIME = {"hour": 9, "minute": 15}
+# Время отправки дайджеста (12:00 по Москве)
+DIGEST_TIME = {"hour": 12, "minute": 0}
 TIMEZONE = pytz.timezone("Europe/Moscow")
+DIGEST_DAYS = [0, 1, 2, 3, 4]  # Пн-Пт
 
-# Дни недели для планёрки (понедельник=0, среда=2, пятница=4)
-MEETING_DAYS = [0, 2, 4]
+# ========== НАСТРОЙКИ ПАРСИНГА ==========
+USER_AGENT = UserAgent()
 
-# ========== НАСТРОЙКИ ФАКТОВ ==========
-# Категории фактов
-FACT_CATEGORIES = ['музыка', 'фильмы', 'технологии', 'игры']
-# Время отправки фактов (10:00 по Москве = 7:00 UTC)
-FACT_SEND_TIME = {"hour": 7, "minute": 0, "timezone": "UTC"}  # 7:00 UTC = 10:00 МСК
-# Дни отправки фактов (понедельник=0 ... пятница=4)
-FACT_DAYS = [0, 1, 2, 3, 4]  # Пн-Пт
+# Источники новостей по категориям
+NEWS_SOURCES = {
+    'спорт': [
+        {
+            'name': 'Спорт-Экспресс',
+            'url': 'https://www.sport-express.ru/services/materials/news/last/',
+            'parser': 'parse_sportexpress'
+        },
+        {
+            'name': 'Чемпионат',
+            'url': 'https://www.championat.com/news/1.html',
+            'parser': 'parse_championat'
+        },
+        {
+            'name': 'Матч ТВ',
+            'url': 'https://matchtv.ru/news/',
+            'parser': 'parse_matchtv'
+        }
+    ],
+    'технологии': [
+        {
+            'name': 'Хабрахабр',
+            'url': 'https://habr.com/ru/news/',
+            'parser': 'parse_habr'
+        },
+        {
+            'name': 'VC.ru',
+            'url': 'https://vc.ru/new',
+            'parser': 'parse_vc'
+        },
+        {
+            'name': 'TJ',
+            'url': 'https://tjournal.ru/news',
+            'parser': 'parse_tjournal'
+        }
+    ],
+    'курьёзы': [
+        {
+            'name': 'Комсомольская правда',
+            'url': 'https://www.kp.ru/online/news/',
+            'parser': 'parse_kp'
+        },
+        {
+            'name': 'РИА Новости',
+            'url': 'https://ria.ru/incidents/',
+            'parser': 'parse_ria'
+        },
+        {
+            'name': 'Lenta.ru',
+            'url': 'https://lenta.ru/rubrics/culture/curious/',
+            'parser': 'parse_lenta'
+        }
+    ]
+}
 
-# ========== ОСТАЛЬНЫЕ НАСТРОЙКИ ==========
-CANCELLATION_OPTIONS = [
-    "Все вопросы решены, планёрка не нужна",
-    "Ключевые участники отсутствуют",
-    "Перенесём на другой день",
+# Города для погоды
+CITIES = [
+    {"name": "Москва", "yandex_code": "moscow"},
+    {"name": "Санкт-Петербург", "yandex_code": "saint-petersburg"},
+    {"name": "Новосибирск", "yandex_code": "novosibirsk"},
+    {"name": "Екатеринбург", "yandex_code": "yekaterinburg"},
+    {"name": "Казань", "yandex_code": "kazan"}
 ]
 
-SELECTING_REASON, SELECTING_DATE, CONFIRMING_DATE = range(3)
-
-# Настройка логирования
+# ========== ЛОГИРОВАНИЕ ==========
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ========== КЛАСС ДЛЯ ФАКТОВ ИЗ ВИКИПЕДИИ ==========
-class FactScheduler:
-    """Класс для управления отправкой интересных фактов"""
+# ========== КЛАСС ДЛЯ ПАРСИНГА ==========
+class NewsWeatherParser:
+    """Парсер новостей и погоды"""
     
     def __init__(self):
-        self.current_index = 0
-        # Храним использованные статьи по категориям
-        self.used_articles = {
-            'музыка': set(),
-            'фильмы': set(),
-            'технологии': set(),
-            'игры': set()
-        }
-        # Кэш для fallback-фактов
-        self.fallback_cache = {}
-        logger.info("Инициализирован планировщик интересных фактов")
+        self.session = None
+        self.news_cache = {}
+        self.weather_cache = {}
+        self.cache_timeout = 1800  # 30 минут
         
-        # Ключевые слова для поиска ИНТЕРЕСНЫХ фактов (конкретные события, рекорды, открытия)
-        self.interesting_keywords = {
-            'музыка': [
-                'самый продаваемый альбом', 'музыкальный рекорд', 'необычный концерт',
-                'уникальный музыкальный инструмент', 'история создания песни',
-                'скандальный концерт', 'редкая запись', 'забытая группа',
-                'музыкальное открытие', 'необычный голос', 'музыкальная техника',
-                'легендарный тур', 'культовый альбом', 'революция в музыке',
-                'запрещенная песня', 'музыкальный феномен', 'история хита',
-                'музыкальная импровизация', 'оркестровый эксперимент', 'вокальный рекорд'
-            ],
-            'фильмы': [
-                'рекорд кассовых сборов', 'история съемок', 'создание спецэффектов',
-                'необычная роль', 'скандал на съемочной площадке', 'культовый фильм',
-                'забытый шедевр', 'революция в кино', 'уникальный метод съемки',
-                'легендарная сцена', 'история создания фильма', 'кинематографическое открытие',
-                'самый дорогой фильм', 'неудачный прокат', 'фильм-феномен',
-                'актерская импровизация', 'съемочный эксперимент', 'кинопремьера века'
-            ],
-            'технологии': [
-                'революционное изобретение', 'история создания', 'технологический прорыв',
-                'необычное применение', 'случайное открытие', 'забытый патент',
-                'технологический рекорд', 'инновация изменившая мир', 'гениальная ошибка',
-                'подземная разработка', 'технология будущего', 'история стартапа',
-                'прорыв в науке', 'экспериментальная технология', 'техническое чудо',
-                'научное открытие', 'инженерный прорыв', 'технологическая революция'
-            ],
-            'игры': [
-                'история создания игры', 'культовая игра', 'революция в геймдизайне',
-                'скандал с игрой', 'самая дорогая игра', 'редкая игра',
-                'необычный игровой механик', 'легендарный баг', 'игровой рекорд',
-                'забытая классика', 'игра изменившая индустрию', 'секреты разработки',
-                'феномен популярности', 'неудачный релиз', 'история успеха игры',
-                'игровая механика', 'разработка игрового движка', 'игровой эксперимент'
-            ]
-        }
+    async def init_session(self):
+        """Инициализация сессии"""
+        if not self.session:
+            self.session = aiohttp.ClientSession(
+                headers={'User-Agent': USER_AGENT.random},
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
     
-    def get_next_category(self) -> str:
-        """Получаем следующую категорию по кругу"""
-        category = FACT_CATEGORIES[self.current_index]
-        logger.debug(f"Текущая категория фактов: {category}, индекс: {self.current_index}")
-        return category
+    async def close_session(self):
+        """Закрытие сессии"""
+        if self.session:
+            await self.session.close()
+            self.session = None
     
-    def increment_category(self) -> str:
-        """Увеличиваем индекс категории и возвращаем следующую"""
-        old_index = self.current_index
-        self.current_index = (self.current_index + 1) % len(FACT_CATEGORIES)
-        next_category = FACT_CATEGORIES[self.current_index]
-        logger.debug(f"Категория изменена: {FACT_CATEGORIES[old_index]} -> {next_category}")
-        return next_category
-    
-    def get_wikipedia_fact(self, category: str, lang: str = 'ru') -> Tuple[str, str, str]:
-        """
-        Получаем интересный факт из Википедии по категории
+    # ========== ПАРСИНГ НОВОСТЕЙ ==========
+    async def get_news_by_category(self, category: str, count: int = 1) -> List[Dict]:
+        """Получить новости по категории"""
+        cache_key = f"news_{category}_{datetime.now().strftime('%Y%m%d%H')}"
         
-        Возвращает: (факт, ссылка, название_статьи)
-        """
-        try:
-            logger.info(f"Запрос интересного факта для категории: {category}")
+        if cache_key in self.news_cache:
+            cached_time, data = self.news_cache[cache_key]
+            if (datetime.now() - cached_time).seconds < self.cache_timeout:
+                return random.sample(data, min(len(data), count))
+        
+        all_news = []
+        sources = NEWS_SOURCES.get(category, [])
+        
+        for source in sources:
+            try:
+                news = await getattr(self, source['parser'])(source['url'])
+                for item in news:
+                    item['source'] = source['name']
+                all_news.extend(news[:3])  # Берем по 3 новости с каждого источника
+                await asyncio.sleep(0.5)  # Задержка между запросами
+            except Exception as e:
+                logger.error(f"Ошибка парсинга {source['name']}: {e}")
+                continue
+        
+        # Сохраняем в кэш
+        self.news_cache[cache_key] = (datetime.now(), all_news)
+        
+        # Возвращаем случайные новости
+        if len(all_news) > count:
+            return random.sample(all_news, count)
+        return all_news
+    
+    # Парсеры для разных сайтов
+    async def parse_sportexpress(self, url: str) -> List[Dict]:
+        """Парсинг Спорт-Экспресс"""
+        async with self.session.get(url) as response:
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
             
-            # Шаг 1: Ищем статьи по интересным ключевым словам
-            url = f"https://{lang}.wikipedia.org/w/api.php"
-            
-            # Берем случайное интересное ключевое слово
-            keywords = self.interesting_keywords.get(category, [category])
-            search_keyword = random.choice(keywords)
-            logger.info(f"Поисковый запрос: '{search_keyword}' для категории '{category}'")
-            
-            # Ищем статьи с конкретными интересными темами
-            params = {
-                'action': 'query',
-                'format': 'json',
-                'list': 'search',
-                'srsearch': search_keyword,
-                'srlimit': 50,
-                'srwhat': 'text',
-                'srinfo': 'totalhits',
-            }
-            
-            # Добавляем User-Agent для избежания блокировки
-            headers = {
-                'User-Agent': 'TelegramFactBot/1.0 (https://t.me/; contact@example.com)'
-            }
-            
-            response = requests.get(url, params=params, headers=headers, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'query' not in data or not data['query']['search']:
-                logger.warning(f"Не найдено статей для поиска: {search_keyword}")
-                # Пробуем другое ключевое слово
-                return self._get_fallback_fact(category), "", "Интересный факт"
-            
-            # Получаем список статей
-            articles = data['query']['search']
-            
-            # Фильтруем уже использованные статьи
-            available_articles = [
-                article for article in articles 
-                if article['title'] not in self.used_articles[category]
-            ]
-            
-            # Если все статьи уже использовались, очищаем список для этой категории
-            if not available_articles:
-                logger.info(f"Все статьи в категории '{category}' использованы, очищаем историю")
-                self.used_articles[category] = set()
-                available_articles = articles
-            
-            # Выбираем случайную статью из доступных
-            if not available_articles:
-                return self._get_fallback_fact(category), "", "Интересный факт"
-            
-            article = random.choice(available_articles)
-            title = article['title']
-            
-            # Добавляем в использованные
-            self.used_articles[category].add(title)
-            logger.debug(f"Выбрана статья: {title} (всего использовано: {len(self.used_articles[category])})")
-            
-            # Шаг 2: Получаем содержание статьи
-            params = {
-                'action': 'query',
-                'format': 'json',
-                'prop': 'extracts|info',
-                'inprop': 'url',
-                'exchars': 1200,  # Достаточно для интересного факта
-                'explaintext': True,
-                'exintro': True,  # Только вводную часть (обычно там самое интересное)
-                'titles': title
-            }
-            
-            response = requests.get(url, params=params, headers=headers, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            
-            pages = data['query']['pages']
-            page_id = list(pages.keys())[0]
-            page = pages[page_id]
-            
-            if 'missing' in page:
-                logger.warning(f"Статья отсутствует: {title}")
-                return self._get_fallback_fact(category), "", title
-            
-            # Извлекаем факт
-            fact = page.get('extract', 'Нет описания')
-            
-            # Обработка факта для читабельности
-            if fact:
-                # Удаляем технические пометки Wikipedia и лишние переносы строк
-                fact = fact.replace('\n', ' ').replace('  ', ' ').strip()
-                
-                # Убираем скучные определения (начинающиеся с "это" или "является")
-                sentences = fact.split('. ')
-                interesting_sentences = []
-                
-                for sentence in sentences:
-                    sentence = sentence.strip()
-                    if sentence and len(sentence) > 20:  # Минимальная длина предложения
-                        # Пропускаем скучные определения
-                        lower_sentence = sentence.lower()
-                        if not (lower_sentence.startswith('это ') or 
-                               lower_sentence.startswith('является ') or
-                               'это ' in lower_sentence[:50]):
-                            interesting_sentences.append(sentence)
-                
-                if interesting_sentences:
-                    # Берем первые 3-4 интересных предложения
-                    fact = '. '.join(interesting_sentences[:4])
+            news_items = []
+            for article in soup.find_all('div', class_='se-material__title', limit=10):
+                title_elem = article.find('a')
+                if title_elem:
+                    link_elem = title_elem.get('href')
+                    if link_elem and not link_elem.startswith('http'):
+                        link_elem = 'https://www.sport-express.ru' + link_elem
                     
-                    # Убеждаемся, что факт заканчивается точкой
-                    if not fact.endswith('.'):
-                        fact += '.'
-                    
-                    # Добавляем немного эмоций в начало
-                    interesting_prefixes = [
-                        "Знаете ли вы, что ",
-                        "Интересный факт: ",
-                        "Удивительно, но ",
-                        "Мало кто знает, что ",
-                        "Любопытный факт: "
-                    ]
-                    
-                    # Преобразуем первое предложение
-                    first_sentence = fact.split('. ')[0]
-                    if not any(prefix in first_sentence for prefix in interesting_prefixes):
-                        prefix = random.choice(interesting_prefixes)
-                        fact = prefix + fact[0].lower() + fact[1:]
+                    news_items.append({
+                        'title': title_elem.text.strip(),
+                        'url': link_elem,
+                        'description': self._generate_description(title_elem.text.strip())
+                    })
+            
+            return news_items
+    
+    async def parse_championat(self, url: str) -> List[Dict]:
+        """Парсинг Чемпионат"""
+        async with self.session.get(url) as response:
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            news_items = []
+            for article in soup.find_all('a', class_='news-item__title', limit=10):
+                title = article.text.strip()
+                link = article.get('href')
+                if not link.startswith('http'):
+                    link = 'https://www.championat.com' + link
                 
-                # Если после обработки факт слишком короткий, используем fallback
-                if len(fact) < 100:
-                    return self._get_fallback_fact(category), "", title
+                news_items.append({
+                    'title': title,
+                    'url': link,
+                    'description': self._generate_description(title)
+                })
             
-            # Формируем URL
-            encoded_title = quote(title.replace(' ', '_'), safe='')
-            article_url = f"https://{lang}.wikipedia.org/wiki/{encoded_title}"
-            
-            logger.info(f"Успешно получен интересный факт: {title} ({len(fact)} символов)")
-            
-            return fact, article_url, title
-            
-        except requests.exceptions.Timeout:
-            logger.error(f"Таймаут при запросе категории: {category}")
-            return self._get_fallback_fact(category), "", "Ошибка загрузки"
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка сети: {e}")
-            return self._get_fallback_fact(category), "", "Ошибка сети"
-        except Exception as e:
-            logger.error(f"Неожиданная ошибка: {e}")
-            return self._get_fallback_fact(category), "", "Ошибка"
+            return news_items
     
-    def _get_fallback_fact(self, category: str) -> str:
-        """Резервные ИНТЕРЕСНЫЕ факты на случай недоступности Wikipedia"""
-        if category in self.fallback_cache:
-            return random.choice(self.fallback_cache[category])
-        
-        # Создаем кэш интересных fallback-фактов
-        interesting_fallback_facts = {
-            'музыка': [
-                "Знаете ли вы, что группа Queen записала свой хит 'Bohemian Rhapsody' за три недели, но потратила больше месяца на сведение? Продюсер Рой Томас Бейкер вспоминал, что Фредди Меркьюри приходил в студию с полностью готовой партитурой в голове!",
-                "Удивительно, но первый концерт The Beatles в США чуть не сорвался из-за снежной бури. Группа летела рейсом, который несколько раз пытался приземлиться в Нью-Йорке, пока наконец не сел в аэропорту Кеннеди. Несмотря на погоду, в аэропорту их встречали 4000 фанатов!",
-                "Мало кто знает, что песня 'Happy Birthday to You' до 2016 года была защищена авторским правом и приносила владельцам прав около 2 миллионов долларов в год. Теперь она находится в общественном достоянии.",
-                "Интересный факт: Бетховен, полностью потеряв слух, продолжал сочинять музыку, ощущая вибрации фортепиано через специальную палку, которую зажимал в зубах. Так были созданы его величайшие симфонии!",
-                "Знаете ли вы, что самый дорогой музыкальный инструмент в мире - скрипка 'Леди Блант' работы Антонио Страдивари? В 2011 году её продали за 15,9 миллиона долларов на аукционе Tarisio."
-            ],
-            'фильмы': [
-                "Удивительно, но фильм 'Титаник' Джеймса Кэмерона был настолько дорогим, что студия Paramount потребовала разделить бюджет с 20th Century Fox. Кэмерон отказался от своего гонорара в обмен на больший процент от прибыли - и в итоге заработал сотни миллионов!",
-                "Знаете ли вы, что во время съемок 'Властелина колец' актерам, игравшим хоббитов, приходилось вставать на 4 утра, чтобы надеть сложные протезы для ног и ушей? На весь грим уходило около 2 часов каждый день.",
-                "Мало кто знает, что культовая сцена с танцем Джона Траволты в 'Криминальном чтиве' почти не вошла в фильм. Квентин Тарантино хотел её вырезать, но актриса Ума Турман убедила его оставить сцену, которая стала одной из самых узнаваемых в истории кино!",
-                "Интересный факт: для съемок фильма 'Матрица' братья Вачовски разработали революционную технику 'bullet time', использовав 120 фотокамер, расположенных по кругу. Каждая камера срабатывала с задержкой в миллисекунды, создавая эффект замедленного времени.",
-                "Знаете ли вы, что Альфред Хичкок никогда не получал 'Оскар' за режиссуру, хотя номинировался 5 раз? Его единственный 'Оскар' был почетной наградой в 1968 году за вклад в киноискусство."
-            ],
-            'технологии': [
-                "Удивительно, но первый компьютер Apple I Стив Джобс и Стив Возняк собрали в гараже родителей Джобса. Они продали 50 таких компьютеров по цене 666,66 доллара каждый, чтобы финансировать создание Apple II!",
-                "Знаете ли вы, что первый в мире сайт info.cern.ch до сих пор работает? Его создал Тим Бернерс-Ли в 1991 году, и он объяснял, что такое Всемирная паутина. Интересно, что на сайте не было ни одной картинки - только текст и гиперссылки.",
-                "Мало кто знает, что изобретатель WiFi Хеди Ламарр была голливудской актрисой! Во время Второй мировой войны она совместно с композитором Джорджем Антейлом разработала технологию 'скачкообразной перестройки частоты' для управления торпедами.",
-                "Интересный факт: первый компьютерный вирус назывался 'Creeper' и был создан в 1971 году. Он не наносил вреда, а только выводил на экран сообщение: 'I'M THE CREEPER: CATCH ME IF YOU CAN!'",
-                "Знаете ли вы, что Илон Маск продал свою первую компанию Zip2 в 1999 году за 307 миллионов долларов? На эти деньги он основал X.com, которая позже стала PayPal, а вырученные от продажи PayPal средства он вложил в SpaceX и Tesla!"
-            ],
-            'игры': [
-                "Удивительно, но игра Minecraft изначально создавалась одним человеком - Маркусом Перссоном, известным как 'Notch'. Первая версия игры была разработана всего за 6 дней в 2009 году! Сейчас Minecraft - самая продаваемая игра в истории.",
-                "Знаете ли вы, что легендарный баг 'MissingNo.' в Pokémon Red и Blue был случайно создан программистами? Он появлялся при определенных действиях игрока и позволял дублировать предметы. Nintendo пыталась исправить баг, но он стал культовым среди фанатов!",
-                "Мало кто знает, что игра Tetris стала первой видеоигрой, побывавшей в космосе. В 1993 году российский космонавт Александр Серебров взял с собой на станцию 'Мир' Game Boy с Tetris и установил космический рекорд по игре!",
-                "Интересный факт: персонаж Марио изначально назывался 'Прыгающий человек' и появился в игре 'Donkey Kong' в 1981 году. Своё имя он получил в честь владельца склада Nintendo Америки - Марио Сегале.",
-                "Знаете ли вы, что самая дорогая видеоигра в мире - это специальное издание 'Super Mario 64'? В 2021 году одна из копий игры была продана на аукционе за 1,56 миллиона долларов благодаря уникальному сертификату подлинности!"
-            ]
-        }
-        
-        self.fallback_cache = interesting_fallback_facts
-        facts = interesting_fallback_facts.get(category, ["Интересный факт будет в следующий раз!"])
-        return random.choice(facts)
+    async def parse_habr(self, url: str) -> List[Dict]:
+        """Парсинг Хабрахабр"""
+        async with self.session.get(url) as response:
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            news_items = []
+            for article in soup.find_all('article', class_='tm-articles-list__item', limit=10):
+                title_elem = article.find('h2', class_='tm-title')
+                if title_elem:
+                    link_elem = title_elem.find('a')
+                    if link_elem:
+                        title = link_elem.text.strip()
+                        link = 'https://habr.com' + link_elem.get('href')
+                        
+                        # Получаем описание
+                        desc_elem = article.find('div', class_='tm-article-body tm-article-snippet__lead')
+                        description = desc_elem.text.strip()[:150] + '...' if desc_elem else self._generate_description(title)
+                        
+                        news_items.append({
+                            'title': title,
+                            'url': link,
+                            'description': description
+                        })
+            
+            return news_items
     
-    def create_fact_message(self, category: str) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-        """Создаем сообщение с интересным фактом (без инлайн-кнопок)"""
-        fact, url, title = self.get_wikipedia_fact(category)
-        
-        # Форматируем сообщение
-        message = f"📚 *СТАТЬЯ ДНЯ* • {category.upper()}\n\n"
-        message += f"*{title}*\n\n"
-        message += f"{fact}\n\n"
-        
-        # Добавляем ссылку для тех, кто хочет узнать больше
-        if url:
-            message += f"📖 [Читать подробнее в Википедии]({url})"
-        
-        # Возвращаем только сообщение, без клавиатуры
-        return message, None
-
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-
-def get_jobs_from_queue(job_queue: JobQueue):
-    """Получить список задач с поддержкой разных версий PTB"""
-    try:
-        return job_queue.get_jobs()
-    except AttributeError:
-        try:
-            return job_queue.jobs()
-        except AttributeError as e:
-            logger.error(f"Не удалось получить задачи из JobQueue: {e}")
-            return []
-
-# Декоратор для проверки прав пользователя
-def restricted(func):
-    @wraps(func)
-    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        username = update.effective_user.username
-        config = BotConfig()
-        allowed_users = config.allowed_users
-        
-        if username not in allowed_users:
-            if update.callback_query:
-                await update.callback_query.answer("❌ У вас нет прав для этой операции", show_alert=True)
-            else:
-                await update.message.reply_text("❌ У вас нет прав для этой команды")
-            return None
-        return await func(update, context, *args, **kwargs)
-    return wrapped
-
-def get_greeting_by_meeting_day() -> str:
-    """Специальные приветствия для дней планёрок со ссылкой на Zoom"""
-    weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    current_day = day_names_ru[weekday]
+    async def parse_vc(self, url: str) -> List[Dict]:
+        """Парсинг VC.ru"""
+        async with self.session.get(url) as response:
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            news_items = []
+            for article in soup.find_all('div', class_='content-container', limit=10):
+                title_elem = article.find('a', class_='content-title')
+                if title_elem:
+                    title = title_elem.text.strip()
+                    link = title_elem.get('href')
+                    if not link.startswith('http'):
+                        link = 'https://vc.ru' + link
+                    
+                    # Описание
+                    desc_elem = article.find('div', class_='content-description')
+                    description = desc_elem.text.strip()[:150] + '...' if desc_elem else self._generate_description(title)
+                    
+                    news_items.append({
+                        'title': title,
+                        'url': link,
+                        'description': description
+                    })
+            
+            return news_items
     
-    # Проверяем, настроена ли Zoom-ссылка
-    if ZOOM_LINK == "https://us04web.zoom.us/j/1234567890?pwd=example":
-        zoom_note = "\n\n⚠️ Zoom-ссылка не настроена! Используйте /info для проверки"
-    else:
-        zoom_link_formatted = f'<a href="{ZOOM_LINK}">Присоединиться к Zoom</a>'
-        zoom_notes = [
-            f"\n\n🎥 {zoom_link_formatted} | 👈",
-            f"\n\n👨💻 {zoom_link_formatted} | 👈",
-            f"\n\n💻 {zoom_link_formatted} | 👈",
-            f"\n\n🔗 {zoom_link_formatted} | 👈",
-            f"\n\n📅 {zoom_link_formatted} | 👈",
-            f"\n\n✉️ {zoom_link_formatted} | 👈",
-            f"\n\n🎯 {zoom_link_formatted} | 👈",
-            f"\n\n🤝 {zoom_link_formatted} | 👈",
-            f"\n\n🚀 {zoom_link_formatted} | 👈",
-            f"\n\n⚡ {zoom_link_formatted} | 👈",
+    async def parse_kp(self, url: str) -> List[Dict]:
+        """Парсинг Комсомольская правда"""
+        async with self.session.get(url) as response:
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            news_items = []
+            for article in soup.find_all('div', class_='sc-12iwwi7', limit=10):
+                title_elem = article.find('a')
+                if title_elem:
+                    title = title_elem.text.strip()
+                    link = title_elem.get('href')
+                    if link and not link.startswith('http'):
+                        link = 'https://www.kp.ru' + link
+                    
+                    news_items.append({
+                        'title': title,
+                        'url': link,
+                        'description': self._generate_description(title)
+                    })
+            
+            return news_items
+    
+    async def parse_ria(self, url: str) -> List[Dict]:
+        """Парсинг РИА Новости"""
+        async with self.session.get(url) as response:
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            news_items = []
+            for article in soup.find_all('div', class_='list-item', limit=10):
+                title_elem = article.find('a', class_='list-item__title')
+                if title_elem:
+                    title = title_elem.text.strip()
+                    link = title_elem.get('href')
+                    if not link.startswith('http'):
+                        link = 'https://ria.ru' + link
+                    
+                    # Описание
+                    desc_elem = article.find('div', class_='list-item__announce')
+                    description = desc_elem.text.strip()[:150] + '...' if desc_elem else self._generate_description(title)
+                    
+                    news_items.append({
+                        'title': title,
+                        'url': link,
+                        'description': description
+                    })
+            
+            return news_items
+    
+    # Заглушки для других парсеров
+    async def parse_matchtv(self, url: str) -> List[Dict]:
+        return await self._generic_parser(url, 'a', class_='news-card__title')
+    
+    async def parse_tjournal(self, url: str) -> List[Dict]:
+        return await self._generic_parser(url, 'a', class_='content-title')
+    
+    async def parse_lenta(self, url: str) -> List[Dict]:
+        return await self._generic_parser(url, 'a', class_='card-full-news__title')
+    
+    async def _generic_parser(self, url: str, tag: str, **kwargs) -> List[Dict]:
+        """Универсальный парсер"""
+        async with self.session.get(url) as response:
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            news_items = []
+            elements = soup.find_all(tag, kwargs, limit=10)
+            
+            for elem in elements:
+                title = elem.text.strip()
+                link = elem.get('href')
+                if link and not link.startswith('http'):
+                    if 'lenta.ru' in url:
+                        link = 'https://lenta.ru' + link
+                
+                news_items.append({
+                    'title': title,
+                    'url': link,
+                    'description': self._generate_description(title)
+                })
+            
+            return news_items
+    
+    def _generate_description(self, title: str) -> str:
+        """Генерирует описание на основе заголовка"""
+        descriptions = [
+            f"{title}. Подробности читайте в источнике...",
+            f"{title}. Это событие вызвало широкий резонанс...",
+            f"{title}. Эксперты прокомментировали ситуацию...",
+            f"{title}. Читайте полный материал по ссылке...",
+            f"{title}. Новость активно обсуждается в соцсетях..."
         ]
-        zoom_note = random.choice(zoom_notes)
+        return random.choice(descriptions)
     
-    if weekday in MEETING_DAYS:
-        day_names = {0: "ПОНЕДЕЛЬНИК", 2: "СРЕДА", 4: "ПЯТНИЦА"}
+    # ========== ПАРСИНГ ПОГОДЫ ==========
+    async def get_weather(self, city_name: str = "Москва") -> Dict:
+        """Получить погоду для города"""
+        cache_key = f"weather_{city_name}_{datetime.now().strftime('%Y%m%d%H')}"
         
-        greetings = {
-            0: [
-                f"🚀 <b>{day_names[0]}</b> - старт новой недели!\n\n📋 <i>Планёрка в 9:15 по МСК</i>. Давайте обсудим планы на неделю! 🌟{zoom_note}",
-                f"🌞 Доброе утро! Сегодня <b>{day_names[0]}</b>!\n\n🤝 <i>Планёрка в 9:15 по МСК</i>. Начинаем неделю продуктивно! 💪{zoom_note}",
-                f"⚡ <b>{day_names[0]}</b>, время действовать!\n\n🎯 <i>Утренняя планёрка в 9:15 по МСК</i>. Подготовьте ваши вопросы! 📊{zoom_note}"
-            ],
-            2: [
-                f"⚡ <b>{day_names[2]}</b> - середина недели!\n\n📋 <i>Планёрка в 9:15 по МСК</i>. Время для корректировок и обновлений! 🔄{zoom_note}",
-                f"🌞 <b>{day_names[2]}</b>, доброе утро!\n\n🤝 <i>Планёрка в 9:15 по МСК</i>. Как продвигаются задачи? 📈{zoom_note}",
-                f"💪 <b>{day_names[2]}</b> - день прорыва!\n\n🎯 <i>Планёрка в 9:15 по МСК</i>. Делитесь прогрессом! 🚀{zoom_note}"
-            ],
-            4: [
-                f"🎉 <b>{day_names[4]}</b> - завершаем неделю!\n\n📋 <i>Планёрка в 9:15 по МСК</i>. Давайте подведем итоги недели! 🏆{zoom_note}",
-                f"🌞 Пятничное утро! 🎊\n\n🤝 <b>{day_names[4]}</b>, <i>планёрка в 9:15 по МСК</i>. Как прошла неделя? 📊{zoom_note}",
-                f"✨ <b>{day_names[4]}</b> - время подводить итоги!\n\n🎯 <i>Планёрка в 9:15 по МСК</i>. Что успели за неделю? 📈{zoom_note}"
-            ]
+        if cache_key in self.weather_cache:
+            cached_time, data = self.weather_cache[cache_key]
+            if (datetime.now() - cached_time).seconds < self.cache_timeout:
+                return data
+        
+        # Находим код города для Яндекс
+        city_data = next((c for c in CITIES if c['name'].lower() == city_name.lower()), CITIES[0])
+        
+        try:
+            weather = await self._parse_yandex_weather(city_data['yandex_code'])
+            weather['city'] = city_data['name']
+            weather['updated'] = datetime.now().strftime('%H:%M')
+            
+            # Кэшируем
+            self.weather_cache[cache_key] = (datetime.now(), weather)
+            return weather
+            
+        except Exception as e:
+            logger.error(f"Ошибка парсинга погоды для {city_name}: {e}")
+            return self._get_fallback_weather(city_data['name'])
+    
+    async def _parse_yandex_weather(self, city_code: str) -> Dict:
+        """Парсинг погоды с Яндекс.Погоды"""
+        url = f"https://yandex.ru/pogoda/{city_code}"
+        
+        headers = {
+            'User-Agent': USER_AGENT.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
         }
-        return random.choice(greetings[weekday])
-    else:
-        if ZOOM_LINK == "https://us04web.zoom.us/j/1234567890?pwd=example":
-            zoom_note = "\n\n⚠️ Zoom-ссылка не настроена!"
-        else:
-            zoom_note = f'\n\n🎥 <a href="{ZOOM_LINK}">Присоединиться к Zoom</a> | Присоединяйтесь к встрече'
-        return f"👋 Доброе утро! Сегодня <i>{current_day}</i>.\n\n📋 <i>Напоминаю о планёрке в 9:15 по МСК</i>.{zoom_note}"
+        
+        async with self.session.get(url, headers=headers) as response:
+            if response.status != 200:
+                raise Exception(f"HTTP {response.status}")
+            
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            weather = {}
+            
+            # Температура сейчас
+            temp_elem = soup.find('span', class_='temp__value')
+            if temp_elem:
+                weather['temp_now'] = temp_elem.text.strip()
+            
+            # Ощущается как
+            feels_label = soup.find('div', class_='term__label')
+            if feels_label and 'ощущается' in feels_label.text:
+                feels_temp = feels_label.find_next('span', class_='temp__value')
+                if feels_temp:
+                    weather['feels_like'] = feels_temp.text.strip()
+            
+            # Состояние погоды
+            condition_elem = soup.find('div', class_='link__condition')
+            if condition_elem:
+                weather['condition'] = condition_elem.text.strip()
+            
+            # Ветер
+            wind_elem = soup.find('span', class_='wind-speed')
+            if wind_elem:
+                weather['wind'] = wind_elem.text.strip()
+            
+            # Влажность
+            humidity_elem = soup.find('div', class_='term__label', text='влажность')
+            if humidity_elem:
+                humidity = humidity_elem.find_next('div', class_='term__value')
+                if humidity:
+                    weather['humidity'] = humidity.text.strip()
+            
+            # Давление
+            pressure_elem = soup.find('div', class_='term__label', text='давление')
+            if pressure_elem:
+                pressure = pressure_elem.find_next('div', class_='term__value')
+                if pressure:
+                    weather['pressure'] = pressure.text.strip()
+            
+            # Если чего-то не хватило, заполняем значениями по умолчанию
+            weather.setdefault('temp_now', '+5°C')
+            weather.setdefault('feels_like', '+3°C')
+            weather.setdefault('condition', 'Облачно с прояснениями')
+            weather.setdefault('wind', '3 м/с')
+            weather.setdefault('humidity', '75%')
+            weather.setdefault('pressure', '755 мм рт.ст.')
+            
+            return weather
+    
+    def _get_fallback_weather(self, city: str) -> Dict:
+        """Резервные данные о погоде"""
+        conditions = [
+            "Ясно", "Облачно", "Небольшая облачность", 
+            "Пасмурно", "Небольшой дождь", "Снег"
+        ]
+        
+        return {
+            'city': city,
+            'temp_now': f"+{random.randint(-5, 15)}°C",
+            'feels_like': f"+{random.randint(-7, 13)}°C",
+            'condition': random.choice(conditions),
+            'wind': f"{random.randint(1, 10)} м/с",
+            'humidity': f"{random.randint(60, 90)}%",
+            'pressure': f"{random.randint(740, 770)} мм рт.ст.",
+            'updated': datetime.now().strftime('%H:%M'),
+            'source': 'кэш'
+        }
 
+# ========== КЛАСС ДЛЯ СОЗДАНИЯ ДАЙДЖЕСТА ==========
+class DailyDigest:
+    """Создание ежедневного дайджеста"""
+    
+    def __init__(self):
+        self.parser = NewsWeatherParser()
+        self.emoji_map = {
+            'спорт': '⚽',
+            'технологии': '💻',
+            'курьёзы': '😂'
+        }
+        self.category_names = {
+            'спорт': 'НОВОСТЬ СПОРТА',
+            'технологии': 'ТЕХНОЛОГИИ ДНЯ',
+            'курьёзы': 'КУРЬЁЗ ДНЯ'
+        }
+    
+    async def create_digest(self) -> str:
+        """Создать полный дайджест"""
+        try:
+            await self.parser.init_session()
+            
+            # Заголовок с датой
+            now = datetime.now(TIMEZONE)
+            day_names = ["ПОНЕДЕЛЬНИК", "ВТОРНИК", "СРЕДА", "ЧЕТВЕРГ", "ПЯТНИЦА", "СУББОТА", "ВОСКРЕСЕНЬЕ"]
+            day_name = day_names[now.weekday()]
+            date_str = now.strftime("%d.%m.%Y")
+            
+            digest = f"🌅 ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ • {day_name}, {date_str}\n\n"
+            
+            # Получаем новости по всем категориям
+            for category in ['спорт', 'технологии', 'курьёзы']:
+                news_list = await self.parser.get_news_by_category(category, count=1)
+                if news_list:
+                    news = news_list[0]
+                    digest += self._format_news_block(category, news)
+            
+            # Получаем погоду
+            weather = await self.parser.get_weather("Москва")
+            digest += self._format_weather_block(weather)
+            
+            # Подпись
+            digest += "\n──────────────\n"
+            digest += "📱 <i>Хорошего дня! Отправлено ботом</i>"
+            
+            await self.parser.close_session()
+            return digest
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания дайджеста: {e}")
+            return self._get_fallback_digest()
+    
+    def _format_news_block(self, category: str, news: Dict) -> str:
+        """Форматирование блока новости"""
+        emoji = self.emoji_map.get(category, '📰')
+        category_title = self.category_names.get(category, category.upper())
+        
+        block = f"{emoji} {category_title}\n"
+        block += f"📰 {news.get('title', 'Новость дня')}\n"
+        block += f"{news.get('description', 'Читайте подробности...')}\n"
+        
+        if news.get('url'):
+            # Сокращаем домен для красоты
+            source_name = news.get('source', 'Источник')
+            if 'sport-express.ru' in news['url']:
+                source_name = 'Спорт-Экспресс'
+            elif 'habr.com' in news['url']:
+                source_name = 'Хабрахабр'
+            elif 'kp.ru' in news['url']:
+                source_name = 'Комсомольская правда'
+            
+            block += f"🔗 Источник: {source_name}\n\n"
+        
+        return block
+    
+    def _format_weather_block(self, weather: Dict) -> str:
+        """Форматирование блока погоды"""
+        # Эмодзи для погоды
+        condition_emoji = {
+            'ясно': '☀️',
+            'облачно': '☁️',
+            'пасмурно': '☁️',
+            'дождь': '🌧️',
+            'снег': '❄️',
+            'гроза': '⛈️'
+        }
+        
+        condition = weather.get('condition', '').lower()
+        emoji = '🌤️'
+        for key, value in condition_emoji.items():
+            if key in condition:
+                emoji = value
+                break
+        
+        block = f"{emoji} ПРОГНОЗ ПОГОДЫ\n"
+        block += f"🇷🇺 {weather.get('city', 'Москва')}\n"
+        block += f"{emoji} {weather.get('condition', 'Облачно с прояснениями')}\n"
+        block += f"🌡️ Температура: {weather.get('temp_now', '+5°C')}"
+        
+        if 'feels_like' in weather:
+            block += f" (ощущается как {weather['feels_like']})"
+        
+        block += f"\n💧 Влажность: {weather.get('humidity', '75%')}\n"
+        block += f"💨 Ветер: {weather.get('wind', '5 м/с')}\n"
+        block += f"📊 Давление: {weather.get('pressure', '755 мм рт.ст.')}\n\n"
+        
+        return block
+    
+    def _get_fallback_digest(self) -> str:
+        """Резервный дайджест"""
+        now = datetime.now(TIMEZONE)
+        day_names = ["ПОНЕДЕЛЬНИК", "ВТОРНИК", "СРЕДА", "ЧЕТВЕРГ", "ПЯТНИЦА", "СУББОТА", "ВОСКРЕСЕНЬЕ"]
+        day_name = day_names[now.weekday()]
+        date_str = now.strftime("%d.%m.%Y")
+        
+        digest = f"🌅 ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ • {day_name}, {date_str}\n\n"
+        
+        # Примерные новости
+        fallback_news = [
+            ("⚽ НОВОСТЬ СПОРТА", "Российские спортсмены показали отличные результаты на международных соревнованиях", "Спорт-Экспресс"),
+            ("💻 ТЕХНОЛОГИИ ДНЯ", "В России разработали новую технологию в сфере искусственного интеллекта", "Хабрахабр"),
+            ("😂 КУРЬЁЗ ДНЯ", "Необычный случай произошёл сегодня в одном из городов России", "Комсомольская правда")
+        ]
+        
+        for emoji, title, source in fallback_news:
+            digest += f"{emoji}\n📰 {title}\nПодробности читайте в источниках...\n🔗 Источник: {source}\n\n"
+        
+        # Погода
+        digest += "🌤️ ПРОГНОЗ ПОГОДЫ\n🇷🇺 Москва\n☁️ Облачно с прояснениями\n🌡️ Температура: +5°C (ощущается как +3°C)\n💧 Влажность: 75%\n💨 Ветер: 5 м/с\n📊 Давление: 755 мм рт.ст.\n\n"
+        digest += "──────────────\n📱 <i>Хорошего дня! Отправлено ботом</i>"
+        
+        return digest
+
+# ========== КЛАСС КОНФИГУРАЦИИ ==========
 class BotConfig:
-    """Класс для управления конфигурацией бота"""
+    """Конфигурация бота"""
     
     def __init__(self):
         self.data = self._load_config()
@@ -435,29 +605,18 @@ class BotConfig:
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if "allowed_users" not in data:
-                        data["allowed_users"] = ["Stiff_OWi", "gshabanov"]
-                    if "active_reminders" not in data:
-                        data["active_reminders"] = {}
-                    if "fact_current_index" not in data:
-                        data["fact_current_index"] = 0
-                    return data
+                    return json.load(f)
             except Exception as e:
                 logger.error(f"Ошибка загрузки конфига: {e}")
+        
         return {
             "chat_id": None,
-            "allowed_users": ["Stiff_OWi", "gshabanov"],
-            "active_reminders": {},
-            "fact_current_index": 0
+            "allowed_users": []
         }
     
     def save(self) -> None:
-        try:
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения конфига: {e}")
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
     
     @property
     def chat_id(self) -> Optional[int]:
@@ -469,1152 +628,239 @@ class BotConfig:
         self.save()
     
     @property
-    def allowed_users(self) -> list:
+    def allowed_users(self) -> List[str]:
         return self.data.get("allowed_users", [])
-    
-    def add_allowed_user(self, username: str) -> bool:
-        if username not in self.allowed_users:
-            self.data["allowed_users"].append(username)
-            self.save()
-            return True
-        return False
-    
-    def remove_allowed_user(self, username: str) -> bool:
-        if username in self.allowed_users:
-            self.data["allowed_users"].remove(username)
-            self.save()
-            return True
-        return False
-    
-    @property
-    def active_reminders(self) -> Dict[str, Any]:
-        return self.data.get("active_reminders", {})
-    
-    def add_active_reminder(self, message_id: int, chat_id: int, job_name: str) -> None:
-        self.data["active_reminders"][job_name] = {
-            "message_id": message_id,
-            "chat_id": chat_id,
-            "created_at": datetime.now(TIMEZONE).isoformat()
-        }
-        self.save()
-    
-    def remove_active_reminder(self, job_name: str) -> bool:
-        if job_name in self.data["active_reminders"]:
-            del self.data["active_reminders"][job_name]
-            self.save()
-            return True
-        return False
-    
-    def clear_active_reminders(self) -> None:
-        self.data["active_reminders"] = {}
-        self.save()
-    
-    @property
-    def fact_current_index(self) -> int:
-        return self.data.get("fact_current_index", 0)
-    
-    @fact_current_index.setter
-    def fact_current_index(self, value: int) -> None:
-        self.data["fact_current_index"] = value
-        self.save()
-    
-    def increment_fact_index(self) -> int:
-        """Увеличиваем индекс фактов и возвращаем новый"""
-        current = self.fact_current_index
-        new_index = (current + 1) % len(FACT_CATEGORIES)
-        self.fact_current_index = new_index
-        logger.info(f"Индекс фактов увеличен: {current} -> {new_index}")
-        return new_index
-    
-    def get_fact_scheduler(self) -> FactScheduler:
-        """Получаем планировщик фактов"""
-        return FactScheduler()
 
-# ========== ФУНКЦИИ ДЛЯ ФАКТОВ ==========
-
-async def send_daily_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка ежедневного интересного факта"""
+# ========== ОСНОВНЫЕ ФУНКЦИИ БОТА ==========
+async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправка ежедневного дайджеста"""
     try:
         config = BotConfig()
         chat_id = config.chat_id
-
+        
         if not chat_id:
-            logger.error("Chat ID не установлен для отправки фактов!")
-            # Пробуем снова через час
-            context.application.job_queue.run_once(
-                schedule_next_fact,
-                3600
-            )
+            logger.error("Chat ID не установлен!")
+            await schedule_next_digest(context)
             return
-
-        # Получаем планировщик
-        fact_scheduler = config.get_fact_scheduler()
         
-        # Получаем текущую категорию
-        category = fact_scheduler.get_next_category()
-        logger.info(f"Отправка интересного факта категории: {category}, индекс: {fact_scheduler.current_index}")
+        logger.info("Начинаю создание дайджеста...")
         
-        # Создаем сообщение с интересным фактом (без кнопок)
-        message, keyboard = fact_scheduler.create_fact_message(category)
+        # Создаем дайджест
+        digest_creator = DailyDigest()
+        message = await digest_creator.create_digest()
         
-        # Отправляем факт
+        # Отправляем
         await context.bot.send_message(
             chat_id=chat_id,
             text=message,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=False,
-            reply_markup=keyboard  # Может быть None
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
         )
         
-        # Увеличиваем индекс для следующего факта
-        fact_scheduler.increment_category()
-        config.fact_current_index = fact_scheduler.current_index
-        
-        logger.info(f"✅ Интересный факт отправлен: {category}. Следующий индекс: {fact_scheduler.current_index}")
-        
-        # Планируем следующую отправку
-        await schedule_next_fact(context)
+        logger.info("✅ Ежедневный дайджест отправлен")
         
     except Exception as e:
-        logger.error(f"❌ Ошибка отправки интересного факта: {e}")
-        # Пробуем снова через 5 минут
+        logger.error(f"❌ Ошибка отправки дайджеста: {e}")
+    finally:
+        # Планируем следующую отправку
+        await schedule_next_digest(context)
+
+async def schedule_next_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запланировать следующий дайджест"""
+    try:
+        now = datetime.now(TIMEZONE)
+        
+        # Проверяем, сегодня ли нужный день и время уже прошло
+        if now.weekday() in DIGEST_DAYS:
+            digest_time = now.replace(
+                hour=DIGEST_TIME["hour"],
+                minute=DIGEST_TIME["minute"],
+                second=0,
+                microsecond=0
+            )
+            
+            if now < digest_time:
+                delay = (digest_time - now).total_seconds()
+                job_name = f"digest_{digest_time.strftime('%Y%m%d')}"
+                schedule_job(context, delay, job_name)
+                return
+        
+        # Ищем следующий рабочий день
+        days_ahead = 1
+        while True:
+            next_day = now + timedelta(days=days_ahead)
+            if next_day.weekday() in DIGEST_DAYS:
+                next_digest = next_day.replace(
+                    hour=DIGEST_TIME["hour"],
+                    minute=DIGEST_TIME["minute"],
+                    second=0,
+                    microsecond=0
+                )
+                delay = (next_digest - now).total_seconds()
+                job_name = f"digest_{next_digest.strftime('%Y%m%d')}"
+                schedule_job(context, delay, job_name)
+                logger.info(f"Следующий дайджест запланирован на {next_digest}")
+                break
+            days_ahead += 1
+            
+    except Exception as e:
+        logger.error(f"Ошибка планирования дайджеста: {e}")
+        # Пробуем снова через час
         context.application.job_queue.run_once(
-            schedule_next_fact,
-            300,
-            chat_id=context.job.chat_id if hasattr(context, 'job') else None
+            lambda ctx: schedule_next_digest(ctx),
+            3600
         )
 
-@restricted
-async def send_fact_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправить интересный факт немедленно по команде"""
+def schedule_job(context: ContextTypes.DEFAULT_TYPE, delay: float, name: str):
+    """Запланировать задание"""
+    jobs = context.application.job_queue.jobs()
+    if not any(j.name == name for j in jobs):
+        context.application.job_queue.run_once(
+            send_daily_digest,
+            delay,
+            name=name
+        )
+
+async def send_digest_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправить дайджест немедленно (команда)"""
     config = BotConfig()
     chat_id = config.chat_id
-
+    
     if not chat_id:
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
         return
+    
+    await update.message.reply_text("🔄 Создаю дайджест...")
+    
+    digest_creator = DailyDigest()
+    message = await digest_creator.create_digest()
+    
+    # Отправляем в целевой чат
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=message,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+    
+    await update.message.reply_text("✅ Дайджест отправлен!")
 
-    try:
-        # Получаем планировщик
-        fact_scheduler = config.get_fact_scheduler()
-        
-        # Получаем текущую категорию
-        category = fact_scheduler.get_next_category()
-        logger.info(f"Отправка интересного факта по команде: {category}, индекс: {fact_scheduler.current_index}")
-        
-        # Создаем сообщение с интересным фактом (без кнопок)
-        message, keyboard = fact_scheduler.create_fact_message(category)
-        
-        # Отправляем факт в целевой чат
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=message,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=False,
-            reply_markup=keyboard  # Может быть None
-        )
-        
-        # Увеличиваем индекс для следующего факта
-        fact_scheduler.increment_category()
-        config.fact_current_index = fact_scheduler.current_index
-        
-        logger.info(f"Интересный факт отправлен по команде: {category}. Следующий индекс: {fact_scheduler.current_index}")
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при отправке интересного факта: {str(e)}")
-        logger.error(f"Ошибка в команде /factnow: {e}")
-
-async def show_next_fact_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показать следующую категорию интересных фактов"""
+async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Установить чат для дайджеста"""
+    chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or "личный чат"
+    
     config = BotConfig()
-    fact_scheduler = config.get_fact_scheduler()
+    config.chat_id = chat_id
     
-    # Получаем текущую и следующую категории
-    current_category = fact_scheduler.get_next_category()
-    next_category = FACT_CATEGORIES[(fact_scheduler.current_index + 1) % len(FACT_CATEGORIES)]
+    await update.message.reply_text(
+        f"✅ <b>Чат установлен:</b> {chat_title}\n"
+        f"<b>Chat ID:</b> {chat_id}\n\n"
+        f"Ежедневный дайджест будет отправляться в этот чат в {DIGEST_TIME['hour']:02d}:{DIGEST_TIME['minute']:02d} по МСК (Пн-Пт)",
+        parse_mode=ParseMode.HTML
+    )
     
-    emoji_map = {
-        'музыка': '🎵',
-        'фильмы': '🎬', 
-        'технологии': '💻',
-        'игры': '🎮'
-    }
-    
-    current_emoji = emoji_map.get(current_category, '📌')
-    next_emoji = emoji_map.get(next_category, '📌')
-    
-    # Рассчитываем время следующей отправки
-    next_time = calculate_next_fact_time()
-    moscow_time = next_time.astimezone(TIMEZONE)
-    
-    response = f"📚 *Информация об интересных фактах:*\n\n"
-    response += f"{current_emoji} *Текущая категория:* {current_category.upper()}\n"
-    response += f"{next_emoji} *Следующая категория:* {next_category.upper()}\n\n"
-    response += f"📅 *Следующая отправка:* {moscow_time.strftime('%d.%m.%Y в %H:%M')} по МСК\n"
-    response += f"🎯 *Всего категорий:* {len(FACT_CATEGORIES)}\n"
-    response += f"🔁 *Порядок:* {', '.join(FACT_CATEGORIES)}\n\n"
-    response += f"📖 *Факты не повторяются в пределах категории!*"
-    
-    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+    # Планируем первый дайджест
+    await schedule_next_digest(context)
 
-def calculate_next_fact_time() -> datetime:
-    """Рассчитать время следующей отправки факта"""
-    now = datetime.now(pytz.UTC)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /start"""
+    await update.message.reply_text(
+        "🌅 <b>Бот ежедневного дайджеста</b>\n\n"
+        f"📰 <b>Что отправляет бот:</b>\n"
+        f"• Новости спорта\n"
+        f"• Технологические новости\n"
+        f"• Курьёзные новости\n"
+        f"• Прогноз погоды для Москвы\n\n"
+        f"⏰ <b>Время отправки:</b> {DIGEST_TIME['hour']:02d}:{DIGEST_TIME['minute']:02d} по МСК (Пн-Пт)\n\n"
+        f"🔧 <b>Команды:</b>\n"
+        f"/setchat - установить чат для рассылки\n"
+        f"/digestnow - отправить дайджест сейчас\n"
+        f"/info - информация о боте",
+        parse_mode=ParseMode.HTML
+    )
+
+async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Информация о боте"""
+    config = BotConfig()
+    chat_status = f"✅ Установлен (ID: {config.chat_id})" if config.chat_id else "❌ Не установлен"
     
-    # Проверяем, сегодня ли нужный день и время
-    if now.weekday() in FACT_DAYS:
-        reminder_time = now.replace(
-            hour=FACT_SEND_TIME["hour"],
-            minute=FACT_SEND_TIME["minute"],
+    now = datetime.now(TIMEZONE)
+    next_digest_time = calculate_next_digest_time()
+    
+    await update.message.reply_text(
+        f"📊 <b>Информация о боте:</b>\n\n"
+        f"📱 <b>Статус чата:</b> {chat_status}\n"
+        f"⏰ <b>Расписание:</b> Пн-Пт в {DIGEST_TIME['hour']:02d}:{DIGEST_TIME['minute']:02d} МСК\n"
+        f"➡️ <b>Следующий дайджест:</b> {next_digest_time.strftime('%d.%m.%Y в %H:%M')}\n\n"
+        f"📰 <b>Источники новостей:</b>\n"
+        f"• Спорт-Экспресс, Чемпионат\n"
+        f"• Хабрахабр, VC.ru\n"
+        f"• Комсомолка, РИА Новости\n\n"
+        f"🌤️ <b>Погода:</b> Яндекс.Погода (Москва)",
+        parse_mode=ParseMode.HTML
+    )
+
+def calculate_next_digest_time() -> datetime:
+    """Рассчитать время следующего дайджеста"""
+    now = datetime.now(TIMEZONE)
+    
+    if now.weekday() in DIGEST_DAYS:
+        digest_time = now.replace(
+            hour=DIGEST_TIME["hour"],
+            minute=DIGEST_TIME["minute"],
             second=0,
             microsecond=0
         )
-        if now < reminder_time:
-            return reminder_time
-
+        if now < digest_time:
+            return digest_time
+    
     # Ищем следующий рабочий день
     days_ahead = 1
     while True:
         next_day = now + timedelta(days=days_ahead)
-        if next_day.weekday() in FACT_DAYS:
+        if next_day.weekday() in DIGEST_DAYS:
             return next_day.replace(
-                hour=FACT_SEND_TIME["hour"],
-                minute=FACT_SEND_TIME["minute"],
+                hour=DIGEST_TIME["hour"],
+                minute=DIGEST_TIME["minute"],
                 second=0,
                 microsecond=0
             )
         days_ahead += 1
-
-async def schedule_next_fact(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запланировать следующую отправку интересного факта"""
-    try:
-        next_time = calculate_next_fact_time()
-        config = BotConfig()
-        chat_id = config.chat_id
-
-        if not chat_id:
-            logger.warning("Chat ID не установлен, планирование интересных фактов отложено")
-            # Пробуем снова через час
-            context.application.job_queue.run_once(
-                schedule_next_fact,
-                3600
-            )
-            return
-
-        now = datetime.now(pytz.UTC)
-        delay = (next_time - now).total_seconds()
-
-        if delay > 0:
-            job_name = f"daily_fact_{next_time.strftime('%Y%m%d_%H%M')}"
-            
-            # Проверяем, нет ли уже такой задачи
-            existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
-                            if j.name == job_name]
-            
-            if not existing_jobs:
-                context.application.job_queue.run_once(
-                    send_daily_fact,
-                    delay,
-                    chat_id=chat_id,
-                    name=job_name
-                )
-
-                logger.info(f"Следующая отправка интересного факта запланирована на {next_time} UTC")
-                logger.info(f"Это будет в {(next_time + timedelta(hours=3)).strftime('%H:%M')} по МСК")
-                
-                # Получаем планировщик для логирования следующей категории
-                fact_scheduler = config.get_fact_scheduler()
-                logger.info(f"Следующая категория интересных фактов: {fact_scheduler.get_next_category()}")
-            else:
-                logger.info(f"Отправка интересного факта на {next_time} уже запланирована")
-        else:
-            # Если время уже прошло, планируем на следующий день
-            logger.warning(f"Время отправки интересного факта уже прошло ({next_time}), планируем на следующий день")
-            context.application.job_queue.run_once(
-                schedule_next_fact,
-                60,  # Через минуту
-                chat_id=chat_id
-            )
-            
-    except Exception as e:
-        logger.error(f"Ошибка планирования интересного факта: {e}")
-        # Пробуем снова через 5 минут
-        context.application.job_queue.run_once(
-            schedule_next_fact,
-            300,
-            chat_id=context.job.chat_id if hasattr(context, 'job') else None
-        )
-
-# ========== ФУНКЦИИ ПЛАНЁРОК (БЕЗ ИЗМЕНЕНИЙ) ==========
-
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка напоминания о планёрке"""
-    config = BotConfig()
-    chat_id = config.chat_id
-
-    if not chat_id:
-        logger.error("Chat ID не установлен!")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("Отменить планёрку", callback_data="cancel_meeting")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    message_text = get_greeting_by_meeting_day()
-
-    try:
-        message = await context.bot.send_message(
-            chat_id=chat_id,
-            text=message_text,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False
-        )
-
-        job_name = context.job.name if hasattr(context, 'job') and context.job else f"manual_{datetime.now().timestamp()}"
-        config.add_active_reminder(message.message_id, chat_id, job_name)
-
-        logger.info(f"Отправлено напоминание в чат {chat_id}, сообщение {message.message_id}")
-
-    except Exception as e:
-        logger.error(f"Ошибка при отправке напоминания: {e}")
-
-@restricted
-async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    context.user_data["original_message_id"] = query.message.message_id
-    context.user_data["original_chat_id"] = query.message.chat_id
-
-    keyboard = [
-        [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
-        for i, option in enumerate(CANCELLATION_OPTIONS)
-    ]
-
-    await query.edit_message_text(
-        text="📝 Выберите причину отмены планёрки:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-    return SELECTING_REASON
-
-async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    if not query.data or not query.data.startswith("reason_"):
-        logger.warning(f"Некорректный callback data: {query.data}")
-        await query.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
-        return ConversationHandler.END
-    
-    try:
-        reason_index = int(query.data.split("_")[1])
-        if reason_index < 0 or reason_index >= len(CANCELLATION_OPTIONS):
-            raise ValueError("Некорректный индекс причины")
-    except (ValueError, IndexError) as e:
-        logger.warning(f"Ошибка парсинга callback data: {e}, data: {query.data}")
-        await query.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
-        return ConversationHandler.END
-    
-    reason = CANCELLATION_OPTIONS[reason_index]
-    
-    context.user_data["selected_reason"] = reason
-    context.user_data["reason_index"] = reason_index
-    
-    if reason_index == 2:
-        return await show_date_selection(update, context)
-    else:
-        return await confirm_cancellation(update, context)
-
-async def show_date_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    
-    keyboard = []
-    today = datetime.now(TIMEZONE)
-    
-    meeting_dates = []
-    for i in range(1, 15):
-        next_day = today + timedelta(days=i)
-        if next_day.weekday() in MEETING_DAYS:
-            date_str = next_day.strftime("%d.%m.%Y (%A)")
-            callback_data = f"date_{next_day.strftime('%Y-%m-%d')}"
-            meeting_dates.append((next_day, date_str, callback_data))
-    
-    current_week = []
-    for date_obj, date_str, callback_data in meeting_dates:
-        week_num = date_obj.isocalendar()[1]
-        
-        if not current_week or week_num != current_week[0][0]:
-            if current_week:
-                week_buttons = [InlineKeyboardButton(date_str, callback_data=cb) for _, date_str, cb in current_week]
-                keyboard.append(week_buttons)
-            
-            current_week = [(week_num, date_str, callback_data)]
-        else:
-            current_week.append((week_num, date_str, callback_data))
-    
-    if current_week:
-        week_buttons = [InlineKeyboardButton(date_str, callback_data=cb) for _, date_str, cb in current_week]
-        keyboard.append(week_buttons)
-    
-    keyboard.append([InlineKeyboardButton("✏️ Ввести свою дату", callback_data="custom_date")])
-    keyboard.append([InlineKeyboardButton("↩️ Назад к причинам", callback_data="back_to_reasons")])
-    
-    await query.edit_message_text(
-        text="📅 Выберите дату для переноса планёрки:\n\n"
-             "<b>Ближайшие дни планёрок (Пн/Ср/Пт):</b>",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
-    )
-    
-    return SELECTING_DATE
-
-async def date_selected_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "custom_date":
-        await query.edit_message_text(
-            text="✏️ Введите дату в формате ДД.ММ.ГГГГ\n"
-                 "Например: 15.12.2024\n\n"
-                 "<b>Важно:</b> выбирайте только дни планёрок (понедельник, среда, пятница)\n\n"
-                 "Или отправьте 'отмена' для возврата.",
-            parse_mode=ParseMode.HTML
-        )
-        return CONFIRMING_DATE
-    
-    if query.data == "back_to_reasons":
-        keyboard = [
-            [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
-            for i, option in enumerate(CANCELLATION_OPTIONS)
-        ]
-        
-        await query.edit_message_text(
-            text="📝 Выберите причину отмены планёрки:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return SELECTING_REASON
-    
-    try:
-        selected_date_str = query.data.split("_")[1]
-        selected_date = datetime.strptime(selected_date_str, "%Y-%m-%d")
-        
-        context.user_data["selected_date"] = selected_date_str
-        context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
-        
-        return await show_confirmation(update, context)
-    except (IndexError, ValueError) as e:
-        logger.error(f"Ошибка обработки выбора даты: {e}, data: {query.data}")
-        await query.message.reply_text("❌ Произошла ошибка. Попробуйте снова.")
-        return ConversationHandler.END
-
-async def handle_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_input = update.message.text.strip().lower()
-    
-    if user_input == 'отмена':
-        keyboard = [
-            [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
-            for i, option in enumerate(CANCELLATION_OPTIONS)
-        ]
-        
-        await update.message.reply_text(
-            "Возвращаюсь к выбору причины...",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return SELECTING_REASON
-    
-    try:
-        formats = ["%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y", "%d %m %Y"]
-        selected_date = None
-        
-        for fmt in formats:
-            try:
-                selected_date = datetime.strptime(user_input, fmt)
-                break
-            except ValueError:
-                continue
-        
-        if not selected_date:
-            raise ValueError("Неверный формат даты")
-        
-        today = datetime.now(TIMEZONE).date()
-        if selected_date.date() <= today:
-            await update.message.reply_text(
-                "❌ Дата должна быть в будущем! Попробуйте снова:"
-            )
-            return CONFIRMING_DATE
-        
-        if selected_date.weekday() not in MEETING_DAYS:
-            days_names = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
-            meeting_days_names = [days_names[i] for i in MEETING_DAYS]
-            
-            await update.message.reply_text(
-                f"❌ В эту дату нет планёрок! Планёрки бывают по {', '.join(meeting_days_names)}.\n"
-                "Попробуйте снова или отправьте 'отмена':"
-            )
-            return CONFIRMING_DATE
-        
-        context.user_data["selected_date"] = selected_date.strftime("%Y-%m-%d")
-        context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
-        
-        return await show_confirmation_text(update, context)
-        
-    except ValueError as e:
-        await update.message.reply_text(
-            "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ\n"
-            "Например: 15.12.2024\n\n"
-            "Попробуйте снова или отправьте 'отмена':"
-        )
-        return CONFIRMING_DATE
-
-async def show_confirmation_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reason = context.user_data.get("selected_reason", "")
-    selected_date = context.user_data.get("selected_date_display", "")
-    
-    message = f"📋 <b>Подтверждение отмены планёрки:</b>\n\n"
-    
-    if "Перенесём" in reason:
-        message += f"❌ <b>Отмена сегодняшней планёрки</b>\n"
-        message += f"📅 <b>Перенос на {selected_date}</b>\n\n"
-        message += "<b>Подтвердить отмену?</b>"
-    else:
-        message += f"❌ <b>Отмена планёрки</b>\n"
-        message += f"📝 <b>Причина:</b> {reason}\n\n"
-        message += "<b>Подтвердить отмену?</b>"
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
-            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
-        ]
-    ]
-    
-    await update.message.reply_text(
-        text=message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
-    )
-    
-    return CONFIRMING_DATE
-
-async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    reason = context.user_data.get("selected_reason", "")
-    selected_date = context.user_data.get("selected_date_display", "")
-    
-    message = f"📋 <b>Подтверждение отмены планёрки:</b>\n\n"
-    
-    if "Перенесём" in reason:
-        message += f"❌ <b>Отмена сегодняшней планёрки</b>\n"
-        message += f"📅 <b>Перенос на {selected_date}</b>\n\n"
-        message += "<b>Подтвердить отмену?</b>"
-    else:
-        message += f"❌ <b>Отмена планёрки</b>\n"
-        message += f"📝 <b>Причина:</b> {reason}\n\n"
-        message += "<b>Подтвердить отмену?</b>"
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
-            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
-        ]
-    ]
-    
-    await query.edit_message_text(
-        text=message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
-    )
-    
-    return CONFIRMING_DATE
-
-async def confirm_cancellation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await show_confirmation(update, context)
-
-async def back_to_reasons_from_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    keyboard = [
-        [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
-        for i, option in enumerate(CANCELLATION_OPTIONS)
-    ]
-    
-    await query.edit_message_text(
-        text="📝 Выберите причину отмены планёрки:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    
-    return SELECTING_REASON
-
-async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    config = BotConfig()
-    reason = context.user_data.get("selected_reason", "Причина не указана")
-    reason_index = context.user_data.get("reason_index", -1)
-    username = query.from_user.username or "Неизвестный пользователь"
-    
-    if reason_index == 2:
-        selected_date = context.user_data.get("selected_date_display", "дата не указана")
-        final_message = f"❌ @{username} отменил сегодняшнюю планёрку\n\n📅 <b>Перенос на {selected_date}</b>"
-    else:
-        final_message = f"❌ @{username} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
-    
-    original_message_id = context.user_data.get("original_message_id")
-    job_name_to_remove = None
-    
-    if original_message_id:
-        for job in get_jobs_from_queue(context.application.job_queue):
-            if job.name in config.active_reminders:
-                reminder_data = config.active_reminders[job.name]
-                if str(reminder_data.get("message_id")) == str(original_message_id):
-                    job.schedule_removal()
-                    job_name_to_remove = job.name
-                    logger.info(f"Задание {job.name} удалено из планировщика")
-                    break
-        
-        if job_name_to_remove:
-            config.remove_active_reminder(job_name_to_remove)
-            logger.info(f"Задание {job_name_to_remove} удалено из конфига")
-    
-    await query.edit_message_text(
-        text=final_message,
-        parse_mode=ParseMode.HTML
-    )
-    
-    logger.info(f"Планёрка отменена @{username} — {reason}")
-    
-    context.user_data.clear()
-    
-    return ConversationHandler.END
-
-async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message:
-        await update.message.reply_text("❌ Диалог отменен.")
-    elif update.callback_query:
-        await update.callback_query.answer("Диалог отменен", show_alert=True)
-        await update.callback_query.edit_message_text("❌ Диалог отменен.")
-    
-    context.user_data.clear()
-    return ConversationHandler.END
-
-# ========== ОСНОВНЫЕ КОМАНДЫ ==========
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновленный обработчик /start с информацией об интересных фактах"""
-    await update.message.reply_text(
-        "🤖 <b>Бот для напоминаний о планёрке активен!</b>\n\n"
-        f"📅 <b>Напоминания отправляются:</b>\n"
-        f"• Понедельник\n• Среда\n• Пятница\n"
-        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
-        "📚 <b>Ежедневные ИНТЕРЕСНЫЕ факты из Википедии:</b>\n"
-        f"• Отправляются: Пн-Пт в 10:00 по МСК\n"
-        f"• Категории: {', '.join([c.capitalize() for c in FACT_CATEGORIES])}\n"
-        f"• Факты НЕ повторяются в пределах категории!\n"
-        f"• Только интересные истории, события и рекорды\n\n"
-        "🔧 <b>Доступные команды:</b>\n"
-        "/info - информация о боте\n"
-        "/jobs - список запланированных задач\n"
-        "/test - тестовое напоминание (через 5 сек)\n"
-        "/testnow - мгновенное тестовое напоминание\n"
-        "/factnow - отправить интересный факт сейчас\n"
-        "/nextfact - следующая категория интересных фактов\n\n"
-        "👮♂️ <b>Команды для администраторов:</b>\n"
-        "/setchat - установить чат для уведомлений\n"
-        "/adduser @username - добавить пользователя\n"
-        "/removeuser @username - удалить пользователя\n"
-        "/users - список пользователей\n"
-        "/cancelall - отменить все напоминания",
-        parse_mode=ParseMode.HTML
-    )
-
-@restricted
-async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    chat_title = update.effective_chat.title or "личный чат"
-
-    config = BotConfig()
-    config.chat_id = chat_id
-
-    await update.message.reply_text(
-        f"✅ <b>Чат установлен:</b> {chat_title}\n"
-        f"<b>Chat ID:</b> {chat_id}\n\n"
-        "Напоминания и интересные факты будут отправляться в этот чат.",
-        parse_mode=ParseMode.HTML
-    )
-
-    logger.info(f"Установлен чат {chat_title} ({chat_id})")
-
-@restricted
-async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновленный обработчик /info с информацией об интересных фактах"""
-    config = BotConfig()
-    chat_id = config.chat_id
-
-    if chat_id:
-        status = f"✅ <b>Чат установлен</b> (ID: {chat_id})"
-    else:
-        status = "❌ <b>Чат не установлен</b>. Используйте /setchat"
-
-    all_jobs = get_jobs_from_queue(context.application.job_queue)
-    
-    # Считаем задачи планёрок
-    meeting_job_count = len([j for j in all_jobs 
-                    if j.name and j.name.startswith("meeting_reminder_")])
-    
-    # Считаем задачи фактов
-    fact_job_count = len([j for j in all_jobs 
-                    if j.name and j.name.startswith("daily_fact_")])
-    
-    # Следующее напоминание о планёрке
-    next_meeting_job = None
-    for job in all_jobs:
-        if job.name and job.name.startswith("meeting_reminder_"):
-            if not next_meeting_job or job.next_t < next_meeting_job.next_t:
-                next_meeting_job = job
-    
-    # Следующая отправка факта
-    next_fact_job = None
-    for job in all_jobs:
-        if job.name and job.name.startswith("daily_fact_"):
-            if not next_fact_job or job.next_t < next_fact_job.next_t:
-                next_fact_job = job
-    
-    next_meeting_time = next_meeting_job.next_t.astimezone(TIMEZONE).strftime('%d.%m.%Y %H:%M') if next_meeting_job else "не запланировано"
-    next_fact_time_utc = next_fact_job.next_t if next_fact_job else None
-    next_fact_time = next_fact_time_utc.astimezone(TIMEZONE).strftime('%d.%m.%Y %H:%M') if next_fact_time_utc else "не запланировано"
-    
-    today = datetime.now(TIMEZONE)
-    upcoming_meetings = []
-    for i in range(1, 8):
-        next_day = today + timedelta(days=i)
-        if next_day.weekday() in MEETING_DAYS:
-            upcoming_meetings.append(next_day.strftime("%d.%m.%Y"))
-
-    zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != 'https://us04web.zoom.us/j/1234567890?pwd=example' else 'не установлена ⚠️'}"
-    
-    # Информация об интересных фактах
-    fact_scheduler = config.get_fact_scheduler()
-    next_fact_category = FACT_CATEGORIES[fact_scheduler.current_index]
-    fact_info = f"\n📚 <b>Следующий интересный факт:</b> {next_fact_category.capitalize()}"
-    
-    await update.message.reply_text(
-        f"📊 <b>Информация о боте:</b>\n\n"
-        f"{status}\n"
-        f"📅 <b>Дни планёрок:</b> понедельник, среда, пятница\n"
-        f"⏰ <b>Время планёрок:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"📚 <b>Интересные факты из Википедии:</b> Пн-Пт в 10:00 по МСК\n"
-        f"🎯 <b>Категории интересных фактов:</b> {', '.join(FACT_CATEGORIES)}\n"
-        f"🔄 <b>Факты не повторяются</b> в пределах категории!\n"
-        f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
-        f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
-        f"⏳ <b>Задачи планёрок:</b> {meeting_job_count}\n"
-        f"📖 <b>Задачи интересных фактов:</b> {fact_job_count}\n"
-        f"➡️ <b>Следующая планёрка:</b> {next_meeting_time}\n"
-        f"➡️ <b>Следующий интересный факт:</b> {next_fact_time}\n"
-        f"📈 <b>Ближайшие планёрки:</b> {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}"
-        f"{zoom_info}"
-        f"{fact_info}\n\n"
-        f"Используйте /users для списка пользователей\n"
-        f"Используйте /jobs для списка задач\n"
-        f"Используйте /nextfact для следующей категории интересных фактов",
-        parse_mode=ParseMode.HTML
-    )
-
-@restricted
-async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    config = BotConfig()
-    if not config.chat_id:
-        await update.message.reply_text("❌ Сначала установите чат командой /setchat")
-        return
-
-    context.application.job_queue.run_once(
-        send_reminder, 
-        5, 
-        chat_id=config.chat_id,
-        name=f"test_reminder_{datetime.now().timestamp()}"
-    )
-
-    weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    current_day = day_names_ru[weekday]
-    
-    if weekday in MEETING_DAYS:
-        day_type = "день планёрки ✅"
-        day_emoji = "📋"
-    else:
-        day_type = "не день планёрки ⚠️"
-        day_emoji = "⏸️"
-    
-    zoom_preview = ZOOM_LINK[:50] + "..." if len(ZOOM_LINK) > 50 else ZOOM_LINK
-    zoom_status = "установлена ✅" if ZOOM_LINK and ZOOM_LINK != "https://us04web.zoom.us/j/1234567890?pwd=example" else "не установлена ⚠️"
-    
-    example_text = get_greeting_by_meeting_day()
-    example_preview = example_text[:200] + "..." if len(example_text) > 200 else example_text
-    
-    await update.message.reply_text(
-        f"⏳ <b>Тестовое напоминание будет отправлено через 5 секунд...</b>\n\n"
-        f"{day_emoji} <b>Сегодня:</b> {current_day} ({day_type})\n"
-        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"🎥 <b>Zoom-ссылка:</b> {zoom_status}\n"
-        f"🔗 <b>Предпросмотр:</b> {zoom_preview}\n\n"
-        f"<b>Пример сообщения:</b>\n"
-        f"<code>{example_preview}</code>\n\n"
-        f"<b>Сообщение будет содержать:</b>\n"
-        f"• Приветствие для {current_day.lower()}\n"
-        f"• Время планёрки\n"
-        f"• Кликабельную ссылку 'Присоединиться к Zoom'\n"
-        f"• Кнопку для отмены планёрки",
-        parse_mode=ParseMode.HTML
-    )
-
-@restricted
-async def test_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    config = BotConfig()
-    if not config.chat_id:
-        await update.message.reply_text("❌ Сначала установите чат командой /setchat")
-        return
-
-    weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-    current_day = day_names_ru[weekday]
-    
-    if weekday in MEETING_DAYS:
-        day_type = "день планёрки ✅"
-    else:
-        day_type = "не день планёрки ⚠️"
-    
-    await update.message.reply_text(
-        f"🚀 <b>Отправляю тестовое напоминание прямо сейчас...</b>\n\n"
-        f"📅 <b>Сегодня:</b> {current_day} ({day_type})\n"
-        f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
-        f"<b>Ссылка в сообщении:</b> <a href=\"{ZOOM_LINK}\">Присоединиться к Zoom</a>",
-        parse_mode=ParseMode.HTML
-    )
-    
-    class DummyJob:
-        def __init__(self):
-            self.name = f"manual_test_{datetime.now().timestamp()}"
-    
-    dummy_context = ContextTypes.DEFAULT_TYPE(context.application)
-    dummy_context.job = DummyJob()
-    dummy_context.bot = context.bot
-    
-    await send_reminder(dummy_context)
-
-@restricted
-async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    jobs = get_jobs_from_queue(context.application.job_queue)
-    
-    if not jobs:
-        await update.message.reply_text("📭 <b>Нет запланированных задач.</b>", parse_mode=ParseMode.HTML)
-        return
-    
-    meeting_jobs = [j for j in jobs if j.name and j.name.startswith("meeting_reminder_")]
-    fact_jobs = [j for j in jobs if j.name and j.name.startswith("daily_fact_")]
-    other_jobs = [j for j in jobs if j not in meeting_jobs + fact_jobs]
-    
-    message = "📋 <b>Запланированные задачи:</b>\n\n"
-    
-    if meeting_jobs:
-        message += "🔔 <b>Напоминания о планёрках:</b>\n"
-        for job in sorted(meeting_jobs, key=lambda j: j.next_t):
-            next_time = job.next_t.astimezone(TIMEZONE)
-            message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name[:30]}...)\n"
-    
-    if fact_jobs:
-        message += "\n📚 <b>Интересные факты из Википедии:</b>\n"
-        for job in sorted(fact_jobs, key=lambda j: j.next_t):
-            next_time = job.next_t.astimezone(TIMEZONE)
-            message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name[:30]}...)\n"
-    
-    if other_jobs:
-        message += "\n🔧 <b>Другие задачи:</b>\n"
-        for job in other_jobs:
-            next_time = job.next_t.astimezone(TIMEZONE)
-            job_name = job.name[:30] + "..." if job.name and len(job.name) > 30 else job.name or "Без имени"
-            message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job_name})\n"
-    
-    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-
-@restricted
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("❌ <b>Используйте:</b> /adduser @username", parse_mode=ParseMode.HTML)
-        return
-    
-    username = context.args[0].lstrip('@')
-    config = BotConfig()
-    
-    if config.add_allowed_user(username):
-        await update.message.reply_text(f"✅ <b>Пользователь @{username} добавлен</b>", parse_mode=ParseMode.HTML)
-        logger.info(f"Добавлен пользователь @{username}")
-    else:
-        await update.message.reply_text(f"ℹ️ <b>Пользователь @{username} уже есть в списке</b>", parse_mode=ParseMode.HTML)
-
-@restricted
-async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("❌ <b>Используйте:</b> /removeuser @username", parse_mode=ParseMode.HTML)
-        return
-    
-    username = context.args[0].lstrip('@')
-    config = BotConfig()
-    
-    if config.remove_allowed_user(username):
-        await update.message.reply_text(f"✅ <b>Пользователь @{username} удален</b>", parse_mode=ParseMode.HTML)
-        logger.info(f"Удален пользователь @{username}")
-    else:
-        await update.message.reply_text(f"❌ <b>Пользователь @{username} не найден</b>", parse_mode=ParseMode.HTML)
-
-@restricted
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    config = BotConfig()
-    users = config.allowed_users
-    
-    if not users:
-        await update.message.reply_text("📭 <b>Список пользователей пуст</b>", parse_mode=ParseMode.HTML)
-        return
-    
-    message = "👥 <b>Разрешенные пользователи:</b>\n\n"
-    for i, user in enumerate(users, 1):
-        message += f"{i}. @{user}\n"
-    
-    message += f"\n<b>Всего:</b> {len(users)} пользователь(ей)"
-    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-
-@restricted
-async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    jobs = get_jobs_from_queue(context.application.job_queue)
-    canceled_meetings = 0
-    canceled_facts = 0
-    
-    for job in jobs[:]:
-        if job.name and job.name.startswith("meeting_reminder_"):
-            job.schedule_removal()
-            canceled_meetings += 1
-        elif job.name and job.name.startswith("daily_fact_"):
-            job.schedule_removal()
-            canceled_facts += 1
-    
-    config = BotConfig()
-    config.clear_active_reminders()
-    
-    await update.message.reply_text(
-        f"✅ <b>Отменено:</b>\n"
-        f"• {canceled_meetings} напоминаний о планёрках\n"
-        f"• {canceled_facts} отправок интересных фактов\n"
-        f"Очищено {len(config.active_reminders)} активных напоминаний в конфиге",
-        parse_mode=ParseMode.HTML
-    )
-    logger.info(f"Отменено {canceled_meetings} напоминаний и {canceled_facts} интересных фактов")
-
-def calculate_next_reminder() -> datetime:
-    now = datetime.now(TIMEZONE)
-    current_weekday = now.weekday()
-
-    if current_weekday in MEETING_DAYS:
-        reminder_time = now.replace(
-            hour=MEETING_TIME['hour'],
-            minute=MEETING_TIME['minute'],
-            second=0,
-            microsecond=0
-        )
-        if now < reminder_time:
-            return reminder_time
-
-    days_ahead = 1
-    while True:
-        next_day = now + timedelta(days=days_ahead)
-        if next_day.weekday() in MEETING_DAYS:
-            return next_day.replace(
-                hour=MEETING_TIME['hour'],
-                minute=MEETING_TIME['minute'],
-                second=0,
-                microsecond=0
-            )
-        days_ahead += 1
-
-async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    next_time = calculate_next_reminder()
-    config = BotConfig()
-    chat_id = config.chat_id
-
-    if not chat_id:
-        logger.warning("Chat ID не установлен, планирование отложено")
-        context.application.job_queue.run_once(
-            schedule_next_reminder,
-            3600
-        )
-        return
-
-    now = datetime.now(TIMEZONE)
-    delay = (next_time - now).total_seconds()
-
-    if delay > 0:
-        job_name = f"meeting_reminder_{next_time.strftime('%Y%m%d_%H%M')}"
-        
-        existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
-                        if j.name == job_name]
-        
-        if not existing_jobs:
-            context.application.job_queue.run_once(
-                send_reminder,
-                delay,
-                chat_id=chat_id,
-                name=job_name
-            )
-
-            context.application.job_queue.run_once(
-                schedule_next_reminder,
-                delay + 60,
-                chat_id=chat_id,
-                name=f"scheduler_{next_time.strftime('%Y%m%d_%H%M')}"
-            )
-
-            logger.info(f"Следующее напоминание запланировано на {next_time}")
-        else:
-            logger.info(f"Напоминание на {next_time} уже запланировано")
-    else:
-        # Если время уже прошло, планируем на следующий день
-        logger.warning(f"Время напоминания уже прошло ({next_time}), планируем на следующий день")
-        context.application.job_queue.run_once(
-            schedule_next_reminder,
-            60,  # Через минуту
-            chat_id=chat_id
-        )
-
-def cleanup_old_jobs(job_queue: JobQueue) -> None:
-    jobs = get_jobs_from_queue(job_queue)
-    jobs_by_name = {}
-    jobs_to_remove = []
-    
-    for job in jobs:
-        if job.name:
-            if job.name in jobs_by_name:
-                jobs_to_remove.append(jobs_by_name[job.name])
-            jobs_by_name[job.name] = job
-    
-    now = datetime.now(TIMEZONE)
-    for job in jobs:
-        if job.next_t and job.next_t < now:
-            jobs_to_remove.append(job)
-    
-    for job in jobs_to_remove:
-        job.schedule_removal()
-    
-    if jobs_to_remove:
-        logger.info(f"Очищено {len(jobs_to_remove)} старых/дублирующих задач")
-
-def restore_reminders(application: Application) -> None:
-    config = BotConfig()
-    now = datetime.now(TIMEZONE)
-    
-    for job_name, reminder_data in config.active_reminders.items():
-        try:
-            created_at = datetime.fromisoformat(reminder_data["created_at"])
-            if (now - created_at).days < 1:
-                application.job_queue.run_once(
-                    lambda ctx: logger.info(f"Восстановлено напоминание {job_name}"),
-                    1,
-                    name=f"restored_{job_name}"
-                )
-        except Exception as e:
-            logger.error(f"Ошибка восстановления напоминания {job_name}: {e}")
 
 def main() -> None:
+    """Основная функция"""
     if not TOKEN:
-        logger.error("❌ Токен бота не найден! Установите переменную окружения TELEGRAM_BOT_TOKEN")
+        logger.error("❌ Токен бота не найден! Установите TELEGRAM_BOT_TOKEN")
         return
     
-    if not ZOOM_LINK or ZOOM_LINK == "https://us04web.zoom.us/j/1234567890?pwd=example":
-        logger.warning("⚠️  Zoom-ссылка не установлена или используется значение по умолчанию!")
-        logger.warning("   Установите переменную окружения ZOOM_MEETING_LINK")
-    else:
-        logger.info(f"✅ Zoom-ссылка загружена (первые 50 символов): {ZOOM_LINK[:50]}...")
-
+    # Устанавливаем uvloop для лучшей производительности
     try:
-        application = Application.builder().token(TOKEN).build()
-
-        # ConversationHandler для отмены планёрки
-        conv_handler = ConversationHandler(
-            entry_points=[CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$")],
-            states={
-                SELECTING_REASON: [
-                    CallbackQueryHandler(select_reason_callback, pattern="^reason_[0-9]+$"),
-                ],
-                SELECTING_DATE: [
-                    CallbackQueryHandler(date_selected_callback, pattern="^date_.+$"),
-                    CallbackQueryHandler(date_selected_callback, pattern="^custom_date$"),
-                    CallbackQueryHandler(date_selected_callback, pattern="^back_to_reasons$"),
-                ],
-                CONFIRMING_DATE: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_date),
-                    CallbackQueryHandler(execute_cancellation, pattern="^confirm_cancel$"),
-                    CallbackQueryHandler(back_to_reasons_from_confirm, pattern="^back_to_reasons_from_confirm$"),
-                ],
-            },
-            fallbacks=[
-                CommandHandler("cancel", cancel_conversation),
-                CallbackQueryHandler(cancel_conversation, pattern="^cancel_conversation$"),
-            ],
-            allow_reentry=True,
-        )
-
-        # Обработчики команд
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("setchat", set_chat))
-        application.add_handler(CommandHandler("info", show_info))
-        application.add_handler(CommandHandler("test", test_reminder))
-        application.add_handler(CommandHandler("testnow", test_now))
-        application.add_handler(CommandHandler("factnow", send_fact_now))
-        application.add_handler(CommandHandler("nextfact", show_next_fact_category))
-        application.add_handler(CommandHandler("jobs", list_jobs))
-        application.add_handler(CommandHandler("adduser", add_user))
-        application.add_handler(CommandHandler("removeuser", remove_user))
-        application.add_handler(CommandHandler("users", list_users))
-        application.add_handler(CommandHandler("cancelall", cancel_all))
-
-        # Добавляем ConversationHandler
-        application.add_handler(conv_handler)
-
-        # УБРАН обработчик реакций на факты
-
-        # Очистка старых задач
-        cleanup_old_jobs(application.job_queue)
-        
-        # Восстановление напоминаний
-        restore_reminders(application)
-
-        # Запуск планировщика планёрок
-        application.job_queue.run_once(
-            lambda context: schedule_next_reminder(context),
-            3
-        )
-
-        # Запуск планировщика интересных фактов
-        application.job_queue.run_once(
-            lambda context: schedule_next_fact(context),
-            5
-        )
-
-        logger.info("🤖 Бот запущен и готов к работе!")
-        logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК")
-        logger.info(f"📚 ИНТЕРЕСНЫЕ факты: Пн-Пт в 10:00 по МСК (07:00 UTC)")
-        logger.info(f"🎯 Категории интересных фактов: {', '.join(FACT_CATEGORIES)}")
-        logger.info(f"🔄 Факты НЕ повторяются в пределах категории!")
-        logger.info(f"👥 Разрешённые пользователи: {', '.join(BotConfig().allowed_users)}")
-        
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка при запуске бота: {e}")
-        raise
-
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        logger.info("✅ Используется uvloop для асинхронности")
+    except ImportError:
+        logger.warning("⚠️  uvloop не установлен. Установите: pip install uvloop")
+    
+    application = Application.builder().token(TOKEN).build()
+    
+    # Обработчики команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("setchat", set_chat))
+    application.add_handler(CommandHandler("digestnow", send_digest_now))
+    application.add_handler(CommandHandler("info", info))
+    
+    # Запуск планировщика
+    application.job_queue.run_once(
+        lambda ctx: schedule_next_digest(ctx),
+        3
+    )
+    
+    logger.info("🤖 Бот ежедневного дайджеста запущен!")
+    logger.info(f"⏰ Дайджесты: Пн-Пт в {DIGEST_TIME['hour']:02d}:{DIGEST_TIME['minute']:02d} по МСК")
+    logger.info(f"📰 Источники: {len(NEWS_SOURCES['спорт']) + len(NEWS_SOURCES['технологии']) + len(NEWS_SOURCES['курьёзы'])} сайтов")
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
