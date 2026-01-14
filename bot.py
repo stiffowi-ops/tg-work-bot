@@ -11,6 +11,7 @@ import pytz
 from urllib.parse import quote
 import re
 import time
+from collections import Counter, defaultdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -30,6 +31,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEFAULT_ZOOM_LINK = "https://us04web.zoom.us/j/1234567890?pwd=example"
 ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", DEFAULT_ZOOM_LINK)
 CONFIG_FILE = "bot_config.json"
+CATEGORY_STATS_FILE = "category_stats.json"  # Файл для статистики категорий
 
 # Время планёрки (9:30 по Москве)
 MEETING_TIME = {"hour": 9, "minute": 15}
@@ -39,8 +41,33 @@ TIMEZONE = pytz.timezone("Europe/Moscow")
 MEETING_DAYS = [0, 2, 4]
 
 # ========== КОНСТАНТЫ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
-# Категории событий
+# Базовые категории событий
 EVENT_CATEGORIES = ['музыка', 'фильмы', 'технологии', 'игры', 'наука', 'спорт', 'история']
+
+# Контекстные привязки дней недели к категориям
+DAY_CATEGORY_PREFERENCES = {
+    0: ['технологии', 'наука', 'история'],      # Понедельник - старт недели, серьезные темы
+    1: ['музыка', 'фильмы', 'игры'],             # Вторник - развлечения
+    2: ['спорт', 'история', 'технологии'],       # Среда - середина недели
+    3: ['наука', 'музыка', 'фильмы'],            # Четверг - культурный день
+    4: ['игры', 'музыка', 'спорт'],              # Пятница - развлечения к выходным
+}
+
+# Сезонные предпочтения (месяц -> приоритетные категории)
+SEASONAL_PREFERENCES = {
+    1: ['история', 'наука', 'спорт'],            # Январь - зимние виды спорта
+    2: ['история', 'наука'],
+    3: ['наука', 'технологии'],
+    4: ['спорт', 'музыка'],
+    5: ['фильмы', 'игры'],
+    6: ['спорт', 'музыка'],
+    7: ['игры', 'технологии'],
+    8: ['история', 'спорт'],
+    9: ['наука', 'фильмы'],
+    10: ['игры', 'музыка'],
+    11: ['история', 'фильмы'],
+    12: ['музыка', 'фильмы', 'игры'],            # Декабрь - развлечения к праздникам
+}
 
 # Время отправки (10:00 по Москве = 7:00 UTC)
 EVENT_SEND_TIME = {"hour": 7, "minute": 0, "timezone": "UTC"}  # 7:00 UTC = 10:00 МСК
@@ -67,9 +94,20 @@ CATEGORY_EMOJIS = {
     'история': '📜'
 }
 
+# Описания категорий для пользователей
+CATEGORY_DESCRIPTIONS = {
+    'музыка': 'Знаменательные события в мире музыки',
+    'фильмы': 'Кинопремьеры и события из мира кино',
+    'технологии': 'Изобретения и технологические прорывы',
+    'игры': 'Выпуски игр и события индустрии',
+    'наука': 'Научные открытия и достижения',
+    'спорт': 'Спортивные рекорды и события',
+    'история': 'Исторические события и даты'
+}
+
 # Wikipedia API константы
 WIKIPEDIA_API_URL = "https://ru.wikipedia.org/w/api.php"
-USER_AGENT = 'TelegramEventBot/3.0 (https://github.com/; contact@example.com)'
+USER_AGENT = 'TelegramEventBot/4.0 (https://github.com/; contact@example.com)'
 REQUEST_TIMEOUT = 20
 REQUEST_RETRIES = 3
 
@@ -80,12 +118,19 @@ class HistoricalEvent(TypedDict):
     description: str
     url: str
     category: str
-    full_article: str  # Полный текст статьи для извлечения фактов
+    full_article: str
 
 class ReminderData(TypedDict):
     message_id: int
     chat_id: int
     created_at: str
+
+class CategoryStats(TypedDict):
+    sent_count: int
+    engagement_score: float
+    last_sent: str
+    popularity_score: float
+    feedback_counts: Dict[str, int]  # 'likes', 'dislikes', 'skips'
 
 # ========== НАСТРОЙКИ ==========
 CANCELLATION_OPTIONS = [
@@ -105,29 +150,304 @@ logger = logging.getLogger(__name__)
 
 # ========== УЛУЧШЕННЫЙ КЛАСС ДЛЯ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
 class EventScheduler:
-    """Класс для управления отправкой исторических событий 'В этот день'"""
+    """Класс для управления отправкой исторических событий 'В этот день' с адаптивными категориями"""
     
     def __init__(self):
         self.current_index = 0
-        # Храним использованные статьи по категориям
         self.used_events: Dict[str, set] = {category: set() for category in EVENT_CATEGORIES}
-        # Кэш для fallback-событий
         self.fallback_cache: Dict[str, List[HistoricalEvent]] = {}
-        logger.info("Инициализирован улучшенный планировщик исторических событий 'В этот день'")
+        
+        # Статистика категорий
+        self.category_stats = self._load_category_stats()
+        
+        # История выбора категорий для анализа паттернов
+        self.category_history: List[str] = []
+        self.max_history_size = 100
+        
+        # Веса категорий для адаптивного выбора
+        self.category_weights = self._calculate_initial_weights()
+        
+        logger.info("Инициализирован адаптивный планировщик исторических событий 'В этот день'")
+    
+    def _load_category_stats(self) -> Dict[str, CategoryStats]:
+        """Загружаем статистику категорий из файла"""
+        if os.path.exists(CATEGORY_STATS_FILE):
+            try:
+                with open(CATEGORY_STATS_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # Убедимся, что все категории есть в статистике
+                    for category in EVENT_CATEGORIES:
+                        if category not in data:
+                            data[category] = {
+                                'sent_count': 0,
+                                'engagement_score': 0.5,
+                                'last_sent': '',
+                                'popularity_score': 0.5,
+                                'feedback_counts': {'likes': 0, 'dislikes': 0, 'skips': 0}
+                            }
+                    return data
+            except Exception as e:
+                logger.error(f"Ошибка загрузки статистики категорий: {e}")
+        
+        # Создаем новую статистику
+        stats = {}
+        for category in EVENT_CATEGORIES:
+            stats[category] = {
+                'sent_count': 0,
+                'engagement_score': 0.5,  # Начальный средний балл
+                'last_sent': '',
+                'popularity_score': 0.5,  # Начальная популярность
+                'feedback_counts': {'likes': 0, 'dislikes': 0, 'skips': 0}
+            }
+        return stats
+    
+    def _save_category_stats(self) -> None:
+        """Сохраняем статистику категорий в файл"""
+        try:
+            with open(CATEGORY_STATS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.category_stats, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения статистики категорий: {e}")
+    
+    def _calculate_initial_weights(self) -> Dict[str, float]:
+        """Рассчитываем начальные веса категорий"""
+        weights = {}
+        
+        # Базовый вес для всех категорий
+        base_weight = 1.0 / len(EVENT_CATEGORIES)
+        
+        for category in EVENT_CATEGORIES:
+            weights[category] = base_weight
+        
+        return weights
+    
+    def _update_category_weights(self) -> None:
+        """Обновляем веса категорий на основе статистики и контекста"""
+        now = datetime.now(TIMEZONE)
+        weekday = now.weekday()
+        month = now.month
+        
+        # 1. Вес на основе статистики вовлеченности
+        engagement_weights = {}
+        total_engagement = sum(stats['engagement_score'] for stats in self.category_stats.values())
+        
+        for category in EVENT_CATEGORIES:
+            if total_engagement > 0:
+                engagement_weights[category] = self.category_stats[category]['engagement_score'] / total_engagement
+            else:
+                engagement_weights[category] = 1.0 / len(EVENT_CATEGORIES)
+        
+        # 2. Вес на основе дня недели
+        day_weights = {}
+        if weekday in DAY_CATEGORY_PREFERENCES:
+            preferred = DAY_CATEGORY_PREFERENCES[weekday]
+            for category in EVENT_CATEGORIES:
+                if category in preferred:
+                    day_weights[category] = 1.5  # Бонус для предпочтительных категорий
+                else:
+                    day_weights[category] = 1.0
+        else:
+            for category in EVENT_CATEGORIES:
+                day_weights[category] = 1.0
+        
+        # 3. Вес на основе сезона/месяца
+        seasonal_weights = {}
+        if month in SEASONAL_PREFERENCES:
+            preferred = SEASONAL_PREFERENCES[month]
+            for category in EVENT_CATEGORIES:
+                if category in preferred:
+                    seasonal_weights[category] = 1.3  # Небольшой бонус
+                else:
+                    seasonal_weights[category] = 1.0
+        else:
+            for category in EVENT_CATEGORIES:
+                seasonal_weights[category] = 1.0
+        
+        # 4. Вес на основе времени с последней отправки
+        recency_weights = {}
+        for category in EVENT_CATEGORIES:
+            last_sent = self.category_stats[category]['last_sent']
+            if last_sent:
+                try:
+                    last_sent_date = datetime.fromisoformat(last_sent)
+                    days_passed = (now - last_sent_date).days
+                    # Чем больше дней прошло, тем выше вес
+                    recency_weights[category] = min(2.0, 1.0 + (days_passed / 30.0))
+                except:
+                    recency_weights[category] = 2.0  # Максимальный вес если дата некорректна
+            else:
+                recency_weights[category] = 2.0  # Никогда не отправлялось
+        
+        # 5. Комбинируем все веса
+        for category in EVENT_CATEGORIES:
+            combined_weight = (
+                engagement_weights[category] *
+                day_weights[category] *
+                seasonal_weights[category] *
+                recency_weights[category]
+            )
+            self.category_weights[category] = combined_weight
+        
+        # Нормализуем веса
+        total_weight = sum(self.category_weights.values())
+        if total_weight > 0:
+            for category in EVENT_CATEGORIES:
+                self.category_weights[category] /= total_weight
+        
+        logger.debug(f"Обновленные веса категорий: {self.category_weights}")
     
     def get_next_category(self) -> str:
-        """Получаем следующую категорию по кругу"""
-        category = EVENT_CATEGORIES[self.current_index]
-        logger.debug(f"Текущая категория событий: {category}, индекс: {self.current_index}")
-        return category
+        """Получаем следующую категорию с учетом адаптивных весов"""
+        self._update_category_weights()
+        
+        # Выбираем категорию на основе весов
+        categories = list(self.category_weights.keys())
+        weights = list(self.category_weights.values())
+        
+        # Используем взвешенный случайный выбор
+        selected_category = random.choices(categories, weights=weights, k=1)[0]
+        
+        # Добавляем в историю
+        self.category_history.append(selected_category)
+        if len(self.category_history) > self.max_history_size:
+            self.category_history.pop(0)
+        
+        logger.info(f"Выбрана адаптивная категория: {selected_category} (вес: {self.category_weights[selected_category]:.3f})")
+        return selected_category
+    
+    def record_category_feedback(self, category: str, feedback_type: str = 'neutral') -> None:
+        """Записываем обратную связь по категории"""
+        if category not in self.category_stats:
+            return
+        
+        stats = self.category_stats[category]
+        
+        if feedback_type in ['like', 'dislike', 'skip']:
+            if feedback_type not in stats['feedback_counts']:
+                stats['feedback_counts'][feedback_type] = 0
+            stats['feedback_counts'][feedback_type] += 1
+        
+        # Пересчитываем engagement_score на основе фидбэка
+        total_feedback = sum(stats['feedback_counts'].values())
+        if total_feedback > 0:
+            likes = stats['feedback_counts'].get('like', 0)
+            dislikes = stats['feedback_counts'].get('dislike', 0)
+            
+            if likes + dislikes > 0:
+                stats['engagement_score'] = likes / (likes + dislikes)
+            else:
+                stats['engagement_score'] = 0.5
+        
+        # Сохраняем статистику
+        self._save_category_stats()
+        logger.info(f"Записан фидбэк для категории {category}: {feedback_type}")
     
     def increment_category(self) -> str:
         """Увеличиваем индекс категории и возвращаем следующую"""
-        old_index = self.current_index
-        self.current_index = (self.current_index + 1) % len(EVENT_CATEGORIES)
-        next_category = EVENT_CATEGORIES[self.current_index]
-        logger.debug(f"Категория изменена: {EVENT_CATEGORIES[old_index]} -> {next_category}")
+        old_category = self.get_next_category()
+        
+        # Обновляем статистику для отправленной категории
+        now = datetime.now(TIMEZONE).isoformat()
+        self.category_stats[old_category]['sent_count'] += 1
+        self.category_stats[old_category]['last_sent'] = now
+        
+        # Рассчитываем популярность на основе частоты отправки
+        total_sent = sum(stats['sent_count'] for stats in self.category_stats.values())
+        if total_sent > 0:
+            for category in EVENT_CATEGORIES:
+                self.category_stats[category]['popularity_score'] = (
+                    self.category_stats[category]['sent_count'] / total_sent
+                )
+        
+        self._save_category_stats()
+        
+        # Получаем следующую категорию
+        next_category = self.get_next_category()
+        logger.info(f"Категория изменена: {old_category} -> {next_category}")
         return next_category
+    
+    def get_category_stats_message(self) -> str:
+        """Получаем статистику категорий в читаемом формате"""
+        message = "📊 *Статистика категорий:*\n\n"
+        
+        # Сортируем категории по популярности
+        sorted_categories = sorted(
+            self.category_stats.items(),
+            key=lambda x: x[1]['popularity_score'],
+            reverse=True
+        )
+        
+        for category, stats in sorted_categories:
+            emoji = CATEGORY_EMOJIS.get(category, '📌')
+            sent_count = stats['sent_count']
+            engagement = stats['engagement_score']
+            
+            # Создаем прогресс-бар для вовлеченности
+            engagement_bar = self._create_progress_bar(engagement, 10)
+            
+            # Рассчитываем процент фидбэка
+            total_feedback = sum(stats['feedback_counts'].values())
+            if total_feedback > 0:
+                likes = stats['feedback_counts'].get('like', 0)
+                likes_percent = (likes / total_feedback) * 100
+            else:
+                likes_percent = 0
+            
+            message += (
+                f"{emoji} *{category.upper()}*\n"
+                f"• Отправлено: {sent_count} раз\n"
+                f"• Вовлеченность: {engagement_bar} ({engagement:.1%})\n"
+                f"• Лайков: {likes_percent:.0f}%\n"
+                f"• Последний раз: {self._format_last_sent(stats['last_sent'])}\n\n"
+            )
+        
+        # Добавляем общую информацию
+        total_sent = sum(stats['sent_count'] for stats in self.category_stats.values())
+        message += f"📈 *Всего отправлено:* {total_sent} событий\n"
+        
+        # Самые популярные категории
+        popular_categories = sorted_categories[:3]
+        if popular_categories:
+            popular_names = [f"{CATEGORY_EMOJIS.get(cat, '')} {cat}" for cat, _ in popular_categories]
+            message += f"🏆 *Топ-3:* {', '.join(popular_names)}\n"
+        
+        # Предсказание следующей категории
+        next_category = self.get_next_category()
+        next_emoji = CATEGORY_EMOJIS.get(next_category, '📌')
+        message += f"🔮 *Следующая (предположительно):* {next_emoji} {next_category}"
+        
+        return message
+    
+    def _create_progress_bar(self, value: float, length: int = 10) -> str:
+        """Создаем текстовый прогресс-бар"""
+        filled = int(value * length)
+        empty = length - filled
+        return '█' * filled + '░' * empty
+    
+    def _format_last_sent(self, last_sent_str: str) -> str:
+        """Форматируем дату последней отправки"""
+        if not last_sent_str:
+            return "никогда"
+        
+        try:
+            last_sent = datetime.fromisoformat(last_sent_str)
+            now = datetime.now(TIMEZONE)
+            days_passed = (now - last_sent).days
+            
+            if days_passed == 0:
+                return "сегодня"
+            elif days_passed == 1:
+                return "вчера"
+            elif days_passed < 7:
+                return f"{days_passed} дней назад"
+            elif days_passed < 30:
+                weeks = days_passed // 7
+                return f"{weeks} недель назад"
+            else:
+                months = days_passed // 30
+                return f"{months} месяцев назад"
+        except:
+            return "неизвестно"
     
     def get_todays_date_parts(self) -> Tuple[int, str, int]:
         """Получаем текущую дату (день, месяц_ru, текущий_год)"""
@@ -138,13 +458,13 @@ class EventScheduler:
         return day, month_ru, year
     
     def cleanup_old_events(self, days_to_keep: int = 30) -> None:
-        """Очистка старых событий (заглушка для будущей реализации)"""
+        """Очистка старых событий"""
         # В будущем можно реализовать очистку по дате использования
         pass
     
     def search_historical_events(self, day: int, month: int, category: str) -> List[HistoricalEvent]:
         """
-        Ищем исторические события, которые произошли в ЭТУ ДАТУ (14 января) в РАЗНЫЕ ГОДЫ
+        Ищем исторические события, которые произошли в ЭТУ ДАТУ в РАЗНЫЕ ГОДЫ
         """
         try:
             date_str = f"{day} {MONTHS_RU_LOWER[month]}"
@@ -239,15 +559,15 @@ class EventScheduler:
             ]
         }
         
-        # Ищем события за последние 200 лет (с шагом 5 лет для производительности)
+        # Ищем события за последние 200 лет
         current_year = datetime.now(TIMEZONE).year
         search_years = list(range(current_year - 200, current_year + 1, 5))
-        random.shuffle(search_years)  # Для разнообразия
+        random.shuffle(search_years)
         
         templates = search_templates_by_category.get(category, [f'"{date_str}" {year}'])
         
-        for year in search_years[:10]:  # Ограничиваем количество проверяемых лет
-            for template in templates[:3]:  # Берем первые 3 шаблона
+        for year in search_years[:10]:
+            for template in templates[:3]:
                 try:
                     search_query = template.replace("{year}", str(year))
                     logger.debug(f"Поиск: {search_query}")
@@ -255,10 +575,10 @@ class EventScheduler:
                     found_events = self._search_wikipedia_precise(search_query, category, day, month, year)
                     if found_events:
                         events.extend(found_events)
-                        if len(events) >= 5:  # Ограничиваем количество найденных событий
+                        if len(events) >= 5:
                             return events
                         
-                    time.sleep(0.5)  # Задержка между запросами
+                    time.sleep(0.5)
                 except Exception as e:
                     logger.warning(f"Ошибка поиска по запросу '{search_query}': {e}")
                     continue
@@ -295,15 +615,13 @@ class EventScheduler:
                 for article in data['query']['search']:
                     title = article['title']
                     
-                    # Пропускаем нерелевантные статьи
                     if any(word in title.lower() for word in ['категория:', 'шаблон:', 'список', 'таблица', 'изображение']):
                         continue
                     
-                    # Пытаемся получить полную статью для анализа
                     event_info = self._analyze_article_for_date_event(title, category, day, month, target_year)
                     if event_info:
                         events.append(event_info)
-                        if len(events) >= 3:  # Ограничиваем количество на запрос
+                        if len(events) >= 3:
                             break
         
         except Exception as e:
@@ -314,7 +632,6 @@ class EventScheduler:
     def _analyze_article_for_date_event(self, title: str, category: str, day: int, month: int, target_year: int) -> Optional[HistoricalEvent]:
         """Анализируем статью на наличие события в конкретную дату"""
         try:
-            # Получаем полный текст статьи
             full_text = self._get_article_full_text(title)
             if not full_text:
                 return None
@@ -323,10 +640,9 @@ class EventScheduler:
                 f"{day}\s*{MONTHS_RU_LOWER[month]}\s*{target_year}",
                 f"{day}\s*{MONTHS_RU_LOWER[month]}\s*{target_year}\s*года",
                 f"{target_year}\s*года\s*{day}\s*{MONTHS_RU_LOWER[month]}",
-                f"{day}[\.\s]*{month:02d}[\.\s]*{target_year}"  # DD.MM.YYYY
+                f"{day}[\.\s]*{month:02d}[\.\s]*{target_year}"
             ]
             
-            # Ищем упоминание конкретной даты в тексте
             date_found = False
             for pattern in date_patterns:
                 if re.search(pattern, full_text, re.IGNORECASE):
@@ -336,12 +652,10 @@ class EventScheduler:
             if not date_found:
                 return None
             
-            # Извлекаем факт о событии
             fact = self._extract_event_fact(full_text, day, month, target_year)
             if not fact:
                 return None
             
-            # Получаем описание
             description = self._get_article_description(title)
             
             encoded_title = quote(title.replace(' ', '_'), safe='')
@@ -353,7 +667,7 @@ class EventScheduler:
                 'description': description,
                 'url': article_url,
                 'category': category,
-                'full_article': full_text[:5000]  # Сохраняем часть текста для извлечения фактов
+                'full_article': full_text[:5000]
             }
             
         except Exception as e:
@@ -389,7 +703,6 @@ class EventScheduler:
             page = pages[page_id]
             
             if 'missing' not in page:
-                # Пробуем получить полный текст разными способами
                 if 'revisions' in page:
                     return page['revisions'][0].get('*', '')
                 elif 'extract' in page:
@@ -405,20 +718,16 @@ class EventScheduler:
         try:
             date_str = f"{day} {MONTHS_RU_LOWER[month]} {year}"
             
-            # Ищем предложения, содержащие дату
             sentences = re.split(r'[.!?]+', text)
             
             for sentence in sentences:
                 if date_str.lower() in sentence.lower():
-                    # Очищаем предложение и обрезаем
                     cleaned = re.sub(r'\s+', ' ', sentence.strip())
                     if len(cleaned) > 20 and len(cleaned) < 500:
                         return cleaned + '.'
             
-            # Если не нашли точную дату, ищем год
             for sentence in sentences:
                 if str(year) in sentence and len(sentence) > 20:
-                    # Проверяем, что это действительно о событии, а не о чем-то другом
                     if any(word in sentence.lower() for word in [
                         'произошло', 'состоялось', 'вышел', 'вышла', 'выпущен', 
                         'родился', 'родилась', 'основан', 'основана', 'открытие',
@@ -514,12 +823,10 @@ class EventScheduler:
         key = (day, month, category)
         if key in known_events_db:
             for event_data in known_events_db[key]:
-                # Пытаемся найти статью на Википедии
                 article_info = self._find_wikipedia_article_for_known_event(event_data['title'], event_data['year'], category, day, month)
                 if article_info:
                     events.append(article_info)
                 else:
-                    # Если не нашли статью, создаем fallback событие
                     events.append({
                         'title': event_data['title'],
                         'year': event_data['year'],
@@ -558,11 +865,9 @@ class EventScheduler:
                 article = data['query']['search'][0]
                 article_title = article['title']
                 
-                # Получаем описание и полный текст
                 description = self._get_article_description(article_title)
                 full_text = self._get_article_full_text(article_title)
                 
-                # Извлекаем факт
                 fact = None
                 if full_text:
                     fact = self._extract_event_fact(full_text, day, month, year)
@@ -593,7 +898,7 @@ class EventScheduler:
             day = now.day
             month = now.month
             
-            logger.info(f"Улучшенный поиск исторических событий за {day} {MONTHS_RU[month]} в категории: {category}")
+            logger.info(f"Адаптивный поиск исторических событий за {day} {MONTHS_RU[month]} в категории: {category}")
             
             # Ищем исторические события для текущей даты
             events = self.search_historical_events(day, month, category)
@@ -626,7 +931,7 @@ class EventScheduler:
                 event['year'],
                 event['description'],
                 event['url'],
-                self._format_event_fact(event, day, month)  # Используем форматированный факт
+                self._format_event_fact(event, day, month)
             )
             
         except Exception as e:
@@ -636,12 +941,10 @@ class EventScheduler:
     def _format_event_fact(self, event: HistoricalEvent, day: int, month: int) -> str:
         """Форматируем факт события"""
         if event.get('full_article'):
-            # Пытаемся извлечь точный факт из полного текста
             fact = self._extract_event_fact(event['full_article'], day, month, event['year'])
             if fact:
                 return fact
         
-        # Fallback: используем заголовок и год
         return f"{event['title']} ({event['year']} год)."
     
     def _get_fallback_event(self, category: str, day: int, month: int) -> Tuple[str, Optional[int], str, str, str]:
@@ -650,7 +953,6 @@ class EventScheduler:
             event = random.choice(self.fallback_cache[category])
             return event['title'], event['year'], event['description'], event['url'], event['title']
         
-        # Расширенная база fallback событий
         historical_events_db = {
             'музыка': [
                 {
@@ -659,13 +961,6 @@ class EventScheduler:
                     'description': 'Легендарный альбом был записан в студии на Эбби-Роуд в Лондоне.',
                     'url': 'https://ru.wikipedia.org/wiki/Abbey_Road',
                     'fact': 'The Beatles выпустили альбом "Abbey Road" 14 января 1969 года.'
-                },
-                {
-                    'title': 'Вышел альбом "The Dark Side of the Moon" группы Pink Floyd',
-                    'year': 1973,
-                    'description': 'Концептуальный альбом, который провел в чарте Billboard 200 рекордные 981 неделю.',
-                    'url': 'https://ru.wikipedia.org/wiki/The_Dark_Side_of_the_Moon',
-                    'fact': 'Альбом "The Dark Side of the Moon" группы Pink Floyd был выпущен 14 января 1973 года.'
                 },
             ],
             'фильмы': [
@@ -737,35 +1032,43 @@ class EventScheduler:
         return event['title'], event['year'], event['description'], event['url'], event.get('fact', event['title'])
     
     def create_event_message(self, category: str) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-        """Создаем сообщение с историческим событием 'В этот день' в указанном формате"""
-        # Получаем текущую дату (день и месяц)
+        """Создаем сообщение с историческим событием 'В этот день' с интерактивными кнопками"""
         day, month_ru, current_year = self.get_todays_date_parts()
         
-        # Получаем историческое событие
         title, event_year, description, url, fact = self.get_historical_event(category)
         
-        # Форматируем сообщение в указанном формате
+        # Форматируем сообщение
         message = f"**В ЭТОТ ДЕНЬ: {day} {month_ru} {event_year} года | КАТЕГОРИЯ: {category.upper()}**\n\n"
         
-        # Эмодзи для категории
         category_emoji = CATEGORY_EMOJIS.get(category, '📌')
+        category_description = CATEGORY_DESCRIPTIONS.get(category, '')
         
-        # Используем факт как основной текст
-        message += f"{category_emoji} {fact}\n\n"
+        message += f"{category_emoji} **{category_description}**\n\n"
+        message += f"✨ {fact}\n\n"
         
-        # Добавляем описание, если есть и оно не дублирует факт
         if description and description not in fact:
-            # Обрезаем описание, если оно слишком длинное
             if len(description) > 300:
                 description = description[:300] + '...'
             message += f"{description}\n\n"
         
-        # Добавляем ссылку для тех, кто хочет узнать больше
         if url:
             message += f"📖 [Подробнее на Википедии]({url})"
         
-        # Возвращаем только сообщение, без клавиатуры
-        return message, None
+        # Создаем интерактивную клавиатуру для обратной связи
+        keyboard = [
+            [
+                InlineKeyboardButton("👍 Понравилось", callback_data=f"feedback_like_{category}"),
+                InlineKeyboardButton("👎 Не понравилось", callback_data=f"feedback_dislike_{category}")
+            ],
+            [
+                InlineKeyboardButton("⏭️ Пропустить", callback_data=f"feedback_skip_{category}"),
+                InlineKeyboardButton("📊 Статистика", callback_data="show_stats")
+            ]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        return message, reply_markup
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
@@ -803,7 +1106,6 @@ def get_greeting_by_meeting_day() -> str:
     day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     current_day = day_names_ru[weekday]
     
-    # Проверяем, настроена ли Zoom-ссылка
     if ZOOM_LINK == DEFAULT_ZOOM_LINK:
         zoom_note = "\n\n⚠️ Zoom-ссылка не настроена! Используйте /info для проверки"
     else:
@@ -813,12 +1115,6 @@ def get_greeting_by_meeting_day() -> str:
             f"\n\n👨💻 {zoom_link_formatted} | 👈",
             f"\n\n💻 {zoom_link_formatted} | 👈",
             f"\n\n🔗 {zoom_link_formatted} | 👈",
-            f"\n\n📅 {zoom_link_formatted} | 👈",
-            f"\n\n✉️ {zoom_link_formatted} | 👈",
-            f"\n\n🎯 {zoom_link_formatted} | 👈",
-            f"\n\n🤝 {zoom_link_formatted} | 👈",
-            f"\n\n🚀 {zoom_link_formatted} | 👈",
-            f"\n\n⚡ {zoom_link_formatted} | 👈",
         ]
         zoom_note = random.choice(zoom_notes)
     
@@ -829,17 +1125,14 @@ def get_greeting_by_meeting_day() -> str:
             0: [
                 f"🚀 <b>{day_names[0]}</b> - старт новой недели!\n\n📋 <i>Планёрка в 9:30 по МСК</i>. Давайте обсудим планы на неделю! 🌟{zoom_note}",
                 f"🌞 Доброе утро! Сегодня <b>{day_names[0]}</b>!\n\n🤝 <i>Планёрка в 9:30 по МСК</i>. Начинаем неделю продуктивно! 💪{zoom_note}",
-                f"⚡ <b>{day_names[0]}</b>, время действовать!\n\n🎯 <i>Утренняя планёрка в 9:30 по МСК</i>. Подготовьте ваши вопросы! 📊{zoom_note}"
             ],
             2: [
                 f"⚡ <b>{day_names[2]}</b> - середина недели!\n\n📋 <i>Планёрка в 9:30 по МСК</i>. Время для корректировок и обновлений! 🔄{zoom_note}",
                 f"🌞 <b>{day_names[2]}</b>, доброе утро!\n\n🤝 <i>Планёрка в 9:30 по МСК</i>. Как продвигаются задачи? 📈{zoom_note}",
-                f"💪 <b>{day_names[2]}</b> - день прорыва!\n\n🎯 <i>Планёрка в 9:30 по МСК</i>. Делитесь прогрессом! 🚀{zoom_note}"
             ],
             4: [
                 f"🎉 <b>{day_names[4]}</b> - завершаем неделю!\n\n📋 <i>Планёрка в 9:30 по МСК</i>. Давайте подведем итоги недели! 🏆{zoom_note}",
                 f"🌞 Пятничное утро! 🎊\n\n🤝 <b>{day_names[4]}</b>, <i>планёрка в 9:30 по МСК</i>. Как прошла неделя? 📊{zoom_note}",
-                f"✨ <b>{day_names[4]}</b> - время подводить итоги!\n\n🎯 <i>Планёрка в 9:30 по МСК</i>. Что успели за неделю? 📈{zoom_note}"
             ]
         }
         return random.choice(greetings[weekday])
@@ -967,7 +1260,6 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if not chat_id:
             logger.error("Chat ID не установлен для отправки исторических событий!")
-            # Пробуем снова через час
             context.application.job_queue.run_once(
                 lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
                 3600
@@ -977,9 +1269,9 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Получаем планировщик
         event_scheduler = config.get_event_scheduler()
         
-        # Получаем текущую категорию
+        # Получаем текущую категорию с адаптивным выбором
         category = event_scheduler.get_next_category()
-        logger.info(f"Отправка улучшенного ИСТОРИЧЕСКОГО события 'В этот день' категории: {category}")
+        logger.info(f"Отправка АДАПТИВНОГО события 'В этот день' категории: {category}")
         
         # Создаем сообщение с историческим событием
         message, keyboard = event_scheduler.create_event_message(category)
@@ -997,14 +1289,13 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
         event_scheduler.increment_category()
         config.event_current_index = event_scheduler.current_index
         
-        logger.info(f"✅ Улучшенное ИСТОРИЧЕСКОЕ событие 'В этот день' отправлено: {category}")
+        logger.info(f"✅ АДАПТИВНОЕ событие 'В этот день' отправлено: {category}")
         
         # Планируем следующую отправку
         await schedule_next_event(context)
         
     except Exception as e:
-        logger.error(f"❌ Ошибка отправки улучшенного ИСТОРИЧЕСКОГО события 'В этот день': {e}")
-        # Пробуем снова через 5 минут
+        logger.error(f"❌ Ошибка отправки АДАПТИВНОГО события 'В этот день': {e}")
         context.application.job_queue.run_once(
             lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
             300
@@ -1012,7 +1303,7 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправить улучшенное ИСТОРИЧЕСКОЕ событие 'В этот день' немедленно по команде"""
+    """Отправить АДАПТИВНОЕ историческое событие 'В этот день' немедленно по команде"""
     config = BotConfig()
     chat_id = config.chat_id
 
@@ -1024,9 +1315,9 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Получаем планировщик
         event_scheduler = config.get_event_scheduler()
         
-        # Получаем текущую категорию
+        # Получаем текущую категорию с адаптивным выбором
         category = event_scheduler.get_next_category()
-        logger.info(f"Отправка улучшенного ИСТОРИЧЕСКОГО события 'В этот день' по команде: {category}")
+        logger.info(f"Отправка АДАПТИВНОГО события 'В этот день' по команде: {category}")
         
         # Создаем сообщение с историческим событием
         message, keyboard = event_scheduler.create_event_message(category)
@@ -1044,46 +1335,135 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         event_scheduler.increment_category()
         config.event_current_index = event_scheduler.current_index
         
-        logger.info(f"Улучшенное ИСТОРИЧЕСКОЕ событие 'В этот день' отправлено по команде: {category}")
+        logger.info(f"АДАПТИВНОЕ событие 'В этот день' отправлено по команде: {category}")
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при отправке улучшенного ИСТОРИЧЕСКОГО события: {str(e)}")
+        await update.message.reply_text(f"❌ Ошибка при отправке АДАПТИВНОГО события: {str(e)}")
         logger.error(f"Ошибка в команде /eventnow: {e}")
 
 async def show_next_event_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показать следующую категорию ИСТОРИЧЕСКИХ событий 'В этот день'"""
+    """Показать следующую категорию АДАПТИВНЫХ событий 'В этот день'"""
     config = BotConfig()
     event_scheduler = config.get_event_scheduler()
     
     # Получаем текущую и следующую категории
     current_category = event_scheduler.get_next_category()
-    next_category = EVENT_CATEGORIES[(event_scheduler.current_index + 1) % len(EVENT_CATEGORIES)]
-    
-    current_emoji = CATEGORY_EMOJIS.get(current_category, '📌')
-    next_emoji = CATEGORY_EMOJIS.get(next_category, '📌')
     
     # Получаем текущую дату для отображения
     now = datetime.now(TIMEZONE)
     day = now.day
     month_ru = MONTHS_RU[now.month]
+    weekday = now.weekday()
     
     # Рассчитываем время следующей отправки
     next_time = calculate_next_event_time()
     moscow_time = next_time.astimezone(TIMEZONE)
     
-    response = f"📅 *Информация о улучшенной рубрике 'В ЭТОТ ДЕНЬ':*\n\n"
-    response += f"🗓️ *Исторические события за:* {day} {month_ru}\n\n"
-    response += f"{current_emoji} *Текущая категория:* {current_category.upper()}\n"
-    response += f"{next_emoji} *Следующая категория:* {next_category.upper()}\n\n"
-    response += f"⏰ *Следующая отправка:* {moscow_time.strftime('%d.%m.%Y в %H:%M')} по МСК\n"
-    response += f"📜 *Тип событий:* ИСТОРИЧЕСКИЕ (произошедшие в эту дату)\n"
-    response += f"🎯 *Улучшенный поиск:* гарантирует точную дату события\n"
-    response += f"🔍 *Формат:* В ЭТОТ ДЕНЬ: {day} {month_ru} ГОД года | КАТЕГОРИЯ: КАТЕГОРИЯ\n"
-    response += f"📖 *Факт:* конкретное предложение о событии\n"
-    response += f"🔗 *Ссылка:* полная статья на Википедии\n\n"
-    response += f"🔄 *События не повторяются в пределах категории!*"
+    # Получаем статистику категорий
+    category_stats_message = event_scheduler.get_category_stats_message()
+    
+    # Добавляем контекстную информацию
+    day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    current_day_name = day_names[weekday]
+    
+    if weekday in DAY_CATEGORY_PREFERENCES:
+        preferred = DAY_CATEGORY_PREFERENCES[weekday]
+        preferred_emojis = [CATEGORY_EMOJIS.get(cat, '') for cat in preferred]
+        preferred_str = ', '.join([f"{emoji} {cat}" for emoji, cat in zip(preferred_emojis, preferred)])
+        day_info = f"\n📅 *Сегодня {current_day_name}* - предпочтительные категории: {preferred_str}"
+    else:
+        day_info = f"\n📅 *Сегодня {current_day_name}*"
+    
+    # Информация о сезонных предпочтениях
+    month = now.month
+    if month in SEASONAL_PREFERENCES:
+        seasonal = SEASONAL_PREFERENCES[month]
+        seasonal_emojis = [CATEGORY_EMOJIS.get(cat, '') for cat in seasonal]
+        seasonal_str = ', '.join([f"{emoji} {cat}" for emoji, cat in zip(seasonal_emojis, seasonal)])
+        month_info = f"\n🌦️ *Сезонные предпочтения ({MONTHS_RU_LOWER[month]}):* {seasonal_str}"
+    else:
+        month_info = ""
+    
+    current_emoji = CATEGORY_EMOJIS.get(current_category, '📌')
+    
+    response = (
+        f"📊 *АДАПТИВНАЯ система категорий 'В ЭТОТ ДЕНЬ':*\n\n"
+        f"🗓️ *Исторические события за:* {day} {month_ru}\n"
+        f"{day_info}"
+        f"{month_info}\n\n"
+        f"🎯 *Текущая категория:* {current_emoji} {current_category.upper()}\n"
+        f"⏰ *Следующая отправка:* {moscow_time.strftime('%d.%m.%Y в %H:%M')} по МСК\n\n"
+        f"{category_stats_message}"
+    )
     
     await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+
+@restricted
+async def show_category_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать детальную статистику категорий"""
+    config = BotConfig()
+    event_scheduler = config.get_event_scheduler()
+    
+    stats_message = event_scheduler.get_category_stats_message()
+    
+    await update.message.reply_text(stats_message, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка обратной связи по категориям"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем тип фидбэка и категорию из callback_data
+    data = query.data
+    logger.info(f"Получен фидбэк: {data}")
+    
+    if data.startswith("feedback_"):
+        try:
+            # Формат: feedback_{type}_{category}
+            parts = data.split("_")
+            if len(parts) >= 3:
+                feedback_type = parts[1]  # like, dislike, skip
+                category = "_".join(parts[2:])  # Категория может содержать _
+                
+                config = BotConfig()
+                event_scheduler = config.get_event_scheduler()
+                
+                # Записываем фидбэк
+                event_scheduler.record_category_feedback(category, feedback_type)
+                
+                # Показываем подтверждение пользователю
+                emoji = "👍" if feedback_type == "like" else "👎" if feedback_type == "dislike" else "⏭️"
+                feedback_texts = {
+                    "like": "понравилось",
+                    "dislike": "не понравилось",
+                    "skip": "пропущено"
+                }
+                
+                category_emoji = CATEGORY_EMOJIS.get(category, '📌')
+                response = f"{emoji} Спасибо! Ваш отзыв ({feedback_texts.get(feedback_type, '')}) записан для категории {category_emoji} {category}."
+                
+                await query.edit_message_text(
+                    text=query.message.text + f"\n\n{response}",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=None
+                )
+            else:
+                await query.answer("❌ Ошибка обработки фидбэка", show_alert=True)
+                
+        except Exception as e:
+            logger.error(f"Ошибка обработки фидбэка: {e}")
+            await query.answer("❌ Произошла ошибка", show_alert=True)
+    
+    elif data == "show_stats":
+        config = BotConfig()
+        event_scheduler = config.get_event_scheduler()
+        stats_message = event_scheduler.get_category_stats_message()
+        
+        await query.edit_message_text(
+            text=stats_message,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=None
+        )
 
 def calculate_next_event_time() -> datetime:
     """Рассчитать время следующей отправки события"""
@@ -1102,7 +1482,7 @@ def calculate_next_event_time() -> datetime:
 
     # Ищем следующий рабочий день
     days_ahead = 1
-    max_days = 365  # Защита от зацикливания
+    max_days = 365
     while days_ahead <= max_days:
         next_day = now + timedelta(days=days_ahead)
         if next_day.weekday() in EVENT_DAYS:
@@ -1117,15 +1497,14 @@ def calculate_next_event_time() -> datetime:
     raise ValueError(f"Не найден подходящий день за {max_days} дней")
 
 async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запланировать следующую отправку улучшенного ИСТОРИЧЕСКОГО события 'В этот день'"""
+    """Запланировать следующую отправку АДАПТИВНОГО события 'В этот день'"""
     try:
         next_time = calculate_next_event_time()
         config = BotConfig()
         chat_id = config.chat_id
 
         if not chat_id:
-            logger.warning("Chat ID не установлен, планирование ИСТОРИЧЕСКИХ событий отложено")
-            # Пробуем снова через час
+            logger.warning("Chat ID не установлен, планирование АДАПТИВНЫХ событий отложено")
             context.application.job_queue.run_once(
                 lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
                 3600
@@ -1138,7 +1517,6 @@ async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
         if delay > 0:
             job_name = f"daily_event_{next_time.strftime('%Y%m%d_%H%M')}"
             
-            # Проверяем, нет ли уже такой задачи
             existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
                             if j.name == job_name]
             
@@ -1150,25 +1528,24 @@ async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
                     name=job_name
                 )
 
-                logger.info(f"Следующая отправка улучшенного ИСТОРИЧЕСКОГО события 'В этот день' запланирована на {next_time} UTC")
+                logger.info(f"Следующая отправка АДАПТИВНОГО события 'В этот день' запланирована на {next_time} UTC")
                 logger.info(f"Это будет в {(next_time + timedelta(hours=3)).strftime('%H:%M')} по МСК")
                 
                 # Получаем планировщик для логирования следующей категории
                 event_scheduler = config.get_event_scheduler()
-                logger.info(f"Следующая категория ИСТОРИЧЕСКИХ событий: {event_scheduler.get_next_category()}")
+                next_category = event_scheduler.get_next_category()
+                logger.info(f"Следующая АДАПТИВНАЯ категория: {next_category}")
             else:
-                logger.info(f"Отправка ИСТОРИЧЕСКОГО события на {next_time} уже запланирована")
+                logger.info(f"Отправка АДАПТИВНОГО события на {next_time} уже запланирована")
         else:
-            # Если время уже прошло, планируем на следующий день
-            logger.warning(f"Время отправки ИСТОРИЧЕСКОГО события уже прошло ({next_time}), планируем на следующий день")
+            logger.warning(f"Время отправки АДАПТИВНОГО события уже прошло ({next_time}), планируем на следующий день")
             context.application.job_queue.run_once(
                 lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
-                60  # Через минуту
+                60
             )
             
     except Exception as e:
-        logger.error(f"Ошибка планирования улучшенного ИСТОРИЧЕСКОГО события: {e}")
-        # Пробуем снова через 5 минут
+        logger.error(f"Ошибка планирования АДАПТИВНОГО события: {e}")
         context.application.job_queue.run_once(
             lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
             300
@@ -1534,28 +1911,28 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ========== ОСНОВНЫЕ КОМАНДЫ ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновленный обработчик /start с информацией об улучшенных ИСТОРИЧЕСКИХ событиях 'В этот день'"""
+    """Обновленный обработчик /start с информацией об АДАПТИВНЫХ событиях 'В этот день'"""
     await update.message.reply_text(
-        "🤖 <b>Бот для напоминаний о планёрке активен!</b>\n\n"
+        "🤖 <b>Бот для напоминаний о планёрке с АДАПТИВНОЙ рубрикой 'В этот день'!</b>\n\n"
         f"📅 <b>Напоминания отправляются:</b>\n"
         f"• Понедельник\n• Среда\n• Пятница\n"
         f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
-        "📅 <b>УЛУЧШЕННАЯ рубрика 'В ЭТОТ ДЕНЬ':</b>\n"
+        "📅 <b>АДАПТИВНАЯ рубрика 'В ЭТОТ ДЕНЬ':</b>\n"
         f"• Отправляется: Пн-Пт в 10:00 по МСК\n"
-        f"• <b>Формат:</b> В ЭТОТ ДЕНЬ: ДЕНЬ МЕСЯЦ ГОД года | КАТЕГОРИЯ: КАТЕГОРИЯ\n"
-        f"• <b>Категории:</b> {', '.join([c.capitalize() for c in EVENT_CATEGORIES])}\n"
-        f"• <b>Тип событий:</b> ИСТОРИЧЕСКИЕ (произошедшие в эту дату)\n"
-        f"• <b>Улучшенный поиск:</b> гарантирует точную дату события\n"
-        f"• <b>Конкретный факт:</b> предложение из статьи с датой\n"
-        f"• <b>Полная ссылка:</b> на статью Википедии\n"
+        f"• <b>Умная система категорий:</b> адаптируется под ваши предпочтения\n"
+        f"• <b>Контекстный выбор:</b> учитывает день недели и сезон\n"
+        f"• <b>Обратная связь:</b: оценивайте события 👍/👎\n"
+        f"• <b>Статистика:</b> /stats - статистика категорий\n"
+        f"• Категории: {', '.join([c.capitalize() for c in EVENT_CATEGORIES])}\n"
         f"• События НЕ повторяются в пределах категории!\n\n"
         "🔧 <b>Доступные команды:</b>\n"
         "/info - информация о боте\n"
+        "/stats - статистика категорий\n"
         "/jobs - список запланированных задач\n"
         "/test - тестовое напоминание (через 5 сек)\n"
         "/testnow - мгновенное тестовое напоминание\n"
-        "/eventnow - отправить УЛУЧШЕННОЕ ИСТОРИЧЕСКОЕ событие 'В этот день' сейчас\n"
-        "/nextevent - следующая категория ИСТОРИЧЕСКИХ событий\n\n"
+        "/eventnow - отправить АДАПТИВНОЕ событие 'В этот день' сейчас\n"
+        "/nextevent - следующая категория АДАПТИВНЫХ событий\n\n"
         "👮♂️ <b>Команды для администраторов:</b>\n"
         "/setchat - установить чат для уведомлений\n"
         "/adduser @username - добавить пользователя\n"
@@ -1576,7 +1953,7 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"✅ <b>Чат установлен:</b> {chat_title}\n"
         f"<b>Chat ID:</b> {chat_id}\n\n"
-        "Напоминания и УЛУЧШЕННЫЕ ИСТОРИЧЕСКИЕ события 'В этот день' будут отправляться в этот чат.",
+        "Напоминания и АДАПТИВНЫЕ события 'В этот день' будут отправляться в этот чат.",
         parse_mode=ParseMode.HTML
     )
 
@@ -1584,7 +1961,7 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновленный обработчик /info с информацией об улучшенных ИСТОРИЧЕСКИХ событиях 'В этот день'"""
+    """Обновленный обработчик /info с информацией об АДАПТИВНЫХ событиях 'В этот день'"""
     config = BotConfig()
     chat_id = config.chat_id
 
@@ -1630,40 +2007,55 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != DEFAULT_ZOOM_LINK else 'не установлена ⚠️'}"
     
-    # Информация об улучшенных ИСТОРИЧЕСКИХ событиях "В этот день"
+    # Информация об АДАПТИВНЫХ событиях "В этот день"
     event_scheduler = config.get_event_scheduler()
-    next_event_category = EVENT_CATEGORIES[event_scheduler.current_index]
+    next_event_category = event_scheduler.get_next_category()
     next_event_emoji = CATEGORY_EMOJIS.get(next_event_category, '📌')
     
     # Получаем текущую дату
     day, month_ru, year = event_scheduler.get_todays_date_parts()
     
-    event_info = f"\n📅 <b>Следующее УЛУЧШЕННОЕ ИСТОРИЧЕСКОЕ событие 'В этот день':</b> {next_event_emoji} {next_event_category.capitalize()}"
+    # Информация о контекстных предпочтениях
+    now = datetime.now(TIMEZONE)
+    weekday = now.weekday()
+    month = now.month
+    
+    day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    current_day = day_names[weekday]
+    
+    context_info = ""
+    if weekday in DAY_CATEGORY_PREFERENCES:
+        preferred = DAY_CATEGORY_PREFERENCES[weekday]
+        context_info = f"\n📅 <b>Сегодня {current_day}</b> - предпочтительные категории: {', '.join(preferred)}"
+    
+    if month in SEASONAL_PREFERENCES:
+        seasonal = SEASONAL_PREFERENCES[month]
+        context_info += f"\n🌦️ <b>Сезон ({MONTHS_RU_LOWER[month]}):</b> предпочтение к {', '.join(seasonal[:2])}"
+    
+    event_info = f"\n📅 <b>Следующее АДАПТИВНОЕ событие 'В этот день':</b> {next_event_emoji} {next_event_category.capitalize()}"
     
     await update.message.reply_text(
-        f"📊 <b>Информация о боте (УЛУЧШЕННАЯ версия):</b>\n\n"
+        f"📊 <b>Информация о боте (АДАПТИВНАЯ версия):</b>\n\n"
         f"{status}\n"
         f"📅 <b>Дни планёрок:</b> понедельник, среда, пятница\n"
         f"⏰ <b>Время планёрок:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"📅 <b>УЛУЧШЕННЫЕ события 'В этот день':</b> Пн-Пт в 10:00 по МСК\n"
-        f"📜 <b>Тип событий:</b> ИСТОРИЧЕСКИЕ (произошедшие в эту дату)\n"
-        f"🎯 <b>Категории событий:</b> {', '.join(EVENT_CATEGORIES)}\n"
-        f"🗓️ <b>Формат:</b> <b>В ЭТОТ ДЕНЬ: {day} {month_ru} ГОД года | КАТЕГОРИЯ: КАТЕГОРИЯ</b>\n"
-        f"🔍 <b>Улучшенный поиск:</b> гарантирует точную дату события\n"
-        f"📖 <b>Конкретный факт:</b> предложение из статьи с датой\n"
-        f"🔗 <b>Полная ссылка:</b> на статью Википедии\n"
+        f"📅 <b>АДАПТИВНЫЕ события 'В этот день':</b> Пн-Пт в 10:00 по МСК\n"
+        f"🎯 <b>Умная система категорий:</b> адаптируется под предпочтения\n"
+        f"📈 <b>Контекстный выбор:</b> день недели + сезонные предпочтения\n"
+        f"📊 <b>Статистика вовлеченности:</b> учитывает обратную связь 👍/👎\n"
         f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
         f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
         f"⏳ <b>Задачи планёрок:</b> {meeting_job_count}\n"
         f"📅 <b>Задачи событий:</b> {event_job_count}\n"
         f"➡️ <b>Следующая планёрка:</b> {next_meeting_time}\n"
-        f"➡️ <b>Следующее УЛУЧШЕННОЕ событие:</b> {next_event_time}\n"
-        f"📈 <b>Ближайшие планёрки:</b> {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}"
+        f"➡️ <b>Следующее АДАПТИВНОЕ событие:</b> {next_event_time}"
+        f"{context_info}"
         f"{zoom_info}"
         f"{event_info}\n\n"
+        f"Используйте /stats для статистики категорий\n"
         f"Используйте /users для списка пользователей\n"
         f"Используйте /jobs для списка задач\n"
-        f"Используйте /nextevent для следующей категории УЛУЧШЕННЫХ ИСТОРИЧЕСКИХ событий",
+        f"Используйте /nextevent для следующей категории АДАПТИВНЫХ событий",
         parse_mode=ParseMode.HTML
     )
 
@@ -1769,7 +2161,7 @@ async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name[:30]}...)\n"
     
     if event_jobs:
-        message += "\n📅 <b>УЛУЧШЕННЫЕ ИСТОРИЧЕСКИЕ события 'В этот день':</b>\n"
+        message += "\n📅 <b>АДАПТИВНЫЕ события 'В этот день':</b>\n"
         for job in sorted(event_jobs, key=lambda j: j.next_t):
             next_time = job.next_t.astimezone(TIMEZONE)
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name[:30]}...)\n"
@@ -1790,7 +2182,6 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     
     username = context.args[0].lstrip('@')
-    # Базовая валидация username
     if not re.match(r'^[a-zA-Z0-9_]{5,32}$', username):
         await update.message.reply_text("❌ <b>Некорректное имя пользователя.</b>", parse_mode=ParseMode.HTML)
         return
@@ -1854,11 +2245,11 @@ async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"✅ <b>Отменено:</b>\n"
         f"• {canceled_meetings} напоминаний о планёрках\n"
-        f"• {canceled_events} отправок УЛУЧШЕННЫХ ИСТОРИЧЕСКИХ событий 'В этот день'\n"
+        f"• {canceled_events} отправок АДАПТИВНЫХ событий 'В этот день'\n"
         f"Очищено {len(config.active_reminders)} активных напоминаний в конфиге",
         parse_mode=ParseMode.HTML
     )
-    logger.info(f"Отменено {canceled_meetings} напоминаний и {canceled_events} УЛУЧШЕННЫХ ИСТОРИЧЕСКИХ событий")
+    logger.info(f"Отменено {canceled_meetings} напоминаний и {canceled_events} АДАПТИВНЫХ событий")
 
 def calculate_next_reminder() -> datetime:
     now = datetime.now(TIMEZONE)
@@ -1875,7 +2266,7 @@ def calculate_next_reminder() -> datetime:
             return reminder_time
 
     days_ahead = 1
-    max_days = 365  # Защита от зацикливания
+    max_days = 365
     while days_ahead <= max_days:
         next_day = now + timedelta(days=days_ahead)
         if next_day.weekday() in MEETING_DAYS:
@@ -1930,11 +2321,10 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             logger.info(f"Напоминание на {next_time} уже запланировано")
     else:
-        # Если время уже прошло, планируем на следующий день
         logger.warning(f"Время напоминания уже прошло ({next_time}), планируем на следующий день")
         context.application.job_queue.run_once(
             lambda ctx: asyncio.create_task(schedule_next_reminder(ctx)),
-            60  # Через минуту
+            60
         )
 
 def cleanup_old_jobs(job_queue: JobQueue) -> None:
@@ -1980,12 +2370,10 @@ def validate_zoom_link(zoom_link: str) -> bool:
     if not zoom_link or zoom_link == DEFAULT_ZOOM_LINK:
         return False
     
-    # Проверяем, что ссылка начинается с https
     if not zoom_link.startswith('https://'):
         logger.warning(f"Zoom ссылка не использует HTTPS: {zoom_link}")
         return False
     
-    # Проверяем наличие домена zoom
     if 'zoom.us' not in zoom_link and 'zoom.com' not in zoom_link:
         logger.warning(f"Zoom ссылка не содержит домен zoom: {zoom_link}")
         return False
@@ -2037,6 +2425,7 @@ def main() -> None:
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("setchat", set_chat))
         application.add_handler(CommandHandler("info", show_info))
+        application.add_handler(CommandHandler("stats", show_category_stats))
         application.add_handler(CommandHandler("test", test_reminder))
         application.add_handler(CommandHandler("testnow", test_now))
         application.add_handler(CommandHandler("eventnow", send_event_now))
@@ -2046,6 +2435,10 @@ def main() -> None:
         application.add_handler(CommandHandler("removeuser", remove_user))
         application.add_handler(CommandHandler("users", list_users))
         application.add_handler(CommandHandler("cancelall", cancel_all))
+
+        # Обработчик фидбэка для категорий
+        application.add_handler(CallbackQueryHandler(handle_feedback_callback, pattern="^feedback_"))
+        application.add_handler(CallbackQueryHandler(handle_feedback_callback, pattern="^show_stats$"))
 
         # Добавляем ConversationHandler
         application.add_handler(conv_handler)
@@ -2062,7 +2455,7 @@ def main() -> None:
             3
         )
 
-        # Запуск планировщика УЛУЧШЕННЫХ ИСТОРИЧЕСКИХ событий "В этот день"
+        # Запуск планировщика АДАПТИВНЫХ событий "В этот день"
         application.job_queue.run_once(
             lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
             5
@@ -2073,18 +2466,29 @@ def main() -> None:
         day = now.day
         month_ru = MONTHS_RU[now.month]
         year = now.year
+        weekday = now.weekday()
+        
+        day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+        current_day = day_names[weekday]
         
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК")
-        logger.info(f"📅 УЛУЧШЕННАЯ рубрика 'В ЭТОТ ДЕНЬ': Пн-Пт в 10:00 по МСК (07:00 UTC)")
-        logger.info(f"📜 Тип событий: ИСТОРИЧЕСКИЕ (произошедшие в эту дату)")
-        logger.info(f"🗓️ Формат: В ЭТОТ ДЕНЬ: {day} {month_ru} ГОД года | КАТЕГОРИЯ: КАТЕГОРИЯ")
-        logger.info(f"🎯 Категории событий: {', '.join(EVENT_CATEGORIES)}")
-        logger.info(f"🔍 Улучшенный поиск: гарантирует точную дату события")
-        logger.info(f"📖 Конкретный факт: предложение из статьи с датой")
-        logger.info(f"🔗 Полная ссылка: на статью Википедии")
+        logger.info(f"📅 АДАПТИВНАЯ рубрика 'В ЭТОТ ДЕНЬ': Пн-Пт в 10:00 по МСК (07:00 UTC)")
+        logger.info(f"🗓️ Сегодня: {current_day}, {day} {month_ru} {year}")
+        logger.info(f"🎯 Умная система категорий: адаптивный выбор на основе статистики")
+        logger.info(f"📈 Контекстный выбор: учитывает день недели и сезонные предпочтения")
+        logger.info(f"📊 Обратная связь: система фидбэка 👍/👎 для улучшения подбора")
         logger.info(f"🔄 События НЕ повторяются в пределах категории!")
         logger.info(f"👥 Разрешённые пользователи: {', '.join(BotConfig().allowed_users)}")
+        
+        # Показываем предпочтения для текущего дня
+        if weekday in DAY_CATEGORY_PREFERENCES:
+            preferred = DAY_CATEGORY_PREFERENCES[weekday]
+            logger.info(f"📅 Предпочтения для {current_day}: {', '.join(preferred)}")
+        
+        if now.month in SEASONAL_PREFERENCES:
+            seasonal = SEASONAL_PREFERENCES[now.month]
+            logger.info(f"🌦️ Сезонные предпочтения ({MONTHS_RU_LOWER[now.month]}): {', '.join(seasonal)}")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
