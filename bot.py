@@ -4,6 +4,7 @@ import random
 import logging
 import requests
 import asyncio
+import html
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, TypedDict
 from functools import wraps
@@ -697,7 +698,7 @@ class EventScheduler:
             for sentence in sentences:
                 if str(year) in sentence and len(sentence) > 20:
                     if any(word in sentence.lower() for word in [
-                        'произошло', 'состоялось', 'вышел', 'вышла', 'выпущен', 
+                        'произшло', 'состоялось', 'вышел', 'вышла', 'выпущен', 
                         'родился', 'родилась', 'основан', 'основана', 'открытие',
                         'изобретение', 'премьера', 'турнир', 'чемпионат'
                     ]):
@@ -995,28 +996,34 @@ class EventScheduler:
         return event['title'], event['year'], event['description'], event['url'], event.get('fact', event['title'])
     
     def create_event_message(self, category: str) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-        """Создаем сообщение с историческим событием 'В этот день' в новом формате"""
+        """Создаем сообщение с историческим событием 'В этот день' в формате HTML"""
         day, month_ru, current_year = self.get_todays_date_parts()
         
         title, event_year, description, url, fact = self.get_historical_event(category)
         
-        # ОБНОВЛЕННЫЙ ФОРМАТ: Жирный заголовок, убрали лишнее
-        message = f"**В ЭТОТ ДЕНЬ: {day} {month_ru} {event_year} года**\n\n"
+        # Форматируем в HTML
+        message = f"<b>В ЭТОТ ДЕНЬ: {day} {month_ru} {event_year} года</b>\n\n"
         
         category_emoji = CATEGORY_EMOJIS.get(category, '📌')
         category_description = CATEGORY_DESCRIPTIONS.get(category, '')
         
         message += f"{category_emoji} {category_description}\n\n"
-        message += f"{fact}\n\n"
+        
+        # Экранируем HTML-сущности в факте
+        safe_fact = html.escape(fact)
+        message += f"{safe_fact}\n\n"
         
         if description and description not in fact:
             if len(description) > 300:
                 description = description[:300] + '...'
-            message += f"{description}\n\n"
+            # Экранируем HTML-сущности в описании
+            safe_description = html.escape(description)
+            message += f"{safe_description}\n\n"
         
         if url:
-            # Обычная ссылка, не markdown
-            message += f"📖 Подробнее на Википедии ({url})"
+            # HTML ссылка - будет работать без проблем
+            safe_url = html.escape(url)
+            message += f'📖 <a href="{safe_url}">Подробнее на Википедии</a>'
         
         # Только кнопки обратной связи, без статистики
         keyboard = [
@@ -1217,7 +1224,7 @@ class BotConfig:
 # ========== ФУНКЦИИ ДЛЯ ИСТОРИЧЕСКИХ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
 
 async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка ежедневного исторического события 'В этот день'"""
+    """Отправка ежедневного исторического события 'В этот день' в формате HTML"""
     try:
         config = BotConfig()
         chat_id = config.chat_id
@@ -1240,7 +1247,7 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(
             chat_id=chat_id,
             text=message,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,  # ✅ ИСПРАВЛЕНО: теперь используем HTML
             disable_web_page_preview=False,
             reply_markup=keyboard
         )
@@ -1280,7 +1287,7 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await context.bot.send_message(
             chat_id=chat_id,
             text=message,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,  # ✅ ИСПРАВЛЕНО: теперь используем HTML
             disable_web_page_preview=False,
             reply_markup=keyboard
         )
@@ -1387,7 +1394,7 @@ async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT
                 
                 await query.edit_message_text(
                     text=query.message.text + f"\n\n{response}",
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=ParseMode.HTML,
                     reply_markup=None
                 )
             else:
