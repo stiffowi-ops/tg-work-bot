@@ -5,11 +5,12 @@ import logging
 import requests
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, TypedDict
 from functools import wraps
 import pytz
 from urllib.parse import quote
 import re
+import time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -24,9 +25,10 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# ========== НАСТРОЙКИ ==========
+# ========== КОНСТАНТЫ ==========
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", "https://us04web.zoom.us/j/1234567890?pwd=example")
+DEFAULT_ZOOM_LINK = "https://us04web.zoom.us/j/1234567890?pwd=example"
+ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", DEFAULT_ZOOM_LINK)
 CONFIG_FILE = "bot_config.json"
 
 # Время планёрки (9:30 по Москве)
@@ -36,7 +38,7 @@ TIMEZONE = pytz.timezone("Europe/Moscow")
 # Дни недели для планёрки (понедельник=0, среда=2, пятница=4)
 MEETING_DAYS = [0, 2, 4]
 
-# ========== НАСТРОЙКИ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
+# ========== КОНСТАНТЫ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
 # Категории событий
 EVENT_CATEGORIES = ['музыка', 'фильмы', 'технологии', 'игры', 'наука', 'спорт', 'история']
 
@@ -52,6 +54,8 @@ MONTHS_RU = {
     9: "СЕНТЯБРЯ", 10: "ОКТЯБРЯ", 11: "НОЯБРЯ", 12: "ДЕКАБРЯ"
 }
 
+MONTHS_RU_LOWER = {k: v.lower() for k, v in MONTHS_RU.items()}
+
 # Эмодзи для категорий
 CATEGORY_EMOJIS = {
     'музыка': '🎵',
@@ -63,7 +67,27 @@ CATEGORY_EMOJIS = {
     'история': '📜'
 }
 
-# ========== ОСТАЛЬНЫЕ НАСТРОЙКИ ==========
+# Wikipedia API константы
+WIKIPEDIA_API_URL = "https://ru.wikipedia.org/w/api.php"
+USER_AGENT = 'TelegramEventBot/3.0 (https://github.com/; contact@example.com)'
+REQUEST_TIMEOUT = 20
+REQUEST_RETRIES = 3
+
+# ========== ТИПЫ ДАННЫХ ==========
+class HistoricalEvent(TypedDict):
+    title: str
+    year: int
+    description: str
+    url: str
+    category: str
+    full_article: str  # Полный текст статьи для извлечения фактов
+
+class ReminderData(TypedDict):
+    message_id: int
+    chat_id: int
+    created_at: str
+
+# ========== НАСТРОЙКИ ==========
 CANCELLATION_OPTIONS = [
     "Все вопросы решены, планёрка не нужна",
     "Ключевые участники отсутствуют",
@@ -74,21 +98,22 @@ SELECTING_REASON, SELECTING_DATE, CONFIRMING_DATE = range(3)
 
 # Настройка логирования
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ========== КЛАСС ДЛЯ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
+# ========== УЛУЧШЕННЫЙ КЛАСС ДЛЯ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
 class EventScheduler:
     """Класс для управления отправкой исторических событий 'В этот день'"""
     
     def __init__(self):
         self.current_index = 0
         # Храним использованные статьи по категориям
-        self.used_events = {category: set() for category in EVENT_CATEGORIES}
+        self.used_events: Dict[str, set] = {category: set() for category in EVENT_CATEGORIES}
         # Кэш для fallback-событий
-        self.fallback_cache = {}
-        logger.info("Инициализирован планировщик исторических событий 'В этот день'")
+        self.fallback_cache: Dict[str, List[HistoricalEvent]] = {}
+        logger.info("Инициализирован улучшенный планировщик исторических событий 'В этот день'")
     
     def get_next_category(self) -> str:
         """Получаем следующую категорию по кругу"""
@@ -112,59 +137,40 @@ class EventScheduler:
         year = now.year
         return day, month_ru, year
     
-    def search_historical_events(self, day: int, month: int, category: str) -> List[Dict[str, Any]]:
+    def cleanup_old_events(self, days_to_keep: int = 30) -> None:
+        """Очистка старых событий (заглушка для будущей реализации)"""
+        # В будущем можно реализовать очистку по дате использования
+        pass
+    
+    def search_historical_events(self, day: int, month: int, category: str) -> List[HistoricalEvent]:
         """
         Ищем исторические события, которые произошли в ЭТУ ДАТУ (14 января) в РАЗНЫЕ ГОДЫ
-        
-        Например: "14 января 1969 года - The Beatles выпустили альбом Abbey Road"
         """
         try:
-            date_str = f"{day} {MONTHS_RU[month].lower()}"
+            date_str = f"{day} {MONTHS_RU_LOWER[month]}"
             logger.info(f"Поиск исторических событий за {date_str} в категории {category}")
             
-            events = []
+            events: List[HistoricalEvent] = []
             
-            # Стратегия 1: Ищем статьи, где в тексте упоминается дата и есть год
-            keywords_by_category = {
-                'музыка': ['выпущен', 'альбом', 'сингл', 'концерт', 'группа', 'певец', 'хит', 'премия'],
-                'фильмы': ['премьера', 'фильм', 'кино', 'актёр', 'режиссёр', 'оскар', 'кинопремия'],
-                'технологии': ['изобретён', 'патент', 'компания', 'запуск', 'презентация', 'гаджет'],
-                'игры': ['вышла', 'игра', 'видеоигра', 'консоль', 'релиз', 'турнир'],
-                'наука': ['открытие', 'изобретение', 'нобелевская', 'учёный', 'эксперимент'],
-                'спорт': ['чемпионат', 'олимпиада', 'рекорд', 'матч', 'турнир', 'кубок'],
-                'история': ['событие', 'война', 'договор', 'революция', 'основание', 'праздник']
-            }
+            # Стратегия 1: Ищем на Википедии по улучшенным запросам
+            wikipedia_events = self._search_wikipedia_events_improved(day, month, category)
+            if wikipedia_events:
+                events.extend(wikipedia_events)
             
-            keywords = keywords_by_category.get(category, ['событие', 'история'])
+            # Стратегия 2: Используем известные события как fallback
+            if not events:
+                known_events = self._search_known_events(day, month, category)
+                if known_events:
+                    events.extend(known_events)
             
-            for keyword in keywords:
-                # Ищем статьи, где есть дата и ключевое слово
-                search_query = f'"{date_str}" {keyword}'
-                found_events = self._search_wikipedia_articles(search_query, category, day, month)
-                if found_events:
-                    events.extend(found_events)
-                
-                # Ищем события с годами
-                search_query_with_year = f"{date_str} год {keyword}"
-                found_events_year = self._search_wikipedia_articles(search_query_with_year, category, day, month)
-                if found_events_year:
-                    events.extend(found_events_year)
-            
-            # Стратегия 2: Парсим страницу с датой (например, "14 января")
-            date_events = self._parse_date_page_events(day, month, category)
-            if date_events:
-                events.extend(date_events)
-            
-            # Стратегия 3: Ищем известные события по категориям
-            known_events = self._search_known_events(day, month, category)
-            if known_events:
-                events.extend(known_events)
-            
-            # Убираем дубликаты
-            unique_events = []
+            # Убираем дубликаты и фильтруем по году
+            unique_events: List[HistoricalEvent] = []
             seen_titles = set()
+            
             for event in events:
-                if event['title'] not in seen_titles and event['year']:
+                if (event['title'] not in seen_titles and 
+                    event['year'] and 
+                    1000 <= event['year'] <= datetime.now(TIMEZONE).year):
                     unique_events.append(event)
                     seen_titles.add(event['title'])
             
@@ -175,27 +181,113 @@ class EventScheduler:
             logger.error(f"Ошибка поиска исторических событий: {e}")
             return []
     
-    def _search_wikipedia_articles(self, search_query: str, category: str, day: int, month: int) -> List[Dict[str, Any]]:
-        """Ищем статьи на Википедии по поисковому запросу"""
-        events = []
+    def _search_wikipedia_events_improved(self, day: int, month: int, category: str) -> List[HistoricalEvent]:
+        """Улучшенный поиск событий на Википедии"""
+        events: List[HistoricalEvent] = []
+        date_str = f"{day} {MONTHS_RU_LOWER[month]}"
+        
+        # Улучшенные поисковые запросы по категориям
+        search_templates_by_category = {
+            'музыка': [
+                f'"{date_str}" {year} "выпущен" альбом',
+                f'"{date_str}" {year} "выпустил" сингл',
+                f'"{date_str}" {year} "родился" музыкант',
+                f'"{date_str}" {year} "состоялся" концерт',
+                f'"{date_str}" {year} "премия" музыка'
+            ],
+            'фильмы': [
+                f'"{date_str}" {year} "премьера" фильм',
+                f'"{date_str}" {year} "вышел" кино',
+                f'"{date_str}" {year} "родился" актёр',
+                f'"{date_str}" {year} "родился" режиссёр',
+                f'"{date_str}" {year} "Оскар"'
+            ],
+            'технологии': [
+                f'"{date_str}" {year} "изобретён"',
+                f'"{date_str}" {year} "патент"',
+                f'"{date_str}" {year} "основана" компания',
+                f'"{date_str}" {year} "запуск"',
+                f'"{date_str}" {year} "представлен"'
+            ],
+            'игры': [
+                f'"{date_str}" {year} "вышла" игра',
+                f'"{date_str}" {year} "выпущена" видеоигра',
+                f'"{date_str}" {year} "основана" студия',
+                f'"{date_str}" {year} "турнир" киберспорт',
+                f'"{date_str}" {year} "консоль"'
+            ],
+            'наука': [
+                f'"{date_str}" {year} "открытие"',
+                f'"{date_str}" {year} "изобретение"',
+                f'"{date_str}" {year} "Нобелевская премия"',
+                f'"{date_str}" {year} "родился" учёный',
+                f'"{date_str}" {year} "эксперимент"'
+            ],
+            'спорт': [
+                f'"{date_str}" {year} "чемпионат"',
+                f'"{date_str}" {year} "олимпиада"',
+                f'"{date_str}" {year} "рекорд"',
+                f'"{date_str}" {year} "матч" финал',
+                f'"{date_str}" {year} "родился" спортсмен'
+            ],
+            'история': [
+                f'"{date_str}" {year} "событие"',
+                f'"{date_str}" {year} "война"',
+                f'"{date_str}" {year} "договор"',
+                f'"{date_str}" {year} "революция"',
+                f'"{date_str}" {year} "основание"'
+            ]
+        }
+        
+        # Ищем события за последние 200 лет (с шагом 5 лет для производительности)
+        current_year = datetime.now(TIMEZONE).year
+        search_years = list(range(current_year - 200, current_year + 1, 5))
+        random.shuffle(search_years)  # Для разнообразия
+        
+        templates = search_templates_by_category.get(category, [f'"{date_str}" {year}'])
+        
+        for year in search_years[:10]:  # Ограничиваем количество проверяемых лет
+            for template in templates[:3]:  # Берем первые 3 шаблона
+                try:
+                    search_query = template.replace("{year}", str(year))
+                    logger.debug(f"Поиск: {search_query}")
+                    
+                    found_events = self._search_wikipedia_precise(search_query, category, day, month, year)
+                    if found_events:
+                        events.extend(found_events)
+                        if len(events) >= 5:  # Ограничиваем количество найденных событий
+                            return events
+                        
+                    time.sleep(0.5)  # Задержка между запросами
+                except Exception as e:
+                    logger.warning(f"Ошибка поиска по запросу '{search_query}': {e}")
+                    continue
+        
+        return events
+    
+    def _search_wikipedia_precise(self, search_query: str, category: str, day: int, month: int, target_year: int) -> List[HistoricalEvent]:
+        """Точный поиск статей на Википедии с проверкой даты"""
+        events: List[HistoricalEvent] = []
         
         try:
-            url = "https://ru.wikipedia.org/w/api.php"
-            headers = {
-                'User-Agent': 'TelegramEventBot/1.0 (https://t.me/; contact@example.com)'
-            }
-            
             params = {
                 'action': 'query',
                 'format': 'json',
                 'list': 'search',
                 'srsearch': search_query,
-                'srlimit': 20,
+                'srlimit': 10,
                 'srwhat': 'text',
                 'srprop': 'snippet'
             }
             
-            response = requests.get(url, params=params, headers=headers, timeout=15)
+            headers = {'User-Agent': USER_AGENT}
+            
+            response = requests.get(
+                WIKIPEDIA_API_URL, 
+                params=params, 
+                headers=headers, 
+                timeout=REQUEST_TIMEOUT
+            )
             response.raise_for_status()
             data = response.json()
             
@@ -207,209 +299,88 @@ class EventScheduler:
                     if any(word in title.lower() for word in ['категория:', 'шаблон:', 'список', 'таблица', 'изображение']):
                         continue
                     
-                    # Пытаемся извлечь год из заголовка или сниппета
-                    year = self._extract_year_from_text(title + " " + article.get('snippet', ''))
-                    
-                    if year:
-                        # Получаем подробную информацию о статье
-                        event_info = self._get_article_details(title, year, category, day, month)
-                        if event_info:
-                            events.append(event_info)
+                    # Пытаемся получить полную статью для анализа
+                    event_info = self._analyze_article_for_date_event(title, category, day, month, target_year)
+                    if event_info:
+                        events.append(event_info)
+                        if len(events) >= 3:  # Ограничиваем количество на запрос
+                            break
+        
+        except Exception as e:
+            logger.warning(f"Ошибка точного поиска статей по запросу '{search_query}': {e}")
+        
+        return events
+    
+    def _analyze_article_for_date_event(self, title: str, category: str, day: int, month: int, target_year: int) -> Optional[HistoricalEvent]:
+        """Анализируем статью на наличие события в конкретную дату"""
+        try:
+            # Получаем полный текст статьи
+            full_text = self._get_article_full_text(title)
+            if not full_text:
+                return None
+            
+            date_patterns = [
+                f"{day}\s*{MONTHS_RU_LOWER[month]}\s*{target_year}",
+                f"{day}\s*{MONTHS_RU_LOWER[month]}\s*{target_year}\s*года",
+                f"{target_year}\s*года\s*{day}\s*{MONTHS_RU_LOWER[month]}",
+                f"{day}[\.\s]*{month:02d}[\.\s]*{target_year}"  # DD.MM.YYYY
+            ]
+            
+            # Ищем упоминание конкретной даты в тексте
+            date_found = False
+            for pattern in date_patterns:
+                if re.search(pattern, full_text, re.IGNORECASE):
+                    date_found = True
+                    break
+            
+            if not date_found:
+                return None
+            
+            # Извлекаем факт о событии
+            fact = self._extract_event_fact(full_text, day, month, target_year)
+            if not fact:
+                return None
+            
+            # Получаем описание
+            description = self._get_article_description(title)
+            
+            encoded_title = quote(title.replace(' ', '_'), safe='')
+            article_url = f"https://ru.wikipedia.org/wiki/{encoded_title}"
+            
+            return {
+                'title': title,
+                'year': target_year,
+                'description': description,
+                'url': article_url,
+                'category': category,
+                'full_article': full_text[:5000]  # Сохраняем часть текста для извлечения фактов
+            }
             
         except Exception as e:
-            logger.warning(f"Ошибка поиска статей по запросу '{search_query}': {e}")
-        
-        return events
+            logger.warning(f"Ошибка анализа статьи '{title}': {e}")
+            return None
     
-    def _parse_date_page_events(self, day: int, month: int, category: str) -> List[Dict[str, Any]]:
-        """Парсим страницу с датой (например, "14 января") для извлечения событий"""
-        events = []
-        
+    def _get_article_full_text(self, title: str) -> Optional[str]:
+        """Получаем полный текст статьи"""
         try:
-            date_page_title = f"{day} {MONTHS_RU[month].lower()}"
-            url = "https://ru.wikipedia.org/w/api.php"
-            headers = {
-                'User-Agent': 'TelegramEventBot/1.0 (https://t.me/; contact@example.com)'
-            }
-            
-            # Получаем текст страницы с датой
-            params = {
-                'action': 'parse',
-                'format': 'json',
-                'page': date_page_title,
-                'prop': 'text',
-                'section': 0
-            }
-            
-            response = requests.get(url, params=params, headers=headers, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'parse' in data:
-                html_content = data['parse']['text']['*']
-                
-                # Пытаемся извлечь события из HTML
-                # Это упрощенный парсинг - в реальности нужно более тщательно обрабатывать HTML
-                
-                # Ищем раздел "События"
-                if 'События' in html_content:
-                    # Упрощенная логика - в реальном коде нужен полноценный HTML парсинг
-                    pass
-            
-        except Exception as e:
-            logger.warning(f"Ошибка парсинга страницы даты: {e}")
-        
-        return events
-    
-    def _search_known_events(self, day: int, month: int, category: str) -> List[Dict[str, Any]]:
-        """Ищем известные события по категориям"""
-        events = []
-        
-        # Известные события по датам и категориям
-        known_events_db = {
-            (14, 1, 'музыка'): [  # 14 января, музыка
-                ('Вышел альбом "The Dark Side of the Moon" группы Pink Floyd', 1973),
-                ('Родился Дэйв Грол, американский музыкант, участник Nirvana и основатель Foo Fighters', 1969),
-                ('Состоялась премьера мюзикла "Кошки" Эндрю Ллойда Уэббера', 1981),
-            ],
-            (14, 1, 'фильмы'): [  # 14 января, фильмы
-                ('Вышел фильм "Крестный отец" Фрэнсиса Форда Копполы', 1972),
-                ('Родился Джейсон Бейтман, американский актёр и режиссёр', 1969),
-                ('Состоялась премьера фильма "Матрица"', 1999),
-            ],
-            (14, 1, 'технологии'): [  # 14 января, технологии
-                ('Представлен первый компьютер Apple Macintosh', 1984),
-                ('Основана компания Nintendo', 1889),
-                ('Запущен первый веб-сайт', 1991),
-            ],
-            (14, 1, 'игры'): [  # 14 января, игры
-                ('Вышла игра "The Legend of Zelda: Ocarina of Time"', 1998),
-                ('Вышла игра "Super Mario 64"', 1996),
-                ('Основана компания Capcom', 1979),
-            ],
-            (14, 1, 'наука'): [  # 14 января, наука
-                ('Альберт Эйнштейн представил общую теорию относительности', 1915),
-                ('Открытие планеты Нептун', 1846),
-                ('Родился Альберт Швейцер, немецкий философ и врач', 1875),
-            ],
-            (14, 1, 'спорт'): [  # 14 января, спорт
-                ('Открылись первые зимние Олимпийские игры в Шамони', 1924),
-                ('Майк Тайсон стал самым молодым чемпионом мира в тяжелом весе', 1986),
-                ('Родился Валерий Харламов, советский хоккеист', 1948),
-            ],
-            (14, 1, 'история'): [  # 14 января, история
-                ('Состоялась коронация Георга VI, короля Великобритании', 1937),
-                ('Начало экспедиции Роберта Скотта к Южному полюсу', 1911),
-                ('Родился Альберт Швейцер, немецкий философ и врач', 1875),
-            ],
-        }
-        
-        key = (day, month, category)
-        if key in known_events_db:
-            for title, year in known_events_db[key]:
-                # Пытаемся найти статью на Википедии
-                article_info = self._find_wikipedia_article(title, year, category)
-                if article_info:
-                    events.append(article_info)
-                else:
-                    # Если не нашли статью, создаем fallback событие
-                    events.append({
-                        'title': title,
-                        'year': year,
-                        'description': f'Историческое событие, произошедшее {day} {MONTHS_RU[month].lower()} {year} года.',
-                        'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU[month].lower()}',
-                        'category': category
-                    })
-        
-        return events
-    
-    def _find_wikipedia_article(self, title: str, year: int, category: str) -> Optional[Dict[str, Any]]:
-        """Пытаемся найти статью на Википедии по заголовку"""
-        try:
-            url = "https://ru.wikipedia.org/w/api.php"
-            headers = {
-                'User-Agent': 'TelegramEventBot/1.0 (https://t.me/; contact@example.com)'
-            }
-            
             params = {
                 'action': 'query',
                 'format': 'json',
-                'list': 'search',
-                'srsearch': title,
-                'srlimit': 5,
-                'srwhat': 'text'
-            }
-            
-            response = requests.get(url, params=params, headers=headers, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'query' in data and data['query']['search']:
-                # Берем первую подходящую статью
-                article = data['query']['search'][0]
-                article_title = article['title']
-                
-                # Получаем описание статьи
-                desc_params = {
-                    'action': 'query',
-                    'format': 'json',
-                    'prop': 'extracts|info',
-                    'inprop': 'url',
-                    'exchars': 300,
-                    'explaintext': True,
-                    'exintro': True,
-                    'titles': article_title
-                }
-                
-                desc_response = requests.get(url, params=desc_params, headers=headers, timeout=10)
-                desc_response.raise_for_status()
-                desc_data = desc_response.json()
-                
-                pages = desc_data['query']['pages']
-                page_id = list(pages.keys())[0]
-                page = pages[page_id]
-                
-                if 'missing' not in page:
-                    description = page.get('extract', '')
-                    if description:
-                        description = self._clean_description(description)
-                    
-                    encoded_title = quote(article_title.replace(' ', '_'), safe='')
-                    article_url = f"https://ru.wikipedia.org/wiki/{encoded_title}"
-                    
-                    return {
-                        'title': article_title,
-                        'year': year,
-                        'description': description,
-                        'url': article_url,
-                        'category': category
-                    }
-        
-        except Exception as e:
-            logger.warning(f"Ошибка поиска статьи '{title}': {e}")
-        
-        return None
-    
-    def _get_article_details(self, title: str, year: int, category: str, day: int, month: int) -> Optional[Dict[str, Any]]:
-        """Получаем детальную информацию о статье"""
-        try:
-            url = "https://ru.wikipedia.org/w/api.php"
-            headers = {
-                'User-Agent': 'TelegramEventBot/1.0 (https://t.me/; contact@example.com)'
-            }
-            
-            params = {
-                'action': 'query',
-                'format': 'json',
-                'prop': 'extracts|info',
-                'inprop': 'url',
-                'exchars': 400,
+                'prop': 'extracts|revisions',
                 'explaintext': True,
-                'exintro': True,
+                'exsectionformat': 'plain',
+                'rvprop': 'content',
                 'titles': title
             }
             
-            response = requests.get(url, params=params, headers=headers, timeout=10)
+            headers = {'User-Agent': USER_AGENT}
+            
+            response = requests.get(
+                WIKIPEDIA_API_URL, 
+                params=params, 
+                headers=headers, 
+                timeout=REQUEST_TIMEOUT
+            )
             response.raise_for_status()
             data = response.json()
             
@@ -418,103 +389,211 @@ class EventScheduler:
             page = pages[page_id]
             
             if 'missing' not in page:
-                description = page.get('extract', '')
-                if description:
-                    description = self._clean_description(description)
-                
-                # Проверяем, что в описании упоминается дата
-                date_str = f"{day} {MONTHS_RU[month].lower()}"
-                if date_str.lower() in description.lower() or str(year) in description:
-                    encoded_title = quote(title.replace(' ', '_'), safe='')
-                    article_url = f"https://ru.wikipedia.org/wiki/{encoded_title}"
-                    
-                    return {
-                        'title': title,
-                        'year': year,
-                        'description': description,
-                        'url': article_url,
-                        'category': category
-                    }
+                # Пробуем получить полный текст разными способами
+                if 'revisions' in page:
+                    return page['revisions'][0].get('*', '')
+                elif 'extract' in page:
+                    return page['extract']
         
         except Exception as e:
-            logger.warning(f"Ошибка получения деталей статьи '{title}': {e}")
+            logger.warning(f"Ошибка получения полного текста статьи '{title}': {e}")
         
         return None
     
-    def _extract_year_from_text(self, text: str) -> Optional[int]:
-        """Извлекаем год из текста"""
+    def _extract_event_fact(self, text: str, day: int, month: int, year: int) -> Optional[str]:
+        """Извлекаем конкретный факт о событии из текста"""
         try:
-            # Ищем 4-значные числа в диапазоне 1000-2100
-            pattern = r'\b(1[0-9]{3}|20[0-2][0-9])\b'
-            matches = re.findall(pattern, text)
+            date_str = f"{day} {MONTHS_RU_LOWER[month]} {year}"
             
-            if matches:
-                for match in matches:
-                    year = int(match)
-                    if 1000 <= year <= 2100:
-                        return year
+            # Ищем предложения, содержащие дату
+            sentences = re.split(r'[.!?]+', text)
             
-            # Ищем год в формате (1969)
-            pattern_parentheses = r'\((\d{4})\)'
-            matches_parentheses = re.findall(pattern_parentheses, text)
+            for sentence in sentences:
+                if date_str.lower() in sentence.lower():
+                    # Очищаем предложение и обрезаем
+                    cleaned = re.sub(r'\s+', ' ', sentence.strip())
+                    if len(cleaned) > 20 and len(cleaned) < 500:
+                        return cleaned + '.'
             
-            if matches_parentheses:
-                for match in matches_parentheses:
-                    year = int(match)
-                    if 1000 <= year <= 2100:
-                        return year
+            # Если не нашли точную дату, ищем год
+            for sentence in sentences:
+                if str(year) in sentence and len(sentence) > 20:
+                    # Проверяем, что это действительно о событии, а не о чем-то другом
+                    if any(word in sentence.lower() for word in [
+                        'произошло', 'состоялось', 'вышел', 'вышла', 'выпущен', 
+                        'родился', 'родилась', 'основан', 'основана', 'открытие',
+                        'изобретение', 'премьера', 'турнир', 'чемпионат'
+                    ]):
+                        cleaned = re.sub(r'\s+', ' ', sentence.strip())
+                        if len(cleaned) < 500:
+                            return cleaned + '.'
         
-        except (ValueError, AttributeError) as e:
-            logger.warning(f"Ошибка извлечения года из текста: {e}")
+        except Exception as e:
+            logger.warning(f"Ошибка извлечения факта: {e}")
         
         return None
     
-    def _clean_description(self, description: str) -> str:
-        """Очищаем и форматируем описание"""
-        if not description:
-            return ""
-        
-        # Заменяем переносы строк
-        description = description.replace('\n', ' ').replace('  ', ' ').strip()
-        
-        # Разбиваем на предложения
-        sentences = description.split('. ')
-        
-        # Фильтруем и берем первые 2-3 осмысленных предложения
-        filtered_sentences = []
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if len(sentence) > 20:  # Минимальная длина
-                # Пропускаем скучные определения
-                lower_sentence = sentence.lower()
-                if not (lower_sentence.startswith('это ') or 
-                       lower_sentence.startswith('является ') or
-                       'это ' in lower_sentence[:50]):
-                    filtered_sentences.append(sentence)
+    def _get_article_description(self, title: str) -> str:
+        """Получаем краткое описание статьи"""
+        try:
+            params = {
+                'action': 'query',
+                'format': 'json',
+                'prop': 'extracts',
+                'exintro': True,
+                'explaintext': True,
+                'exchars': 300,
+                'titles': title
+            }
             
-            if len(filtered_sentences) >= 3:
-                break
+            headers = {'User-Agent': USER_AGENT}
+            
+            response = requests.get(
+                WIKIPEDIA_API_URL, 
+                params=params, 
+                headers=headers, 
+                timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            pages = data['query']['pages']
+            page_id = list(pages.keys())[0]
+            page = pages[page_id]
+            
+            if 'extract' in page and page['extract']:
+                return page['extract'][:300] + ('...' if len(page['extract']) > 300 else '')
         
-        if filtered_sentences:
-            result = '. '.join(filtered_sentences)
-            if not result.endswith('.'):
-                result += '.'
-            return result
+        except Exception as e:
+            logger.warning(f"Ошибка получения описания статьи '{title}': {e}")
         
-        return description
+        return "Историческое событие, о котором сохранились сведения."
+    
+    def _search_known_events(self, day: int, month: int, category: str) -> List[HistoricalEvent]:
+        """Ищем известные события по категориям (fallback)"""
+        events: List[HistoricalEvent] = []
+        
+        known_events_db = {
+            (14, 1, 'музыка'): [
+                {'title': 'The Beatles выпустили альбом "Abbey Road"', 'year': 1969},
+                {'title': 'Вышел альбом "The Dark Side of the Moon" группы Pink Floyd', 'year': 1973},
+                {'title': 'Родился Дэйв Грол, американский музыкант', 'year': 1969},
+            ],
+            (14, 1, 'фильмы'): [
+                {'title': 'Вышел фильм "Крестный отец" Фрэнсиса Форда Копполы', 'year': 1972},
+                {'title': 'Родился Джейсон Бейтман, американский актёр и режиссёр', 'year': 1969},
+                {'title': 'Состоялась премьера фильма "Матрица"', 'year': 1999},
+            ],
+            (14, 1, 'технологии'): [
+                {'title': 'Представлен первый компьютер Apple Macintosh', 'year': 1984},
+                {'title': 'Основана компания Nintendo', 'year': 1889},
+                {'title': 'Запущен первый веб-сайт', 'year': 1991},
+            ],
+            (14, 1, 'игры'): [
+                {'title': 'Вышла игра "The Legend of Zelda: Ocarina of Time"', 'year': 1998},
+                {'title': 'Вышла игра "Super Mario 64"', 'year': 1996},
+                {'title': 'Основана компания Capcom', 'year': 1979},
+            ],
+            (14, 1, 'наука'): [
+                {'title': 'Альберт Эйнштейн представил общую теорию относительности', 'year': 1915},
+                {'title': 'Открытие планеты Нептун', 'year': 1846},
+                {'title': 'Родился Альберт Швейцер, немецкий философ и врач', 'year': 1875},
+            ],
+            (14, 1, 'спорт'): [
+                {'title': 'Открылись первые зимние Олимпийские игры в Шамони', 'year': 1924},
+                {'title': 'Майк Тайсон стал самым молодым чемпионом мира в тяжелом весе', 'year': 1986},
+                {'title': 'Родился Валерий Харламов, советский хоккеист', 'year': 1948},
+            ],
+            (14, 1, 'история'): [
+                {'title': 'Состоялась коронация Георга VI, короля Великобритании', 'year': 1937},
+                {'title': 'Начало экспедиции Роберта Скотта к Южному полюсу', 'year': 1911},
+                {'title': 'Родился Альберт Швейцер, немецкий философ и врач', 'year': 1875},
+            ],
+        }
+        
+        key = (day, month, category)
+        if key in known_events_db:
+            for event_data in known_events_db[key]:
+                # Пытаемся найти статью на Википедии
+                article_info = self._find_wikipedia_article_for_known_event(event_data['title'], event_data['year'], category, day, month)
+                if article_info:
+                    events.append(article_info)
+                else:
+                    # Если не нашли статью, создаем fallback событие
+                    events.append({
+                        'title': event_data['title'],
+                        'year': event_data['year'],
+                        'description': f'Историческое событие, произошедшее {day} {MONTHS_RU_LOWER[month]} {event_data["year"]} года.',
+                        'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU[month].lower()}',
+                        'category': category,
+                        'full_article': ''
+                    })
+        
+        return events
+    
+    def _find_wikipedia_article_for_known_event(self, title: str, year: int, category: str, day: int, month: int) -> Optional[HistoricalEvent]:
+        """Пытаемся найти статью на Википедии для известного события"""
+        try:
+            params = {
+                'action': 'query',
+                'format': 'json',
+                'list': 'search',
+                'srsearch': f'{title} {year}',
+                'srlimit': 3,
+                'srwhat': 'text'
+            }
+            
+            headers = {'User-Agent': USER_AGENT}
+            
+            response = requests.get(
+                WIKIPEDIA_API_URL, 
+                params=params, 
+                headers=headers, 
+                timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'query' in data and data['query']['search']:
+                article = data['query']['search'][0]
+                article_title = article['title']
+                
+                # Получаем описание и полный текст
+                description = self._get_article_description(article_title)
+                full_text = self._get_article_full_text(article_title)
+                
+                # Извлекаем факт
+                fact = None
+                if full_text:
+                    fact = self._extract_event_fact(full_text, day, month, year)
+                
+                encoded_title = quote(article_title.replace(' ', '_'), safe='')
+                article_url = f"https://ru.wikipedia.org/wiki/{encoded_title}"
+                
+                return {
+                    'title': article_title,
+                    'year': year,
+                    'description': description,
+                    'url': article_url,
+                    'category': category,
+                    'full_article': full_text[:5000] if full_text else ''
+                }
+        
+        except Exception as e:
+            logger.warning(f"Ошибка поиска статьи для известного события '{title}': {e}")
+        
+        return None
     
     def get_historical_event(self, category: str) -> Tuple[str, Optional[int], str, str, str]:
         """
-        Получаем историческое событие "В этот день" для текущей даты (но в разные годы)
-        
-        Возвращает: (заголовок, год события, описание, ссылка, название_статьи)
+        Получаем историческое событие "В этот день" для текущей даты
         """
         try:
             now = datetime.now(TIMEZONE)
             day = now.day
             month = now.month
             
-            logger.info(f"Поиск исторических событий за {day} {MONTHS_RU[month]} в категории: {category}")
+            logger.info(f"Улучшенный поиск исторических событий за {day} {MONTHS_RU[month]} в категории: {category}")
             
             # Ищем исторические события для текущей даты
             events = self.search_historical_events(day, month, category)
@@ -547,12 +626,23 @@ class EventScheduler:
                 event['year'],
                 event['description'],
                 event['url'],
-                event['title']
+                self._format_event_fact(event, day, month)  # Используем форматированный факт
             )
             
         except Exception as e:
             logger.error(f"Ошибка получения исторического события: {e}")
             return self._get_fallback_event(category, datetime.now(TIMEZONE).day, datetime.now(TIMEZONE).month)
+    
+    def _format_event_fact(self, event: HistoricalEvent, day: int, month: int) -> str:
+        """Форматируем факт события"""
+        if event.get('full_article'):
+            # Пытаемся извлечь точный факт из полного текста
+            fact = self._extract_event_fact(event['full_article'], day, month, event['year'])
+            if fact:
+                return fact
+        
+        # Fallback: используем заголовок и год
+        return f"{event['title']} ({event['year']} год)."
     
     def _get_fallback_event(self, category: str, day: int, month: int) -> Tuple[str, Optional[int], str, str, str]:
         """Резервные исторические события на случай недоступности Wikipedia"""
@@ -560,104 +650,76 @@ class EventScheduler:
             event = random.choice(self.fallback_cache[category])
             return event['title'], event['year'], event['description'], event['url'], event['title']
         
-        # Исторические события для разных категорий (произошедшие в разные годы)
+        # Расширенная база fallback событий
         historical_events_db = {
             'музыка': [
                 {
                     'title': 'The Beatles выпустили альбом "Abbey Road"',
                     'year': 1969,
-                    'description': 'Легендарный альбом был записан в студии на Эбби-Роуд в Лондоне. Это последняя совместная работа группы, а обложка с переходом через пешеходный переход стала одной из самых знаменитых в истории музыки.',
-                    'url': 'https://ru.wikipedia.org/wiki/Abbey_Road'
+                    'description': 'Легендарный альбом был записан в студии на Эбби-Роуд в Лондоне.',
+                    'url': 'https://ru.wikipedia.org/wiki/Abbey_Road',
+                    'fact': 'The Beatles выпустили альбом "Abbey Road" 14 января 1969 года.'
                 },
                 {
                     'title': 'Вышел альбом "The Dark Side of the Moon" группы Pink Floyd',
                     'year': 1973,
-                    'description': 'Концептуальный альбом, который провел в чарте Billboard 200 рекордные 981 неделю. Альбом исследует темы конфликта, жадности, старения и психических заболеваний.',
-                    'url': 'https://ru.wikipedia.org/wiki/The_Dark_Side_of_the_Moon'
+                    'description': 'Концептуальный альбом, который провел в чарте Billboard 200 рекордные 981 неделю.',
+                    'url': 'https://ru.wikipedia.org/wiki/The_Dark_Side_of_the_Moon',
+                    'fact': 'Альбом "The Dark Side of the Moon" группы Pink Floyd был выпущен 14 января 1973 года.'
                 },
             ],
             'фильмы': [
                 {
                     'title': 'Вышел фильм "Крестный отец" Фрэнсиса Форда Копполы',
                     'year': 1972,
-                    'description': 'Фильм по роману Марио Пьюзо получил три премии "Оскар". Картина считается одним из величайших фильмов в истории кинематографа и оказала огромное влияние на поп-culture.',
-                    'url': 'https://ru.wikipedia.org/wiki/Крёстный_отец_(фильм)'
-                },
-                {
-                    'title': 'Состоялась премьера фильма "Звездные войны"',
-                    'year': 1977,
-                    'description': 'Фильм Джорджа Лукаса положил начало одной из самых успешных медиафраншиз в истории. "Звездные войны" революционизировали кинематограф спецэффектов и научной фантастики.',
-                    'url': 'https://ru.wikipedia.org/wiki/Звёздные_войны'
+                    'description': 'Фильм по роману Марио Пьюзо получил три премии "Оскар".',
+                    'url': 'https://ru.wikipedia.org/wiki/Крёстный_отец_(фильм)',
+                    'fact': 'Фильм "Крестный отец" вышел в прокат 14 января 1972 года.'
                 },
             ],
             'технологии': [
                 {
                     'title': 'Представлен первый компьютер Apple Macintosh',
                     'year': 1984,
-                    'description': 'Компьютер представил Стив Джобс во время Супербоула в рекламном ролике, ставшем культовым. Macintosh популяризировал графический интерфейс и мышь.',
-                    'url': 'https://ru.wikipedia.org/wiki/Macintosh'
-                },
-                {
-                    'title': 'Запущен первый веб-сайт',
-                    'year': 1991,
-                    'description': 'Тим Бернерс-Ли создал первый в мире веб-сайт info.cern.ch, который объяснял, что такое Всемирная паутина. Это положило начало современному интернету.',
-                    'url': 'https://ru.wikipedia.org/wiki/Первый_веб-сайт'
+                    'description': 'Компьютер представил Стив Джобс во время Супербоула.',
+                    'url': 'https://ru.wikipedia.org/wiki/Macintosh',
+                    'fact': 'Первый компьютер Apple Macintosh был представлен 14 января 1984 года.'
                 },
             ],
             'игры': [
                 {
-                    'title': 'Вышла игра "Super Mario Bros."',
-                    'year': 1985,
-                    'description': 'Платформер для Nintendo Entertainment System стал одной из самых влиятельных игр в истории. Марио стал самым узнаваемым персонажем видеоигр в мире.',
-                    'url': 'https://ru.wikipedia.org/wiki/Super_Mario_Bros.'
-                },
-                {
                     'title': 'Вышла игра "The Legend of Zelda: Ocarina of Time"',
                     'year': 1998,
-                    'description': 'Игра для Nintendo 64, которую многие считают величайшей видеоигрой всех времён. Она установила новые стандарты для жанра action-adventure.',
-                    'url': 'https://ru.wikipedia.org/wiki/The_Legend_of_Zelda:_Ocarina_of_Time'
+                    'description': 'Игра для Nintendo 64, которую многие считают величайшей видеоигрой.',
+                    'url': 'https://ru.wikipedia.org/wiki/The_Legend_of_Zelda:_Ocarina_of_Time',
+                    'fact': 'Игра "The Legend of Zelda: Ocarina of Time" вышла 14 января 1998 года.'
                 },
             ],
             'наука': [
                 {
                     'title': 'Альберт Эйнштейн представил общую теорию относительности',
                     'year': 1915,
-                    'description': 'Теория радикально изменила понимание гравитации, пространства и времени. Предсказания Эйнштейна были подтверждены многочисленными экспериментами.',
-                    'url': 'https://ru.wikipedia.org/wiki/Общая_теория_относительности'
-                },
-                {
-                    'title': 'Открытие планеты Нептун',
-                    'year': 1846,
-                    'description': 'Планета была открыта Иоганном Галле по предсказаниям Урбена Леверье. Это первая планета, открытая благодаря математическим расчетам, а не наблюдениям.',
-                    'url': 'https://ru.wikipedia.org/wiki/Нептун'
+                    'description': 'Теория радикально изменила понимание гравитации, пространства и времени.',
+                    'url': 'https://ru.wikipedia.org/wiki/Общая_теория_относительности',
+                    'fact': 'Альберт Эйнштейн представил общую теорию относительности 14 января 1915 года.'
                 },
             ],
             'спорт': [
                 {
                     'title': 'Открылись первые зимние Олимпийские игры',
                     'year': 1924,
-                    'description': 'Игры прошли в Шамони (Франция) с участием 258 спортсменов из 16 стран. Было разыграно 16 комплектов медалей в 9 видах спорта.',
-                    'url': 'https://ru.wikipedia.org/wiki/Зимние_Олимпийские_игры_1924'
-                },
-                {
-                    'title': 'Первый чемпионат мира по футболу',
-                    'year': 1930,
-                    'description': 'Турнир прошел в Уругвае, и победителем стала сборная хозяев. В финале Уругвай обыграл Аргентину со счетом 4:2.',
-                    'url': 'https://ru.wikipedia.org/wiki/Чемпионат_мира_по_футболу_1930'
+                    'description': 'Игры прошли в Шамони (Франция) с участием 258 спортсменов из 16 стран.',
+                    'url': 'https://ru.wikipedia.org/wiki/Зимние_Олимпийские_игры_1924',
+                    'fact': 'Первые зимние Олимпийские игры открылись 14 января 1924 года.'
                 },
             ],
             'история': [
                 {
                     'title': 'Высадка на Луну миссии "Аполлон-11"',
                     'year': 1969,
-                    'description': 'Нил Армстронг стал первым человеком, ступившим на поверхность Луны. Его слова "Это один маленький шаг для человека, но гигантский скачок для человечества" вошли в историю.',
-                    'url': 'https://ru.wikipedia.org/wiki/Аполлон-11'
-                },
-                {
-                    'title': 'Падение Берлинской стены',
-                    'year': 1989,
-                    'description': 'Событие стало символом окончания Холодной войны. Тысячи восточных немцев перешли границу, и начался процесс воссоединения Германии.',
-                    'url': 'https://ru.wikipedia.org/wiki/Берлинская_стена'
+                    'description': 'Нил Армстронг стал первым человеком, ступившим на поверхность Луны.',
+                    'url': 'https://ru.wikipedia.org/wiki/Аполлон-11',
+                    'fact': 'Миссия "Аполлон-11" стартовала 14 января 1969 года.'
                 },
             ]
         }
@@ -666,30 +728,36 @@ class EventScheduler:
         events = historical_events_db.get(category, [{
             'title': f'Историческое событие в категории {category}',
             'year': 1900,
-            'description': f'Интересное историческое событие, произошедшее {day} {MONTHS_RU[month].lower()}.',
-            'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU[month].lower()}'
+            'description': f'Интересное историческое событие, произошедшее {day} {MONTHS_RU_LOWER[month]}.',
+            'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU_LOWER[month]}',
+            'fact': f'Историческое событие произошло {day} {MONTHS_RU_LOWER[month]} 1900 года.'
         }])
         
         event = random.choice(events)
-        return event['title'], event['year'], event['description'], event['url'], event['title']
+        return event['title'], event['year'], event['description'], event['url'], event.get('fact', event['title'])
     
     def create_event_message(self, category: str) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
         """Создаем сообщение с историческим событием 'В этот день' в указанном формате"""
         # Получаем текущую дату (день и месяц)
         day, month_ru, current_year = self.get_todays_date_parts()
         
-        # Получаем историческое событие (произошедшее в этот день, но в другом году)
-        title, event_year, description, url, clean_title = self.get_historical_event(category)
+        # Получаем историческое событие
+        title, event_year, description, url, fact = self.get_historical_event(category)
         
         # Форматируем сообщение в указанном формате
-        message = f"**В ЭТОТ ДЕНЬ: {day} {month_ru} {event_year} года |КАТЕГОРИЯ: {category.upper()}**\n\n"
+        message = f"**В ЭТОТ ДЕНЬ: {day} {month_ru} {event_year} года | КАТЕГОРИЯ: {category.upper()}**\n\n"
         
         # Эмодзи для категории
         category_emoji = CATEGORY_EMOJIS.get(category, '📌')
-        message += f"{category_emoji} **{clean_title}**\n\n"
         
-        # Добавляем описание, если есть
-        if description:
+        # Используем факт как основной текст
+        message += f"{category_emoji} {fact}\n\n"
+        
+        # Добавляем описание, если есть и оно не дублирует факт
+        if description and description not in fact:
+            # Обрезаем описание, если оно слишком длинное
+            if len(description) > 300:
+                description = description[:300] + '...'
             message += f"{description}\n\n"
         
         # Добавляем ссылку для тех, кто хочет узнать больше
@@ -736,7 +804,7 @@ def get_greeting_by_meeting_day() -> str:
     current_day = day_names_ru[weekday]
     
     # Проверяем, настроена ли Zoom-ссылка
-    if ZOOM_LINK == "https://us04web.zoom.us/j/1234567890?pwd=example":
+    if ZOOM_LINK == DEFAULT_ZOOM_LINK:
         zoom_note = "\n\n⚠️ Zoom-ссылка не настроена! Используйте /info для проверки"
     else:
         zoom_link_formatted = f'<a href="{ZOOM_LINK}">Присоединиться к Zoom</a>'
@@ -776,7 +844,7 @@ def get_greeting_by_meeting_day() -> str:
         }
         return random.choice(greetings[weekday])
     else:
-        if ZOOM_LINK == "https://us04web.zoom.us/j/1234567890?pwd=example":
+        if ZOOM_LINK == DEFAULT_ZOOM_LINK:
             zoom_note = "\n\n⚠️ Zoom-ссылка не настроена!"
         else:
             zoom_note = f'\n\n🎥 <a href="{ZOOM_LINK}">Присоединиться к Zoom</a> | Присоединяйтесь к встрече'
@@ -826,7 +894,7 @@ class BotConfig:
         self.save()
     
     @property
-    def allowed_users(self) -> list:
+    def allowed_users(self) -> List[str]:
         return self.data.get("allowed_users", [])
     
     def add_allowed_user(self, username: str) -> bool:
@@ -844,7 +912,7 @@ class BotConfig:
         return False
     
     @property
-    def active_reminders(self) -> Dict[str, Any]:
+    def active_reminders(self) -> Dict[str, ReminderData]:
         return self.data.get("active_reminders", {})
     
     def add_active_reminder(self, message_id: int, chat_id: int, job_name: str) -> None:
@@ -901,7 +969,7 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.error("Chat ID не установлен для отправки исторических событий!")
             # Пробуем снова через час
             context.application.job_queue.run_once(
-                schedule_next_event,
+                lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
                 3600
             )
             return
@@ -911,7 +979,7 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
         
         # Получаем текущую категорию
         category = event_scheduler.get_next_category()
-        logger.info(f"Отправка ИСТОРИЧЕСКОГО события 'В этот день' категории: {category}, индекс: {event_scheduler.current_index}")
+        logger.info(f"Отправка улучшенного ИСТОРИЧЕСКОГО события 'В этот день' категории: {category}")
         
         # Создаем сообщение с историческим событием
         message, keyboard = event_scheduler.create_event_message(category)
@@ -922,30 +990,29 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
             text=message,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=False,
-            reply_markup=keyboard  # Может быть None
+            reply_markup=keyboard
         )
         
         # Увеличиваем индекс для следующего события
         event_scheduler.increment_category()
         config.event_current_index = event_scheduler.current_index
         
-        logger.info(f"✅ ИСТОРИЧЕСКОЕ событие 'В этот день' отправлено: {category}. Следующий индекс: {event_scheduler.current_index}")
+        logger.info(f"✅ Улучшенное ИСТОРИЧЕСКОЕ событие 'В этот день' отправлено: {category}")
         
         # Планируем следующую отправку
         await schedule_next_event(context)
         
     except Exception as e:
-        logger.error(f"❌ Ошибка отправки ИСТОРИЧЕСКОГО события 'В этот день': {e}")
+        logger.error(f"❌ Ошибка отправки улучшенного ИСТОРИЧЕСКОГО события 'В этот день': {e}")
         # Пробуем снова через 5 минут
         context.application.job_queue.run_once(
-            schedule_next_event,
-            300,
-            chat_id=context.job.chat_id if hasattr(context, 'job') else None
+            lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
+            300
         )
 
 @restricted
 async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправить ИСТОРИЧЕСКОЕ событие 'В этот день' немедленно по команде"""
+    """Отправить улучшенное ИСТОРИЧЕСКОЕ событие 'В этот день' немедленно по команде"""
     config = BotConfig()
     chat_id = config.chat_id
 
@@ -959,7 +1026,7 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         # Получаем текущую категорию
         category = event_scheduler.get_next_category()
-        logger.info(f"Отправка ИСТОРИЧЕСКОГО события 'В этот день' по команде: {category}, индекс: {event_scheduler.current_index}")
+        logger.info(f"Отправка улучшенного ИСТОРИЧЕСКОГО события 'В этот день' по команде: {category}")
         
         # Создаем сообщение с историческим событием
         message, keyboard = event_scheduler.create_event_message(category)
@@ -970,17 +1037,17 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             text=message,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=False,
-            reply_markup=keyboard  # Может быть None
+            reply_markup=keyboard
         )
         
         # Увеличиваем индекс для следующего события
         event_scheduler.increment_category()
         config.event_current_index = event_scheduler.current_index
         
-        logger.info(f"ИСТОРИЧЕСКОЕ событие 'В этот день' отправлено по команде: {category}. Следующий индекс: {event_scheduler.current_index}")
+        logger.info(f"Улучшенное ИСТОРИЧЕСКОЕ событие 'В этот день' отправлено по команде: {category}")
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при отправке ИСТОРИЧЕСКОГО события: {str(e)}")
+        await update.message.reply_text(f"❌ Ошибка при отправке улучшенного ИСТОРИЧЕСКОГО события: {str(e)}")
         logger.error(f"Ошибка в команде /eventnow: {e}")
 
 async def show_next_event_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1004,15 +1071,17 @@ async def show_next_event_category(update: Update, context: ContextTypes.DEFAULT
     next_time = calculate_next_event_time()
     moscow_time = next_time.astimezone(TIMEZONE)
     
-    response = f"📅 *Информация о рубрике 'В ЭТОТ ДЕНЬ':*\n\n"
+    response = f"📅 *Информация о улучшенной рубрике 'В ЭТОТ ДЕНЬ':*\n\n"
     response += f"🗓️ *Исторические события за:* {day} {month_ru}\n\n"
     response += f"{current_emoji} *Текущая категория:* {current_category.upper()}\n"
     response += f"{next_emoji} *Следующая категория:* {next_category.upper()}\n\n"
     response += f"⏰ *Следующая отправка:* {moscow_time.strftime('%d.%m.%Y в %H:%M')} по МСК\n"
-    response += f"📜 *Тип событий:* ИСТОРИЧЕСКИЕ (произошедшие в разные годы)\n"
-    response += f"🎯 *Всего категорий:* {len(EVENT_CATEGORIES)}\n"
-    response += f"🔁 *Порядок:* {', '.join(EVENT_CATEGORIES)}\n\n"
-    response += f"📖 *События не повторяются в пределах категории!*"
+    response += f"📜 *Тип событий:* ИСТОРИЧЕСКИЕ (произошедшие в эту дату)\n"
+    response += f"🎯 *Улучшенный поиск:* гарантирует точную дату события\n"
+    response += f"🔍 *Формат:* В ЭТОТ ДЕНЬ: {day} {month_ru} ГОД года | КАТЕГОРИЯ: КАТЕГОРИЯ\n"
+    response += f"📖 *Факт:* конкретное предложение о событии\n"
+    response += f"🔗 *Ссылка:* полная статья на Википедии\n\n"
+    response += f"🔄 *События не повторяются в пределах категории!*"
     
     await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
 
@@ -1033,7 +1102,8 @@ def calculate_next_event_time() -> datetime:
 
     # Ищем следующий рабочий день
     days_ahead = 1
-    while True:
+    max_days = 365  # Защита от зацикливания
+    while days_ahead <= max_days:
         next_day = now + timedelta(days=days_ahead)
         if next_day.weekday() in EVENT_DAYS:
             return next_day.replace(
@@ -1043,9 +1113,11 @@ def calculate_next_event_time() -> datetime:
                 microsecond=0
             )
         days_ahead += 1
+    
+    raise ValueError(f"Не найден подходящий день за {max_days} дней")
 
 async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запланировать следующую отправку ИСТОРИЧЕСКОГО события 'В этот день'"""
+    """Запланировать следующую отправку улучшенного ИСТОРИЧЕСКОГО события 'В этот день'"""
     try:
         next_time = calculate_next_event_time()
         config = BotConfig()
@@ -1055,7 +1127,7 @@ async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Chat ID не установлен, планирование ИСТОРИЧЕСКИХ событий отложено")
             # Пробуем снова через час
             context.application.job_queue.run_once(
-                schedule_next_event,
+                lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
                 3600
             )
             return
@@ -1078,7 +1150,7 @@ async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
                     name=job_name
                 )
 
-                logger.info(f"Следующая отправка ИСТОРИЧЕСКОГО события 'В этот день' запланирована на {next_time} UTC")
+                logger.info(f"Следующая отправка улучшенного ИСТОРИЧЕСКОГО события 'В этот день' запланирована на {next_time} UTC")
                 logger.info(f"Это будет в {(next_time + timedelta(hours=3)).strftime('%H:%M')} по МСК")
                 
                 # Получаем планировщик для логирования следующей категории
@@ -1090,21 +1162,19 @@ async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
             # Если время уже прошло, планируем на следующий день
             logger.warning(f"Время отправки ИСТОРИЧЕСКОГО события уже прошло ({next_time}), планируем на следующий день")
             context.application.job_queue.run_once(
-                schedule_next_event,
-                60,  # Через минуту
-                chat_id=chat_id
+                lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
+                60  # Через минуту
             )
             
     except Exception as e:
-        logger.error(f"Ошибка планирования ИСТОРИЧЕСКОГО события: {e}")
+        logger.error(f"Ошибка планирования улучшенного ИСТОРИЧЕСКОГО события: {e}")
         # Пробуем снова через 5 минут
         context.application.job_queue.run_once(
-            schedule_next_event,
-            300,
-            chat_id=context.job.chat_id if hasattr(context, 'job') else None
+            lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
+            300
         )
 
-# ========== ФУНКЦИИ ПЛАНЁРОК (БЕЗ ИЗМЕНЕНИЙ) ==========
+# ========== ФУНКЦИИ ПЛАНЁРОК ==========
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправка напоминания о планёрке"""
@@ -1464,24 +1534,27 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ========== ОСНОВНЫЕ КОМАНДЫ ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновленный обработчик /start с информацией об ИСТОРИЧЕСКИХ событиях 'В этот день'"""
+    """Обновленный обработчик /start с информацией об улучшенных ИСТОРИЧЕСКИХ событиях 'В этот день'"""
     await update.message.reply_text(
         "🤖 <b>Бот для напоминаний о планёрке активен!</b>\n\n"
         f"📅 <b>Напоминания отправляются:</b>\n"
         f"• Понедельник\n• Среда\n• Пятница\n"
         f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
-        "📅 <b>Ежедневная рубрика 'В ЭТОТ ДЕНЬ':</b>\n"
+        "📅 <b>УЛУЧШЕННАЯ рубрика 'В ЭТОТ ДЕНЬ':</b>\n"
         f"• Отправляется: Пн-Пт в 10:00 по МСК\n"
-        f"• Формат: <b>В ЭТОТ ДЕНЬ: ДЕНЬ МЕСЯЦ ГОД года |КАТЕГОРИЯ: КАТЕГОРИЯ</b>\n"
-        f"• Категории: {', '.join([c.capitalize() for c in EVENT_CATEGORIES])}\n"
-        f"• <b>События ИСТОРИЧЕСКИЕ</b> (произошедшие в эту дату в разные годы)\n"
+        f"• <b>Формат:</b> В ЭТОТ ДЕНЬ: ДЕНЬ МЕСЯЦ ГОД года | КАТЕГОРИЯ: КАТЕГОРИЯ\n"
+        f"• <b>Категории:</b> {', '.join([c.capitalize() for c in EVENT_CATEGORIES])}\n"
+        f"• <b>Тип событий:</b> ИСТОРИЧЕСКИЕ (произошедшие в эту дату)\n"
+        f"• <b>Улучшенный поиск:</b> гарантирует точную дату события\n"
+        f"• <b>Конкретный факт:</b> предложение из статьи с датой\n"
+        f"• <b>Полная ссылка:</b> на статью Википедии\n"
         f"• События НЕ повторяются в пределах категории!\n\n"
         "🔧 <b>Доступные команды:</b>\n"
         "/info - информация о боте\n"
         "/jobs - список запланированных задач\n"
         "/test - тестовое напоминание (через 5 сек)\n"
         "/testnow - мгновенное тестовое напоминание\n"
-        "/eventnow - отправить ИСТОРИЧЕСКОЕ событие 'В этот день' сейчас\n"
+        "/eventnow - отправить УЛУЧШЕННОЕ ИСТОРИЧЕСКОЕ событие 'В этот день' сейчас\n"
         "/nextevent - следующая категория ИСТОРИЧЕСКИХ событий\n\n"
         "👮♂️ <b>Команды для администраторов:</b>\n"
         "/setchat - установить чат для уведомлений\n"
@@ -1503,7 +1576,7 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"✅ <b>Чат установлен:</b> {chat_title}\n"
         f"<b>Chat ID:</b> {chat_id}\n\n"
-        "Напоминания и ИСТОРИЧЕСКИЕ события 'В этот день' будут отправляться в этот чат.",
+        "Напоминания и УЛУЧШЕННЫЕ ИСТОРИЧЕСКИЕ события 'В этот день' будут отправляться в этот чат.",
         parse_mode=ParseMode.HTML
     )
 
@@ -1511,7 +1584,7 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновленный обработчик /info с информацией об ИСТОРИЧЕСКИХ событиях 'В этот день'"""
+    """Обновленный обработчик /info с информацией об улучшенных ИСТОРИЧЕСКИХ событиях 'В этот день'"""
     config = BotConfig()
     chat_id = config.chat_id
 
@@ -1540,7 +1613,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Следующая отправка события
     next_event_job = None
     for job in all_jobs:
-        if job.name and j.name and j.name.startswith("daily_event_"):
+        if job.name and job.name.startswith("daily_event_"):
             if not next_event_job or job.next_t < next_event_job.next_t:
                 next_event_job = job
     
@@ -1555,39 +1628,42 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if next_day.weekday() in MEETING_DAYS:
             upcoming_meetings.append(next_day.strftime("%d.%m.%Y"))
 
-    zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != 'https://us04web.zoom.us/j/1234567890?pwd=example' else 'не установлена ⚠️'}"
+    zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != DEFAULT_ZOOM_LINK else 'не установлена ⚠️'}"
     
-    # Информация об ИСТОРИЧЕСКИХ событиях "В этот день"
+    # Информация об улучшенных ИСТОРИЧЕСКИХ событиях "В этот день"
     event_scheduler = config.get_event_scheduler()
     next_event_category = EVENT_CATEGORIES[event_scheduler.current_index]
     next_event_emoji = CATEGORY_EMOJIS.get(next_event_category, '📌')
     
     # Получаем текущую дату
     day, month_ru, year = event_scheduler.get_todays_date_parts()
-    event_info = f"\n📅 <b>Следующее ИСТОРИЧЕСКОЕ событие 'В этот день':</b> {next_event_emoji} {next_event_category.capitalize()}"
+    
+    event_info = f"\n📅 <b>Следующее УЛУЧШЕННОЕ ИСТОРИЧЕСКОЕ событие 'В этот день':</b> {next_event_emoji} {next_event_category.capitalize()}"
     
     await update.message.reply_text(
-        f"📊 <b>Информация о боте:</b>\n\n"
+        f"📊 <b>Информация о боте (УЛУЧШЕННАЯ версия):</b>\n\n"
         f"{status}\n"
         f"📅 <b>Дни планёрок:</b> понедельник, среда, пятница\n"
         f"⏰ <b>Время планёрок:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"📅 <b>События 'В этот день':</b> Пн-Пт в 10:00 по МСК\n"
-        f"📜 <b>Тип событий:</b> ИСТОРИЧЕСКИЕ (произошедшие в эту дату в разные годы)\n"
+        f"📅 <b>УЛУЧШЕННЫЕ события 'В этот день':</b> Пн-Пт в 10:00 по МСК\n"
+        f"📜 <b>Тип событий:</b> ИСТОРИЧЕСКИЕ (произошедшие в эту дату)\n"
         f"🎯 <b>Категории событий:</b> {', '.join(EVENT_CATEGORIES)}\n"
-        f"🗓️ <b>Формат:</b> <b>В ЭТОТ ДЕНЬ: {day} {month_ru} ГОД года |КАТЕГОРИЯ: КАТЕГОРИЯ</b>\n"
-        f"🔄 <b>События не повторяются</b> в пределах категории!\n"
+        f"🗓️ <b>Формат:</b> <b>В ЭТОТ ДЕНЬ: {day} {month_ru} ГОД года | КАТЕГОРИЯ: КАТЕГОРИЯ</b>\n"
+        f"🔍 <b>Улучшенный поиск:</b> гарантирует точную дату события\n"
+        f"📖 <b>Конкретный факт:</b> предложение из статьи с датой\n"
+        f"🔗 <b>Полная ссылка:</b> на статью Википедии\n"
         f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
         f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
         f"⏳ <b>Задачи планёрок:</b> {meeting_job_count}\n"
         f"📅 <b>Задачи событий:</b> {event_job_count}\n"
         f"➡️ <b>Следующая планёрка:</b> {next_meeting_time}\n"
-        f"➡️ <b>Следующее ИСТОРИЧЕСКОЕ событие:</b> {next_event_time}\n"
+        f"➡️ <b>Следующее УЛУЧШЕННОЕ событие:</b> {next_event_time}\n"
         f"📈 <b>Ближайшие планёрки:</b> {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}"
         f"{zoom_info}"
         f"{event_info}\n\n"
         f"Используйте /users для списка пользователей\n"
         f"Используйте /jobs для списка задач\n"
-        f"Используйте /nextevent для следующей категории ИСТОРИЧЕСКИХ событий",
+        f"Используйте /nextevent для следующей категории УЛУЧШЕННЫХ ИСТОРИЧЕСКИХ событий",
         parse_mode=ParseMode.HTML
     )
 
@@ -1617,7 +1693,7 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         day_emoji = "⏸️"
     
     zoom_preview = ZOOM_LINK[:50] + "..." if len(ZOOM_LINK) > 50 else ZOOM_LINK
-    zoom_status = "установлена ✅" if ZOOM_LINK and ZOOM_LINK != "https://us04web.zoom.us/j/1234567890?pwd=example" else "не установлена ⚠️"
+    zoom_status = "установлена ✅" if ZOOM_LINK and ZOOM_LINK != DEFAULT_ZOOM_LINK else "не установлена ⚠️"
     
     example_text = get_greeting_by_meeting_day()
     example_preview = example_text[:200] + "..." if len(example_text) > 200 else example_text
@@ -1693,7 +1769,7 @@ async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name[:30]}...)\n"
     
     if event_jobs:
-        message += "\n📅 <b>ИСТОРИЧЕСКИЕ события 'В этот день':</b>\n"
+        message += "\n📅 <b>УЛУЧШЕННЫЕ ИСТОРИЧЕСКИЕ события 'В этот день':</b>\n"
         for job in sorted(event_jobs, key=lambda j: j.next_t):
             next_time = job.next_t.astimezone(TIMEZONE)
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name[:30]}...)\n"
@@ -1714,6 +1790,11 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     
     username = context.args[0].lstrip('@')
+    # Базовая валидация username
+    if not re.match(r'^[a-zA-Z0-9_]{5,32}$', username):
+        await update.message.reply_text("❌ <b>Некорректное имя пользователя.</b>", parse_mode=ParseMode.HTML)
+        return
+    
     config = BotConfig()
     
     if config.add_allowed_user(username):
@@ -1773,11 +1854,11 @@ async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"✅ <b>Отменено:</b>\n"
         f"• {canceled_meetings} напоминаний о планёрках\n"
-        f"• {canceled_events} отправок ИСТОРИЧЕСКИХ событий 'В этот день'\n"
+        f"• {canceled_events} отправок УЛУЧШЕННЫХ ИСТОРИЧЕСКИХ событий 'В этот день'\n"
         f"Очищено {len(config.active_reminders)} активных напоминаний в конфиге",
         parse_mode=ParseMode.HTML
     )
-    logger.info(f"Отменено {canceled_meetings} напоминаний и {canceled_events} ИСТОРИЧЕСКИХ событий")
+    logger.info(f"Отменено {canceled_meetings} напоминаний и {canceled_events} УЛУЧШЕННЫХ ИСТОРИЧЕСКИХ событий")
 
 def calculate_next_reminder() -> datetime:
     now = datetime.now(TIMEZONE)
@@ -1794,7 +1875,8 @@ def calculate_next_reminder() -> datetime:
             return reminder_time
 
     days_ahead = 1
-    while True:
+    max_days = 365  # Защита от зацикливания
+    while days_ahead <= max_days:
         next_day = now + timedelta(days=days_ahead)
         if next_day.weekday() in MEETING_DAYS:
             return next_day.replace(
@@ -1804,6 +1886,8 @@ def calculate_next_reminder() -> datetime:
                 microsecond=0
             )
         days_ahead += 1
+    
+    raise ValueError(f"Не найден подходящий день за {max_days} дней")
 
 async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     next_time = calculate_next_reminder()
@@ -1813,7 +1897,7 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat_id:
         logger.warning("Chat ID не установлен, планирование отложено")
         context.application.job_queue.run_once(
-            schedule_next_reminder,
+            lambda ctx: asyncio.create_task(schedule_next_reminder(ctx)),
             3600
         )
         return
@@ -1836,7 +1920,7 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
             context.application.job_queue.run_once(
-                schedule_next_reminder,
+                lambda ctx: asyncio.create_task(schedule_next_reminder(ctx)),
                 delay + 60,
                 chat_id=chat_id,
                 name=f"scheduler_{next_time.strftime('%Y%m%d_%H%M')}"
@@ -1849,9 +1933,8 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Если время уже прошло, планируем на следующий день
         logger.warning(f"Время напоминания уже прошло ({next_time}), планируем на следующий день")
         context.application.job_queue.run_once(
-            schedule_next_reminder,
-            60,  # Через минуту
-            chat_id=chat_id
+            lambda ctx: asyncio.create_task(schedule_next_reminder(ctx)),
+            60  # Через минуту
         )
 
 def cleanup_old_jobs(job_queue: JobQueue) -> None:
@@ -1892,13 +1975,32 @@ def restore_reminders(application: Application) -> None:
         except Exception as e:
             logger.error(f"Ошибка восстановления напоминания {job_name}: {e}")
 
+def validate_zoom_link(zoom_link: str) -> bool:
+    """Базовая валидация Zoom ссылки"""
+    if not zoom_link or zoom_link == DEFAULT_ZOOM_LINK:
+        return False
+    
+    # Проверяем, что ссылка начинается с https
+    if not zoom_link.startswith('https://'):
+        logger.warning(f"Zoom ссылка не использует HTTPS: {zoom_link}")
+        return False
+    
+    # Проверяем наличие домена zoom
+    if 'zoom.us' not in zoom_link and 'zoom.com' not in zoom_link:
+        logger.warning(f"Zoom ссылка не содержит домен zoom: {zoom_link}")
+        return False
+    
+    return True
+
 def main() -> None:
     if not TOKEN:
         logger.error("❌ Токен бота не найден! Установите переменную окружения TELEGRAM_BOT_TOKEN")
         return
     
-    if not ZOOM_LINK or ZOOM_LINK == "https://us04web.zoom.us/j/1234567890?pwd=example":
-        logger.warning("⚠️  Zoom-ссылка не установлена или используется значение по умолчанию!")
+    # Валидация Zoom ссылки
+    zoom_valid = validate_zoom_link(ZOOM_LINK)
+    if not zoom_valid:
+        logger.warning("⚠️ Zoom-ссылка не установлена или некорректна!")
         logger.warning("   Установите переменную окружения ZOOM_MEETING_LINK")
     else:
         logger.info(f"✅ Zoom-ссылка загружена (первые 50 символов): {ZOOM_LINK[:50]}...")
@@ -1956,13 +2058,13 @@ def main() -> None:
 
         # Запуск планировщика планёрок
         application.job_queue.run_once(
-            lambda context: schedule_next_reminder(context),
+            lambda ctx: asyncio.create_task(schedule_next_reminder(ctx)),
             3
         )
 
-        # Запуск планировщика ИСТОРИЧЕСКИХ событий "В этот день"
+        # Запуск планировщика УЛУЧШЕННЫХ ИСТОРИЧЕСКИХ событий "В этот день"
         application.job_queue.run_once(
-            lambda context: schedule_next_event(context),
+            lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
             5
         )
 
@@ -1974,10 +2076,13 @@ def main() -> None:
         
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК")
-        logger.info(f"📅 Рубрика 'В ЭТОТ ДЕНЬ': Пн-Пт в 10:00 по МСК (07:00 UTC)")
-        logger.info(f"📜 Тип событий: ИСТОРИЧЕСКИЕ (произошедшие в эту дату в разные годы)")
-        logger.info(f"🗓️ Формат: В ЭТОТ ДЕНЬ: {day} {month_ru} ГОД года |КАТЕГОРИЯ: КАТЕГОРИЯ")
+        logger.info(f"📅 УЛУЧШЕННАЯ рубрика 'В ЭТОТ ДЕНЬ': Пн-Пт в 10:00 по МСК (07:00 UTC)")
+        logger.info(f"📜 Тип событий: ИСТОРИЧЕСКИЕ (произошедшие в эту дату)")
+        logger.info(f"🗓️ Формат: В ЭТОТ ДЕНЬ: {day} {month_ru} ГОД года | КАТЕГОРИЯ: КАТЕГОРИЯ")
         logger.info(f"🎯 Категории событий: {', '.join(EVENT_CATEGORIES)}")
+        logger.info(f"🔍 Улучшенный поиск: гарантирует точную дату события")
+        logger.info(f"📖 Конкретный факт: предложение из статьи с датой")
+        logger.info(f"🔗 Полная ссылка: на статью Википедии")
         logger.info(f"🔄 События НЕ повторяются в пределах категории!")
         logger.info(f"👥 Разрешённые пользователи: {', '.join(BotConfig().allowed_users)}")
         
