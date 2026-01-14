@@ -62,38 +62,6 @@ CATEGORY_EMOJIS = {
     'история': '📜'
 }
 
-# Ключевые слова для поиска событий по категориям
-EVENT_KEYWORDS = {
-    'музыка': [
-        'альбом', 'сингл', 'концерт', 'группа', 'певец', 'певица',
-        'музыкальный', 'хит', 'чарт', 'премия', 'фестиваль', 'тур'
-    ],
-    'фильмы': [
-        'фильм', 'кино', 'премьера', 'актёр', 'актриса', 'режиссёр',
-        'съёмки', 'оскар', 'кинопремия', 'кинофестиваль', 'премьера'
-    ],
-    'технологии': [
-        'изобретение', 'патент', 'компания', 'технология', 'гаджет',
-        'программное', 'аппаратное', 'запуск', 'презентация', 'конференция'
-    ],
-    'игры': [
-        'игра', 'видеоигра', 'консоль', 'разработчик', 'издатель',
-        'релиз', 'презентация', 'конференция', 'чемпионат', 'турнир'
-    ],
-    'наука': [
-        'открытие', 'изобретение', 'нобелевская', 'учёный', 'исследование',
-        'эксперимент', 'теория', 'лауреат', 'премия', 'конференция'
-    ],
-    'спорт': [
-        'чемпионат', 'олимпиада', 'спортсмен', 'рекорд', 'матч',
-        'турнир', 'соревнование', 'победа', 'медаль', 'кубок'
-    ],
-    'история': [
-        'событие', 'война', 'мир', 'договор', 'революция',
-        'открытие', 'основание', 'праздник', 'памятная дата'
-    ]
-}
-
 # ========== ОСТАЛЬНЫЕ НАСТРОЙКИ ==========
 CANCELLATION_OPTIONS = [
     "Все вопросы решены, планёрка не нужна",
@@ -145,38 +113,194 @@ class EventScheduler:
     
     def search_wikipedia_events(self, day: int, month: int, category: str, lang: str = 'ru') -> List[Dict[str, Any]]:
         """
-        Ищем события на Wikipedia для указанной даты и категории
+        Ищем ВСЕМИРНЫЕ события на Wikipedia для указанной даты и категории
         
-        Возвращает список событий: [{'title': ..., 'year': ..., 'description': ...}, ...]
+        Возвращает список событий: [{'title': ..., 'year': ..., 'description': ..., 'url': ...}, ...]
         """
         try:
-            # Форматируем дату для поиска (14 января, 14 января 1969, 14 января события)
+            # Форматируем дату для поиска (14 января события, 14 января история, January 14 events)
             date_formats = [
                 f"{day} {MONTHS_RU[month].lower()}",
                 f"{day} января",
                 f"{day} {month}",
-                f"{day}.{month}",
+                f"{day}.{month:02d}",
             ]
             
             events = []
-            url = f"https://{lang}.wikipedia.org/w/api.php"
             
-            # Добавляем User-Agent для избежания блокировки
-            headers = {
-                'User-Agent': 'TelegramEventBot/1.0 (https://t.me/; contact@example.com)'
-            }
+            # Ищем на русской Википедии (всемирные события на русском языке)
+            ru_events = self._search_wikipedia_ru(day, month, category, date_formats)
+            if ru_events:
+                events.extend(ru_events)
             
-            # Ищем страницу с событиями этого дня
-            for date_format in date_formats:
+            # Если не нашли на русской, ищем на английской и переводим
+            if not events:
+                en_events = self._search_wikipedia_en(day, month, category)
+                if en_events:
+                    events.extend(en_events)
+            
+            return events
+            
+        except Exception as e:
+            logger.error(f"Ошибка поиска событий: {e}")
+            return []
+    
+    def _search_wikipedia_ru(self, day: int, month: int, category: str, date_formats: List[str]) -> List[Dict[str, Any]]:
+        """Ищем события на русской Википедии (всемирные события)"""
+        events = []
+        url = "https://ru.wikipedia.org/w/api.php"
+        
+        headers = {
+            'User-Agent': 'TelegramEventBot/1.0 (https://t.me/; contact@example.com)'
+        }
+        
+        # Ключевые слова для поиска всемирных событий
+        world_keywords = {
+            'музыка': ['релиз альбома', 'концерт', 'премия', 'фестиваль', 'хит', 'чарт', 'тур'],
+            'фильмы': ['премьера фильма', 'кинофестиваль', 'оскар', 'награда', 'съёмки', 'релиз'],
+            'технологии': ['изобретение', 'патент', 'запуск', 'презентация', 'компания', 'гаджет'],
+            'игры': ['релиз игры', 'конференция', 'чемпионат', 'турнир', 'консоль', 'разработка'],
+            'наука': ['открытие', 'изобретение', 'нобелевская премия', 'исследование', 'эксперимент'],
+            'спорт': ['чемпионат мира', 'олимпиада', 'рекорд', 'матч', 'турнир', 'кубок'],
+            'история': ['событие', 'война', 'мирный договор', 'революция', 'открытие', 'основание']
+        }
+        
+        keywords = world_keywords.get(category, ['событие', 'история'])
+        
+        for date_format in date_formats:
+            for keyword in keywords:
                 params = {
                     'action': 'query',
                     'format': 'json',
                     'list': 'search',
-                    'srsearch': f"{date_format} события {category}",
+                    'srsearch': f"{date_format} {keyword}",
                     'srlimit': 20,
                     'srwhat': 'text',
+                    'srprop': 'snippet'
                 }
                 
+                try:
+                    response = requests.get(url, params=params, headers=headers, timeout=15)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if 'query' in data and data['query']['search']:
+                        articles = data['query']['search']
+                        
+                        for article in articles:
+                            title = article['title']
+                            
+                            # Пропускаем общие страницы
+                            if any(common in title.lower() for common in [
+                                f"{day} января", 
+                                f"{day} {MONTHS_RU[month].lower()}",
+                                "категория:",
+                                "шаблон:",
+                                "список",
+                                "таблица"
+                            ]):
+                                continue
+                            
+                            # Извлекаем год из заголовка (если есть)
+                            year_match = self._extract_year_from_title(title)
+                            
+                            # Получаем описание статьи
+                            desc_params = {
+                                'action': 'query',
+                                'format': 'json',
+                                'prop': 'extracts|info',
+                                'inprop': 'url',
+                                'exchars': 400,
+                                'explaintext': True,
+                                'exintro': True,
+                                'titles': title
+                            }
+                            
+                            desc_response = requests.get(url, params=desc_params, headers=headers, timeout=10)
+                            desc_response.raise_for_status()
+                            desc_data = desc_response.json()
+                            
+                            pages = desc_data['query']['pages']
+                            page_id = list(pages.keys())[0]
+                            page = pages[page_id]
+                            
+                            if 'missing' not in page:
+                                description = page.get('extract', '')
+                                # Очищаем описание
+                                if description:
+                                    description = self._clean_description(description)
+                                
+                                # Формируем URL
+                                encoded_title = quote(title.replace(' ', '_'), safe='')
+                                article_url = f"https://ru.wikipedia.org/wiki/{encoded_title}"
+                                
+                                events.append({
+                                    'title': title,
+                                    'year': year_match,
+                                    'description': description,
+                                    'url': article_url,
+                                    'category': category,
+                                    'lang': 'ru'
+                                })
+                    
+                    if events:
+                        break
+                
+                except Exception as e:
+                    logger.warning(f"Ошибка при поиске на русской Википедии: {e}")
+                    continue
+            
+            if events:
+                break
+        
+        return events
+    
+    def _search_wikipedia_en(self, day: int, month: int, category: str) -> List[Dict[str, Any]]:
+        """Ищем события на английской Википедии и получаем русскую версию"""
+        events = []
+        
+        # Английские названия месяцев
+        months_en = {
+            1: "January", 2: "February", 3: "March", 4: "April",
+            5: "May", 6: "June", 7: "July", 8: "August",
+            9: "September", 10: "October", 11: "November", 12: "December"
+        }
+        
+        month_en = months_en.get(month, "")
+        if not month_en:
+            return events
+        
+        url = "https://en.wikipedia.org/w/api.php"
+        headers = {
+            'User-Agent': 'TelegramEventBot/1.0 (https://t.me/; contact@example.com)'
+        }
+        
+        # Ключевые слова на английском
+        en_keywords = {
+            'музыка': ['album release', 'concert', 'award', 'festival', 'hit single', 'chart'],
+            'фильмы': ['film premiere', 'movie release', 'oscar', 'award', 'production'],
+            'технологии': ['invention', 'patent', 'launch', 'presentation', 'company founded'],
+            'игры': ['game release', 'video game', 'championship', 'tournament', 'console'],
+            'наука': ['discovery', 'invention', 'nobel prize', 'experiment', 'research'],
+            'спорт': ['championship', 'olympics', 'world cup', 'record', 'tournament'],
+            'история': ['event', 'war', 'treaty', 'revolution', 'discovery', 'founding']
+        }
+        
+        keywords = en_keywords.get(category, ['event', 'history'])
+        
+        for keyword in keywords:
+            search_query = f"{month_en} {day} {keyword}"
+            params = {
+                'action': 'query',
+                'format': 'json',
+                'list': 'search',
+                'srsearch': search_query,
+                'srlimit': 15,
+                'srwhat': 'text',
+                'srprop': 'snippet'
+            }
+            
+            try:
                 response = requests.get(url, params=params, headers=headers, timeout=15)
                 response.raise_for_status()
                 data = response.json()
@@ -187,117 +311,185 @@ class EventScheduler:
                     for article in articles:
                         title = article['title']
                         
-                        # Пропускаем общие страницы (например, "14 января")
-                        if title.lower() in [f"{day} января", f"{day} {MONTHS_RU[month].lower()}"]:
+                        # Пропускаем общие страницы
+                        if any(common in title.lower() for common in [
+                            f"{month_en} {day}",
+                            "category:",
+                            "template:",
+                            "list of",
+                            "timeline"
+                        ]):
                             continue
                         
-                        # Извлекаем год из заголовка (если есть)
-                        year_match = None
-                        import re
-                        year_pattern = r'\((\d{4})\)$|^(\d{4})\s|(\d{4})\sгод'
-                        match = re.search(year_pattern, title)
-                        if match:
-                            for group in match.groups():
-                                if group and group.isdigit():
-                                    year_match = int(group)
-                                    break
+                        # Пробуем найти русскую версию статьи
+                        ru_title = self._get_russian_version(title)
+                        if ru_title:
+                            # Используем русский заголовок
+                            title = ru_title
+                            lang = 'ru'
+                        else:
+                            # Оставляем английский, но переводим описание
+                            lang = 'en'
                         
-                        # Получаем описание статьи
-                        desc_params = {
-                            'action': 'query',
-                            'format': 'json',
-                            'prop': 'extracts|info',
-                            'inprop': 'url',
-                            'exchars': 500,
-                            'explaintext': True,
-                            'exintro': True,
-                            'titles': title
-                        }
+                        # Извлекаем год
+                        year_match = self._extract_year_from_title(title)
                         
-                        desc_response = requests.get(url, params=desc_params, headers=headers, timeout=10)
-                        desc_response.raise_for_status()
-                        desc_data = desc_response.json()
+                        # Получаем описание
+                        description = self._get_article_description(title, lang)
                         
-                        pages = desc_data['query']['pages']
-                        page_id = list(pages.keys())[0]
-                        page = pages[page_id]
-                        
-                        if 'missing' not in page:
-                            description = page.get('extract', '')
-                            # Очищаем описание
-                            if description:
-                                description = description.replace('\n', ' ').replace('  ', ' ').strip()
-                                # Берем первые 2-3 предложения
-                                sentences = description.split('. ')
-                                if len(sentences) > 3:
-                                    description = '. '.join(sentences[:3]) + '.'
-                            
-                            # Формируем URL
+                        # Формируем URL
+                        if lang == 'ru':
                             encoded_title = quote(title.replace(' ', '_'), safe='')
-                            article_url = f"https://{lang}.wikipedia.org/wiki/{encoded_title}"
-                            
-                            events.append({
-                                'title': title,
-                                'year': year_match,
-                                'description': description,
-                                'url': article_url,
-                                'category': category
-                            })
-                    
-                    if events:
-                        break
+                            article_url = f"https://ru.wikipedia.org/wiki/{encoded_title}"
+                        else:
+                            encoded_title = quote(title.replace(' ', '_'), safe='')
+                            article_url = f"https://en.wikipedia.org/wiki/{encoded_title}"
+                        
+                        events.append({
+                            'title': title,
+                            'year': year_match,
+                            'description': description,
+                            'url': article_url,
+                            'category': category,
+                            'lang': lang
+                        })
+                
+                if events:
+                    break
             
-            # Если не нашли события через поиск, пробуем получить из страницы даты
-            if not events:
-                events = self._get_events_from_date_page(day, month, category, lang)
+            except Exception as e:
+                logger.warning(f"Ошибка при поиске на английской Википедии: {e}")
+                continue
+        
+        return events
+    
+    def _get_russian_version(self, en_title: str) -> Optional[str]:
+        """Пытаемся получить русскую версию английской статьи"""
+        try:
+            url = "https://en.wikipedia.org/w/api.php"
+            headers = {
+                'User-Agent': 'TelegramEventBot/1.0 (https://t.me/; contact@example.com)'
+            }
             
-            return events
+            params = {
+                'action': 'query',
+                'format': 'json',
+                'prop': 'langlinks',
+                'lllang': 'ru',
+                'titles': en_title
+            }
+            
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            pages = data.get('query', {}).get('pages', {})
+            for page in pages.values():
+                langlinks = page.get('langlinks', [])
+                for link in langlinks:
+                    if link.get('lang') == 'ru':
+                        return link.get('*')
+            
+            return None
             
         except Exception as e:
-            logger.error(f"Ошибка поиска событий: {e}")
-            return []
+            logger.warning(f"Ошибка получения русской версии: {e}")
+            return None
     
-    def _get_events_from_date_page(self, day: int, month: int, category: str, lang: str = 'ru') -> List[Dict[str, Any]]:
-        """Получаем события из страницы Wikipedia с датой (например, '14 января')"""
+    def _get_article_description(self, title: str, lang: str) -> str:
+        """Получаем описание статьи на указанном языке"""
         try:
-            # Формируем название страницы с датой
-            date_page_title = f"{day} {MONTHS_RU[month].lower()}"
-            
             url = f"https://{lang}.wikipedia.org/w/api.php"
             headers = {
                 'User-Agent': 'TelegramEventBot/1.0 (https://t.me/; contact@example.com)'
             }
             
-            # Получаем содержимое страницы с датой
             params = {
-                'action': 'parse',
+                'action': 'query',
                 'format': 'json',
-                'page': date_page_title,
-                'prop': 'text',
-                'section': 0,  # Секция "События"
+                'prop': 'extracts',
+                'exchars': 300,
+                'explaintext': True,
+                'exintro': True,
+                'titles': title
             }
             
-            response = requests.get(url, params=params, headers=headers, timeout=15)
+            response = requests.get(url, params=params, headers=headers, timeout=10)
             response.raise_for_status()
             data = response.json()
             
-            if 'parse' not in data:
-                return []
+            pages = data.get('query', {}).get('pages', {})
+            for page in pages.values():
+                if 'extract' in page:
+                    description = page['extract']
+                    return self._clean_description(description)
             
-            # Здесь нужно парсить HTML для извлечения событий
-            # Это упрощенная версия - в реальности нужен более сложный парсинг
-            events = []
-            
-            # Для простоты вернем пустой список, а в реальном коде здесь будет парсинг HTML
-            return events
+            return ""
             
         except Exception as e:
-            logger.error(f"Ошибка получения событий из страницы даты: {e}")
-            return []
+            logger.warning(f"Ошибка получения описания: {e}")
+            return ""
     
-    def get_todays_event(self, category: str, lang: str = 'ru') -> Tuple[str, Optional[int], str, str, str]:
+    def _extract_year_from_title(self, title: str) -> Optional[int]:
+        """Извлекаем год из заголовка статьи"""
+        import re
+        # Ищем год в формате (1969) или 1969 год
+        patterns = [
+            r'\((\d{4})\)',           # (1969)
+            r'\b(\d{4})\s+год',       # 1969 год
+            r'\b(\d{4})\b',           # 1969
+            r'в\s+(\d{4})\s+',        # в 1969 году
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, title)
+            if match:
+                try:
+                    year = int(match.group(1))
+                    if 1000 <= year <= 2100:  # Разумный диапазон лет
+                        return year
+                except (ValueError, IndexError):
+                    continue
+        
+        return None
+    
+    def _clean_description(self, description: str) -> str:
+        """Очищаем и форматируем описание"""
+        if not description:
+            return ""
+        
+        # Заменяем переносы строк
+        description = description.replace('\n', ' ').replace('  ', ' ').strip()
+        
+        # Разбиваем на предложения
+        sentences = description.split('. ')
+        
+        # Фильтруем и берем первые 2-3 осмысленных предложения
+        filtered_sentences = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) > 20:  # Минимальная длина
+                # Пропускаем скучные определения
+                lower_sentence = sentence.lower()
+                if not (lower_sentence.startswith('это ') or 
+                       lower_sentence.startswith('является ') or
+                       'это ' in lower_sentence[:50]):
+                    filtered_sentences.append(sentence)
+            
+            if len(filtered_sentences) >= 3:
+                break
+        
+        if filtered_sentences:
+            result = '. '.join(filtered_sentences)
+            if not result.endswith('.'):
+                result += '.'
+            return result
+        
+        return description
+    
+    def get_todays_event(self, category: str) -> Tuple[str, Optional[int], str, str, str]:
         """
-        Получаем событие "В этот день" для текущей даты и категории
+        Получаем ВСЕМИРНОЕ событие "В этот день" для текущей даты и категории
         
         Возвращает: (заголовок, год, описание, ссылка, название_статьи)
         """
@@ -306,10 +498,10 @@ class EventScheduler:
             day = now.day
             month = now.month
             
-            logger.info(f"Поиск событий для {day} {MONTHS_RU[month]} в категории: {category}")
+            logger.info(f"Поиск ВСЕМИРНЫХ событий для {day} {MONTHS_RU[month]} в категории: {category}")
             
             # Ищем события для текущей даты
-            events = self.search_wikipedia_events(day, month, category, lang)
+            events = self.search_wikipedia_events(day, month, category)
             
             # Фильтруем уже использованные события
             available_events = [
@@ -325,14 +517,14 @@ class EventScheduler:
             
             # Выбираем случайное событие из доступных
             if not available_events:
-                logger.warning(f"Не найдено событий для {day} {MONTHS_RU[month]} в категории {category}")
+                logger.warning(f"Не найдено ВСЕМИРНЫХ событий для {day} {MONTHS_RU[month]} в категории {category}")
                 return self._get_fallback_event(category, day, month)
             
             event = random.choice(available_events)
             
             # Добавляем в использованные
             self.used_events[category].add(event['title'])
-            logger.info(f"Выбрано событие: {event['title']} ({event['year']})")
+            logger.info(f"Выбрано ВСЕМИРНОЕ событие: {event['title']} ({event['year']})")
             
             return (
                 event['title'],
@@ -347,33 +539,45 @@ class EventScheduler:
             return self._get_fallback_event(category, datetime.now(TIMEZONE).day, datetime.now(TIMEZONE).month)
     
     def _get_fallback_event(self, category: str, day: int, month: int) -> Tuple[str, Optional[int], str, str, str]:
-        """Резервные события на случай недоступности Wikipedia"""
+        """Резервные ВСЕМИРНЫЕ события на случай недоступности Wikipedia"""
         if category in self.fallback_cache:
             event = random.choice(self.fallback_cache[category])
             return event['title'], event['year'], event['description'], event['url'], event['title']
         
-        # Создаем кэш интересных fallback-событий для каждой категории
+        # ВСЕМИРНЫЕ fallback-события для каждой категории
         fallback_events = {
             'музыка': [
                 {
                     'title': 'The Beatles выпустили альбом "Abbey Road"',
                     'year': 1969,
-                    'description': 'Легендарный альбом был записан в студии на Эбби-Роуд и стал последней совместной работой группы. Обложка с переходом через зебру стала одной из самых знаменитых в истории музыки.',
+                    'description': 'Легендарный альбом был записан в студии на Эбби-Роуд в Лондоне. Это последняя совместная работа группы, а обложка с переходом через пешеходный переход стала одной из самых знаменитых в истории музыки.',
                     'url': 'https://ru.wikipedia.org/wiki/Abbey_Road'
                 },
                 {
-                    'title': 'Состоялась премьера оперы "Князь Игорь" Александра Бородина',
-                    'year': 1890,
-                    'description': 'Опера была завершена после смерти композитора его друзьями Римским-Корсаковым и Глазуновым. "Половецкие пляски" из этой оперы стали всемирно известными.',
-                    'url': 'https://ru.wikipedia.org/wiki/Князь_Игорь_(опера)'
+                    'title': 'Майкл Джексон выпустил альбом "Thriller"',
+                    'year': 1982,
+                    'description': 'Альбом стал самым продаваемым в истории, разойдясь тиражом более 66 миллионов копий. Синглы "Billie Jean", "Beat It" и "Thriller" возглавляли чарты по всему миру.',
+                    'url': 'https://ru.wikipedia.org/wiki/Thriller'
+                },
+                {
+                    'title': 'Состоялся концерт Live Aid',
+                    'year': 1985,
+                    'description': 'Масштабный благотворительный концерт прошел одновременно в Лондоне и Филадельфии. В нем участвовали Queen, U2, Дэвид Боуи, Пол Маккартни и многие другие звезды мировой музыки.',
+                    'url': 'https://ru.wikipedia.org/wiki/Live_Aid'
                 }
             ],
             'фильмы': [
                 {
-                    'title': 'Состоялась премьера фильма "Броненосец Потёмкин"',
-                    'year': 1926,
-                    'description': 'Немой художественный фильм Сергея Эйзенштейна, который вошёл в историю кинематографа как эталон монтажного кино. Сцена на Потемкинской лестнице стала классикой.',
-                    'url': 'https://ru.wikipedia.org/wiki/Броненосец_Потёмкин'
+                    'title': 'Состоялась премьера фильма "Звездные войны"',
+                    'year': 1977,
+                    'description': 'Фильм Джорджа Лукаса положил начало одной из самых успешных медиафраншиз в истории. "Звездные войны" революционизировали кинематограф спецэффектов и научной фантастики.',
+                    'url': 'https://ru.wikipedia.org/wiki/Звёздные_войны'
+                },
+                {
+                    'title': 'Выход фильма "Крестный отец"',
+                    'year': 1972,
+                    'description': 'Фильм Фрэнсиса Форда Копполы по роману Марио Пьюзо получил три премии "Оскар". Картина считается одним из величайших фильмов в истории кинематографа.',
+                    'url': 'https://ru.wikipedia.org/wiki/Крёстный_отец_(фильм)'
                 }
             ],
             'технологии': [
@@ -382,47 +586,77 @@ class EventScheduler:
                     'year': 2007,
                     'description': 'На конференции Macworld в Сан-Франциско был представлен смартфон, который революционизировал мобильную индустрию. Джобс назвал его "революционным продуктом".',
                     'url': 'https://ru.wikipedia.org/wiki/IPhone_(1-го_поколения)'
+                },
+                {
+                    'title': 'Запуск первого веб-сайта',
+                    'year': 1991,
+                    'description': 'Тим Бернерс-Ли создал первый в мире веб-сайт info.cern.ch, который объяснял, что такое Всемирная паутина. Это положило начало современному интернету.',
+                    'url': 'https://ru.wikipedia.org/wiki/Первый_веб-сайт'
                 }
             ],
             'игры': [
                 {
-                    'title': 'Вышла игра "The Legend of Zelda: Ocarina of Time"',
-                    'year': 1998,
-                    'description': 'Игра для Nintendo 64, которую многие считают величайшей видеоигрой всех времён. Она установила новые стандарты для жанра action-adventure.',
-                    'url': 'https://ru.wikipedia.org/wiki/The_Legend_of_Zelda:_Ocarina_of_Time'
+                    'title': 'Вышла игра "Super Mario Bros."',
+                    'year': 1985,
+                    'description': 'Платформер для Nintendo Entertainment System стал одной из самых влиятельных игр в истории. Марио стал самым узнаваемым персонажем видеоигр в мире.',
+                    'url': 'https://ru.wikipedia.org/wiki/Super_Mario_Bros.'
+                },
+                {
+                    'title': 'Релиз игры "Minecraft"',
+                    'year': 2011,
+                    'description': 'Игра, созданная Маркусом Перссоном, стала самой продаваемой видеоигрой в истории. В 2014 году Microsoft купила Mojang за 2,5 миллиарда долларов.',
+                    'url': 'https://ru.wikipedia.org/wiki/Minecraft'
                 }
             ],
             'наука': [
                 {
-                    'title': 'Альберт Эйнштейн представил общую теорию относительности',
+                    'title': 'Альберт Эйнштейн опубликовал общую теорию относительности',
                     'year': 1915,
-                    'description': 'Физик представил свои уравнения поля в Берлинской академии наук. Теория радикально изменила понимание гравитации, пространства и времени.',
+                    'description': 'Теория радикально изменила понимание гравитации, пространства и времени. Предсказания Эйнштейна были подтверждены многочисленными экспериментами.',
                     'url': 'https://ru.wikipedia.org/wiki/Общая_теория_относительности'
+                },
+                {
+                    'title': 'Открытие пенициллина Александром Флемингом',
+                    'year': 1928,
+                    'description': 'Случайное открытие первого антибиотика спасло миллионы жизней. Флеминг обнаружил, что плесень Penicillium notatum подавляет рост бактерий.',
+                    'url': 'https://ru.wikipedia.org/wiki/Пенициллин'
                 }
             ],
             'спорт': [
                 {
-                    'title': 'Открылись первые зимние Олимпийские игры',
-                    'year': 1924,
-                    'description': 'Игры прошли в Шамони (Франция) с участием 258 спортсменов из 16 стран. Было разыграно 16 комплектов медалей в 9 видах спорта.',
-                    'url': 'https://ru.wikipedia.org/wiki/Зимние_Олимпийские_игры_1924'
+                    'title': 'Открылись первые современные Олимпийские игры',
+                    'year': 1896,
+                    'description': 'Игры прошли в Афинах с участием 241 спортсмена из 14 стран. Это возрождение олимпийского движения после 1500-летнего перерыва.',
+                    'url': 'https://ru.wikipedia.org/wiki/Летние_Олимпийские_игры_1896'
+                },
+                {
+                    'title': 'Первый чемпионат мира по футболу',
+                    'year': 1930,
+                    'description': 'Турнир прошел в Уругвае, и победителем стала сборная хозяев. В финале Уругвай обыграл Аргентину со счетом 4:2.',
+                    'url': 'https://ru.wikipedia.org/wiki/Чемпионат_мира_по_футболу_1930'
                 }
             ],
             'история': [
                 {
-                    'title': 'Состоялось первое заседание Государственной думы Российской империи',
-                    'year': 1906,
-                    'description': 'В Таврическом дворце Санкт-Петербурга открылось первое в истории России общенациональное представительное учреждение. Дума проработала всего 72 дня.',
-                    'url': 'https://ru.wikipedia.org/wiki/Государственная_дума_Российской_империи_I_созыва'
+                    'title': 'Высадка на Луну миссии "Аполлон-11"',
+                    'year': 1969,
+                    'description': 'Нил Армстронг стал первым человеком, ступившим на поверхность Луны. Его слова "Это один маленький шаг для человека, но гигантский скачок для человечества" вошли в историю.',
+                    'url': 'https://ru.wikipedia.org/wiki/Аполлон-11'
+                },
+                {
+                    'title': 'Падение Берлинской стены',
+                    'year': 1989,
+                    'description': 'Событие стало символом окончания Холодной войны. Тысячи восточных немцев перешли границу, и начался процесс воссоединения Германии.',
+                    'url': 'https://ru.wikipedia.org/wiki/Берлинская_стена'
                 }
             ]
         }
         
         self.fallback_cache = fallback_events
         events = fallback_events.get(category, [{
-            'title': f'Интересное событие в категории {category}',
+            'title': f'Всемирное историческое событие в категории {category}',
             'year': 2000,
-            'description': 'Подробности этого события можно узнать в статьях Википедии.',
+            'description': 'Интересное всемирное событие, изменившее историю.',
             'url': 'https://ru.wikipedia.org'
         }])
         
@@ -430,7 +664,7 @@ class EventScheduler:
         return event['title'], event['year'], event['description'], event['url'], event['title']
     
     def create_event_message(self, category: str) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-        """Создаем сообщение с событием "В этот день" (без инлайн-кнопок)"""
+        """Создаем сообщение с событием 'В этот день' в указанном формате"""
         # Получаем текущую дату
         day, month_ru, current_year = self.get_todays_date_parts()
         
@@ -444,7 +678,7 @@ class EventScheduler:
         category_emoji = CATEGORY_EMOJIS.get(category, '📌')
         
         # Форматируем сообщение в указанном формате
-        message = f"🎯 **{day} {month_ru}{year_display} | {category.upper()}**\n\n"
+        message = f"**В ЭТОТ ДЕНЬ: {day} {month_ru}{year_display} |КАТЕГОРИЯ: {category.upper()}**\n\n"
         message += f"{category_emoji} **{clean_title}**\n\n"
         
         # Добавляем описание, если есть
@@ -670,7 +904,7 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
         
         # Получаем текущую категорию
         category = event_scheduler.get_next_category()
-        logger.info(f"Отправка события 'В этот день' категории: {category}, индекс: {event_scheduler.current_index}")
+        logger.info(f"Отправка ВСЕМИРНОГО события 'В этот день' категории: {category}, индекс: {event_scheduler.current_index}")
         
         # Создаем сообщение с событием
         message, keyboard = event_scheduler.create_event_message(category)
@@ -688,13 +922,13 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
         event_scheduler.increment_category()
         config.event_current_index = event_scheduler.current_index
         
-        logger.info(f"✅ Событие 'В этот день' отправлено: {category}. Следующий индекс: {event_scheduler.current_index}")
+        logger.info(f"✅ ВСЕМИРНОЕ событие 'В этот день' отправлено: {category}. Следующий индекс: {event_scheduler.current_index}")
         
         # Планируем следующую отправку
         await schedule_next_event(context)
         
     except Exception as e:
-        logger.error(f"❌ Ошибка отправки события 'В этот день': {e}")
+        logger.error(f"❌ Ошибка отправки ВСЕМИРНОГО события 'В этот день': {e}")
         # Пробуем снова через 5 минут
         context.application.job_queue.run_once(
             schedule_next_event,
@@ -704,7 +938,7 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправить событие 'В этот день' немедленно по команде"""
+    """Отправить ВСЕМИРНОЕ событие 'В этот день' немедленно по команде"""
     config = BotConfig()
     chat_id = config.chat_id
 
@@ -718,7 +952,7 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         # Получаем текущую категорию
         category = event_scheduler.get_next_category()
-        logger.info(f"Отправка события 'В этот день' по команде: {category}, индекс: {event_scheduler.current_index}")
+        logger.info(f"Отправка ВСЕМИРНОГО события 'В этот день' по команде: {category}, индекс: {event_scheduler.current_index}")
         
         # Создаем сообщение с событием
         message, keyboard = event_scheduler.create_event_message(category)
@@ -736,14 +970,14 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         event_scheduler.increment_category()
         config.event_current_index = event_scheduler.current_index
         
-        logger.info(f"Событие 'В этот день' отправлено по команде: {category}. Следующий индекс: {event_scheduler.current_index}")
+        logger.info(f"ВСЕМИРНОЕ событие 'В этот день' отправлено по команде: {category}. Следующий индекс: {event_scheduler.current_index}")
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при отправке события: {str(e)}")
+        await update.message.reply_text(f"❌ Ошибка при отправке ВСЕМИРНОГО события: {str(e)}")
         logger.error(f"Ошибка в команде /eventnow: {e}")
 
 async def show_next_event_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показать следующую категорию событий 'В этот день'"""
+    """Показать следующую категорию ВСЕМИРНЫХ событий 'В этот день'"""
     config = BotConfig()
     event_scheduler = config.get_event_scheduler()
     
@@ -763,11 +997,12 @@ async def show_next_event_category(update: Update, context: ContextTypes.DEFAULT
     next_time = calculate_next_event_time()
     moscow_time = next_time.astimezone(TIMEZONE)
     
-    response = f"📅 *Информация о рубрике 'В этот день':*\n\n"
+    response = f"📅 *Информация о рубрике 'В ЭТОТ ДЕНЬ':*\n\n"
     response += f"🗓️ *Сегодня:* {day} {month_ru}\n\n"
     response += f"{current_emoji} *Текущая категория:* {current_category.upper()}\n"
     response += f"{next_emoji} *Следующая категория:* {next_category.upper()}\n\n"
     response += f"⏰ *Следующая отправка:* {moscow_time.strftime('%d.%m.%Y в %H:%M')} по МСК\n"
+    response += f"🌍 *Тип событий:* ВСЕМИРНЫЕ (на русском языке)\n"
     response += f"🎯 *Всего категорий:* {len(EVENT_CATEGORIES)}\n"
     response += f"🔁 *Порядок:* {', '.join(EVENT_CATEGORIES)}\n\n"
     response += f"📖 *События не повторяются в пределах категории!*"
@@ -803,14 +1038,14 @@ def calculate_next_event_time() -> datetime:
         days_ahead += 1
 
 async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запланировать следующую отправку события 'В этот день'"""
+    """Запланировать следующую отправку ВСЕМИРНОГО события 'В этот день'"""
     try:
         next_time = calculate_next_event_time()
         config = BotConfig()
         chat_id = config.chat_id
 
         if not chat_id:
-            logger.warning("Chat ID не установлен, планирование событий отложено")
+            logger.warning("Chat ID не установлен, планирование ВСЕМИРНЫХ событий отложено")
             # Пробуем снова через час
             context.application.job_queue.run_once(
                 schedule_next_event,
@@ -836,17 +1071,17 @@ async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
                     name=job_name
                 )
 
-                logger.info(f"Следующая отправка события 'В этот день' запланирована на {next_time} UTC")
+                logger.info(f"Следующая отправка ВСЕМИРНОГО события 'В этот день' запланирована на {next_time} UTC")
                 logger.info(f"Это будет в {(next_time + timedelta(hours=3)).strftime('%H:%M')} по МСК")
                 
                 # Получаем планировщик для логирования следующей категории
                 event_scheduler = config.get_event_scheduler()
-                logger.info(f"Следующая категория событий: {event_scheduler.get_next_category()}")
+                logger.info(f"Следующая категория ВСЕМИРНЫХ событий: {event_scheduler.get_next_category()}")
             else:
-                logger.info(f"Отправка события на {next_time} уже запланирована")
+                logger.info(f"Отправка ВСЕМИРНОГО события на {next_time} уже запланирована")
         else:
             # Если время уже прошло, планируем на следующий день
-            logger.warning(f"Время отправки события уже прошло ({next_time}), планируем на следующий день")
+            logger.warning(f"Время отправки ВСЕМИРНОГО события уже прошло ({next_time}), планируем на следующий день")
             context.application.job_queue.run_once(
                 schedule_next_event,
                 60,  # Через минуту
@@ -854,7 +1089,7 @@ async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             
     except Exception as e:
-        logger.error(f"Ошибка планирования события: {e}")
+        logger.error(f"Ошибка планирования ВСЕМИРНОГО события: {e}")
         # Пробуем снова через 5 минут
         context.application.job_queue.run_once(
             schedule_next_event,
@@ -1222,7 +1457,7 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ========== ОСНОВНЫЕ КОМАНДЫ ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновленный обработчик /start с информацией о событиях 'В этот день'"""
+    """Обновленный обработчик /start с информацией о ВСЕМИРНЫХ событиях 'В этот день'"""
     await update.message.reply_text(
         "🤖 <b>Бот для напоминаний о планёрке активен!</b>\n\n"
         f"📅 <b>Напоминания отправляются:</b>\n"
@@ -1230,17 +1465,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
         "📅 <b>Ежедневная рубрика 'В ЭТОТ ДЕНЬ':</b>\n"
         f"• Отправляется: Пн-Пт в 10:00 по МСК\n"
-        f"• Формат: ДЕНЬ МЕСЯЦ ГОД | КАТЕГОРИЯ\n"
+        f"• Формат: <b>В ЭТОТ ДЕНЬ: ДЕНЬ МЕСЯЦ ГОД |КАТЕГОРИЯ: КАТЕГОРИЯ</b>\n"
         f"• Категории: {', '.join([c.capitalize() for c in EVENT_CATEGORIES])}\n"
-        f"• События НЕ повторяются в пределах категории!\n"
-        f"• Исторические события, произошедшие в этот день\n\n"
+        f"• <b>События ВСЕМИРНЫЕ</b> (на русском языке)\n"
+        f"• События НЕ повторяются в пределах категории!\n\n"
         "🔧 <b>Доступные команды:</b>\n"
         "/info - информация о боте\n"
         "/jobs - список запланированных задач\n"
         "/test - тестовое напоминание (через 5 сек)\n"
         "/testnow - мгновенное тестовое напоминание\n"
-        "/eventnow - отправить событие 'В этот день' сейчас\n"
-        "/nextevent - следующая категория событий\n\n"
+        "/eventnow - отправить ВСЕМИРНОЕ событие 'В этот день' сейчас\n"
+        "/nextevent - следующая категория ВСЕМИРНЫХ событий\n\n"
         "👮♂️ <b>Команды для администраторов:</b>\n"
         "/setchat - установить чат для уведомлений\n"
         "/adduser @username - добавить пользователя\n"
@@ -1261,7 +1496,7 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"✅ <b>Чат установлен:</b> {chat_title}\n"
         f"<b>Chat ID:</b> {chat_id}\n\n"
-        "Напоминания и события 'В этот день' будут отправляться в этот чат.",
+        "Напоминания и ВСЕМИРНЫЕ события 'В этот день' будут отправляться в этот чат.",
         parse_mode=ParseMode.HTML
     )
 
@@ -1269,7 +1504,7 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновленный обработчик /info с информацией о событиях 'В этот день'"""
+    """Обновленный обработчик /info с информацией о ВСЕМИРНЫХ событиях 'В этот день'"""
     config = BotConfig()
     chat_id = config.chat_id
 
@@ -1315,14 +1550,14 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != 'https://us04web.zoom.us/j/1234567890?pwd=example' else 'не установлена ⚠️'}"
     
-    # Информация о событиях "В этот день"
+    # Информация о ВСЕМИРНЫХ событиях "В этот день"
     event_scheduler = config.get_event_scheduler()
     next_event_category = EVENT_CATEGORIES[event_scheduler.current_index]
     next_event_emoji = CATEGORY_EMOJIS.get(next_event_category, '📌')
     
     # Получаем текущую дату
     day, month_ru, year = event_scheduler.get_todays_date_parts()
-    event_info = f"\n📅 <b>Следующее событие 'В этот день':</b> {next_event_emoji} {next_event_category.capitalize()}"
+    event_info = f"\n📅 <b>Следующее ВСЕМИРНОЕ событие 'В этот день':</b> {next_event_emoji} {next_event_category.capitalize()}"
     
     await update.message.reply_text(
         f"📊 <b>Информация о боте:</b>\n\n"
@@ -1330,21 +1565,22 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📅 <b>Дни планёрок:</b> понедельник, среда, пятница\n"
         f"⏰ <b>Время планёрок:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
         f"📅 <b>События 'В этот день':</b> Пн-Пт в 10:00 по МСК\n"
+        f"🌍 <b>Тип событий:</b> ВСЕМИРНЫЕ (на русском языке)\n"
         f"🎯 <b>Категории событий:</b> {', '.join(EVENT_CATEGORIES)}\n"
-        f"🗓️ <b>Формат:</b> {day} {month_ru} ГОД | КАТЕГОРИЯ\n"
+        f"🗓️ <b>Формат:</b> <b>В ЭТОТ ДЕНЬ: {day} {month_ru} ГОД |КАТЕГОРИЯ: КАТЕГОРИЯ</b>\n"
         f"🔄 <b>События не повторяются</b> в пределах категории!\n"
         f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
         f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
         f"⏳ <b>Задачи планёрок:</b> {meeting_job_count}\n"
         f"📅 <b>Задачи событий:</b> {event_job_count}\n"
         f"➡️ <b>Следующая планёрка:</b> {next_meeting_time}\n"
-        f"➡️ <b>Следующее событие:</b> {next_event_time}\n"
+        f"➡️ <b>Следующее ВСЕМИРНОЕ событие:</b> {next_event_time}\n"
         f"📈 <b>Ближайшие планёрки:</b> {', '.join(upcoming_meetings[:3]) if upcoming_meetings else 'нет'}"
         f"{zoom_info}"
         f"{event_info}\n\n"
         f"Используйте /users для списка пользователей\n"
         f"Используйте /jobs для списка задач\n"
-        f"Используйте /nextevent для следующей категории событий",
+        f"Используйте /nextevent для следующей категории ВСЕМИРНЫХ событий",
         parse_mode=ParseMode.HTML
     )
 
@@ -1450,7 +1686,7 @@ async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name[:30]}...)\n"
     
     if event_jobs:
-        message += "\n📅 <b>События 'В этот день':</b>\n"
+        message += "\n📅 <b>ВСЕМИРНЫЕ события 'В этот день':</b>\n"
         for job in sorted(event_jobs, key=lambda j: j.next_t):
             next_time = job.next_t.astimezone(TIMEZONE)
             message += f"  • {next_time.strftime('%d.%m.%Y %H:%M')} ({job.name[:30]}...)\n"
@@ -1530,11 +1766,11 @@ async def cancel_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"✅ <b>Отменено:</b>\n"
         f"• {canceled_meetings} напоминаний о планёрках\n"
-        f"• {canceled_events} отправок событий 'В этот день'\n"
+        f"• {canceled_events} отправок ВСЕМИРНЫХ событий 'В этот день'\n"
         f"Очищено {len(config.active_reminders)} активных напоминаний в конфиге",
         parse_mode=ParseMode.HTML
     )
-    logger.info(f"Отменено {canceled_meetings} напоминаний и {canceled_events} событий")
+    logger.info(f"Отменено {canceled_meetings} напоминаний и {canceled_events} ВСЕМИРНЫХ событий")
 
 def calculate_next_reminder() -> datetime:
     now = datetime.now(TIMEZONE)
@@ -1717,7 +1953,7 @@ def main() -> None:
             3
         )
 
-        # Запуск планировщика событий "В этот день"
+        # Запуск планировщика ВСЕМИРНЫХ событий "В этот день"
         application.job_queue.run_once(
             lambda context: schedule_next_event(context),
             5
@@ -1732,7 +1968,8 @@ def main() -> None:
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК")
         logger.info(f"📅 Рубрика 'В ЭТОТ ДЕНЬ': Пн-Пт в 10:00 по МСК (07:00 UTC)")
-        logger.info(f"🗓️ Сегодня: {day} {month_ru} {year}")
+        logger.info(f"🌍 Тип событий: ВСЕМИРНЫЕ (на русском языке)")
+        logger.info(f"🗓️ Формат: В ЭТОТ ДЕНЬ: {day} {month_ru} ГОД |КАТЕГОРИЯ: КАТЕГОРИЯ")
         logger.info(f"🎯 Категории событий: {', '.join(EVENT_CATEGORIES)}")
         logger.info(f"🔄 События НЕ повторяются в пределах категории!")
         logger.info(f"👥 Разрешённые пользователи: {', '.join(BotConfig().allowed_users)}")
