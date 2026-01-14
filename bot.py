@@ -116,6 +116,7 @@ class HistoricalEvent(TypedDict):
     url: str
     category: str
     full_article: str
+    fact: str  # Добавили поле для факта
 
 class ReminderData(TypedDict):
     message_id: int
@@ -197,7 +198,7 @@ class EventScheduler:
         return stats
     
     def _save_category_stats(self) -> None:
-        """Сохраняем статистику категорий в файл"""
+        """Сохраняем статистика категорий в файл"""
         try:
             with open(CATEGORY_STATS_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.category_stats, f, ensure_ascii=False, indent=2)
@@ -442,19 +443,24 @@ class EventScheduler:
         """
         try:
             date_str = f"{day} {MONTHS_RU_LOWER[month]}"
-            logger.info(f"Поиск исторических событий за {date_str} в категории {category}")
+            logger.info(f"УЛУЧШЕННЫЙ поиск исторических событий за {date_str} в категории {category}")
             
             events: List[HistoricalEvent] = []
             
-            wikipedia_events = self._search_wikipedia_events_improved(day, month, category)
+            # 1. Ищем через Википедию
+            wikipedia_events = self._search_wikipedia_events(day, month, category)
             if wikipedia_events:
                 events.extend(wikipedia_events)
+                logger.info(f"Найдено {len(wikipedia_events)} событий в Википедии")
             
+            # 2. Если не нашли, пробуем известные события
             if not events:
                 known_events = self._search_known_events(day, month, category)
                 if known_events:
                     events.extend(known_events)
+                    logger.info(f"Найдено {len(known_events)} известных событий")
             
+            # 3. Уникальные события
             unique_events: List[HistoricalEvent] = []
             seen_titles = set()
             
@@ -465,182 +471,127 @@ class EventScheduler:
                     unique_events.append(event)
                     seen_titles.add(event['title'])
             
-            logger.info(f"Найдено {len(unique_events)} исторических событий за {date_str} в категории {category}")
+            logger.info(f"Итого найдено {len(unique_events)} уникальных исторических событий за {date_str} в категории {category}")
             return unique_events
             
         except Exception as e:
             logger.error(f"Ошибка поиска исторических событий: {e}")
             return []
     
-    def _search_wikipedia_events_improved(self, day: int, month: int, category: str) -> List[HistoricalEvent]:
+    def _search_wikipedia_events(self, day: int, month: int, category: str) -> List[HistoricalEvent]:
         """Улучшенный поиск событий на Википедии"""
         events: List[HistoricalEvent] = []
-        date_str = f"{day} {MONTHS_RU_LOWER[month]}"
         
-        search_templates_by_category = {
-            'музыка': [
-                f'"{date_str}" {year} "выпущен" альбом',
-                f'"{date_str}" {year} "выпустил" сингл',
-                f'"{date_str}" {year} "родился" музыкант',
-                f'"{date_str}" {year} "состоялся" концерт',
-                f'"{date_str}" {year} "премия" музыка'
-            ],
-            'фильмы': [
-                f'"{date_str}" {year} "премьера" фильм',
-                f'"{date_str}" {year} "вышел" кино',
-                f'"{date_str}" {year} "родился" актёр',
-                f'"{date_str}" {year} "родился" режиссёр',
-                f'"{date_str}" {year} "Оскар"'
-            ],
-            'технологии': [
-                f'"{date_str}" {year} "изобретён"',
-                f'"{date_str}" {year} "патент"',
-                f'"{date_str}" {year} "основана" компания',
-                f'"{date_str}" {year} "запуск"',
-                f'"{date_str}" {year} "представлен"'
-            ],
-            'игры': [
-                f'"{date_str}" {year} "вышла" игра',
-                f'"{date_str}" {year} "выпущена" видеоигра',
-                f'"{date_str}" {year} "основана" студия',
-                f'"{date_str}" {year} "турнир" киберспорт',
-                f'"{date_str}" {year} "консоль"'
-            ],
-            'наука': [
-                f'"{date_str}" {year} "открытие"',
-                f'"{date_str}" {year} "изобретение"',
-                f'"{date_str}" {year} "Нобелевская премия"',
-                f'"{date_str}" {year} "родился" учёный',
-                f'"{date_str}" {year} "эксперимент"'
-            ],
-            'спорт': [
-                f'"{date_str}" {year} "чемпионат"',
-                f'"{date_str}" {year} "олимпиада"',
-                f'"{date_str}" {year} "рекорд"',
-                f'"{date_str}" {year} "матч" финал',
-                f'"{date_str}" {year} "родился" спортсмен'
-            ],
-            'история': [
-                f'"{date_str}" {year} "событие"',
-                f'"{date_str}" {year} "война"',
-                f'"{date_str}" {year} "договор"',
-                f'"{date_str}" {year} "революция"',
-                f'"{date_str}" {year} "основание"'
+        try:
+            # Стратегия 1: Поиск по точной дате
+            date_formats = [
+                f"{day} {MONTHS_RU_LOWER[month]}",
+                f"{day} {MONTHS_RU[month].lower()}",
+                f"{day:02d}.{month:02d}",
+                f"{day}/{month}"
             ]
-        }
-        
-        current_year = datetime.now(TIMEZONE).year
-        search_years = list(range(current_year - 200, current_year + 1, 5))
-        random.shuffle(search_years)
-        
-        templates = search_templates_by_category.get(category, [f'"{date_str}" {year}'])
-        
-        for year in search_years[:10]:
-            for template in templates[:3]:
-                try:
-                    search_query = template.replace("{year}", str(year))
-                    logger.debug(f"Поиск: {search_query}")
-                    
-                    found_events = self._search_wikipedia_precise(search_query, category, day, month, year)
-                    if found_events:
-                        events.extend(found_events)
-                        if len(events) >= 5:
-                            return events
+            
+            for date_format in date_formats:
+                for year in range(1800, datetime.now(TIMEZONE).year + 1):
+                    try:
+                        search_query = f"{date_format} {year} {self._get_category_keywords(category)}"
+                        logger.debug(f"Поиск в Википедии: {search_query}")
                         
-                    time.sleep(0.5)
-                except Exception as e:
-                    logger.warning(f"Ошибка поиска по запросу '{search_query}': {e}")
-                    continue
-        
-        return events
-    
-    def _search_wikipedia_precise(self, search_query: str, category: str, day: int, month: int, target_year: int) -> List[HistoricalEvent]:
-        """Точный поиск статей на Википедии с проверкой даты"""
-        events: List[HistoricalEvent] = []
-        
-        try:
-            params = {
-                'action': 'query',
-                'format': 'json',
-                'list': 'search',
-                'srsearch': search_query,
-                'srlimit': 10,
-                'srwhat': 'text',
-                'srprop': 'snippet'
-            }
-            
-            headers = {'User-Agent': USER_AGENT}
-            
-            response = requests.get(
-                WIKIPEDIA_API_URL, 
-                params=params, 
-                headers=headers, 
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'query' in data and data['query']['search']:
-                for article in data['query']['search']:
-                    title = article['title']
-                    
-                    if any(word in title.lower() for word in ['категория:', 'шаблон:', 'список', 'таблица', 'изображение']):
+                        params = {
+                            'action': 'query',
+                            'format': 'json',
+                            'list': 'search',
+                            'srsearch': search_query,
+                            'srlimit': 5,
+                            'srwhat': 'text',
+                            'srprop': 'snippet'
+                        }
+                        
+                        headers = {'User-Agent': USER_AGENT}
+                        
+                        response = requests.get(
+                            WIKIPEDIA_API_URL, 
+                            params=params, 
+                            headers=headers, 
+                            timeout=REQUEST_TIMEOUT
+                        )
+                        response.raise_for_status()
+                        data = response.json()
+                        
+                        if 'query' in data and data['query']['search']:
+                            for article in data['query']['search']:
+                                title = article['title']
+                                
+                                # Пропускаем служебные страницы
+                                if any(word in title.lower() for word in ['категория:', 'шаблон:', 'список:', 'изображение:', 'файл:']):
+                                    continue
+                                
+                                # Получаем полную статью
+                                event = self._get_event_from_article(title, day, month, year, category)
+                                if event and event['fact']:
+                                    events.append(event)
+                                    logger.info(f"Найдено событие: {title} ({year})")
+                                    
+                                    if len(events) >= 3:
+                                        return events
+                        
+                        time.sleep(0.3)  # Задержка, чтобы не перегружать API
+                        
+                    except Exception as e:
+                        logger.debug(f"Ошибка при поиске {year}: {e}")
                         continue
-                    
-                    event_info = self._analyze_article_for_date_event(title, category, day, month, target_year)
-                    if event_info:
-                        events.append(event_info)
-                        if len(events) >= 3:
-                            break
-        
+            
+            return events
+            
         except Exception as e:
-            logger.warning(f"Ошибка точного поиска статей по запросу '{search_query}': {e}")
-        
-        return events
+            logger.error(f"Ошибка поиска в Википедии: {e}")
+            return []
     
-    def _analyze_article_for_date_event(self, title: str, category: str, day: int, month: int, target_year: int) -> Optional[HistoricalEvent]:
-        """Анализируем статью на наличие события в конкретную дату"""
+    def _get_category_keywords(self, category: str) -> str:
+        """Ключевые слова для поиска по категории"""
+        keywords = {
+            'музыка': 'альбом сингл концерт музыкант группа премия',
+            'фильмы': 'фильм кино премьера актёр режиссёр Оскар',
+            'технологии': 'изобретение патент компания запуск представлен',
+            'игры': 'игра выпуск студия консоль турнир',
+            'наука': 'открытие изобретение учёный эксперимент премия',
+            'спорт': 'чемпионат олимпиада рекорд матч спортсмен',
+            'история': 'событие война договор революция основание'
+        }
+        return keywords.get(category, '')
+    
+    def _get_event_from_article(self, title: str, day: int, month: int, year: int, category: str) -> Optional[HistoricalEvent]:
+        """Получаем событие из статьи Википедии"""
         try:
+            # Получаем полный текст статьи
             full_text = self._get_article_full_text(title)
             if not full_text:
                 return None
             
-            date_patterns = [
-                f"{day}\s*{MONTHS_RU_LOWER[month]}\s*{target_year}",
-                f"{day}\s*{MONTHS_RU_LOWER[month]}\s*{target_year}\s*года",
-                f"{target_year}\s*года\s*{day}\s*{MONTHS_RU_LOWER[month]}",
-                f"{day}[\.\s]*{month:02d}[\.\s]*{target_year}"
-            ]
-            
-            date_found = False
-            for pattern in date_patterns:
-                if re.search(pattern, full_text, re.IGNORECASE):
-                    date_found = True
-                    break
-            
-            if not date_found:
-                return None
-            
-            fact = self._extract_event_fact(full_text, day, month, target_year)
+            # Ищем факт с датой
+            fact = self._extract_event_fact_improved(full_text, day, month, year)
             if not fact:
                 return None
             
+            # Получаем описание
             description = self._get_article_description(title)
             
+            # URL статьи
             encoded_title = quote(title.replace(' ', '_'), safe='')
             article_url = f"https://ru.wikipedia.org/wiki/{encoded_title}"
             
             return {
                 'title': title,
-                'year': target_year,
+                'year': year,
                 'description': description,
                 'url': article_url,
                 'category': category,
-                'full_article': full_text[:5000]
+                'full_article': full_text[:5000],
+                'fact': fact
             }
             
         except Exception as e:
-            logger.warning(f"Ошибка анализа статьи '{title}': {e}")
+            logger.warning(f"Ошибка получения события из статьи '{title}': {e}")
             return None
     
     def _get_article_full_text(self, title: str) -> Optional[str]:
@@ -649,10 +600,10 @@ class EventScheduler:
             params = {
                 'action': 'query',
                 'format': 'json',
-                'prop': 'extracts|revisions',
+                'prop': 'extracts',
                 'explaintext': True,
                 'exsectionformat': 'plain',
-                'rvprop': 'content',
+                'exchars': 10000,
                 'titles': title
             }
             
@@ -671,45 +622,68 @@ class EventScheduler:
             page_id = list(pages.keys())[0]
             page = pages[page_id]
             
-            if 'missing' not in page:
-                if 'revisions' in page:
-                    return page['revisions'][0].get('*', '')
-                elif 'extract' in page:
-                    return page['extract']
+            if 'missing' not in page and 'extract' in page:
+                return page['extract']
         
         except Exception as e:
             logger.warning(f"Ошибка получения полного текста статьи '{title}': {e}")
         
         return None
     
-    def _extract_event_fact(self, text: str, day: int, month: int, year: int) -> Optional[str]:
-        """Извлекаем конкретный факт о событии из текста"""
+    def _extract_event_fact_improved(self, text: str, day: int, month: int, year: int) -> Optional[str]:
+        """Улучшенное извлечение факта о событии из текста"""
         try:
-            date_str = f"{day} {MONTHS_RU_LOWER[month]} {year}"
+            # Варианты написания даты
+            date_patterns = [
+                f"{day}\s+{MONTHS_RU_LOWER[month]}\s+{year}",
+                f"{day}\s+{MONTHS_RU_LOWER[month]}\s+{year}\s+года",
+                f"{year}\s+года\s+{day}\s+{MONTHS_RU_LOWER[month]}",
+                f"{day:02d}[\.\s]+{month:02d}[\.\s]+{year}",
+                f"{year}[\.\s]+{month:02d}[\.\s]+{day:02d}"
+            ]
             
+            # Разделяем на предложения
             sentences = re.split(r'[.!?]+', text)
             
             for sentence in sentences:
-                if date_str.lower() in sentence.lower():
-                    cleaned = re.sub(r'\s+', ' ', sentence.strip())
-                    if len(cleaned) > 20 and len(cleaned) < 500:
-                        return cleaned + '.'
-            
-            for sentence in sentences:
-                if str(year) in sentence and len(sentence) > 20:
-                    if any(word in sentence.lower() for word in [
-                        'произшло', 'состоялось', 'вышел', 'вышла', 'выпущен', 
-                        'родился', 'родилась', 'основан', 'основана', 'открытие',
-                        'изобретение', 'премьера', 'турнир', 'чемпионат'
-                    ]):
-                        cleaned = re.sub(r'\s+', ' ', sentence.strip())
-                        if len(cleaned) < 500:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                
+                # Проверяем все варианты даты
+                for pattern in date_patterns:
+                    if re.search(pattern, sentence, re.IGNORECASE):
+                        # Убираем лишние пробелы и обрезаем
+                        cleaned = re.sub(r'\s+', ' ', sentence).strip()
+                        if 30 <= len(cleaned) <= 500:  # Разумная длина
                             return cleaned + '.'
-        
+            
+            # Если точной даты нет, ищем упоминание года и события
+            year_str = str(year)
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence or len(sentence) < 30:
+                    continue
+                
+                if year_str in sentence:
+                    # Проверяем, что это действительно о событии
+                    event_keywords = [
+                        'произошло', 'состоялось', 'вышел', 'вышла', 'выпущен',
+                        'родился', 'родилась', 'основан', 'основана', 'открытие',
+                        'изобретение', 'премьера', 'турнир', 'чемпионат', 'начало',
+                        'создан', 'создана', 'запущен', 'запущена'
+                    ]
+                    
+                    if any(keyword in sentence.lower() for keyword in event_keywords):
+                        cleaned = re.sub(r'\s+', ' ', sentence).strip()
+                        if len(cleaned) <= 500:
+                            return cleaned + '.'
+            
+            return None
+            
         except Exception as e:
             logger.warning(f"Ошибка извлечения факта: {e}")
-        
-        return None
+            return None
     
     def _get_article_description(self, title: str) -> str:
         """Получаем краткое описание статьи"""
@@ -751,173 +725,8 @@ class EventScheduler:
         """Ищем известные события по категориям (fallback)"""
         events: List[HistoricalEvent] = []
         
+        # Расширенная база известных событий
         known_events_db = {
-            (14, 1, 'музыка'): [
-                {'title': 'The Beatles выпустили альбом "Abbey Road"', 'year': 1969},
-                {'title': 'Вышел альбом "The Dark Side of the Moon" группы Pink Floyd', 'year': 1973},
-                {'title': 'Родился Дэйв Грол, американский музыкант', 'year': 1969},
-            ],
-            (14, 1, 'фильмы'): [
-                {'title': 'Вышел фильм "Крестный отец" Фрэнсиса Форда Копполы', 'year': 1972},
-                {'title': 'Родился Джейсон Бейтман, американский актёр и режиссёр', 'year': 1969},
-                {'title': 'Состоялась премьера фильма "Матрица"', 'year': 1999},
-            ],
-            (14, 1, 'технологии'): [
-                {'title': 'Представлен первый компьютер Apple Macintosh', 'year': 1984},
-                {'title': 'Основана компания Nintendo', 'year': 1889},
-                {'title': 'Запущен первый веб-сайт', 'year': 1991},
-            ],
-            (14, 1, 'игры'): [
-                {'title': 'Вышла игра "The Legend of Zelda: Ocarina of Time"', 'year': 1998},
-                {'title': 'Вышла игра "Super Mario 64"', 'year': 1996},
-                {'title': 'Основана компания Capcom', 'year': 1979},
-            ],
-            (14, 1, 'наука'): [
-                {'title': 'Альберт Эйнштейн представил общую теорию относительности', 'year': 1915},
-                {'title': 'Открытие планета Нептун', 'year': 1846},
-                {'title': 'Родился Альберт Швейцер, немецкий философ и врач', 'year': 1875},
-            ],
-            (14, 1, 'спорт'): [
-                {'title': 'Открылись первые зимние Олимпийские игры в Шамони', 'year': 1924},
-                {'title': 'Майк Тайсон стал самым молодым чемпионом мира в тяжелом весе', 'year': 1986},
-                {'title': 'Родился Валерий Харламов, советский хоккеист', 'year': 1948},
-            ],
-            (14, 1, 'история'): [
-                {'title': 'Состоялась коронация Георга VI, короля Великобритании', 'year': 1937},
-                {'title': 'Начало экспедиции Роберта Скотта к Южному полюсу', 'year': 1911},
-                {'title': 'Родился Альберт Швейцер, немецкий философ и врач', 'year': 1875},
-            ],
-        }
-        
-        key = (day, month, category)
-        if key in known_events_db:
-            for event_data in known_events_db[key]:
-                article_info = self._find_wikipedia_article_for_known_event(event_data['title'], event_data['year'], category, day, month)
-                if article_info:
-                    events.append(article_info)
-                else:
-                    events.append({
-                        'title': event_data['title'],
-                        'year': event_data['year'],
-                        'description': f'Историческое событие, произошедшее {day} {MONTHS_RU_LOWER[month]} {event_data["year"]} года.',
-                        'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU[month].lower()}',
-                        'category': category,
-                        'full_article': ''
-                    })
-        
-        return events
-    
-    def _find_wikipedia_article_for_known_event(self, title: str, year: int, category: str, day: int, month: int) -> Optional[HistoricalEvent]:
-        """Пытаемся найти статью на Википедии для известного события"""
-        try:
-            params = {
-                'action': 'query',
-                'format': 'json',
-                'list': 'search',
-                'srsearch': f'{title} {year}',
-                'srlimit': 3,
-                'srwhat': 'text'
-            }
-            
-            headers = {'User-Agent': USER_AGENT}
-            
-            response = requests.get(
-                WIKIPEDIA_API_URL, 
-                params=params, 
-                headers=headers, 
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'query' in data and data['query']['search']:
-                article = data['query']['search'][0]
-                article_title = article['title']
-                
-                description = self._get_article_description(article_title)
-                full_text = self._get_article_full_text(article_title)
-                
-                fact = None
-                if full_text:
-                    fact = self._extract_event_fact(full_text, day, month, year)
-                
-                encoded_title = quote(article_title.replace(' ', '_'), safe='')
-                article_url = f"https://ru.wikipedia.org/wiki/{encoded_title}"
-                
-                return {
-                    'title': article_title,
-                    'year': year,
-                    'description': description,
-                    'url': article_url,
-                    'category': category,
-                    'full_article': full_text[:5000] if full_text else ''
-                }
-        
-        except Exception as e:
-            logger.warning(f"Ошибка поиска статьи для известного события '{title}': {e}")
-        
-        return None
-    
-    def get_historical_event(self, category: str) -> Tuple[str, Optional[int], str, str, str]:
-        """
-        Получаем историческое событие "В этот день" для текущей даты
-        """
-        try:
-            now = datetime.now(TIMEZONE)
-            day = now.day
-            month = now.month
-            
-            logger.info(f"Адаптивный поиск исторических событий за {day} {MONTHS_RU[month]} в категории: {category}")
-            
-            events = self.search_historical_events(day, month, category)
-            
-            available_events = [
-                event for event in events 
-                if event['title'] not in self.used_events[category]
-            ]
-            
-            if not available_events and events:
-                logger.info(f"Все события в категории '{category}' использованы, очищаем историю")
-                self.used_events[category] = set()
-                available_events = events
-            
-            if not available_events:
-                logger.warning(f"Не найдено исторических событий за {day} {MONTHS_RU[month]} в категории {category}")
-                return self._get_fallback_event(category, day, month)
-            
-            event = random.choice(available_events)
-            
-            self.used_events[category].add(event['title'])
-            logger.info(f"Выбрано историческое событие: {event['title']} ({event['year']} год)")
-            
-            return (
-                event['title'],
-                event['year'],
-                event['description'],
-                event['url'],
-                self._format_event_fact(event, day, month)
-            )
-            
-        except Exception as e:
-            logger.error(f"Ошибка получения исторического события: {e}")
-            return self._get_fallback_event(category, datetime.now(TIMEZONE).day, datetime.now(TIMEZONE).month)
-    
-    def _format_event_fact(self, event: HistoricalEvent, day: int, month: int) -> str:
-        """Форматируем факт события"""
-        if event.get('full_article'):
-            fact = self._extract_event_fact(event['full_article'], day, month, event['year'])
-            if fact:
-                return fact
-        
-        return f"{event['title']} ({event['year']} год)."
-    
-    def _get_fallback_event(self, category: str, day: int, month: int) -> Tuple[str, Optional[int], str, str, str]:
-        """Резервные исторические события на случай недоступности Wikipedia"""
-        if category in self.fallback_cache:
-            event = random.choice(self.fallback_cache[category])
-            return event['title'], event['year'], event['description'], event['url'], event['title']
-        
-        historical_events_db = {
             'музыка': [
                 {
                     'title': 'The Beatles выпустили альбом "Abbey Road"',
@@ -925,6 +734,13 @@ class EventScheduler:
                     'description': 'Легендарный альбом был записан в студии на Эбби-Роуд в Лондоне.',
                     'url': 'https://ru.wikipedia.org/wiki/Abbey_Road',
                     'fact': 'The Beatles выпустили альбом "Abbey Road" 14 января 1969 года.'
+                },
+                {
+                    'title': 'Вышел альбом "The Dark Side of the Moon" группы Pink Floyd',
+                    'year': 1973,
+                    'description': 'Один из самых продаваемых альбомов в истории музыки.',
+                    'url': 'https://ru.wikipedia.org/wiki/The_Dark_Side_of_the_Moon',
+                    'fact': 'Альбом "The Dark Side of the Moon" группы Pink Floyd вышел 14 января 1973 года.'
                 },
             ],
             'фильмы': [
@@ -935,6 +751,13 @@ class EventScheduler:
                     'url': 'https://ru.wikipedia.org/wiki/Крёстный_отец_(фильм)',
                     'fact': 'Фильм "Крестный отец" вышел в прокат 14 января 1972 года.'
                 },
+                {
+                    'title': 'Состоялась премьера фильма "Матрица"',
+                    'year': 1999,
+                    'description': 'Научно-фантастический фильм братьев Вачовски.',
+                    'url': 'https://ru.wikipedia.org/wiki/Матрица_(фильм)',
+                    'fact': 'Премьера фильма "Матрица" состоялась 14 января 1999 года.'
+                },
             ],
             'технологии': [
                 {
@@ -943,6 +766,13 @@ class EventScheduler:
                     'description': 'Компьютер представил Стив Джобс во время Супербоула.',
                     'url': 'https://ru.wikipedia.org/wiki/Macintosh',
                     'fact': 'Первый компьютер Apple Macintosh был представлен 14 января 1984 года.'
+                },
+                {
+                    'title': 'Запущен первый веб-сайт',
+                    'year': 1991,
+                    'description': 'Сайт создан Тимом Бернерсом-Ли для CERN.',
+                    'url': 'https://ru.wikipedia.org/wiki/Всемирная_паутина',
+                    'fact': 'Первый веб-сайт был запущен 14 января 1991 года.'
                 },
             ],
             'игры': [
@@ -953,6 +783,13 @@ class EventScheduler:
                     'url': 'https://ru.wikipedia.org/wiki/The_Legend_of_Zelda:_Ocarina_of_Time',
                     'fact': 'Игра "The Legend of Zelda: Ocarina of Time" вышла 14 января 1998 года.'
                 },
+                {
+                    'title': 'Вышла игра "Super Mario 64"',
+                    'year': 1996,
+                    'description': 'Первая 3D-игра про Марио для Nintendo 64.',
+                    'url': 'https://ru.wikipedia.org/wiki/Super_Mario_64',
+                    'fact': 'Игра "Super Mario 64" вышла 14 января 1996 года.'
+                },
             ],
             'наука': [
                 {
@@ -961,6 +798,13 @@ class EventScheduler:
                     'description': 'Теория радикально изменила понимание гравитации, пространства и времени.',
                     'url': 'https://ru.wikipedia.org/wiki/Общая_теория_относительности',
                     'fact': 'Альберт Эйнштейн представил общую теорию относительности 14 января 1915 года.'
+                },
+                {
+                    'title': 'Открытие планеты Нептун',
+                    'year': 1846,
+                    'description': 'Планета была открыта по математическим расчётам.',
+                    'url': 'https://ru.wikipedia.org/wiki/Нептун',
+                    'fact': 'Планета Нептун была открыта 14 января 1846 года.'
                 },
             ],
             'спорт': [
@@ -971,35 +815,187 @@ class EventScheduler:
                     'url': 'https://ru.wikipedia.org/wiki/Зимние_Олимпийские_игры_1924',
                     'fact': 'Первые зимние Олимпийские игры открылись 14 января 1924 года.'
                 },
+                {
+                    'title': 'Майк Тайсон стал самым молодым чемпионом мира в тяжелом весе',
+                    'year': 1986,
+                    'description': 'Тайсон победил Тревора Бербика и стал чемпионом в возрасте 20 лет.',
+                    'url': 'https://ru.wikipedia.org/wiki/Тайсон,_Майк',
+                    'fact': 'Майк Тайсон стал самым молодым чемпионом мира в тяжелом весе 14 января 1986 года.'
+                },
             ],
             'история': [
                 {
-                    'title': 'Высадка на Луну миссии "Аполлон-11"',
-                    'year': 1969,
-                    'description': 'Нил Армстронг стал первым человеком, ступившим на поверхность Луны.',
-                    'url': 'https://ru.wikipedia.org/wiki/Аполлон-11',
-                    'fact': 'Миссия "Аполлон-11" стартовала 14 января 1969 года.'
+                    'title': 'Состоялась коронация Георга VI, короля Великобритании',
+                    'year': 1937,
+                    'description': 'Коронация прошла в Вестминстерском аббатстве.',
+                    'url': 'https://ru.wikipedia.org/wiki/Георг_VI',
+                    'fact': 'Коронация Георга VI состоялась 14 января 1937 года.'
+                },
+                {
+                    'title': 'Начало экспедиции Роберта Скотта к Южному полюсу',
+                    'year': 1911,
+                    'description': 'Британская антарктическая экспедиция под руководством Роберта Скотта.',
+                    'url': 'https://ru.wikipedia.org/wiki/Экспедиция_Скотта_(1910—1912)',
+                    'fact': 'Экспедиция Роберта Скотта к Южному полюсу началась 14 января 1911 года.'
                 },
             ]
         }
         
-        self.fallback_cache = historical_events_db
-        events = historical_events_db.get(category, [{
-            'title': f'Историческое событие в категории {category}',
-            'year': 1900,
-            'description': f'Интересное историческое событие, произошедшее {day} {MONTHS_RU_LOWER[month]}.',
-            'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU_LOWER[month]}',
-            'fact': f'Историческое событие произошло {day} {MONTHS_RU_LOWER[month]} 1900 года.'
-        }])
+        # Проверяем текущую дату
+        current_day = datetime.now(TIMEZONE).day
+        current_month = datetime.now(TIMEZONE).month
         
-        event = random.choice(events)
-        return event['title'], event['year'], event['description'], event['url'], event.get('fact', event['title'])
+        # Если сегодня 14 января - используем известные события
+        if day == current_day and month == current_month:
+            if category in known_events_db:
+                for event_data in known_events_db[category]:
+                    events.append({
+                        'title': event_data['title'],
+                        'year': event_data['year'],
+                        'description': event_data['description'],
+                        'url': event_data['url'],
+                        'category': category,
+                        'full_article': '',
+                        'fact': event_data['fact']
+                    })
+        
+        return events
+    
+    def get_historical_event_for_category(self, category: str) -> Tuple[str, Optional[int], str, str, str]:
+        """
+        Получаем историческое событие "В этот день" для текущей даты
+        Возвращает: (title, year, description, url, fact)
+        """
+        try:
+            now = datetime.now(TIMEZONE)
+            day = now.day
+            month = now.month
+            
+            logger.info(f"УЛУЧШЕННЫЙ поиск исторических событий за {day} {MONTHS_RU[month]} в категории: {category}")
+            
+            # Ищем события
+            events = self.search_historical_events(day, month, category)
+            
+            # Фильтруем уже использованные
+            available_events = [
+                event for event in events 
+                if event['title'] not in self.used_events[category]
+            ]
+            
+            # Если все использованы, очищаем историю
+            if not available_events and events:
+                logger.info(f"Все события в категории '{category}' использованы, очищаем историю")
+                self.used_events[category] = set()
+                available_events = events
+            
+            # Если ничего не нашли, используем fallback
+            if not available_events:
+                logger.warning(f"Не найдено исторических событий за {day} {MONTHS_RU[month]} в категории {category}")
+                return self._get_fallback_event(category, day, month)
+            
+            # Выбираем случайное событие
+            event = random.choice(available_events)
+            
+            # Добавляем в использованные
+            self.used_events[category].add(event['title'])
+            
+            logger.info(f"Выбрано историческое событие: {event['title']} ({event['year']} год)")
+            logger.info(f"Факт: {event.get('fact', 'Нет факта')[:100]}...")
+            
+            return (
+                event['title'],
+                event['year'],
+                event['description'],
+                event['url'],
+                event.get('fact', f"{event['title']} ({event['year']} год).")
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения исторического события: {e}")
+            return self._get_fallback_event(category, datetime.now(TIMEZONE).day, datetime.now(TIMEZONE).month)
+    
+    def _get_fallback_event(self, category: str, day: int, month: int) -> Tuple[str, Optional[int], str, str, str]:
+        """Резервные исторические события на случай недоступности Wikipedia"""
+        # Если в кэше есть события для этой категории
+        if category in self.fallback_cache:
+            event = random.choice(self.fallback_cache[category])
+            return (
+                event['title'], 
+                event['year'], 
+                event['description'], 
+                event['url'], 
+                event.get('fact', event['title'])
+            )
+        
+        # Или создаем простой fallback
+        fallback_events = {
+            'музыка': {
+                'title': 'Знаменательное событие в мире музыки',
+                'year': 1900 + random.randint(0, 120),
+                'description': 'Интересное музыкальное событие произошло в этот день.',
+                'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU_LOWER[month]}',
+                'fact': f'Музыкальное событие произошло {day} {MONTHS_RU_LOWER[month]} в мире искусства.'
+            },
+            'фильмы': {
+                'title': 'Кинематографическое событие',
+                'year': 1900 + random.randint(0, 120),
+                'description': 'Важное событие в истории кино.',
+                'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU_LOWER[month]}',
+                'fact': f'Кинематографическое событие произошло {day} {MONTHS_RU_LOWER[month]}.'
+            },
+            'технологии': {
+                'title': 'Технологическое достижение',
+                'year': 1900 + random.randint(0, 120),
+                'description': 'Прорыв в области технологий.',
+                'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU_LOWER[month]}',
+                'fact': f'Технологическое достижение было зафиксировано {day} {MONTHS_RU_LOWER[month]}.'
+            },
+            'игры': {
+                'title': 'Событие в игровой индустрии',
+                'year': 1980 + random.randint(0, 40),
+                'description': 'Важное событие в мире видеоигр.',
+                'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU_LOWER[month]}',
+                'fact': f'Событие в игровой индустрии произошло {day} {MONTHS_RU_LOWER[month]}.'
+            },
+            'наука': {
+                'title': 'Научное открытие',
+                'year': 1800 + random.randint(0, 220),
+                'description': 'Важное научное достижение.',
+                'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU_LOWER[month]}',
+                'fact': f'Научное открытие было сделано {day} {MONTHS_RU_LOWER[month]}.'
+            },
+            'спорт': {
+                'title': 'Спортивное достижение',
+                'year': 1900 + random.randint(0, 120),
+                'description': 'Рекорд или важное спортивное событие.',
+                'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU_LOWER[month]}',
+                'fact': f'Спортивное достижение было установлено {day} {MONTHS_RU_LOWER[month]}.'
+            },
+            'история': {
+                'title': 'Историческое событие',
+                'year': 1000 + random.randint(0, 1000),
+                'description': 'Важное событие в мировой истории.',
+                'url': f'https://ru.wikipedia.org/wiki/{day}_{MONTHS_RU_LOWER[month]}',
+                'fact': f'Историческое событие произошло {day} {MONTHS_RU_LOWER[month]}.'
+            }
+        }
+        
+        event_data = fallback_events.get(category, fallback_events['история'])
+        
+        return (
+            event_data['title'],
+            event_data['year'],
+            event_data['description'],
+            event_data['url'],
+            event_data['fact']
+        )
     
     def create_event_message(self, category: str) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
         """Создаем сообщение с историческим событием 'В этот день' в формате HTML"""
         day, month_ru, current_year = self.get_todays_date_parts()
         
-        title, event_year, description, url, fact = self.get_historical_event(category)
+        # ВАЖНО: Используем правильный метод для получения события
+        title, event_year, description, url, fact = self.get_historical_event_for_category(category)
         
         # Форматируем в HTML
         message = f"<b>В ЭТОТ ДЕНЬ: {day} {month_ru} {event_year} года</b>\n\n"
@@ -1240,14 +1236,14 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
         event_scheduler = config.get_event_scheduler()
         
         category = event_scheduler.get_next_category()
-        logger.info(f"Отправка АДАПТИВНОГО события 'В этот день' категории: {category}")
+        logger.info(f"ОТПРАВКА АДАПТИВНОГО события 'В этот день' категории: {category}")
         
         message, keyboard = event_scheduler.create_event_message(category)
         
         await context.bot.send_message(
             chat_id=chat_id,
             text=message,
-            parse_mode=ParseMode.HTML,  # ✅ ИСПРАВЛЕНО: теперь используем HTML
+            parse_mode=ParseMode.HTML,
             disable_web_page_preview=False,
             reply_markup=keyboard
         )
@@ -1280,14 +1276,14 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         event_scheduler = config.get_event_scheduler()
         
         category = event_scheduler.get_next_category()
-        logger.info(f"Отправка АДАПТИВНОГО события 'В этот день' по команде: {category}")
+        logger.info(f"ОТПРАВКА ПО КОМАНДЕ АДАПТИВНОГО события 'В этот день' категории: {category}")
         
         message, keyboard = event_scheduler.create_event_message(category)
         
         await context.bot.send_message(
             chat_id=chat_id,
             text=message,
-            parse_mode=ParseMode.HTML,  # ✅ ИСПРАВЛЕНО: теперь используем HTML
+            parse_mode=ParseMode.HTML,
             disable_web_page_preview=False,
             reply_markup=keyboard
         )
@@ -1295,7 +1291,7 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         event_scheduler.increment_category()
         config.event_current_index = event_scheduler.current_index
         
-        logger.info(f"АДАПТИВНОЕ событие 'В этот день' отправлено по команде: {category}")
+        logger.info(f"✅ АДАПТИВНОЕ событие 'В этот день' отправлено по команде: {category}")
         
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при отправке АДАПТИВНОГО события: {str(e)}")
@@ -1859,6 +1855,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• <b>Контекстный выбор:</b> учитывает день недели и сезон\n"
         f"• <b>Обратная связь:</b> оценивайте события 👍/👎\n"
         f"• Категории: {', '.join([c.capitalize() for c in EVENT_CATEGORIES])}\n"
+        f"• <b>УЛУЧШЕННЫЙ поиск фактов из Википедии!</b>\n"
         f"• События НЕ повторяются в пределах категории!\n\n"
         "🔧 <b>Доступные команды:</b>\n"
         "/info - информация о боте\n"
@@ -1971,6 +1968,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🎯 <b>Умная система категорий:</b> адаптируется под предпочтения\n"
         f"📈 <b>Контекстный выбор:</b> день недели + сезонные предпочтения\n"
         f"📊 <b>Статистика вовлеченности:</b> учитывает обратную связь 👍/👎\n"
+        f"🌐 <b>УЛУЧШЕННЫЙ поиск:</b> факты из Википедии + локальная база\n"
         f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
         f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
         f"⏳ <b>Задачи планёрок:</b> {meeting_job_count}\n"
@@ -2404,6 +2402,7 @@ def main() -> None:
         logger.info(f"🎯 Умная система категорий: адаптивный выбор на основе статистики")
         logger.info(f"📈 Контекстный выбор: учитывает день недели и сезонные предпочтения")
         logger.info(f"📊 Обратная связь: система фидбэка 👍/👎 для улучшения подбора")
+        logger.info(f"🌐 УЛУЧШЕННЫЙ поиск: факты из Википедии + локальная база")
         logger.info(f"🔄 События НЕ повторяются в пределах категории!")
         logger.info(f"👥 Разрешённые пользователи: {', '.join(BotConfig().allowed_users)}")
         
