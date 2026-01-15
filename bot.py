@@ -526,38 +526,56 @@ def translate_simple(text: str) -> str:
     return result
 
 def get_horoscope_from_api(sign: str) -> Optional[Dict]:
-    """Получаем гороскоп из Aztro API"""
+    """Получаем гороскоп из работающего API (Horoscope API)"""
     try:
-        params = {
-            'sign': sign.lower(),
-            'day': 'today'
+        # Преобразуем знак в русское название для API
+        sign_translations = {
+            'aries': 'oven',
+            'taurus': 'telec',
+            'gemini': 'bliznecy',
+            'cancer': 'rak',
+            'leo': 'lev',
+            'virgo': 'deva',
+            'libra': 'vesy',
+            'scorpio': 'skorpion',
+            'sagittarius': 'strelec',
+            'capricorn': 'kozerog',
+            'aquarius': 'vodoley',
+            'pisces': 'ryby'
         }
         
-        response = requests.post(
-            "https://aztro.sameerkumar.website/",
-            params=params, 
+        api_sign = sign_translations.get(sign.lower())
+        if not api_sign:
+            logger.error(f"Неизвестный знак зодиака: {sign}")
+            return None
+        
+        # Используем альтернативный API
+        response = requests.get(
+            f"https://horoscope-api.vercel.app/api/horoscope/today/{api_sign}",
+            headers={"User-Agent": USER_AGENT},
             timeout=REQUEST_TIMEOUT
         )
         
         if response.status_code == 200:
             data = response.json()
             
-            # Простой перевод полей
-            translated = {
+            # API возвращает данные на русском языке
+            horoscope_data = {
                 'sign': ZODIAC_SIGNS[sign]['ru'],
-                'date': data.get('current_date', ''),
-                'prediction': translate_simple(data.get('description', 'No prediction available')),
-                'mood': translate_simple(data.get('mood', 'Unknown')),
-                'color': translate_simple(data.get('color', 'Unknown')),
-                'lucky_number': str(data.get('lucky_number', '?')),
-                'lucky_time': data.get('lucky_time', 'Unknown'),
+                'date': datetime.now(TIMEZONE).strftime('%d.%m.%Y'),
+                'prediction': data.get('prediction', 'Нет предсказания на сегодня'),
+                'mood': data.get('mood', 'Нейтральное'),
+                'color': data.get('color', 'Неизвестно'),
+                'lucky_number': str(data.get('lucky_number', '7')),
+                'lucky_time': data.get('lucky_time', 'День'),
                 'compatibility': ZODIAC_SIGNS.get(
-                    data.get('compatibility', '').lower(), 
-                    {'ru': 'Неизвестно'}
+                    data.get('compatibility', 'aries').lower(), 
+                    {'ru': 'Овен'}
                 )['ru']
             }
             
-            return translated
+            return horoscope_data
+            
     except Exception as e:
         logger.error(f"Ошибка получения гороскопа для {sign}: {e}")
     
@@ -862,8 +880,15 @@ async def send_morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
         sign_key = random.choice(list(ZODIAC_SIGNS.keys()))
         sign_name = ZODIAC_SIGNS[sign_key]['ru']
         
-        # Получаем гороскоп
-        horoscope = get_horoscope_from_api(sign_key) or get_backup_horoscope(sign_key)
+        # Получаем гороскоп из API
+        horoscope = get_horoscope_from_api(sign_key)
+        
+        # Если API не вернуло данные, используем резервный
+        if not horoscope:
+            horoscope = get_backup_horoscope(sign_key)
+            logger.warning(f"API не вернуло гороскоп, используется резервный для {sign_name}")
+        else:
+            logger.info(f"Гороскоп получен из API для {sign_name}")
         
         # Отправляем гороскоп с мемом
         await send_horoscope_with_meme(
@@ -1398,7 +1423,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• <i>🎭 + персональный мем к каждому гороскопу!</i>\n"
         f"• <i>🇷🇺 С приоритетом русских мемов</i>\n\n"
         f"📅 <b>Планёрки:</b>\n"
-        ,
+        f"• Пн, Ср, Пт в 9:30 по МСК\n"
+        f"• Возможность отмены\n\n"
+        f"📅 <b>Отраслевые встречи:</b>\n"
+        f"• Вт в 12:00 по МСК\n"
+        f"• Обсуждение трендов и инсайтов\n"
+        f"• Нетворкинг с коллегами\n\n"
+        f"📅 <b>Исторические события:</b>\n"
+        f"• Пн-Пт в 10:00 по МСК\n\n"
+        f"🔧 <b>Основные команды:</b>\n"
+        "/eventnow - историческое событие сейчас\n"
+        "/info - информация о боте\n"
+        "/setchat - установить чат\n"
+        "/testmorning - тест утреннего приветствия\n"
+        "/testindustry - тест отраслевой встречи\n"
+        "/jobs - список запланированных задач\n\n"
+        f"✨ <b>Каждое утро в 9:00 бот присылает приветствие и гороскоп с мемом!</b>\n"
+        f"🇷🇺 <i>Русские мемы имеют приоритет при поиске</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -1478,6 +1519,10 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• API: Meme API\n"
         f"• Приоритет: Русские мемы 🇷🇺\n"
         f"• Резерв: встроенные мемы\n\n"
+        f"🔮 <b>Гороскопы:</b>\n"
+        f"• Источник: Horoscope API\n"
+        f"• Язык: Русский\n"
+        f"• Резерв: встроенные предсказания\n\n"
         f"📅 <b>Сегодня:</b> {current_day}, {now.day} {MONTHS_RU[now.month]} {now.year}\n\n"
         f"✨ <b>Гороскопы приходят автоматически в 9:00 каждый будний день!</b>\n"
         f"🎭 <i>Каждый гороскоп сопровождается тематическим мемом</i>\n"
@@ -1667,6 +1712,7 @@ def main() -> None:
         logger.info(f"✨ Утренние гороскопы: Пн-Пт в 9:00 по МСК")
         logger.info(f"🎭 Каждый гороскоп теперь с персональным мемом!")
         logger.info(f"🇷🇺 Приоритет русских мемов при поиске")
+        logger.info(f"🔮 API гороскопов: Horoscope API (рабочее)")
         logger.info(f"🚫 Нет ручных запросов гороскопов - только автоматические!")
         logger.info(f"📅 Планёрки: Пн/Ср/Пт в 9:30 по МСК")
         logger.info(f"🏢 Отраслевые встречи: Вт в 12:00 по МСК")
