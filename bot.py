@@ -12,7 +12,6 @@ import pytz
 from urllib.parse import quote
 import re
 import time
-from googletrans import Translator
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -55,20 +54,20 @@ MONTHS_RU = {
     9: "СЕНТЯБРЯ", 10: "ОКТЯБРЯ", 11: "НОЯБРЯ", 12: "ДЕКАБРЯ"
 }
 
-# Знаки зодиака
+# Знаки зодиака с русскими переводами
 ZODIAC_SIGNS = {
-    'aries': {'ru': '♈ Овен', 'emoji': '♈'},
-    'taurus': {'ru': '♉ Телец', 'emoji': '♉'},
-    'gemini': {'ru': '♊ Близнецы', 'emoji': '♊'},
-    'cancer': {'ru': '♋ Рак', 'emoji': '♋'},
-    'leo': {'ru': '♌ Лев', 'emoji': '♌'},
-    'virgo': {'ru': '♍ Дева', 'emoji': '♍'},
-    'libra': {'ru': '♎ Весы', 'emoji': '♎'},
-    'scorpio': {'ru': '♏ Скорпион', 'emoji': '♏'},
-    'sagittarius': {'ru': '♐ Стрелец', 'emoji': '♐'},
-    'capricorn': {'ru': '♑ Козерог', 'emoji': '♑'},
-    'aquarius': {'ru': '♒ Водолей', 'emoji': '♒'},
-    'pisces': {'ru': '♓ Рыбы', 'emoji': '♓'}
+    'aries': {'ru': '♈ Овен', 'emoji': '♈', 'en': 'Aries'},
+    'taurus': {'ru': '♉ Телец', 'emoji': '♉', 'en': 'Taurus'},
+    'gemini': {'ru': '♊ Близнецы', 'emoji': '♊', 'en': 'Gemini'},
+    'cancer': {'ru': '♋ Рак', 'emoji': '♋', 'en': 'Cancer'},
+    'leo': {'ru': '♌ Лев', 'emoji': '♌', 'en': 'Leo'},
+    'virgo': {'ru': '♍ Дева', 'emoji': '♍', 'en': 'Virgo'},
+    'libra': {'ru': '♎ Весы', 'emoji': '♎', 'en': 'Libra'},
+    'scorpio': {'ru': '♏ Скорпион', 'emoji': '♏', 'en': 'Scorpio'},
+    'sagittarius': {'ru': '♐ Стрелец', 'emoji': '♐', 'en': 'Sagittarius'},
+    'capricorn': {'ru': '♑ Козерог', 'emoji': '♑', 'en': 'Capricorn'},
+    'aquarius': {'ru': '♒ Водолей', 'emoji': '♒', 'en': 'Aquarius'},
+    'pisces': {'ru': '♓ Рыбы', 'emoji': '♓', 'en': 'Pisces'}
 }
 
 # Утренние приветствия
@@ -82,9 +81,6 @@ MORNING_GREETINGS = [
 WIKIPEDIA_API_URL = "https://ru.wikipedia.org/w/api.php"
 USER_AGENT = 'TelegramEventBot/7.0 (https://github.com/; contact@example.com)'
 REQUEST_TIMEOUT = 10
-
-# Aztro API для гороскопов
-AZTRO_API_URL = "https://aztro.sameerkumar.website/"
 
 # ========== ТИПЫ ДАННЫХ ==========
 class HistoricalEvent(TypedDict):
@@ -125,9 +121,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# Инициализация переводчика
-translator = Translator()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
@@ -306,6 +299,70 @@ def build_event_message(event: HistoricalEvent) -> str:
         f"📖 <a href=\"{event['url']}\">Подробнее на Википедии</a>"
     )
 
+def translate_simple(text: str) -> str:
+    """Простой перевод для гороскопов (без внешних библиотек)"""
+    # Словарь для перевода ключевых слов гороскопов
+    translation_dict = {
+        # Настроения
+        'happy': 'Счастливое',
+        'excited': 'Взволнованное',
+        'romantic': 'Романтичное',
+        'calm': 'Спокойное',
+        'energetic': 'Энергичное',
+        'creative': 'Творческое',
+        'optimistic': 'Оптимистичное',
+        'adventurous': 'Приключенческое',
+        
+        # Цвета
+        'red': 'Красный',
+        'blue': 'Синий',
+        'green': 'Зеленый',
+        'yellow': 'Желтый',
+        'purple': 'Фиолетовый',
+        'orange': 'Оранжевый',
+        'pink': 'Розовый',
+        'gold': 'Золотой',
+        'silver': 'Серебряный',
+        'white': 'Белый',
+        'black': 'Черный',
+        
+        # Совместимость
+        'aries': 'Овен',
+        'taurus': 'Телец',
+        'gemini': 'Близнецы',
+        'cancer': 'Рак',
+        'leo': 'Лев',
+        'virgo': 'Дева',
+        'libra': 'Весы',
+        'scorpio': 'Скорпион',
+        'sagittarius': 'Стрелец',
+        'capricorn': 'Козерог',
+        'aquarius': 'Водолей',
+        'pisces': 'Рыбы',
+        
+        # Общие слова
+        'today': 'сегодня',
+        'day': 'день',
+        'good': 'хороший',
+        'great': 'отличный',
+        'excellent': 'превосходный',
+        'opportunity': 'возможность',
+        'chance': 'шанс',
+        'love': 'любовь',
+        'money': 'деньги',
+        'success': 'успех',
+        'work': 'работа',
+        'family': 'семья',
+        'friends': 'друзья',
+    }
+    
+    # Простой перевод - заменяем известные слова
+    result = text
+    for eng, rus in translation_dict.items():
+        result = re.sub(rf'\b{eng}\b', rus, result, flags=re.IGNORECASE)
+    
+    return result
+
 def get_horoscope_from_api(sign: str) -> Optional[Dict]:
     """Получаем гороскоп из Aztro API"""
     try:
@@ -314,33 +371,28 @@ def get_horoscope_from_api(sign: str) -> Optional[Dict]:
             'day': 'today'
         }
         
-        response = requests.post(AZTRO_API_URL, params=params, timeout=REQUEST_TIMEOUT)
+        response = requests.post(
+            "https://aztro.sameerkumar.website/",
+            params=params, 
+            timeout=REQUEST_TIMEOUT
+        )
         
         if response.status_code == 200:
             data = response.json()
             
-            # Переводим поля на русский
+            # Простой перевод полей
             translated = {
                 'sign': ZODIAC_SIGNS[sign]['ru'],
                 'date': data.get('current_date', ''),
-                'prediction': translator.translate(
-                    data.get('description', 'Нет данных'), 
-                    dest='ru'
-                ).text,
-                'mood': translator.translate(
-                    data.get('mood', 'Нет данных'), 
-                    dest='ru'
-                ).text,
-                'color': translator.translate(
-                    data.get('color', 'Нет данных'), 
-                    dest='ru'
-                ).text,
+                'prediction': translate_simple(data.get('description', 'No prediction available')),
+                'mood': translate_simple(data.get('mood', 'Unknown')),
+                'color': translate_simple(data.get('color', 'Unknown')),
                 'lucky_number': str(data.get('lucky_number', '?')),
-                'lucky_time': data.get('lucky_time', 'Нет данных'),
-                'compatibility': translator.translate(
-                    data.get('compatibility', 'Нет данных'), 
-                    dest='ru'
-                ).text
+                'lucky_time': data.get('lucky_time', 'Unknown'),
+                'compatibility': ZODIAC_SIGNS.get(
+                    data.get('compatibility', '').lower(), 
+                    {'ru': 'Неизвестно'}
+                )['ru']
             }
             
             return translated
@@ -369,6 +421,10 @@ def get_backup_horoscope(sign: str) -> Dict:
     times = ['Утро', 'День', 'Вечер', 'Полдень']
     numbers = ['7', '3', '11', '22', '5']
     
+    # Выбираем случайную совместимость
+    compatible_signs = list(ZODIAC_SIGNS.values())
+    compatibility = random.choice([s['ru'] for s in compatible_signs])
+    
     return {
         'sign': ZODIAC_SIGNS[sign]['ru'],
         'date': datetime.now(TIMEZONE).strftime('%d.%m.%Y'),
@@ -377,7 +433,7 @@ def get_backup_horoscope(sign: str) -> Dict:
         'color': random.choice(colors),
         'lucky_number': random.choice(numbers),
         'lucky_time': random.choice(times),
-        'compatibility': random.choice(list(ZODIAC_SIGNS.values()))['ru']
+        'compatibility': compatibility
     }
 
 def build_horoscope_message(horoscope: Dict) -> str:
@@ -604,12 +660,8 @@ async def handle_horoscope_callback(update: Update, context: ContextTypes.DEFAUL
             )
             return
         
-        # Получаем гороскоп из API
-        horoscope = get_horoscope_from_api(sign_key)
-        
-        # Если API не сработало, используем резервный
-        if not horoscope:
-            horoscope = get_backup_horoscope(sign_key)
+        # Получаем гороскоп
+        horoscope = get_horoscope_from_api(sign_key) or get_backup_horoscope(sign_key)
         
         # Сохраняем выбор пользователя
         config = BotConfig()
@@ -618,7 +670,7 @@ async def handle_horoscope_callback(update: Update, context: ContextTypes.DEFAUL
         # Создаем сообщение с гороскопом
         message = build_horoscope_message(horoscope)
         
-        # Отправляем гороскоп ЛИЧНО пользователю (через ответ на callback)
+        # Отправляем гороскоп ЛИЧНО пользователю
         await query.edit_message_text(
             text=message,
             parse_mode=ParseMode.HTML
@@ -765,7 +817,7 @@ async def schedule_next_morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> 
             300
         )
 
-# ========== ФУНКЦИИ ДЛЯ ИСТОРИЧЕСКИХ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
+# ========== ФУНКЦИИ ДЛЯ ИСТОРИЧЕСКИХ СОБЫТИЙ ==========
 
 async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправка ежедневного исторического события"""
@@ -785,7 +837,7 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
             await schedule_next_event(context)
             return
 
-        event = events[0]  # Берем лучшее событие
+        event = events[0]
         message = build_event_message(event)
 
         await context.bot.send_message(
@@ -947,8 +999,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"Ошибка при отправке напоминания: {e}")
 
 # ========== КОНВЕРСАЦИЯ ДЛЯ ОТМЕНЫ ПЛАНЁРКИ ==========
-# (Весь код ConversationHandler остается таким же, как в предыдущей версии)
-# Для экономии места оставляю только заглушки
+# (Упрощенная версия)
 
 @restricted
 async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -981,132 +1032,32 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["selected_reason"] = reason
         context.user_data["reason_index"] = reason_index
         
-        if reason_index == 2:
-            # Показать выбор даты для переноса
-            return await show_date_selection(update, context)
-        else:
-            return await confirm_cancellation(update, context)
-    except:
-        return ConversationHandler.END
-
-async def show_date_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    
-    keyboard = []
-    today = datetime.now(TIMEZONE)
-    
-    for i in range(1, 8):
-        next_day = today + timedelta(days=i)
-        if next_day.weekday() in MEETING_DAYS:
-            date_str = next_day.strftime("%d.%m.%Y")
-            callback_data = f"date_{next_day.strftime('%Y-%m-%d')}"
-            keyboard.append([InlineKeyboardButton(date_str, callback_data=callback_data)])
-    
-    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data="back_to_reasons")])
-    
-    await query.edit_message_text(
-        text="📅 Выберите дату для переноса планёрки:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    
-    return SELECTING_DATE
-
-async def date_selected_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "back_to_reasons":
-        keyboard = [
-            [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
-            for i, option in enumerate(CANCELLATION_OPTIONS)
-        ]
+        final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
+        
+        config = BotConfig()
+        original_message_id = context.user_data.get("original_message_id")
+        
+        if original_message_id:
+            for job in get_jobs_from_queue(context.application.job_queue):
+                if job.name in config.active_reminders:
+                    reminder_data = config.active_reminders[job.name]
+                    if str(reminder_data.get("message_id")) == str(original_message_id):
+                        job.schedule_removal()
+                        config.remove_active_reminder(job.name)
+                        break
         
         await query.edit_message_text(
-            text="📝 Выберите причину отмены планёрки:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            text=final_message,
+            parse_mode=ParseMode.HTML
         )
-        return SELECTING_REASON
-    
-    try:
-        selected_date_str = query.data.split("_")[1]
-        selected_date = datetime.strptime(selected_date_str, "%Y-%m-%d")
         
-        context.user_data["selected_date"] = selected_date_str
-        context.user_data["selected_date_display"] = selected_date.strftime("%d.%m.%Y")
+        logger.info(f"Планёрка отменена @{query.from_user.username} — {reason}")
         
-        return await show_confirmation(update, context)
-    except:
-        return ConversationHandler.END
-
-async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    reason = context.user_data.get("selected_reason", "")
-    selected_date = context.user_data.get("selected_date_display", "")
-    
-    message = f"📋 <b>Подтверждение отмены планёрки:</b>\n\n"
-    
-    if "Перенесём" in reason:
-        message += f"❌ <b>Отмена сегодняшней планёрки</b>\n"
-        message += f"📅 <b>Перенос на {selected_date}</b>\n\n"
-        message += "<b>Подтвердить отмену?</b>"
-    else:
-        message += f"❌ <b>Отмена планёрки</b>\n"
-        message += f"📝 <b>Причина:</b> {reason}\n\n"
-        message += "<b>Подтвердить отмену?</b>"
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Да, отменить", callback_data="confirm_cancel"),
-            InlineKeyboardButton("❌ Нет, вернуться", callback_data="back_to_reasons_from_confirm")
-        ]
-    ]
-    
-    await query.edit_message_text(
-        text=message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
-    )
-    
-    return CONFIRMING_DATE
-
-async def execute_cancellation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    config = BotConfig()
-    reason = context.user_data.get("selected_reason", "Причина не указана")
-    reason_index = context.user_data.get("reason_index", -1)
-    username = query.from_user.username or "Неизвестный пользователь"
-    
-    if reason_index == 2:
-        selected_date = context.user_data.get("selected_date_display", "дата не указана")
-        final_message = f"❌ @{username} отменил сегодняшнюю планёрку\n\n📅 <b>Перенос на {selected_date}</b>"
-    else:
-        final_message = f"❌ @{username} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
-    
-    original_message_id = context.user_data.get("original_message_id")
-    job_name_to_remove = None
-    
-    if original_message_id:
-        for job in get_jobs_from_queue(context.application.job_queue):
-            if job.name in config.active_reminders:
-                reminder_data = config.active_reminders[job.name]
-                if str(reminder_data.get("message_id")) == str(original_message_id):
-                    job.schedule_removal()
-                    job_name_to_remove = job.name
-                    break
+        context.user_data.clear()
         
-        if job_name_to_remove:
-            config.remove_active_reminder(job_name_to_remove)
-    
-    await query.edit_message_text(
-        text=final_message,
-        parse_mode=ParseMode.HTML
-    )
-    
-    logger.info(f"Планёрка отменена @{username} — {reason}")
-    
-    context.user_data.clear()
+    except Exception as e:
+        logger.error(f"Ошибка отмены планёрки: {e}")
+        await query.message.reply_text("❌ Произошла ошибка")
     
     return ConversationHandler.END
 
@@ -1132,7 +1083,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Персональные предсказания\n\n"
         f"📅 <b>Планёрки:</b>\n"
         f"• Пн, Ср, Пт в 9:30 по МСК\n"
-        f"• Возможность отмены/переноса\n\n"
+        f"• Возможность отмены\n\n"
         f"📅 <b>Исторические события:</b>\n"
         f"• Пн-Пт в 10:00 по МСК\n\n"
         f"🔧 <b>Основные команды:</b>\n"
@@ -1182,7 +1133,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     now = datetime.now(TIMEZONE)
     weekday = now.weekday()
-    day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Саббота", "Воскресенье"]
     current_day = day_names[weekday]
     
     is_morning_day = weekday in MORNING_DAYS
@@ -1204,7 +1155,6 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.HTML
     )
 
-# Добавим недостающие команды для полноты
 async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     jobs = get_jobs_from_queue(context.application.job_queue)
     
@@ -1303,14 +1253,6 @@ def main() -> None:
             states={
                 SELECTING_REASON: [
                     CallbackQueryHandler(select_reason_callback, pattern="^reason_[0-9]+$"),
-                ],
-                SELECTING_DATE: [
-                    CallbackQueryHandler(date_selected_callback, pattern="^date_.+$"),
-                    CallbackQueryHandler(date_selected_callback, pattern="^back_to_reasons$"),
-                ],
-                CONFIRMING_DATE: [
-                    CallbackQueryHandler(execute_cancellation, pattern="^confirm_cancel$"),
-                    CallbackQueryHandler(show_confirmation, pattern="^back_to_reasons_from_confirm$"),
                 ],
             },
             fallbacks=[
