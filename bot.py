@@ -75,34 +75,37 @@ ZODIAC_SIGNS = {
     'pisces': {'ru': '♓ Рыбы', 'emoji': '♓', 'en': 'Pisces'}
 }
 
-# Соответствие знаков зодиака и сабреддитов для мемов
+# Соответствие знаков зодиака и сабреддитов для мемов (с приоритетом русских мемов)
 ZODIAC_TO_MEME = {
-    'aries': ['programmingmemes', 'dankmemes', 'motivation'],
-    'taurus': ['wholesomememes', 'food', 'memes'],
-    'gemini': ['funny', 'dankmemes', 'memes'],
-    'cancer': ['wholesomememes', 'memes', 'MadeMeSmile'],
-    'leo': ['dankmemes', 'memes', 'motivation'],
-    'virgo': ['programmingmemes', 'memes', 'wholesomememes'],
-    'libra': ['wholesomememes', 'memes', 'funny'],
-    'scorpio': ['dankmemes', 'memes', 'programmingmemes'],
-    'sagittarius': ['dankmemes', 'memes', 'funny'],
-    'capricorn': ['programmingmemes', 'memes', 'wholesomememes'],
-    'aquarius': ['programmingmemes', 'dankmemes', 'memes'],
-    'pisces': ['wholesomememes', 'memes', 'MadeMeSmile']
+    'aries': ['Pikabu', 'ru_Anime', 'dankmemes', 'programmingmemes', 'motivation'],
+    'taurus': ['Pikabu', 'ru_Anime', 'wholesomememes', 'food', 'memes'],
+    'gemini': ['Pikabu', 'ru_Anime', 'funny', 'dankmemes', 'memes'],
+    'cancer': ['Pikabu', 'ru_Anime', 'wholesomememes', 'memes', 'MadeMeSmile'],
+    'leo': ['Pikabu', 'ru_Anime', 'dankmemes', 'memes', 'motivation'],
+    'virgo': ['Pikabu', 'ru_Anime', 'programmingmemes', 'memes', 'wholesomememes'],
+    'libra': ['Pikabu', 'ru_Anime', 'wholesomememes', 'memes', 'funny'],
+    'scorpio': ['Pikabu', 'ru_Anime', 'dankmemes', 'memes', 'programmingmemes'],
+    'sagittarius': ['Pikabu', 'ru_Anime', 'dankmemes', 'memes', 'funny'],
+    'capricorn': ['Pikabu', 'ru_Anime', 'programmingmemes', 'memes', 'wholesomememes'],
+    'aquarius': ['Pikabu', 'ru_Anime', 'programmingmemes', 'dankmemes', 'memes'],
+    'pisces': ['Pikabu', 'ru_Anime', 'wholesomememes', 'memes', 'MadeMeSmile']
 }
+
+# Русскоязычные сабреддиты (будем пытаться сначала их)
+RUSSIAN_SUBREDDITS = ['Pikabu', 'ru_Anime', 'RU_Memes', 'russian', 'RussNews']
 
 # Утренние приветствия
 MORNING_GREETINGS = [
     "Оу, еще спишь? 😴 Давай посмотрим, что говорят звезды о тебе сегодня! ✨",
-    "Доброе утро! ☀️ Хочешь узнать, что приготовили для тебя звезды? 🔮",
-    "Привет! 👋 Готов узнать свой гороскоп на сегодня? Давай заглянем в будущее! 🌟"
+    "☀️ Хочешь узнать, что приготовили для тебя звезды? 🔮",
+    "👋 Готов(а) узнать свой гороскоп на сегодня? Давай заглянем в будущее! 🌟"
 ]
 
 # Текст для отраслевой встречи
 INDUSTRY_MEETING_TEXTS = [
     "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n🎯 Что делаем:\n• Обсудим итоги за неделю\n• Новые тренды и инсайты\n• Обмен опытом с коллегами\n• Запланируем мероприятия на следующую\n\n🕐 Начало: 12:00 по МСК\n📍 Формат: Zoom-конференция\n\n🔗 Всех причастных ждём! {zoom_link} | 👈",
-    "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n📊 Сегодня на повестке:\n• Анализ недельных результатов\n• Выявление ключевых трендов\n• Коллективный разбор кейсов\n• Планирование совместных активностей\n\n🕐 Старт: 12:00 (МСК)\n🎥 Онлайн в Zoom\n\n🔗 Присоединяйтесь: {zoom_link} ← переход",
-    "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n✨ В программе:\n• Итоги рабочей недели\n• Прогнозы и инсайты\n• Нетворкинг с экспертами\n• Дорожная карта на неделю\n\n⏰ Время: 12:00 по Москве\n💻 Платформа: Zoom\n\n🔗 Подключайтесь: {zoom_link} | 👈"
+    "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n📊 Сегодня на повестке:\n• Анализ недельных результатов\n• Выявление ключевых трендов\n• Коллективный разбор кейсов\n• Планирование активностей\n\n🕐 Старт: 12:00 (МСК)\n🎥 Онлайн в Zoom\n\n🔗 Присоединяйтесь: {zoom_link} ← переход",
+    "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n✨ На повестке дня:\n• Итоги рабочей недели\n• Прогнозы и инсайты\n•Планы на неделю\n\n⏰ Время: 12:00 по Москве\n💻 Платформа: Zoom\n\n🔗 Подключайтесь: {zoom_link} | 👈"
 ]
 
 # Wikipedia API
@@ -196,67 +199,59 @@ def restricted(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
-def can_user_request_horoscope(user_id: int, config: 'BotConfig') -> Tuple[bool, Optional[str]]:
-    """
-    Проверяет, может ли пользователь запросить гороскоп сегодня.
-    Возвращает (может_ли_запросить, сообщение_об_ошибке)
-    """
-    today = datetime.now(TIMEZONE).strftime('%Y-%m-%d')
-    horoscope_requests = config.horoscope_requests
-    
-    # Проверяем, делал ли пользователь запрос сегодня
-    if str(user_id) in horoscope_requests:
-        last_request_date = horoscope_requests[str(user_id)].get('last_request_date')
-        
-        if last_request_date == today:
-            # Получаем время последнего запроса
-            last_request_time_str = horoscope_requests[str(user_id)].get('last_request_time', '00:00')
-            
-            # Формируем сообщение о том, когда можно будет сделать следующий запрос
-            tomorrow = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime('%d.%m.%Y')
-            return False, f"😔 Увы, сегодня звёзды свою работу сделали! Подмигивание 🤫\n\nЗагляни за новым предсказанием завтра, {tomorrow} ✨"
-    
-    return True, None
-
-def record_horoscope_request(user_id: int, config: 'BotConfig') -> None:
-    """Записывает факт запроса гороскопа пользователем на сегодня"""
-    today = datetime.now(TIMEZONE)
-    
-    config.horoscope_requests[str(user_id)] = {
-        'last_request_date': today.strftime('%Y-%m-%d'),
-        'last_request_time': today.strftime('%H:%M'),
-        'username': f"user_{user_id}"
-    }
-    config.save()
-
 def get_zodiac_meme(zodiac_sign: str) -> Optional[MemeData]:
-    """Получаем тематический мем для знака зодиака"""
+    """Получаем тематический мем для знака зодиака с приоритетом русских мемов"""
     try:
         # Получаем подходящие сабреддиты для знака зодиака
-        subreddits = ZODIAC_TO_MEME.get(zodiac_sign, ['memes', 'dankmemes', 'wholesomememes'])
-        subreddit = random.choice(subreddits)
+        subreddits = ZODIAC_TO_MEME.get(zodiac_sign, ['Pikabu', 'ru_Anime', 'memes'])
         
-        # Пробуем получить мем из конкретного сабреддита
-        try:
-            response = requests.get(
-                f"{MEME_API_URL}/{subreddit}",
-                headers={"User-Agent": USER_AGENT},
-                timeout=REQUEST_TIMEOUT
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('nsfw', False) or data.get('spoiler', False):
-                    raise ValueError("NSFW или спойлер-контент")
-                
-                return {
-                    'url': data.get('url'),
-                    'title': data.get('title', 'Без названия'),
-                    'subreddit': data.get('subreddit', 'memes'),
-                    'post_url': data.get('postLink', '')
-                }
-        except Exception as e:
-            logger.warning(f"Ошибка получения мема из {subreddit}: {e}")
+        # Сначала пробуем русскоязычные сабреддиты
+        for subreddit in subreddits:
+            if subreddit in RUSSIAN_SUBREDDITS:
+                try:
+                    response = requests.get(
+                        f"{MEME_API_URL}/{subreddit}",
+                        headers={"User-Agent": USER_AGENT},
+                        timeout=REQUEST_TIMEOUT
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data.get('nsfw', False) or data.get('spoiler', False):
+                            continue
+                        
+                        return {
+                            'url': data.get('url'),
+                            'title': data.get('title', 'Без названия'),
+                            'subreddit': data.get('subreddit', 'memes'),
+                            'post_url': data.get('postLink', '')
+                        }
+                except Exception as e:
+                    logger.debug(f"Не удалось получить мем из русского сабреддита {subreddit}: {e}")
+        
+        # Если русские мемы не найдены, пробуем английские
+        for subreddit in subreddits:
+            if subreddit not in RUSSIAN_SUBREDDITS:
+                try:
+                    response = requests.get(
+                        f"{MEME_API_URL}/{subreddit}",
+                        headers={"User-Agent": USER_AGENT},
+                        timeout=REQUEST_TIMEOUT
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data.get('nsfw', False) or data.get('spoiler', False):
+                            continue
+                        
+                        return {
+                            'url': data.get('url'),
+                            'title': data.get('title', 'Без названия'),
+                            'subreddit': data.get('subreddit', 'memes'),
+                            'post_url': data.get('postLink', '')
+                        }
+                except Exception as e:
+                    logger.debug(f"Не удалось получить мем из {subreddit}: {e}")
         
         # Если не получилось, пробуем общий запрос
         response = requests.get(
@@ -619,8 +614,11 @@ def build_horoscope_message(horoscope: Dict, meme: Optional[MemeData] = None) ->
     )
     
     if meme:
+        # Определяем источник мема
+        source = "🇷🇺 Русский мем" if meme['subreddit'] in RUSSIAN_SUBREDDITS else "🌍 Мем"
+        
         horoscope_text += (
-            f"🎭 <b>Персональный мем на сегодня:</b>\n"
+            f"🎭 <b>Мем дня:</b> {source}\n"
             f"<i>«{html.escape(meme['title'])}»</i>\n"
             f"📁 <a href=\"{meme['post_url']}\">r/{meme['subreddit']}</a>\n\n"
         )
@@ -630,16 +628,16 @@ def build_horoscope_message(horoscope: Dict, meme: Optional[MemeData] = None) ->
     return horoscope_text
 
 async def send_horoscope_with_meme(chat_id: int, horoscope: Dict, context: ContextTypes.DEFAULT_TYPE, 
-                                  sign_key: str, original_message_id: int = None) -> None:
+                                  sign_key: str) -> None:
     """Отправляет гороскоп с прикреплённым мемом"""
     try:
-        # Получаем мем для знака зодиака
+        # Получаем мем для знака зодиака (с приоритетом русских)
         meme = get_zodiac_meme(sign_key) or get_backup_meme()
         
         # Строим текстовое сообщение с информацией о меме
         message_text = build_horoscope_message(horoscope, meme)
         
-        # Сначала отправляем мем как фото
+        # Отправляем мем как фото
         await context.bot.send_photo(
             chat_id=chat_id,
             photo=meme['url'],
@@ -647,13 +645,8 @@ async def send_horoscope_with_meme(chat_id: int, horoscope: Dict, context: Conte
             parse_mode=ParseMode.HTML
         )
         
-        # Если было оригинальное сообщение (из callback), удаляем его
-        if original_message_id:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=original_message_id)
-            except Exception as e:
-                logger.warning(f"Не удалось удалить сообщение: {e}")
-                
+        logger.info(f"✅ Автоматический гороскоп с мемом отправлен в чат {chat_id} ({horoscope['sign']})")
+        
     except Exception as e:
         logger.error(f"Ошибка отправки гороскопа с мемом: {e}")
         # Если не удалось отправить фото, отправляем текстовый гороскоп
@@ -838,7 +831,7 @@ class BotConfig:
 # ========== ФУНКЦИИ ДЛЯ ГОРОСКОПОВ С МЕМАМИ ==========
 
 async def send_morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка утреннего приветствия с предложением гороскопа"""
+    """Отправка утреннего приветствия и автоматического гороскопа с мемом"""
     try:
         config = BotConfig()
         chat_id = config.chat_id
@@ -848,21 +841,39 @@ async def send_morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
             await schedule_next_morning_greeting(context)
             return
 
-        # Выбираем случайное приветствие
+        # Отправляем случайное приветствие
         greeting = random.choice(MORNING_GREETINGS)
         
-        # Создаем клавиатуру со знаками зодиака
-        keyboard = create_zodiac_keyboard()
-        
-        # Отправляем сообщение в чат
+        # Отправляем приветствие
         await context.bot.send_message(
             chat_id=chat_id,
             text=greeting,
-            reply_markup=keyboard,
             parse_mode=ParseMode.HTML
         )
 
         logger.info(f"✅ Утреннее приветствие отправлено в чат {chat_id}")
+        
+        # Ждем 1 секунду перед отправкой гороскопа
+        await asyncio.sleep(1)
+        
+        # Выбираем случайный знак зодиака для группового гороскопа
+        # Можно сделать один знак для всех или разные варианты
+        # Для простоты выберем случайный знак
+        sign_key = random.choice(list(ZODIAC_SIGNS.keys()))
+        sign_name = ZODIAC_SIGNS[sign_key]['ru']
+        
+        # Получаем гороскоп
+        horoscope = get_horoscope_from_api(sign_key) or get_backup_horoscope(sign_key)
+        
+        # Отправляем гороскоп с мемом
+        await send_horoscope_with_meme(
+            chat_id=chat_id,
+            horoscope=horoscope,
+            context=context,
+            sign_key=sign_key
+        )
+        
+        logger.info(f"✅ Автоматический гороскоп отправлен в чат {chat_id} ({sign_name})")
         
         # Планируем следующее приветствие
         await schedule_next_morning_greeting(context)
@@ -870,137 +881,6 @@ async def send_morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"❌ Ошибка отправки утреннего приветствия: {e}")
         await schedule_next_morning_greeting(context)
-
-async def handle_horoscope_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка выбора знака зодиака с отправкой мема"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    config = BotConfig()
-    
-    # Проверяем, может ли пользователь запросить гороскоп сегодня
-    can_request, error_message = can_user_request_horoscope(user_id, config)
-    
-    if not can_request:
-        await query.edit_message_text(
-            text=error_message,
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    # Показываем "загрузку"
-    await query.edit_message_text(
-        text="🔮 <i>Спрашиваю у звезд и ищу подходящий мем...</i>",
-        parse_mode=ParseMode.HTML
-    )
-    
-    try:
-        # Получаем выбранный знак из callback_data
-        sign_key = query.data.replace("horoscope_", "")
-        
-        if sign_key not in ZODIAC_SIGNS:
-            await query.edit_message_text(
-                text="❌ Ошибка: неверный знак зодиака",
-                parse_mode=ParseMode.HTML
-            )
-            return
-        
-        # Получаем гороскоп
-        horoscope = get_horoscope_from_api(sign_key) or get_backup_horoscope(sign_key)
-        
-        # Сохраняем выбор пользователя
-        config.set_user_zodiac(user_id, sign_key)
-        
-        # Записываем факт запроса гороскопа
-        record_horoscope_request(user_id, config)
-        
-        # Отправляем гороскоп с мемом
-        await send_horoscope_with_meme(
-            chat_id=user_id,
-            horoscope=horoscope,
-            context=context,
-            sign_key=sign_key,
-            original_message_id=query.message.message_id
-        )
-        
-        logger.info(f"✅ Гороскоп с мемом отправлен пользователю {query.from_user.username} ({ZODIAC_SIGNS[sign_key]['ru']})")
-        
-    except Exception as e:
-        logger.error(f"Ошибка обработки гороскопа: {e}")
-        await query.edit_message_text(
-            text="❌ Произошла ошибка при получении гороскопа. Попробуйте позже.",
-            parse_mode=ParseMode.HTML
-        )
-
-async def send_personal_horoscope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка персонального гороскопа по команде с мемом"""
-    try:
-        config = BotConfig()
-        user_id = update.effective_user.id
-        
-        # Проверяем, может ли пользователь запросить гороскоп сегодня
-        can_request, error_message = can_user_request_horoscope(user_id, config)
-        
-        if not can_request:
-            await update.message.reply_text(
-                error_message,
-                parse_mode=ParseMode.HTML
-            )
-            return
-        
-        # Проверяем, есть ли сохраненный знак у пользователя
-        saved_zodiac = config.get_user_zodiac(user_id)
-        
-        if saved_zodiac:
-            # Используем сохраненный знак
-            sign_key = saved_zodiac
-            sign_name = ZODIAC_SIGNS[saved_zodiac]['ru']
-        elif context.args:
-            # Пользователь указал знак в команде
-            sign_arg = context.args[0].lower()
-            if sign_arg in ZODIAC_SIGNS:
-                sign_key = sign_arg
-                sign_name = ZODIAC_SIGNS[sign_arg]['ru']
-                config.set_user_zodiac(user_id, sign_key)
-            else:
-                await update.message.reply_text(
-                    "❌ Неверный знак зодиака. Используйте один из:\n" +
-                    "\n".join([f"• {data['ru']}" for data in ZODIAC_SIGNS.values()])
-                )
-                return
-        else:
-            # Просим выбрать знак
-            keyboard = create_zodiac_keyboard()
-            await update.message.reply_text(
-                "✨ <b>Выбери свой знак зодиака:</b>",
-                reply_markup=keyboard,
-                parse_mode=ParseMode.HTML
-            )
-            return
-        
-        # Получаем гороскоп
-        horoscope = get_horoscope_from_api(sign_key) or get_backup_horoscope(sign_key)
-        
-        # Записываем факт запроса гороскопа
-        record_horoscope_request(user_id, config)
-        
-        # Отправляем гороскоп с мемом
-        await send_horoscope_with_meme(
-            chat_id=user_id,
-            horoscope=horoscope,
-            context=context,
-            sign_key=sign_key
-        )
-        
-        logger.info(f"✅ Персональный гороскоп с мемом отправлен {update.effective_user.username} ({sign_name})")
-        
-    except Exception as e:
-        logger.error(f"Ошибка отправки персонального гороскопа: {e}")
-        await update.message.reply_text(
-            "❌ Произошла ошибка. Попробуйте позже.",
-            parse_mode=ParseMode.HTML
-        )
 
 def calculate_next_morning_time() -> datetime:
     """Рассчитать время следующего утреннего приветствия"""
@@ -1515,25 +1395,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📅 <b>Утренние гороскопы:</b>\n"
         f"• Пн-Пт в 9:00 по МСК\n"
         f"• 3 разных приветствия\n"
-        f"• <i>💫 Только 1 предсказание в день!</i>\n"
-        f"• <i>🎭 + персональный мем к каждому гороскопу!</i>\n\n"
+        f"• <i>🎭 + персональный мем к каждому гороскопу!</i>\n"
+        f"• <i>🇷🇺 С приоритетом русских мемов</i>\n\n"
         f"📅 <b>Планёрки:</b>\n"
-        f"• Пн, Ср, Пт в 9:30 по МСК\n"
-        f"• Возможность отмены\n\n"
-        f"📅 <b>Отраслевые встречи:</b>\n"
-        f"• Вт в 12:00 по МСК\n"
-        f"• Обсуждение трендов и инсайтов\n"
-        f"• Нетворкинг с коллегами\n\n"
-        f"📅 <b>Исторические события:</b>\n"
-        f"• Пн-Пт в 10:00 по МСК\n\n"
-        f"🔧 <b>Основные команды:</b>\n"
-        "/horoscope - получить гороскоп с мемом 🎭\n"
-        "/eventnow - историческое событие сейчас\n"
-        "/info - информация о боте\n"
-        "/setchat - установить чат\n"
-        "/testindustry - тест отраслевой встречи\n\n"
-        f"✨ <b>Каждое утро в 9:00 бот присылает приветствие с предложением узнать гороскоп!</b>\n"
-        f"💫 <i>Но помни: только одно предсказание в день!</i>",
+        ,
         parse_mode=ParseMode.HTML
     )
 
@@ -1552,8 +1417,8 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Планёрки (9:30, Пн/Ср/Пт)\n"
         f"• Отраслевые встречи (12:00, Вт)\n"
         f"• Исторические события (10:00, Пн-Пт)\n\n"
-        f"💫 <i>Пользователи смогут получать только 1 гороскоп в день!</i>\n"
-        f"🎭 <i>Каждый гороскоп теперь с персональным мемом!</i>",
+        f"🎭 <i>Каждый гороскоп с персональным мемом!</i>\n"
+        f"🇷🇺 <i>Русские мемы имеют приоритет при поиске</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -1589,13 +1454,6 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Очищаем старые записи о запросах
     config.cleanup_old_requests()
     
-    # Статистика запросов гороскопов
-    today = now.strftime('%Y-%m-%d')
-    today_requests = 0
-    for request_data in config.horoscope_requests.values():
-        if request_data.get('last_request_date') == today:
-            today_requests += 1
-    
     # Проверяем настройку ссылок
     zoom_status = "✅" if ZOOM_LINK != DEFAULT_ZOOM_LINK else "❌"
     industry_zoom_status = "✅" if INDUSTRY_ZOOM_LINK != DEFAULT_ZOOM_LINK else "❌"
@@ -1618,14 +1476,12 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• События: {event_jobs}\n\n"
         f"🎭 <b>Мемы:</b>\n"
         f"• API: Meme API\n"
-        f"• Темы: по знакам зодиака\n"
+        f"• Приоритет: Русские мемы 🇷🇺\n"
         f"• Резерв: встроенные мемы\n\n"
-        f"💫 <b>Статистика гороскопов:</b>\n"
-        f"• Запросов сегодня: {today_requests}\n"
-        f"• Всего пользователей: {len(config.horoscope_requests)}\n\n"
         f"📅 <b>Сегодня:</b> {current_day}, {now.day} {MONTHS_RU[now.month]} {now.year}\n\n"
-        f"✨ <b>Используйте /horoscope для получения гороскопа с мемом! 🎭</b>\n"
-        f"💫 <i>Но помните: только одно предсказание в день!</i>",
+        f"✨ <b>Гороскопы приходят автоматически в 9:00 каждый будний день!</b>\n"
+        f"🎭 <i>Каждый гороскоп сопровождается тематическим мемом</i>\n"
+        f"🇷🇺 <i>Приоритет отдается русскоязычным мемам</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -1666,7 +1522,7 @@ async def test_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
         return
 
-    await update.message.reply_text("⏳ <b>Отправляю тестовое утреннее приветствие...</b>", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("⏳ <b>Отправляю тестовое утреннее приветствие и гороскоп...</b>", parse_mode=ParseMode.HTML)
     await send_morning_greeting(context)
 
 @restricted
@@ -1679,30 +1535,6 @@ async def test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text("⏳ <b>Отправляю тестовое уведомление об отраслевой встрече...</b>", parse_mode=ParseMode.HTML)
     await send_industry_reminder(context)
-
-@restricted
-async def test_meme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Тестовая отправка мема"""
-    config = BotConfig()
-    chat_id = config.chat_id or update.effective_chat.id
-    
-    await update.message.reply_text("⏳ <b>Ищу тестовый мем...</b>", parse_mode=ParseMode.HTML)
-    
-    try:
-        meme = get_zodiac_meme('aries') or get_backup_meme()
-        
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=meme['url'],
-            caption=f"🎭 <b>Тестовый мем:</b>\n<i>«{html.escape(meme['title'])}»</i>\n\n📁 r/{meme['subreddit']}",
-            parse_mode=ParseMode.HTML
-        )
-        
-        logger.info(f"Тестовый мем отправлен: {meme['title']}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка отправки тестового мема: {e}")
-        await update.message.reply_text("❌ Ошибка при получении мема")
 
 def calculate_next_reminder() -> datetime:
     """Рассчитать время следующего напоминания о планёрке"""
@@ -1789,19 +1621,17 @@ def main() -> None:
             ],
         )
 
-        # Основные обработчики
+        # Основные обработчики (убрали /horoscope)
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("setchat", set_chat))
         application.add_handler(CommandHandler("info", show_info))
-        application.add_handler(CommandHandler("horoscope", send_personal_horoscope))
         application.add_handler(CommandHandler("eventnow", send_event_now))
         application.add_handler(CommandHandler("testmorning", test_morning))
         application.add_handler(CommandHandler("testindustry", test_industry))
-        application.add_handler(CommandHandler("testmeme", test_meme))
         application.add_handler(CommandHandler("jobs", list_jobs))
 
-        # Обработчики callback (гороскопы)
-        application.add_handler(CallbackQueryHandler(handle_horoscope_callback, pattern="^horoscope_"))
+        # Убрали обработчики callback для гороскопов
+        # application.add_handler(CallbackQueryHandler(handle_horoscope_callback, pattern="^horoscope_"))
 
         # Добавляем ConversationHandler
         application.add_handler(conv_handler)
@@ -1836,7 +1666,8 @@ def main() -> None:
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"✨ Утренние гороскопы: Пн-Пт в 9:00 по МСК")
         logger.info(f"🎭 Каждый гороскоп теперь с персональным мемом!")
-        logger.info(f"💫 Ограничение: 1 гороскоп в день на пользователя")
+        logger.info(f"🇷🇺 Приоритет русских мемов при поиске")
+        logger.info(f"🚫 Нет ручных запросов гороскопов - только автоматические!")
         logger.info(f"📅 Планёрки: Пн/Ср/Пт в 9:30 по МСК")
         logger.info(f"🏢 Отраслевые встречи: Вт в 12:00 по МСК")
         logger.info(f"📜 Исторические события: Пн-Пт в 10:00 по МСК")
