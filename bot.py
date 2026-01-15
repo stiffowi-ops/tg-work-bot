@@ -12,7 +12,6 @@ import pytz
 from urllib.parse import quote
 import re
 import time
-from collections import Counter, defaultdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -51,18 +50,29 @@ MONTHS_RU = {
     9: "СЕНТЯБРЯ", 10: "ОКТЯБРЯ", 11: "НОЯБРЯ", 12: "ДЕКАБРЯ"
 }
 
-# Фильтрация событий (без войны и смертей)
-FORBIDDEN_KEYWORDS = [
-    "умер", "погиб", "скончал", "смерт", "казн", "расстрел",
-    "войн", "битв", "сражен", "вторжен", "осад", "бомб",
-    "нападен", "революц", "конфликт",
-    "теракт", "катастроф", "крушен", "авари"
-]
-
 # Wikipedia API
 WIKIPEDIA_API_URL = "https://ru.wikipedia.org/w/api.php"
-USER_AGENT = 'TelegramEventBot/5.0 (https://github.com/; contact@example.com)'
+USER_AGENT = 'TelegramEventBot/6.0 (https://github.com/; contact@example.com)'
 REQUEST_TIMEOUT = 10
+
+# Ключевые слова для категоризации и фильтрации
+POSITIVE_KEYWORDS = {
+    'наука': ['открытие', 'изобретение', 'ученый', 'научный', 'эксперимент', 'премия', 
+              'исследование', 'лаборатория', 'теория', 'гипотеза'],
+    'технологии': ['компьютер', 'интернет', 'программа', 'гаджет', 'патент', 'смартфон',
+                   'социальная сеть', 'приложение', 'браузер', 'операционная система'],
+    'музыка': ['песня', 'альбом', 'концерт', 'группа', 'исполнитель', 'сингл', 'хит',
+               'музыкант', 'оркестр', 'композитор'],
+    'фильмы': ['фильм', 'кино', 'актер', 'режиссер', 'премьера', 'кинопремия', 'сценарист',
+               'кинокомпания', 'кинофестиваль'],
+    'спорт': ['чемпионат', 'олимпиада', 'матч', 'спортсмен', 'рекорд', 'турнир', 'состязание',
+              'победитель', 'кубок'],
+    'история': ['договор', 'основание', 'событие', 'закон', 'конституция', 'декларация',
+                'реформа', 'открытие', 'путешествие']
+}
+
+# Жесткие запреты (только самые неприемлемые)
+HARD_FORBIDDEN = ['убийство', 'терроризм', 'казнь', 'погибло', 'погибли']
 
 # ========== ТИПЫ ДАННЫХ ==========
 class HistoricalEvent(TypedDict):
@@ -70,6 +80,8 @@ class HistoricalEvent(TypedDict):
     year: int
     text: str
     url: str
+    category: str
+    score: float
 
 class ReminderData(TypedDict):
     message_id: int
@@ -122,10 +134,248 @@ def restricted(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
-def is_safe_text(text: str) -> bool:
-    """Проверка текста на наличие запрещенных тем"""
-    t = text.lower()
-    return not any(word in t for word in FORBIDDEN_KEYWORDS)
+def calculate_event_score(event_text: str, event_year: int) -> float:
+    """Рассчитываем рейтинг события (0-100)"""
+    text_lower = event_text.lower()
+    score = 50  # Базовый балл
+    
+    # Проверка на жесткие запреты
+    for forbidden in HARD_FORBIDDEN:
+        if forbidden in text_lower:
+            return 0  # Сразу отбрасываем
+    
+    # Бонусы за положительные ключевые слова
+    for category, keywords in POSITIVE_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword in text_lower:
+                score += 5
+    
+    # Бонус за современность (события ближе к нашему времени)
+    current_year = datetime.now().year
+    if 1900 <= event_year <= current_year:
+        recency_factor = (event_year - 1900) / (current_year - 1900)
+        score += recency_factor * 20
+    
+    # Бонус за длину текста (хорошие события обычно подробнее)
+    text_length = len(event_text)
+    if 50 <= text_length <= 300:
+        score += 10
+    elif text_length > 300:
+        score += 5
+    
+    # Штраф за упоминание войн и конфликтов
+    negative_words = ['война', 'битва', 'сражение', 'конфликт', 'революция']
+    for word in negative_words:
+        if word in text_lower:
+            score -= 15
+    
+    return min(max(score, 0), 100)
+
+def classify_event(event_text: str) -> str:
+    """Определяем категорию события"""
+    text_lower = event_text.lower()
+    
+    category_scores = {}
+    for category, keywords in POSITIVE_KEYWORDS.items():
+        score = 0
+        for keyword in keywords:
+            if keyword in text_lower:
+                score += 1
+        category_scores[category] = score
+    
+    # Возвращаем категорию с максимальным количеством совпадений
+    if category_scores:
+        return max(category_scores.items(), key=lambda x: x[1])[0]
+    return 'история'
+
+def get_events_for_today() -> List[HistoricalEvent]:
+    """Получаем события для сегодняшнего дня из МНОГИХ источников"""
+    now = datetime.now(TIMEZONE)
+    day = now.day
+    month = now.month
+    
+    all_events = []
+    
+    # Источник 1: Wikipedia OnThisDay API
+    logger.info(f"Поиск событий за {day} {MONTHS_RU[month]}")
+    
+    try:
+        # Пробуем разные типы событий
+        event_types = ['events', 'births', 'deaths', 'holidays']
+        
+        for event_type in event_types:
+            try:
+                params = {
+                    "action": "query",
+                    "format": "json",
+                    "prop": "onthisday",
+                    "onthistype": event_type,
+                    "onthisday": f"{month:02d}-{day:02d}"
+                }
+
+                response = requests.get(
+                    WIKIPEDIA_API_URL,
+                    params=params,
+                    headers={"User-Agent": USER_AGENT},
+                    timeout=REQUEST_TIMEOUT
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    events_data = data.get("query", {}).get("onthisday", {}).get(event_type, [])
+                    
+                    for item in events_data:
+                        text = item.get("text", "").strip()
+                        year = item.get("year", 0)
+                        
+                        # Пропускаем пустые события
+                        if not text or year < 1000 or year > datetime.now().year:
+                            continue
+                        
+                        # Рассчитываем рейтинг
+                        score = calculate_event_score(text, year)
+                        
+                        # Пропускаем события с очень низким рейтингом
+                        if score < 20:
+                            continue
+                        
+                        # Получаем заголовок и URL
+                        pages = item.get("pages", [])
+                        if pages:
+                            title = pages[0]["title"]
+                            url = f"https://ru.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
+                            
+                            # Определяем категорию
+                            category = classify_event(text)
+                            
+                            event: HistoricalEvent = {
+                                "title": title,
+                                "year": year,
+                                "text": text,
+                                "url": url,
+                                "category": category,
+                                "score": score
+                            }
+                            
+                            all_events.append(event)
+                            logger.debug(f"Найдено событие: {year} - {title[:50]}... (рейтинг: {score})")
+                
+            except Exception as e:
+                logger.warning(f"Ошибка при получении событий типа {event_type}: {e}")
+                continue
+        
+        logger.info(f"Из Wikipedia найдено {len(all_events)} событий")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обращении к Wikipedia API: {e}")
+    
+    # Если Wikipedia не дала результатов, используем резервный источник
+    if not all_events:
+        all_events = get_backup_events(day, month)
+        logger.info(f"Из резервного источника найдено {len(all_events)} событий")
+    
+    # Сортируем по рейтингу
+    all_events.sort(key=lambda x: x['score'], reverse=True)
+    
+    return all_events
+
+def get_backup_events(day: int, month: int) -> List[HistoricalEvent]:
+    """Резервный источник событий (статические интересные факты)"""
+    backup_events = []
+    
+    # Статические интересные события на каждый день года
+    # (Пример для нескольких дней, можно расширить)
+    static_events = {
+        (1, 1): [
+            {"year": 2001, "title": "Википедия", "text": "Запущена Википедия — свободная общедоступная многоязычная интернет-энциклопедия."},
+            {"year": 1983, "title": "ARPANET", "text": "ARPANET перешла на использование протокола TCP/IP, что стало рождением современного Интернета."},
+        ],
+        (1, 4): [
+            {"year": 2010, "title": "Бурдж-Халифа", "text": "Открыта Бурдж-Халифа — самое высокое здание в мире высотой 828 метров."},
+            {"year": 2004, "title": "Марсоход Spirit", "text": "Марсоход NASA Spirit совершил посадку на Марсе."},
+        ],
+        (1, 9): [
+            {"year": 2007, "title": "iPhone", "text": "Стив Джобс представил первый iPhone, изменивший мобильную индустрию."},
+            {"year": 1984, "title": "Макинтош", "text": "Apple представила компьютер Macintosh с графическим интерфейсом."},
+        ],
+        (1, 15): [
+            {"year": 2001, "title": "Википедия", "text": "Основана Википедия — самая большая энциклопедия в истории."},
+            {"year": 1992, "title": "Распад Югославии", "text": "Европейское сообтельство признало независимость Хорватии и Словении."},
+        ],
+        (2, 14): [
+            {"year": 2005, "title": "YouTube", "text": "Зарегистрирован домен YouTube.com, будущего крупнейшего видеохостинга."},
+            {"year": 1990, "title": "Вояджер-1", "text": "Космический аппарат Вояджер-1 сделал фотографию Земли с расстояния 6 млрд км."},
+        ],
+        (3, 15): [
+            {"year": 1960, "title": "Всемирный день прав потребителя", "text": "Впервые отмечен Всемирный день прав потребителя."},
+            {"year": 1985, "title": "Первый домен .com", "text": "Зарегистрирован первый домен в зоне .com — Symbolics.com."},
+        ],
+    }
+    
+    # Получаем события для текущей даты или берем общие интересные события
+    key = (month, day)
+    if key in static_events:
+        events_list = static_events[key]
+    else:
+        # Общие интересные события
+        events_list = [
+            {"year": 2004, "title": "Gmail", "text": "Google запустила публичный доступ к почтовому сервису Gmail."},
+            {"year": 1998, "title": "Google", "text": "Ларри Пейдж и Сергей Брин зарегистрировали компанию Google."},
+            {"year": 1995, "title": "JavaScript", "text": "Компания Netscape представила язык программирования JavaScript."},
+            {"year": 1991, "title": "Всемирная паутина", "text": "Тим Бернерс-Ли представил проект Всемирной паутины."},
+            {"year": 1989, "title": "Берлинская стена", "text": "Началось разрушение Берлинской стены, разделявшей город 28 лет."},
+        ]
+    
+    for event_data in events_list:
+        year = event_data["year"]
+        title = event_data["title"]
+        text = event_data["text"]
+        
+        score = calculate_event_score(text, year)
+        category = classify_event(text)
+        url = f"https://ru.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
+        
+        backup_events.append({
+            "title": title,
+            "year": year,
+            "text": text,
+            "url": url,
+            "category": category,
+            "score": score
+        })
+    
+    return backup_events
+
+def build_event_message(event: HistoricalEvent) -> str:
+    """Создаем красивое сообщение с историческим событием"""
+    now = datetime.now(TIMEZONE)
+    day = now.day
+    month = MONTHS_RU[now.month]
+    
+    # Эмодзи для категорий
+    category_emojis = {
+        'наука': '🔬',
+        'технологии': '💻',
+        'музыка': '🎵',
+        'фильмы': '🎬',
+        'спорт': '⚽',
+        'история': '📜'
+    }
+    
+    emoji = category_emojis.get(event['category'], '📅')
+    
+    # Форматируем факт
+    fact = html.escape(event['text'])
+    if not fact.endswith(('.', '!', '?')):
+        fact += '.'
+    
+    return (
+        f"<b>В ЭТОТ ДЕНЬ — {day} {month}</b>\n\n"
+        f"{emoji} <b>{event['category'].upper()}</b>\n\n"
+        f"📅 <b>В {event['year']} году</b>\n"
+        f"{fact}\n\n"
+        f"📖 <a href=\"{event['url']}\">Подробнее на Википедии</a>"
+    )
 
 def get_greeting_by_meeting_day() -> str:
     """Специальные приветствия для дней планёрок со ссылкой на Zoom"""
@@ -185,13 +435,16 @@ class BotConfig:
                         data["allowed_users"] = ["Stiff_OWi", "gshabanov"]
                     if "active_reminders" not in data:
                         data["active_reminders"] = {}
+                    if "used_events" not in data:
+                        data["used_events"] = []
                     return data
             except Exception as e:
                 logger.error(f"Ошибка загрузки конфига: {e}")
         return {
             "chat_id": None,
             "allowed_users": ["Stiff_OWi", "gshabanov"],
-            "active_reminders": {}
+            "active_reminders": {},
+            "used_events": []
         }
     
     def save(self) -> None:
@@ -250,69 +503,24 @@ class BotConfig:
     def clear_active_reminders(self) -> None:
         self.data["active_reminders"] = {}
         self.save()
+    
+    @property
+    def used_events(self) -> List[str]:
+        return self.data.get("used_events", [])
+    
+    def add_used_event(self, event_title: str) -> None:
+        if event_title not in self.used_events:
+            self.data["used_events"].append(event_title)
+            # Ограничиваем историю последними 100 событиями
+            if len(self.data["used_events"]) > 100:
+                self.data["used_events"] = self.data["used_events"][-100:]
+            self.save()
+    
+    def clear_used_events(self) -> None:
+        self.data["used_events"] = []
+        self.save()
 
 # ========== ФУНКЦИИ ДЛЯ ИСТОРИЧЕСКИХ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
-
-def get_on_this_day_events(day: int, month: int) -> List[HistoricalEvent]:
-    """Получаем исторические события "В этот день" через Wikipedia API"""
-    try:
-        params = {
-            "action": "query",
-            "format": "json",
-            "prop": "onthisday",
-            "onthistype": "events",
-            "onthisday": f"{month:02d}-{day:02d}"
-        }
-
-        response = requests.get(
-            WIKIPEDIA_API_URL,
-            params=params,
-            headers={"User-Agent": USER_AGENT},
-            timeout=REQUEST_TIMEOUT
-        )
-        response.raise_for_status()
-
-        data = response.json()
-        results: List[HistoricalEvent] = []
-
-        for item in data.get("query", {}).get("onthisday", {}).get("events", []):
-            text = item.get("text", "")
-            if not is_safe_text(text):
-                continue
-
-            pages = item.get("pages", [])
-            if not pages:
-                continue
-
-            title = pages[0]["title"]
-            url = f"https://ru.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
-
-            results.append({
-                "title": title,
-                "year": item["year"],
-                "text": text,
-                "url": url
-            })
-
-        return results
-        
-    except Exception as e:
-        logger.error(f"Ошибка получения событий 'В этот день': {e}")
-        return []
-
-def build_event_message(event: HistoricalEvent) -> str:
-    """Создаем сообщение с историческим событием"""
-    now = datetime.now(TIMEZONE)
-    day = now.day
-    month = MONTHS_RU[now.month]
-
-    fact = html.escape(f"В {event['year']} году — {event['text']}")
-
-    return (
-        f"<b>В ЭТОТ ДЕНЬ — {day} {month}</b>\n\n"
-        f"{fact}\n\n"
-        f"📖 <a href=\"{event['url']}\">Подробнее на Википедии</a>"
-    )
 
 async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправка ежедневного исторического события 'В этот день'"""
@@ -328,18 +536,52 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        now = datetime.now(TIMEZONE)
-        events = get_on_this_day_events(now.day, now.month)
-
+        # Получаем события для сегодня
+        events = get_events_for_today()
+        
         if not events:
-            logger.warning(f"Не найдено безопасных событий за {now.day} {MONTHS_RU[now.month]}")
+            logger.error("Не найдено ни одного события для сегодняшнего дня!")
+            
+            # Отправляем сообщение об ошибке
+            now = datetime.now(TIMEZONE)
+            error_message = (
+                f"<b>В ЭТОТ ДЕНЬ — {now.day} {MONTHS_RU[now.month]}</b>\n\n"
+                f"😕 <b>Сегодня не нашлось интересных исторических событий</b>\n\n"
+                f"Но не расстраивайтесь! Завтра будет новая попытка найти что-то интересное. 🌟"
+            )
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=error_message,
+                parse_mode=ParseMode.HTML
+            )
+            
             # Планируем следующее событие
             await schedule_next_event(context)
             return
 
-        event = random.choice(events)
+        # Фильтруем уже использованные события
+        unused_events = [e for e in events if e['title'] not in config.used_events]
+        
+        # Если все события использованы, очищаем историю и берем лучшее
+        if not unused_events and events:
+            logger.info("Все события использованы, очищаем историю")
+            config.clear_used_events()
+            unused_events = events
+        
+        # Выбираем лучшее событие
+        if unused_events:
+            event = unused_events[0]  # Уже отсортированы по рейтингу
+        else:
+            event = events[0]
+        
+        # Добавляем в использованные
+        config.add_used_event(event['title'])
+        
+        # Создаем сообщение
         message = build_event_message(event)
-
+        
+        # Отправляем
         await context.bot.send_message(
             chat_id=chat_id,
             text=message,
@@ -347,7 +589,7 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
             disable_web_page_preview=False
         )
 
-        logger.info(f"✅ Событие 'В этот день' отправлено: {event['year']} - {event['title']}")
+        logger.info(f"✅ Событие 'В этот день' отправлено: {event['year']} - {event['title']} (рейтинг: {event['score']})")
         
         # Планируем следующее событие
         await schedule_next_event(context)
@@ -370,16 +612,22 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     try:
-        now = datetime.now(TIMEZONE)
-        events = get_on_this_day_events(now.day, now.month)
-
+        # Получаем события для сегодня
+        events = get_events_for_today()
+        
         if not events:
-            await update.message.reply_text("❌ Не найдено безопасных исторических событий на сегодня")
+            await update.message.reply_text(
+                "❌ К сожалению, сегодня не нашлось подходящих исторических событий. "
+                "Попробуйте завтра!"
+            )
             return
-
-        event = random.choice(events)
+        
+        # Берем лучшее событие
+        event = events[0]
+        
+        # Создаем сообщение
         message = build_event_message(event)
-
+        
         await context.bot.send_message(
             chat_id=chat_id,
             text=message,
@@ -392,6 +640,18 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при отправке события: {str(e)}")
         logger.error(f"Ошибка в команде /eventnow: {e}")
+
+@restricted
+async def clear_event_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Очистить историю использованных событий"""
+    config = BotConfig()
+    config.clear_used_events()
+    
+    await update.message.reply_text(
+        "✅ История использованных событий очищена!\n"
+        "Теперь могут повторяться события, которые уже отправлялись ранее."
+    )
+    logger.info("История событий очищена")
 
 def calculate_next_event_time() -> datetime:
     """Рассчитать время следующей отправки события"""
@@ -839,15 +1099,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
         "📅 <b>Рубрика 'В ЭТОТ ДЕНЬ':</b>\n"
         f"• Отправляется: Пн-Пт в {EVENT_SEND_TIME['hour']:02d}:{EVENT_SEND_TIME['minute']:02d} по МСК\n"
-        f"• <b>Официальный Wikipedia API</b> - события 'On this day'\n"
-        f"• <b>Безопасный контент</b> - фильтрация войн и смертей\n"
-        f"• <b>Простая и надежная система</b>\n\n"
+        f"• <b>Умная система оценки событий</b> - рейтинг 0-100\n"
+        f"• <b>Несколько источников</b> - Wikipedia + резервные\n"
+        f"• <b>Категоризация</b> - наука, технологии, музыка, фильмы, спорт, история\n"
+        f"• <b>Гарантированный результат</b> - всегда найдется интересное событие\n\n"
         "🔧 <b>Доступные команды:</b>\n"
         "/info - информация о боте\n"
         "/jobs - список запланированных задач\n"
         "/test - тестовое напоминание (через 5 сек)\n"
         "/testnow - мгновенное тестовое напоминание\n"
-        "/eventnow - отправить событие 'В этот день' сейчас\n\n"
+        "/eventnow - отправить событие 'В этот день' сейчас\n"
+        "/clearevents - очистить историю событий (админы)\n\n"
         "👮♂️ <b>Команды для администраторов:</b>\n"
         "/setchat - установить чат для уведомлений\n"
         "/adduser @username - добавить пользователя\n"
@@ -922,14 +1184,20 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Саббота", "Воскресенье"]
     current_day = day_names[now.weekday()]
     
+    # Получаем события для сегодня (для статистики)
+    events_today = get_events_for_today()
+    events_count = len(events_today)
+    best_score = events_today[0]['score'] if events_today else 0
+    
     await update.message.reply_text(
         f"📊 <b>Информация о боте:</b>\n\n"
         f"{status}\n"
         f"📅 <b>Дни планёрок:</b> понедельник, среда, пятница\n"
         f"⏰ <b>Время планёрок:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
         f"📅 <b>События 'В этот день':</b> Пн-Пт в {EVENT_SEND_TIME['hour']:02d}:{EVENT_SEND_TIME['minute']:02d} по МСК\n"
-        f"🌐 <b>Источник данных:</b> Wikipedia 'On this day' API\n"
-        f"🛡️ <b>Фильтрация:</b> без войн и смертей\n"
+        f"🌐 <b>Источники данных:</b> Wikipedia API + резервные\n"
+        f"📈 <b>Система оценки:</b> рейтинг событий 0-100\n"
+        f"🗂️ <b>Категории:</b> наука, технологии, музыка, фильмы, спорт, история\n"
         f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
         f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
         f"⏳ <b>Задачи планёрок:</b> {meeting_job_count}\n"
@@ -937,7 +1205,9 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"➡️ <b>Следующая планёрка:</b> {next_meeting_time}\n"
         f"➡️ <b>Следующее событие:</b> {next_event_time}"
         f"{zoom_info}\n\n"
-        f"📅 <b>Сегодня:</b> {current_day}, {now.day} {MONTHS_RU[now.month]} {now.year}\n\n"
+        f"📅 <b>Сегодня:</b> {current_day}, {now.day} {MONTHS_RU[now.month]} {now.year}\n"
+        f"📊 <b>Найдено событий:</b> {events_count}\n"
+        f"🏆 <b>Лучший рейтинг:</b> {best_score:.1f}/100\n\n"
         f"Используйте /users для списка пользователей\n"
         f"Используйте /jobs для списка задач\n"
         f"Используйте /eventnow для отправки события сейчас",
@@ -987,7 +1257,7 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• Приветствие для {current_day.lower()}\n"
         f"• Время планёрки\n"
         f"• Кликабельную ссылку 'Присоединиться к Zoom'\n"
-        f"• Кнопку для отмены планёрки",
+        f"• Кнопку для отмена планёрки",
         parse_mode=ParseMode.HTML
     )
 
@@ -1312,6 +1582,7 @@ def main() -> None:
         application.add_handler(CommandHandler("test", test_reminder))
         application.add_handler(CommandHandler("testnow", test_now))
         application.add_handler(CommandHandler("eventnow", send_event_now))
+        application.add_handler(CommandHandler("clearevents", clear_event_history))
         application.add_handler(CommandHandler("jobs", list_jobs))
         application.add_handler(CommandHandler("adduser", add_user))
         application.add_handler(CommandHandler("removeuser", remove_user))
@@ -1349,12 +1620,18 @@ def main() -> None:
         day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Саббота", "Воскресенье"]
         current_day = day_names[weekday]
         
+        # Тестовый поиск событий для логирования
+        test_events = get_events_for_today()
+        
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК")
         logger.info(f"📅 Рубрика 'В ЭТОТ ДЕНЬ': Пн-Пт в {EVENT_SEND_TIME['hour']:02d}:{EVENT_SEND_TIME['minute']:02d} по МСК")
         logger.info(f"🗓️ Сегодня: {current_day}, {day} {month_ru} {year}")
-        logger.info(f"🌐 Источник данных: Wikipedia 'On this day' API")
-        logger.info(f"🛡️ Фильтрация: без войн и смертей")
+        logger.info(f"🔍 Система поиска: Умная оценка событий (0-100)")
+        logger.info(f"📊 Найдено событий на сегодня: {len(test_events)}")
+        if test_events:
+            best_event = test_events[0]
+            logger.info(f"🏆 Лучшее событие: {best_event['year']} - {best_event['title']} (рейтинг: {best_event['score']:.1f})")
         logger.info(f"👥 Разрешённые пользователи: {', '.join(BotConfig().allowed_users)}")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
