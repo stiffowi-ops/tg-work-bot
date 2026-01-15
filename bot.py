@@ -152,6 +152,39 @@ def restricted(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
+def can_user_request_horoscope(user_id: int, config: 'BotConfig') -> Tuple[bool, Optional[str]]:
+    """
+    Проверяет, может ли пользователь запросить гороскоп сегодня.
+    Возвращает (может_ли_запросить, сообщение_об_ошибке)
+    """
+    today = datetime.now(TIMEZONE).strftime('%Y-%m-%d')
+    horoscope_requests = config.horoscope_requests
+    
+    # Проверяем, делал ли пользователь запрос сегодня
+    if str(user_id) in horoscope_requests:
+        last_request_date = horoscope_requests[str(user_id)].get('last_request_date')
+        
+        if last_request_date == today:
+            # Получаем время последнего запроса
+            last_request_time_str = horoscope_requests[str(user_id)].get('last_request_time', '00:00')
+            
+            # Формируем сообщение о том, когда можно будет сделать следующий запрос
+            tomorrow = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime('%d.%m.%Y')
+            return False, f"😔 Увы, сегодня звёзды свою работу сделали! Подмигивание 🤫\n\nЗагляни за новым предсказанием завтра, {tomorrow} ✨"
+    
+    return True, None
+
+def record_horoscope_request(user_id: int, config: 'BotConfig') -> None:
+    """Записывает факт запроса гороскопа пользователем на сегодня"""
+    today = datetime.now(TIMEZONE)
+    
+    config.horoscope_requests[str(user_id)] = {
+        'last_request_date': today.strftime('%Y-%m-%d'),
+        'last_request_time': today.strftime('%H:%M'),
+        'username': f"user_{user_id}"
+    }
+    config.save()
+
 def calculate_event_score(event_text: str, event_year: int) -> float:
     """Рассчитываем рейтинг события (0-100)"""
     text_lower = event_text.lower()
@@ -523,6 +556,8 @@ class BotConfig:
                         data["active_reminders"] = {}
                     if "user_zodiacs" not in data:
                         data["user_zodiacs"] = {}
+                    if "horoscope_requests" not in data:
+                        data["horoscope_requests"] = {}
                     return data
             except Exception as e:
                 logger.error(f"Ошибка загрузки конфига: {e}")
@@ -530,7 +565,8 @@ class BotConfig:
             "chat_id": None,
             "allowed_users": ["Stiff_OWi", "gshabanov"],
             "active_reminders": {},
-            "user_zodiacs": {}
+            "user_zodiacs": {},
+            "horoscope_requests": {}
         }
     
     def save(self) -> None:
@@ -601,6 +637,24 @@ class BotConfig:
     
     def get_user_zodiac(self, user_id: int) -> Optional[str]:
         return self.data.get("user_zodiacs", {}).get(str(user_id))
+    
+    @property
+    def horoscope_requests(self) -> Dict[str, Dict[str, str]]:
+        """Словарь user_id -> информация о последнем запросе гороскопа"""
+        return self.data.get("horoscope_requests", {})
+    
+    def cleanup_old_requests(self) -> None:
+        """Очищает старые записи о запросах (старше 7 дней)"""
+        today = datetime.now(TIMEZONE)
+        week_ago = (today - timedelta(days=7)).strftime('%Y-%m-%d')
+        
+        updated_requests = {}
+        for user_id, request_data in self.horoscope_requests.items():
+            if request_data.get('last_request_date', '') >= week_ago:
+                updated_requests[user_id] = request_data
+        
+        self.data["horoscope_requests"] = updated_requests
+        self.save()
 
 # ========== ФУНКЦИИ ДЛЯ ГОРОСКОПОВ ==========
 
@@ -643,6 +697,19 @@ async def handle_horoscope_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await query.answer()
     
+    user_id = query.from_user.id
+    config = BotConfig()
+    
+    # Проверяем, может ли пользователь запросить гороскоп сегодня
+    can_request, error_message = can_user_request_horoscope(user_id, config)
+    
+    if not can_request:
+        await query.edit_message_text(
+            text=error_message,
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
     # Показываем "загрузку"
     await query.edit_message_text(
         text="🔮 <i>Спрашиваю у звезд...</i>",
@@ -664,8 +731,10 @@ async def handle_horoscope_callback(update: Update, context: ContextTypes.DEFAUL
         horoscope = get_horoscope_from_api(sign_key) or get_backup_horoscope(sign_key)
         
         # Сохраняем выбор пользователя
-        config = BotConfig()
-        config.set_user_zodiac(query.from_user.id, sign_key)
+        config.set_user_zodiac(user_id, sign_key)
+        
+        # Записываем факт запроса гороскопа
+        record_horoscope_request(user_id, config)
         
         # Создаем сообщение с гороскопом
         message = build_horoscope_message(horoscope)
@@ -690,6 +759,16 @@ async def send_personal_horoscope(update: Update, context: ContextTypes.DEFAULT_
     try:
         config = BotConfig()
         user_id = update.effective_user.id
+        
+        # Проверяем, может ли пользователь запросить гороскоп сегодня
+        can_request, error_message = can_user_request_horoscope(user_id, config)
+        
+        if not can_request:
+            await update.message.reply_text(
+                error_message,
+                parse_mode=ParseMode.HTML
+            )
+            return
         
         # Проверяем, есть ли сохраненный знак у пользователя
         saved_zodiac = config.get_user_zodiac(user_id)
@@ -724,6 +803,9 @@ async def send_personal_horoscope(update: Update, context: ContextTypes.DEFAULT_
         # Получаем гороскоп
         horoscope = get_horoscope_from_api(sign_key) or get_backup_horoscope(sign_key)
         message = build_horoscope_message(horoscope)
+        
+        # Записываем факт запроса гороскопа
+        record_horoscope_request(user_id, config)
         
         await update.message.reply_text(
             message,
@@ -1080,7 +1162,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📅 <b>Утренние гороскопы:</b>\n"
         f"• Пн-Пт в 9:00 по МСК\n"
         f"• 3 разных приветствия\n"
-        f"• Персональные предсказания\n\n"
+        f"• <i>💫 Только 1 предсказание в день!</i>\n\n"
         f"📅 <b>Планёрки:</b>\n"
         f"• Пн, Ср, Пт в 9:30 по МСК\n"
         f"• Возможность отмены\n\n"
@@ -1091,7 +1173,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/eventnow - историческое событие сейчас\n"
         "/info - информация о боте\n"
         "/setchat - установить чат\n\n"
-        f"✨ <b>Каждое утро в 9:00 бот присылает приветствие с предложением узнать гороскоп!</b>",
+        f"✨ <b>Каждое утро в 9:00 бот присылает приветствие с предложением узнать гороскоп!</b>\n"
+        f"💫 <i>Но помни: только одно предсказание в день!</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -1108,7 +1191,8 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Теперь бот будет отправлять:\n"
         f"• Утренние гороскопы (9:00, Пн-Пт)\n"
         f"• Напоминания о планёрках (9:30, Пн/Ср/Пт)\n"
-        f"• Исторические события (10:00, Пн-Пт)",
+        f"• Исторические события (10:00, Пн-Пт)\n\n"
+        f"💫 <i>Пользователи смогут получать только 1 гороскоп в день!</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -1139,6 +1223,16 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     is_morning_day = weekday in MORNING_DAYS
     is_meeting_day = weekday in MEETING_DAYS
     
+    # Очищаем старые записи о запросах
+    config.cleanup_old_requests()
+    
+    # Статистика запросов гороскопов
+    today = now.strftime('%Y-%m-%d')
+    today_requests = 0
+    for request_data in config.horoscope_requests.values():
+        if request_data.get('last_request_date') == today:
+            today_requests += 1
+    
     await update.message.reply_text(
         f"📊 <b>Информация о боте:</b>\n\n"
         f"{status}\n\n"
@@ -1150,8 +1244,12 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Гороскопы: {morning_jobs}\n"
         f"• Планёрки: {meeting_jobs}\n"
         f"• События: {event_jobs}\n\n"
+        f"💫 <b>Статистика гороскопов:</b>\n"
+        f"• Запросов сегодня: {today_requests}\n"
+        f"• Всего пользователей: {len(config.horoscope_requests)}\n\n"
         f"📅 <b>Сегодня:</b> {current_day}, {now.day} {MONTHS_RU[now.month]} {now.year}\n\n"
-        f"✨ <b>Используйте /horoscope для получения гороскопа!</b>",
+        f"✨ <b>Используйте /horoscope для получения гороскопа!</b>\n"
+        f"💫 <i>Но помните: только одно предсказание в день!</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -1292,10 +1390,15 @@ def main() -> None:
             7
         )
 
+        # Очистка старых записей при запуске
+        config = BotConfig()
+        config.cleanup_old_requests()
+        
         # Логирование при запуске
         now = datetime.now(TIMEZONE)
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"✨ Утренние гороскопы: Пн-Пт в 9:00 по МСК")
+        logger.info(f"💫 Ограничение: 1 гороскоп в день на пользователя")
         logger.info(f"📅 Планёрки: Пн/Ср/Пт в 9:30 по МСК")
         logger.info(f"📜 Исторические события: Пн-Пт в 10:00 по МСК")
         logger.info(f"🗓️ Сегодня: {now.strftime('%d.%m.%Y')}")
