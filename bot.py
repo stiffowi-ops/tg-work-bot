@@ -30,6 +30,7 @@ from telegram.ext import (
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEFAULT_ZOOM_LINK = "https://us04web.zoom.us/j/1234567890?pwd=example"
 ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", DEFAULT_ZOOM_LINK)
+INDUSTRY_ZOOM_LINK = os.getenv("INDUSTRY_MEETING_LINK", DEFAULT_ZOOM_LINK)
 CONFIG_FILE = "bot_config.json"
 
 # Время планёрки (9:30 по Москве)
@@ -46,6 +47,10 @@ MORNING_DAYS = [0, 1, 2, 3, 4]  # Пн-Пт
 # Время отправки исторических событий "В этот день" (10:00 по МСК, Пн-Пт)
 EVENT_SEND_TIME = {"hour": 10, "minute": 0}
 EVENT_DAYS = [0, 1, 2, 3, 4]  # Пн-Пт
+
+# Время отраслевой встречи (вторник 12:00 по МСК)
+INDUSTRY_MEETING_TIME = {"hour": 12, "minute": 0}
+INDUSTRY_MEETING_DAY = [1]  # Вторник
 
 # Русские названия месяцев
 MONTHS_RU = {
@@ -75,6 +80,13 @@ MORNING_GREETINGS = [
     "Оу, еще спишь? 😴 Давай посмотрим, что говорят звезды о тебе сегодня! ✨",
     "Доброе утро! ☀️ Хочешь узнать, что приготовили для тебя звезды? 🔮",
     "Привет! 👋 Готов узнать свой гороскоп на сегодня? Давай заглянем в будущее! 🌟"
+]
+
+# Текст для отраслевой встречи
+INDUSTRY_MEETING_TEXTS = [
+    "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n🎯 Что делаем:\n• Обсудим итоги за неделю\n• Новые тренды и инсайты\n• Обмен опытом с коллегами\n• Запланируем мероприятия на следующую\n\n🕐 Начало: 12:00 по МСК\n📍 Формат: Zoom-конференция\n\n🔗 Всех причастных ждём! {zoom_link} | 👈",
+    "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n📊 Сегодня на повестке:\n• Анализ недельных результатов\n• Выявление ключевых трендов\n• Коллективный разбор кейсов\n• Планирование совместных активностей\n\n🕐 Старт: 12:00 (МСК)\n🎥 Онлайн в Zoom\n\n🔗 Присоединяйтесь: {zoom_link} ← переход",
+    "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n✨ В программе:\n• Итоги рабочей недели\n• Прогнозы и инсайты\n• Нетворкинг с экспертами\n• Дорожная карта на неделю\n\n⏰ Время: 12:00 по Москве\n💻 Платформа: Zoom\n\n🔗 Подключайтесь: {zoom_link} | 👈"
 ]
 
 # Wikipedia API
@@ -113,7 +125,14 @@ CANCELLATION_OPTIONS = [
     "Перенесём на другой день",
 ]
 
+INDUSTRY_CANCELLATION_OPTIONS = [
+    "Основные спикеры не смогут участвовать",
+    "Переносим на другую дату",
+    "Актуальные вопросы решены вне встречи",
+]
+
 SELECTING_REASON, SELECTING_DATE, CONFIRMING_DATE = range(3)
+SELECTING_INDUSTRY_REASON = 4
 
 # Настройка логирования
 logging.basicConfig(
@@ -170,7 +189,7 @@ def can_user_request_horoscope(user_id: int, config: 'BotConfig') -> Tuple[bool,
             
             # Формируем сообщение о том, когда можно будет сделать следующий запрос
             tomorrow = (datetime.now(TIMEZONE) + timedelta(days=1)).strftime('%d.%m.%Y')
-            return False, f"😔 Увы, сегодня звёзды свою работу сделали!🤫\n\nЗагляни за новым предсказанием завтра, {tomorrow} ✨"
+            return False, f"😔 Увы, сегодня звёзды свою работу сделали! Подмигивание 🤫\n\nЗагляни за новым предсказанием завтра, {tomorrow} ✨"
     
     return True, None
 
@@ -184,6 +203,18 @@ def record_horoscope_request(user_id: int, config: 'BotConfig') -> None:
         'username': f"user_{user_id}"
     }
     config.save()
+
+def get_industry_meeting_text() -> str:
+    """Получаем текст для отраслевой встречи с ссылкой"""
+    zoom_link = INDUSTRY_ZOOM_LINK
+    
+    if zoom_link == DEFAULT_ZOOM_LINK:
+        zoom_link_formatted = f'<a href="{zoom_link}">[НЕ НАСТРОЕНА - настройте INDUSTRY_MEETING_LINK]</a>'
+    else:
+        zoom_link_formatted = f'<a href="{zoom_link}">Присоединиться к Zoom</a>'
+    
+    text = random.choice(INDUSTRY_MEETING_TEXTS)
+    return text.format(zoom_link=zoom_link_formatted)
 
 def calculate_event_score(event_text: str, event_year: int) -> float:
     """Рассчитываем рейтинг события (0-100)"""
@@ -509,7 +540,7 @@ def create_zodiac_keyboard() -> InlineKeyboardMarkup:
 def get_greeting_by_meeting_day() -> str:
     """Специальные приветствия для дней планёрок"""
     weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Саббота", "Воскресенье"]
     current_day = day_names_ru[weekday]
     
     if ZOOM_LINK == DEFAULT_ZOOM_LINK:
@@ -1080,8 +1111,119 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"Ошибка при отправке напоминания: {e}")
 
-# ========== КОНВЕРСАЦИЯ ДЛЯ ОТМЕНЫ ПЛАНЁРКИ ==========
-# (Упрощенная версия)
+# ========== ФУНКЦИИ ДЛЯ ОТРАСЛЕВОЙ ВСТРЕЧИ ==========
+
+async def send_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправка напоминания об отраслевой встрече"""
+    config = BotConfig()
+    chat_id = config.chat_id
+
+    if not chat_id:
+        logger.error("Chat ID не установлен!")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("Отменить встречу", callback_data="cancel_industry")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message_text = get_industry_meeting_text()
+
+    try:
+        message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=message_text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=False
+        )
+
+        job_name = context.job.name if hasattr(context, 'job') and context.job else f"industry_{datetime.now().timestamp()}"
+        config.add_active_reminder(message.message_id, chat_id, job_name)
+
+        logger.info(f"Отправлено напоминание об отраслевой встрече в чат {chat_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при отправке напоминания об отраслевой встрече: {e}")
+
+def calculate_next_industry_time() -> datetime:
+    """Рассчитать время следующей отраслевой встречи"""
+    now = datetime.now(TIMEZONE)
+    
+    # Сегодняшнее время отправки
+    today_target = now.replace(
+        hour=INDUSTRY_MEETING_TIME["hour"],
+        minute=INDUSTRY_MEETING_TIME["minute"],
+        second=0,
+        microsecond=0
+    )
+
+    # Если сегодня вторник и время еще не наступило
+    if now < today_target and now.weekday() in INDUSTRY_MEETING_DAY:
+        return today_target
+
+    # Ищем следующий вторник
+    for i in range(1, 8):
+        next_day = now + timedelta(days=i)
+        if next_day.weekday() in INDUSTRY_MEETING_DAY:
+            return next_day.replace(
+                hour=INDUSTRY_MEETING_TIME["hour"],
+                minute=INDUSTRY_MEETING_TIME["minute"],
+                second=0,
+                microsecond=0
+            )
+    
+    raise ValueError("Не найден подходящий день для отраслевой встречи")
+
+async def schedule_next_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запланировать следующее напоминание об отраслевой встрече"""
+    try:
+        next_time = calculate_next_industry_time()
+        config = BotConfig()
+        chat_id = config.chat_id
+
+        if not chat_id:
+            logger.warning("Chat ID не установлен, планирование отраслевых встреч отложено")
+            context.application.job_queue.run_once(
+                lambda ctx: asyncio.create_task(schedule_next_industry_reminder(ctx)),
+                3600
+            )
+            return
+
+        now = datetime.now(TIMEZONE)
+        delay = (next_time - now).total_seconds()
+
+        if delay > 0:
+            job_name = f"industry_meeting_{next_time.strftime('%Y%m%d_%H%M')}"
+            
+            existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
+                            if j.name == job_name]
+            
+            if not existing_jobs:
+                context.application.job_queue.run_once(
+                    send_industry_reminder,
+                    delay,
+                    chat_id=chat_id,
+                    name=job_name
+                )
+                logger.info(f"Напоминание об отраслевой встрече запланировано на {next_time}")
+            else:
+                logger.info(f"Отраслевая встреча на {next_time} уже запланирована")
+        else:
+            logger.warning(f"Время отраслевой встречи уже прошло ({next_time}), планируем на следующий вторник")
+            context.application.job_queue.run_once(
+                lambda ctx: asyncio.create_task(schedule_next_industry_reminder(ctx)),
+                60
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка планирования отраслевой встречи: {e}")
+        context.application.job_queue.run_once(
+            lambda ctx: asyncio.create_task(schedule_next_industry_reminder(ctx)),
+            300
+        )
+
+# ========== КОНВЕРСАЦИИ ДЛЯ ОТМЕНЫ ВСТРЕЧ ==========
 
 @restricted
 async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1102,6 +1244,27 @@ async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
     return SELECTING_REASON
+
+@restricted
+async def cancel_industry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["original_message_id"] = query.message.message_id
+    context.user_data["original_chat_id"] = query.message.chat_id
+    context.user_data["meeting_type"] = "industry"
+
+    keyboard = [
+        [InlineKeyboardButton(option, callback_data=f"industry_reason_{i}")]
+        for i, option in enumerate(INDUSTRY_CANCELLATION_OPTIONS)
+    ]
+
+    await query.edit_message_text(
+        text="📝 Выберите причину отмены отраслевой встречи:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    return SELECTING_INDUSTRY_REASON
 
 async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -1143,6 +1306,46 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
     
     return ConversationHandler.END
 
+async def select_industry_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        reason_index = int(query.data.split("_")[2])
+        reason = INDUSTRY_CANCELLATION_OPTIONS[reason_index]
+        
+        context.user_data["selected_reason"] = reason
+        context.user_data["reason_index"] = reason_index
+        
+        final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил отраслевую встречу\n\n📝 <b>Причина:</b> {reason}"
+        
+        config = BotConfig()
+        original_message_id = context.user_data.get("original_message_id")
+        
+        if original_message_id:
+            for job in get_jobs_from_queue(context.application.job_queue):
+                if job.name in config.active_reminders:
+                    reminder_data = config.active_reminders[job.name]
+                    if str(reminder_data.get("message_id")) == str(original_message_id):
+                        job.schedule_removal()
+                        config.remove_active_reminder(job.name)
+                        break
+        
+        await query.edit_message_text(
+            text=final_message,
+            parse_mode=ParseMode.HTML
+        )
+        
+        logger.info(f"Отраслевая встреча отменена @{query.from_user.username} — {reason}")
+        
+        context.user_data.clear()
+        
+    except Exception as e:
+        logger.error(f"Ошибка отмены отраслевой встречи: {e}")
+        await query.message.reply_text("❌ Произошла ошибка")
+    
+    return ConversationHandler.END
+
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message:
         await update.message.reply_text("❌ Диалог отменен.")
@@ -1158,7 +1361,7 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик /start"""
     await update.message.reply_text(
-        "🤖 <b>Бот для планёрок, гороскопов и исторических событий!</b>\n\n"
+        "🤖 <b>Бот для планёрок, отраслевых встреч, гороскопов и исторических событий!</b>\n\n"
         f"📅 <b>Утренние гороскопы:</b>\n"
         f"• Пн-Пт в 9:00 по МСК\n"
         f"• 3 разных приветствия\n"
@@ -1166,13 +1369,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📅 <b>Планёрки:</b>\n"
         f"• Пн, Ср, Пт в 9:30 по МСК\n"
         f"• Возможность отмены\n\n"
+        f"📅 <b>Отраслевые встречи:</b>\n"
+        f"• Вт в 12:00 по МСК\n"
+        f"• Обсуждение трендов и инсайтов\n"
+        f"• Нетворкинг с коллегами\n\n"
         f"📅 <b>Исторические события:</b>\n"
         f"• Пн-Пт в 10:00 по МСК\n\n"
         f"🔧 <b>Основные команды:</b>\n"
         "/horoscope - получить гороскоп\n"
         "/eventnow - историческое событие сейчас\n"
         "/info - информация о боте\n"
-        "/setchat - установить чат\n\n"
+        "/setchat - установить чат\n"
+        "/testindustry - тест отраслевой встречи\n\n"
         f"✨ <b>Каждое утро в 9:00 бот присылает приветствие с предложением узнать гороскоп!</b>\n"
         f"💫 <i>Но помни: только одно предсказание в день!</i>",
         parse_mode=ParseMode.HTML
@@ -1190,7 +1398,8 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"✅ <b>Чат установлен:</b> {chat_title}\n\n"
         f"Теперь бот будет отправлять:\n"
         f"• Утренние гороскопы (9:00, Пн-Пт)\n"
-        f"• Напоминания о планёрках (9:30, Пн/Ср/Пт)\n"
+        f"• Планёрки (9:30, Пн/Ср/Пт)\n"
+        f"• Отраслевые встречи (12:00, Вт)\n"
         f"• Исторические события (10:00, Пн-Пт)\n\n"
         f"💫 <i>Пользователи смогут получать только 1 гороскоп в день!</i>",
         parse_mode=ParseMode.HTML
@@ -1213,6 +1422,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     morning_jobs = len([j for j in all_jobs if j.name and j.name.startswith("morning_greeting_")])
     meeting_jobs = len([j for j in all_jobs if j.name and j.name.startswith("meeting_reminder_")])
+    industry_jobs = len([j for j in all_jobs if j.name and j.name.startswith("industry_meeting_")])
     event_jobs = len([j for j in all_jobs if j.name and j.name.startswith("daily_event_")])
     
     now = datetime.now(TIMEZONE)
@@ -1222,6 +1432,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     is_morning_day = weekday in MORNING_DAYS
     is_meeting_day = weekday in MEETING_DAYS
+    is_industry_day = weekday in INDUSTRY_MEETING_DAY
     
     # Очищаем старые записи о запросах
     config.cleanup_old_requests()
@@ -1233,16 +1444,25 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if request_data.get('last_request_date') == today:
             today_requests += 1
     
+    # Проверяем настройку ссылок
+    zoom_status = "✅" if ZOOM_LINK != DEFAULT_ZOOM_LINK else "❌"
+    industry_zoom_status = "✅" if INDUSTRY_ZOOM_LINK != DEFAULT_ZOOM_LINK else "❌"
+    
     await update.message.reply_text(
         f"📊 <b>Информация о боте:</b>\n\n"
         f"{status}\n\n"
         f"⏰ <b>Расписание:</b>\n"
         f"• Гороскопы: 9:00 (Пн-Пт) {'✅ сегодня' if is_morning_day else '❌ не сегодня'}\n"
         f"• Планёрки: 9:30 (Пн/Ср/Пт) {'✅ сегодня' if is_meeting_day else '❌ не сегодня'}\n"
+        f"• Отраслевые: 12:00 (Вт) {'✅ сегодня' if is_industry_day else '❌ не сегодня'}\n"
         f"• События: 10:00 (Пн-Пт) {'✅ сегодня' if is_morning_day else '❌ не сегодня'}\n\n"
+        f"🔗 <b>Настройка ссылок:</b>\n"
+        f"• Планёрки: {zoom_status}\n"
+        f"• Отраслевые: {industry_zoom_status}\n\n"
         f"📋 <b>Активные задачи:</b>\n"
         f"• Гороскопы: {morning_jobs}\n"
         f"• Планёрки: {meeting_jobs}\n"
+        f"• Отраслевые: {industry_jobs}\n"
         f"• События: {event_jobs}\n\n"
         f"💫 <b>Статистика гороскопов:</b>\n"
         f"• Запросов сегодня: {today_requests}\n"
@@ -1265,7 +1485,20 @@ async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for job in sorted(jobs, key=lambda j: j.next_t):
         next_time = job.next_t.astimezone(TIMEZONE)
         job_name = job.name or "Без имени"
-        message += f"• {next_time.strftime('%d.%m.%Y %H:%M')} - {job_name[:30]}\n"
+        
+        # Определяем тип задачи для иконки
+        if "morning_greeting" in job_name:
+            icon = "🌅"
+        elif "meeting_reminder" in job_name:
+            icon = "🤝"
+        elif "industry_meeting" in job_name:
+            icon = "🏢"
+        elif "daily_event" in job_name:
+            icon = "📜"
+        else:
+            icon = "🔧"
+        
+        message += f"{icon} {next_time.strftime('%d.%m.%Y %H:%M')} - {job_name[:30]}\n"
     
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
@@ -1279,6 +1512,17 @@ async def test_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await update.message.reply_text("⏳ <b>Отправляю тестовое утреннее приветствие...</b>", parse_mode=ParseMode.HTML)
     await send_morning_greeting(context)
+
+@restricted
+async def test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Тестовая отправка отраслевой встречи"""
+    config = BotConfig()
+    if not config.chat_id:
+        await update.message.reply_text("❌ Сначала установите чат командой /setchat")
+        return
+
+    await update.message.reply_text("⏳ <b>Отправляю тестовое уведомление об отраслевой встрече...</b>", parse_mode=ParseMode.HTML)
+    await send_industry_reminder(context)
 
 def calculate_next_reminder() -> datetime:
     """Рассчитать время следующего напоминания о планёрке"""
@@ -1347,10 +1591,16 @@ def main() -> None:
 
         # ConversationHandler для отмены планёрки
         conv_handler = ConversationHandler(
-            entry_points=[CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$")],
+            entry_points=[
+                CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$"),
+                CallbackQueryHandler(cancel_industry_callback, pattern="^cancel_industry$")
+            ],
             states={
                 SELECTING_REASON: [
                     CallbackQueryHandler(select_reason_callback, pattern="^reason_[0-9]+$"),
+                ],
+                SELECTING_INDUSTRY_REASON: [
+                    CallbackQueryHandler(select_industry_reason_callback, pattern="^industry_reason_[0-9]+$"),
                 ],
             },
             fallbacks=[
@@ -1366,6 +1616,7 @@ def main() -> None:
         application.add_handler(CommandHandler("horoscope", send_personal_horoscope))
         application.add_handler(CommandHandler("eventnow", send_event_now))
         application.add_handler(CommandHandler("testmorning", test_morning))
+        application.add_handler(CommandHandler("testindustry", test_industry))
         application.add_handler(CommandHandler("jobs", list_jobs))
 
         # Обработчики callback (гороскопы)
@@ -1386,8 +1637,13 @@ def main() -> None:
         )
         
         application.job_queue.run_once(
-            lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
+            lambda ctx: asyncio.create_task(schedule_next_industry_reminder(ctx)),
             7
+        )
+        
+        application.job_queue.run_once(
+            lambda ctx: asyncio.create_task(schedule_next_event(ctx)),
+            9
         )
 
         # Очистка старых записей при запуске
@@ -1400,7 +1656,10 @@ def main() -> None:
         logger.info(f"✨ Утренние гороскопы: Пн-Пт в 9:00 по МСК")
         logger.info(f"💫 Ограничение: 1 гороскоп в день на пользователя")
         logger.info(f"📅 Планёрки: Пн/Ср/Пт в 9:30 по МСК")
+        logger.info(f"🏢 Отраслевые встречи: Вт в 12:00 по МСК")
         logger.info(f"📜 Исторические события: Пн-Пт в 10:00 по МСК")
+        logger.info(f"🔗 Ссылка для планёрок: {'Настроена' if ZOOM_LINK != DEFAULT_ZOOM_LINK else 'НЕ настроена'}")
+        logger.info(f"🔗 Ссылка для отраслевых: {'Настроена' if INDUSTRY_ZOOM_LINK != DEFAULT_ZOOM_LINK else 'НЕ настроена'}")
         logger.info(f"🗓️ Сегодня: {now.strftime('%d.%m.%Y')}")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
