@@ -32,7 +32,6 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEFAULT_ZOOM_LINK = "https://us04web.zoom.us/j/1234567890?pwd=example"
 ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", DEFAULT_ZOOM_LINK)
 CONFIG_FILE = "bot_config.json"
-CATEGORY_STATS_FILE = "category_stats.json"
 
 # Время планёрки (9:30 по Москве)
 MEETING_TIME = {"hour": 9, "minute": 15}
@@ -41,35 +40,9 @@ TIMEZONE = pytz.timezone("Europe/Moscow")
 # Дни недели для планёрки (понедельник=0, среда=2, пятница=4)
 MEETING_DAYS = [0, 2, 4]
 
-# ========== КОНСТАНТЫ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
-EVENT_CATEGORIES = ['музыка', 'фильмы', 'технологии', 'игры', 'наука', 'спорт', 'история']
-
-DAY_CATEGORY_PREFERENCES = {
-    0: ['технологии', 'наука', 'история'],
-    1: ['музыка', 'фильмы', 'игры'],
-    2: ['спорт', 'история', 'технологии'],
-    3: ['наука', 'музыка', 'фильмы'],
-    4: ['игры', 'музыка', 'спорт'],
-}
-
-SEASONAL_PREFERENCES = {
-    1: ['история', 'наука', 'спорт'],
-    2: ['история', 'наука'],
-    3: ['наука', 'технологии'],
-    4: ['спорт', 'музыка'],
-    5: ['фильмы', 'игры'],
-    6: ['спорт', 'музыка'],
-    7: ['игры', 'технологии'],
-    8: ['история', 'спорт'],
-    9: ['наука', 'фильмы'],
-    10: ['игры', 'музыка'],
-    11: ['история', 'фильмы'],
-    12: ['музыка', 'фильмы', 'игры'],
-}
-
-# Время отправки (10:00 по Москве = 7:00 UTC)
-EVENT_SEND_TIME = {"hour": 7, "minute": 0, "timezone": "UTC"}
-EVENT_DAYS = [0, 1, 2, 3, 4]
+# Время отправки событий "В этот день" (10:00 по Москве)
+EVENT_SEND_TIME = {"hour": 10, "minute": 0}
+EVENT_DAYS = [0, 1, 2, 3, 4]  # Пн-Пт
 
 # Русские названия месяцев
 MONTHS_RU = {
@@ -78,58 +51,30 @@ MONTHS_RU = {
     9: "СЕНТЯБРЯ", 10: "ОКТЯБРЯ", 11: "НОЯБРЯ", 12: "ДЕКАБРЯ"
 }
 
-MONTHS_RU_LOWER = {k: v.lower() for k, v in MONTHS_RU.items()}
-MONTHS_RU_TITLE = {k: v.title() for k, v in MONTHS_RU.items()}
-
-# Эмодзи для категорий
-CATEGORY_EMOJIS = {
-    'музыка': '🎵',
-    'фильмы': '🎬',
-    'технологии': '💻',
-    'игры': '🎮',
-    'наука': '🔬',
-    'спорт': '⚽',
-    'история': '📜'
-}
-
-# Описания категорий
-CATEGORY_DESCRIPTIONS = {
-    'музыка': 'Знаменательные события в мире музыки',
-    'фильмы': 'Кинопремьеры и события из мира кино',
-    'технологии': 'Изобретения и технологические прорывы',
-    'игры': 'Выпуски игр и события индустрии',
-    'наука': 'Научные открытия и достижения',
-    'спорт': 'Спортивные рекорды и события',
-    'история': 'Исторические события и даты'
-}
+# Фильтрация событий (без войны и смертей)
+FORBIDDEN_KEYWORDS = [
+    "умер", "погиб", "скончал", "смерт", "казн", "расстрел",
+    "войн", "битв", "сражен", "вторжен", "осад", "бомб",
+    "нападен", "революц", "конфликт",
+    "теракт", "катастроф", "крушен", "авари"
+]
 
 # Wikipedia API
 WIKIPEDIA_API_URL = "https://ru.wikipedia.org/w/api.php"
-USER_AGENT = 'TelegramEventBot/4.1 (https://github.com/; contact@example.com)'
+USER_AGENT = 'TelegramEventBot/5.0 (https://github.com/; contact@example.com)'
 REQUEST_TIMEOUT = 10
-REQUEST_RETRIES = 2
 
 # ========== ТИПЫ ДАННЫХ ==========
 class HistoricalEvent(TypedDict):
     title: str
     year: int
-    description: str
+    text: str
     url: str
-    category: str
-    full_article: str
-    fact: str
 
 class ReminderData(TypedDict):
     message_id: int
     chat_id: int
     created_at: str
-
-class CategoryStats(TypedDict):
-    sent_count: int
-    engagement_score: float
-    last_sent: str
-    popularity_score: float
-    feedback_counts: Dict[str, int]
 
 # ========== НАСТРОЙКИ ==========
 CANCELLATION_OPTIONS = [
@@ -146,880 +91,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# ========== УЛУЧШЕННЫЙ КЛАСС ДЛЯ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
-class EventScheduler:
-    """Класс для управления отправкой исторических событий 'В этот день' с адаптивными категориями"""
-    
-    def __init__(self):
-        self.current_index = 0
-        self.used_events: Dict[str, set] = {category: set() for category in EVENT_CATEGORIES}
-        
-        # Статистика категорий
-        self.category_stats = self._load_category_stats()
-        
-        # История выбора категорий
-        self.category_history: List[str] = []
-        self.max_history_size = 100
-        
-        # Веса категорий для адаптивного выбора
-        self.category_weights = self._calculate_initial_weights()
-        
-        # Кэш для статей Wikipedia
-        self.article_cache: Dict[str, Dict] = {}
-        self.cache_ttl = 3600  # 1 час
-        
-        logger.info("Инициализирован адаптивный планировщик исторических событий 'В этот день'")
-    
-    def _load_category_stats(self) -> Dict[str, CategoryStats]:
-        """Загружаем статистику категорий из файла"""
-        if os.path.exists(CATEGORY_STATS_FILE):
-            try:
-                with open(CATEGORY_STATS_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    for category in EVENT_CATEGORIES:
-                        if category not in data:
-                            data[category] = {
-                                'sent_count': 0,
-                                'engagement_score': 0.5,
-                                'last_sent': '',
-                                'popularity_score': 0.5,
-                                'feedback_counts': {'likes': 0, 'dislikes': 0, 'skips': 0}
-                            }
-                    return data
-            except Exception as e:
-                logger.error(f"Ошибка загрузки статистики категорий: {e}")
-        
-        stats = {}
-        for category in EVENT_CATEGORIES:
-            stats[category] = {
-                'sent_count': 0,
-                'engagement_score': 0.5,
-                'last_sent': '',
-                'popularity_score': 0.5,
-                'feedback_counts': {'likes': 0, 'dislikes': 0, 'skips': 0}
-            }
-        return stats
-    
-    def _save_category_stats(self) -> None:
-        """Сохраняем статистика категорий в файл"""
-        try:
-            with open(CATEGORY_STATS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.category_stats, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения статистики категорий: {e}")
-    
-    def _calculate_initial_weights(self) -> Dict[str, float]:
-        """Рассчитываем начальные веса категорий"""
-        weights = {}
-        base_weight = 1.0 / len(EVENT_CATEGORIES)
-        
-        for category in EVENT_CATEGORIES:
-            weights[category] = base_weight
-        
-        return weights
-    
-    def _update_category_weights(self) -> None:
-        """Обновляем веса категорий на основе статистики и контекста"""
-        now = datetime.now(TIMEZONE)
-        weekday = now.weekday()
-        month = now.month
-        
-        # 1. Вес на основе статистики вовлеченности
-        engagement_weights = {}
-        total_engagement = sum(stats['engagement_score'] for stats in self.category_stats.values())
-        
-        for category in EVENT_CATEGORIES:
-            if total_engagement > 0:
-                engagement_weights[category] = self.category_stats[category]['engagement_score'] / total_engagement
-            else:
-                engagement_weights[category] = 1.0 / len(EVENT_CATEGORIES)
-        
-        # 2. Вес на основе дня недели
-        day_weights = {}
-        if weekday in DAY_CATEGORY_PREFERENCES:
-            preferred = DAY_CATEGORY_PREFERENCES[weekday]
-            for category in EVENT_CATEGORIES:
-                if category in preferred:
-                    day_weights[category] = 1.5
-                else:
-                    day_weights[category] = 1.0
-        else:
-            for category in EVENT_CATEGORIES:
-                day_weights[category] = 1.0
-        
-        # 3. Вес на основе сезона/месяца
-        seasonal_weights = {}
-        if month in SEASONAL_PREFERENCES:
-            preferred = SEASONAL_PREFERENCES[month]
-            for category in EVENT_CATEGORIES:
-                if category in preferred:
-                    seasonal_weights[category] = 1.3
-                else:
-                    seasonal_weights[category] = 1.0
-        else:
-            for category in EVENT_CATEGORIES:
-                seasonal_weights[category] = 1.0
-        
-        # 4. Вес на основе времени с последней отправки
-        recency_weights = {}
-        for category in EVENT_CATEGORIES:
-            last_sent = self.category_stats[category]['last_sent']
-            if last_sent:
-                try:
-                    last_sent_date = datetime.fromisoformat(last_sent)
-                    days_passed = (now - last_sent_date).days
-                    recency_weights[category] = min(2.0, 1.0 + (days_passed / 30.0))
-                except:
-                    recency_weights[category] = 2.0
-            else:
-                recency_weights[category] = 2.0
-        
-        # 5. Комбинируем все веса
-        for category in EVENT_CATEGORIES:
-            combined_weight = (
-                engagement_weights[category] *
-                day_weights[category] *
-                seasonal_weights[category] *
-                recency_weights[category]
-            )
-            self.category_weights[category] = combined_weight
-        
-        # Нормализуем веса
-        total_weight = sum(self.category_weights.values())
-        if total_weight > 0:
-            for category in EVENT_CATEGORIES:
-                self.category_weights[category] /= total_weight
-        
-        logger.debug(f"Обновленные веса категорий: {self.category_weights}")
-    
-    def get_next_category(self) -> str:
-        """Получаем следующую категорию с учетом адаптивных весов"""
-        self._update_category_weights()
-        
-        categories = list(self.category_weights.keys())
-        weights = list(self.category_weights.values())
-        
-        selected_category = random.choices(categories, weights=weights, k=1)[0]
-        
-        self.category_history.append(selected_category)
-        if len(self.category_history) > self.max_history_size:
-            self.category_history.pop(0)
-        
-        logger.info(f"Выбрана адаптивная категория: {selected_category} (вес: {self.category_weights[selected_category]:.3f})")
-        return selected_category
-    
-    def record_category_feedback(self, category: str, feedback_type: str = 'neutral') -> None:
-        """Записываем обратную связь по категории"""
-        if category not in self.category_stats:
-            return
-        
-        stats = self.category_stats[category]
-        
-        if feedback_type in ['like', 'dislike', 'skip']:
-            if feedback_type not in stats['feedback_counts']:
-                stats['feedback_counts'][feedback_type] = 0
-            stats['feedback_counts'][feedback_type] += 1
-        
-        # Пересчитываем engagement_score
-        total_feedback = sum(stats['feedback_counts'].values())
-        if total_feedback > 0:
-            likes = stats['feedback_counts'].get('like', 0)
-            dislikes = stats['feedback_counts'].get('dislike', 0)
-            
-            if likes + dislikes > 0:
-                stats['engagement_score'] = likes / (likes + dislikes)
-            else:
-                stats['engagement_score'] = 0.5
-        
-        self._save_category_stats()
-        logger.info(f"Записан фидбэк для категории {category}: {feedback_type}")
-    
-    def increment_category(self) -> str:
-        """Увеличиваем индекс категории и возвращаем следующую"""
-        old_category = self.get_next_category()
-        
-        now = datetime.now(TIMEZONE).isoformat()
-        self.category_stats[old_category]['sent_count'] += 1
-        self.category_stats[old_category]['last_sent'] = now
-        
-        total_sent = sum(stats['sent_count'] for stats in self.category_stats.values())
-        if total_sent > 0:
-            for category in EVENT_CATEGORIES:
-                self.category_stats[category]['popularity_score'] = (
-                    self.category_stats[category]['sent_count'] / total_sent
-                )
-        
-        self._save_category_stats()
-        
-        next_category = self.get_next_category()
-        logger.info(f"Категория изменена: {old_category} -> {next_category}")
-        return next_category
-    
-    def get_category_stats_message(self) -> str:
-        """Получаем статистику категорий в читаемом формате"""
-        message = "📊 *Статистика категорий:*\n\n"
-        
-        sorted_categories = sorted(
-            self.category_stats.items(),
-            key=lambda x: x[1]['popularity_score'],
-            reverse=True
-        )
-        
-        for category, stats in sorted_categories:
-            emoji = CATEGORY_EMOJIS.get(category, '📌')
-            sent_count = stats['sent_count']
-            engagement = stats['engagement_score']
-            
-            engagement_bar = self._create_progress_bar(engagement, 10)
-            
-            total_feedback = sum(stats['feedback_counts'].values())
-            if total_feedback > 0:
-                likes = stats['feedback_counts'].get('like', 0)
-                likes_percent = (likes / total_feedback) * 100
-            else:
-                likes_percent = 0
-            
-            message += (
-                f"{emoji} *{category.upper()}*\n"
-                f"• Отправлено: {sent_count} раз\n"
-                f"• Вовлеченность: {engagement_bar} ({engagement:.1%})\n"
-                f"• Лайков: {likes_percent:.0f}%\n"
-                f"• Последний раз: {self._format_last_sent(stats['last_sent'])}\n\n"
-            )
-        
-        total_sent = sum(stats['sent_count'] for stats in self.category_stats.values())
-        message += f"📈 *Всего отправлено:* {total_sent} событий\n"
-        
-        popular_categories = sorted_categories[:3]
-        if popular_categories:
-            popular_names = [f"{CATEGORY_EMOJIS.get(cat, '')} {cat}" for cat, _ in popular_categories]
-            message += f"🏆 *Топ-3:* {', '.join(popular_names)}\n"
-        
-        next_category = self.get_next_category()
-        next_emoji = CATEGORY_EMOJIS.get(next_category, '📌')
-        message += f"🔮 *Следующая (предположительно):* {next_emoji} {next_category}"
-        
-        return message
-    
-    def _create_progress_bar(self, value: float, length: int = 10) -> str:
-        """Создаем текстовый прогресс-бар"""
-        filled = int(value * length)
-        empty = length - filled
-        return '█' * filled + '░' * empty
-    
-    def _format_last_sent(self, last_sent_str: str) -> str:
-        """Форматируем дату последней отправки"""
-        if not last_sent_str:
-            return "никогда"
-        
-        try:
-            last_sent = datetime.fromisoformat(last_sent_str)
-            now = datetime.now(TIMEZONE)
-            days_passed = (now - last_sent).days
-            
-            if days_passed == 0:
-                return "сегодня"
-            elif days_passed == 1:
-                return "вчера"
-            elif days_passed < 7:
-                return f"{days_passed} дней назад"
-            elif days_passed < 30:
-                weeks = days_passed // 7
-                return f"{weeks} недель назад"
-            else:
-                months = days_passed // 30
-                return f"{months} месяцев назад"
-        except:
-            return "неизвестно"
-    
-    def get_todays_date_parts(self) -> Tuple[int, str, int]:
-        """Получаем текущую дату (день, месяц_ru, текущий_год)"""
-        now = datetime.now(TIMEZONE)
-        day = now.day
-        month_ru = MONTHS_RU[now.month]
-        year = now.year
-        return day, month_ru, year
-    
-    def search_historical_events(self, day: int, month: int, category: str) -> List[HistoricalEvent]:
-        """
-        Ищем исторические события, которые произошли в ЭТУ ДАТУ в РАЗНЫЕ ГОДЫ
-        Сначала ищем события по точной дате, затем fallback
-        """
-        try:
-            date_str = f"{day} {MONTHS_RU_LOWER[month]}"
-            logger.info(f"Поиск исторических событий за {date_str} в категории {category}")
-            
-            events: List[HistoricalEvent] = []
-            
-            # 1. Поиск по точной дате
-            exact_events = self._search_exact_date_events(day, month, category)
-            if exact_events:
-                events.extend(exact_events)
-                logger.info(f"Найдено {len(exact_events)} событий по точной дате {date_str}")
-            
-            # 2. Fallback поиск по категории (если не нашли по дате)
-            if not events:
-                logger.info(f"Событий по точной дате не найдено, ищем fallback события в категории {category}")
-                fallback_events = self._search_fallback_events(category)
-                if fallback_events:
-                    events.extend(fallback_events)
-                    logger.info(f"Найдено {len(fallback_events)} fallback событий в категории {category}")
-            
-            # Уникальные события
-            unique_events: List[HistoricalEvent] = []
-            seen_titles = set()
-            
-            for event in events:
-                if (event['title'] not in seen_titles and 
-                    event['year'] and 
-                    1000 <= event['year'] <= datetime.now(TIMEZONE).year):
-                    unique_events.append(event)
-                    seen_titles.add(event['title'])
-            
-            logger.info(f"Итого найдено {len(unique_events)} уникальных исторических событий за {date_str} в категории {category}")
-            return unique_events
-            
-        except Exception as e:
-            logger.error(f"Ошибка поиска исторических событий: {e}")
-            return []
-    
-    def _search_exact_date_events(self, day: int, month: int, category: str) -> List[HistoricalEvent]:
-        """Поиск событий по точной дате"""
-        events: List[HistoricalEvent] = []
-        
-        try:
-            # Формируем точные поисковые запросы для даты
-            date_queries = [
-                f"{day} {MONTHS_RU_LOWER[month]}",
-                f"{day} {MONTHS_RU_TITLE[month]}",
-                f"{day:02d}.{month:02d}",
-                f"{month:02d}.{day:02d}",
-            ]
-            
-            for date_query in date_queries:
-                # Добавляем ключевые слова категории
-                search_query = f"{date_query} {self._get_category_keywords(category)}"
-                logger.info(f"Поиск по точной дате: {search_query}")
-                
-                # Поиск статей
-                articles = self._search_wikipedia_articles(search_query, limit=10)
-                
-                for article in articles:
-                    title = article['title']
-                    
-                    # Пропускаем служебные страницы
-                    if any(word in title.lower() for word in ['категория:', 'шаблон:', 'список:', 'изображение:', 'файл:']):
-                        continue
-                    
-                    # Получаем событие из статьи с проверкой даты
-                    event = self._get_event_from_article_with_date_check(title, day, month, category)
-                    if event and event['fact']:
-                        events.append(event)
-                        logger.info(f"Найдено событие по точной дате: {title} ({event['year']})")
-                        
-                        if len(events) >= 3:  # Ограничиваем количество
-                            break
-                
-                if events:
-                    break  # Если нашли события, прекращаем поиск
-            
-            return events
-            
-        except Exception as e:
-            logger.error(f"Ошибка поиска событий по точной дате: {e}")
-            return []
-    
-    def _search_fallback_events(self, category: str) -> List[HistoricalEvent]:
-        """Fallback поиск: любые события из категории"""
-        events: List[HistoricalEvent] = []
-        
-        try:
-            # Ключевые слова для категории
-            category_keywords = self._get_category_keywords(category)
-            
-            # Общие запросы для категории
-            search_queries = [
-                category_keywords,
-                f"знаменитые события {category}",
-                f"известные {category}",
-                f"исторические события {category}",
-            ]
-            
-            for search_query in search_queries:
-                logger.info(f"Fallback поиск: {search_query}")
-                
-                articles = self._search_wikipedia_articles(search_query, limit=15)
-                
-                for article in articles:
-                    title = article['title']
-                    
-                    # Пропускаем служебные страницы
-                    if any(word in title.lower() for word in ['категория:', 'шаблон:', 'список:', 'изображение:', 'файл:']):
-                        continue
-                    
-                    # Получаем событие из статьи (без проверки даты)
-                    event = self._get_event_from_article_fallback(title, category)
-                    if event and event['fact']:
-                        events.append(event)
-                        logger.info(f"Найдено fallback событие: {title} ({event['year']})")
-                        
-                        if len(events) >= 5:  # Ограничиваем количество
-                            break
-                
-                if events:
-                    break
-            
-            return events
-            
-        except Exception as e:
-            logger.error(f"Ошибка fallback поиска: {e}")
-            return []
-    
-    def _search_wikipedia_articles(self, search_query: str, limit: int = 10) -> List[Dict]:
-        """Поиск статей в Википедии"""
-        articles = []
-        
-        try:
-            params = {
-                'action': 'query',
-                'format': 'json',
-                'list': 'search',
-                'srsearch': search_query,
-                'srlimit': limit,
-                'srwhat': 'text',
-                'srprop': 'snippet|timestamp'
-            }
-            
-            headers = {'User-Agent': USER_AGENT}
-            
-            response = requests.get(
-                WIKIPEDIA_API_URL, 
-                params=params, 
-                headers=headers, 
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            search_data = response.json()
-            
-            if 'query' in search_data and 'search' in search_data['query']:
-                articles = search_data['query']['search']
-                logger.info(f"Найдено {len(articles)} статей по запросу: {search_query}")
-            else:
-                logger.warning(f"Не найдено статей по запросу: {search_query}")
-            
-        except requests.exceptions.Timeout:
-            logger.error(f"Таймаут при поиске статей для {search_query}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка запроса при поиске статей: {e}")
-        except Exception as e:
-            logger.error(f"Неожиданная ошибка при поиске статей: {e}")
-        
-        return articles
-    
-    def _get_event_from_article_with_date_check(self, title: str, day: int, month: int, category: str) -> Optional[HistoricalEvent]:
-        """Получаем событие из статьи с проверкой точной даты"""
-        try:
-            # Получаем полный текст статьи
-            full_text = self._get_article_full_text(title)
-            if not full_text:
-                return None
-            
-            # Ищем точное совпадение с датой
-            year, fact = self._extract_exact_date_fact(full_text, day, month)
-            if not year or not fact:
-                return None
-            
-            # Получаем описание
-            description = self._get_article_description(title)
-            
-            # URL статьи
-            encoded_title = quote(title.replace(' ', '_'), safe='')
-            article_url = f"https://ru.wikipedia.org/wiki/{encoded_title}"
-            
-            return {
-                'title': title,
-                'year': year,
-                'description': description,
-                'url': article_url,
-                'category': category,
-                'full_article': full_text[:3000],
-                'fact': fact
-            }
-            
-        except Exception as e:
-            logger.warning(f"Ошибка получения события с проверкой даты из статьи '{title}': {e}")
-            return None
-    
-    def _get_event_from_article_fallback(self, title: str, category: str) -> Optional[HistoricalEvent]:
-        """Fallback: получаем событие из статьи без проверки точной даты"""
-        try:
-            # Получаем полный текст статьи
-            full_text = self._get_article_full_text(title)
-            if not full_text:
-                return None
-            
-            # Ищем любой год и факт
-            year, fact = self._extract_any_year_fact(full_text)
-            if not year or not fact:
-                return None
-            
-            # Получаем описание
-            description = self._get_article_description(title)
-            
-            # URL статьи
-            encoded_title = quote(title.replace(' ', '_'), safe='')
-            article_url = f"https://ru.wikipedia.org/wiki/{encoded_title}"
-            
-            return {
-                'title': title,
-                'year': year,
-                'description': description,
-                'url': article_url,
-                'category': category,
-                'full_article': full_text[:3000],
-                'fact': fact
-            }
-            
-        except Exception as e:
-            logger.warning(f"Ошибка получения fallback события из статьи '{title}': {e}")
-            return None
-    
-    def _extract_exact_date_fact(self, text: str, day: int, month: int) -> Tuple[Optional[int], Optional[str]]:
-        """Извлекаем год и факт с точной датой"""
-        try:
-            # Варианты написания даты
-            date_patterns = [
-                f"{day}\s+{MONTHS_RU_LOWER[month]}\s+(\d{{4}})",
-                f"{day}\s+{MONTHS_RU_TITLE[month]}\s+(\d{{4}})",
-                f"{day}\s+{MONTHS_RU_LOWER[month]}\s+(\d{{4}})\s+года",
-                f"(\d{{4}})\s+года\s+{day}\s+{MONTHS_RU_LOWER[month]}",
-                f"{day:02d}[\.\s]+{month:02d}[\.\s]+(\d{{4}})",
-                f"(\d{{4}})[\.\s]+{month:02d}[\.\s]+{day:02d}",
-                f"{day}\s+{MONTHS_RU_LOWER[month]}\s+(\d{{4}})\s+г\.?",
-                f"(\d{{4}})\s+г\.?\s+{day}\s+{MONTHS_RU_LOWER[month]}"
-            ]
-            
-            # Разделяем на предложения
-            sentences = re.split(r'[.!?]+', text)
-            
-            for sentence in sentences:
-                sentence = sentence.strip()
-                if not sentence or len(sentence) < 30:
-                    continue
-                
-                # Проверяем все варианты даты
-                for pattern in date_patterns:
-                    match = re.search(pattern, sentence, re.IGNORECASE)
-                    if match:
-                        try:
-                            year = int(match.group(1))
-                            # Проверяем разумность года
-                            if 1000 <= year <= datetime.now(TIMEZONE).year:
-                                # Убираем лишние пробелы
-                                cleaned = re.sub(r'\s+', ' ', sentence).strip()
-                                if 30 <= len(cleaned) <= 400:
-                                    return year, cleaned + '.'
-                        except (ValueError, IndexError):
-                            continue
-            
-            return None, None
-            
-        except Exception as e:
-            logger.warning(f"Ошибка извлечения точной даты: {e}")
-            return None, None
-    
-    def _extract_any_year_fact(self, text: str) -> Tuple[Optional[int], Optional[str]]:
-        """Извлекаем любой год и факт"""
-        try:
-            # Разделяем на предложения
-            sentences = re.split(r'[.!?]+', text)
-            
-            for sentence in sentences:
-                sentence = sentence.strip()
-                if not sentence or len(sentence) < 30:
-                    continue
-                
-                # Ищем год
-                year_match = re.search(r'\b(1[0-9]{3}|20[0-2][0-9])\b', sentence)
-                if year_match:
-                    try:
-                        year = int(year_match.group(1))
-                        # Проверяем разумность года
-                        if 1000 <= year <= datetime.now(TIMEZONE).year:
-                            # Ключевые слова, указывающие на событие
-                            event_keywords = [
-                                'произошло', 'состоялось', 'вышел', 'вышла', 'выпущен',
-                                'родился', 'родилась', 'основан', 'основана', 'открытие',
-                                'изобретение', 'премьера', 'турнир', 'чемпионат', 'начало',
-                                'создан', 'создана', 'запущен', 'запущена', 'учреждён',
-                                'открыт', 'открыта', 'принят', 'принята', 'подписан',
-                                'утвержден', 'утверждена', 'завершен', 'завершена'
-                            ]
-                            
-                            # Проверяем, что это действительно о событии
-                            if any(keyword in sentence.lower() for keyword in event_keywords):
-                                cleaned = re.sub(r'\s+', ' ', sentence).strip()
-                                if 30 <= len(cleaned) <= 400:
-                                    return year, cleaned + '.'
-                    except ValueError:
-                        continue
-            
-            return None, None
-            
-        except Exception as e:
-            logger.warning(f"Ошибка извлечения любого года: {e}")
-            return None, None
-    
-    def _get_category_keywords(self, category: str) -> str:
-        """Ключевые слова для поиска по категории"""
-        keywords = {
-            'музыка': 'альбом сингл концерт музыкант группа премия песня композитор',
-            'фильмы': 'фильм кино премьера актёр режиссёр Оскар кинопремия сериал',
-            'технологии': 'изобретение патент компания запуск представлен компьютер программа',
-            'игры': 'игра выпуск студия консоль турнир видеоигра приставка',
-            'наука': 'открытие изобретение учёный эксперимент премия исследование',
-            'спорт': 'чемпионат олимпиада рекорд матч спортсмен турнир соревнование',
-            'история': 'событие война договор революция основание битва соглашение'
-        }
-        return keywords.get(category, '')
-    
-    def _get_article_full_text(self, title: str) -> Optional[str]:
-        """Получаем полный текст статьи с таймаутом"""
-        cache_key = f"full_{title}"
-        
-        # Проверяем кэш
-        if cache_key in self.article_cache:
-            cached_data = self.article_cache[cache_key]
-            if time.time() - cached_data['timestamp'] < self.cache_ttl:
-                return cached_data['content']
-        
-        try:
-            params = {
-                'action': 'query',
-                'format': 'json',
-                'prop': 'extracts',
-                'explaintext': True,
-                'exsectionformat': 'plain',
-                'exchars': 5000,
-                'titles': title
-            }
-            
-            headers = {'User-Agent': USER_AGENT}
-            
-            response = requests.get(
-                WIKIPEDIA_API_URL, 
-                params=params, 
-                headers=headers, 
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            pages = data['query']['pages']
-            page_id = list(pages.keys())[0]
-            page = pages[page_id]
-            
-            if 'missing' not in page and 'extract' in page:
-                content = page['extract']
-                # Сохраняем в кэш
-                self.article_cache[cache_key] = {
-                    'content': content,
-                    'timestamp': time.time()
-                }
-                return content
-        
-        except requests.exceptions.Timeout:
-            logger.warning(f"Таймаут при получении статьи '{title}'")
-            return None
-        except Exception as e:
-            logger.warning(f"Ошибка получения полного текста статьи '{title}': {e}")
-        
-        return None
-    
-    def _get_article_description(self, title: str) -> str:
-        """Получаем краткое описание статьи с таймаутом"""
-        cache_key = f"desc_{title}"
-        
-        # Проверяем кэш
-        if cache_key in self.article_cache:
-            cached_data = self.article_cache[cache_key]
-            if time.time() - cached_data['timestamp'] < self.cache_ttl:
-                return cached_data['content']
-        
-        try:
-            params = {
-                'action': 'query',
-                'format': 'json',
-                'prop': 'extracts',
-                'exintro': True,
-                'explaintext': True,
-                'exchars': 300,
-                'titles': title
-            }
-            
-            headers = {'User-Agent': USER_AGENT}
-            
-            response = requests.get(
-                WIKIPEDIA_API_URL, 
-                params=params, 
-                headers=headers, 
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            pages = data['query']['pages']
-            page_id = list(pages.keys())[0]
-            page = pages[page_id]
-            
-            if 'extract' in page and page['extract']:
-                content = page['extract'][:300] + ('...' if len(page['extract']) > 300 else '')
-                # Сохраняем в кэш
-                self.article_cache[cache_key] = {
-                    'content': content,
-                    'timestamp': time.time()
-                }
-                return content
-        
-        except requests.exceptions.Timeout:
-            logger.warning(f"Таймаут при получении описания статьи '{title}'")
-        except Exception as e:
-            logger.warning(f"Ошибка получения описания статьи '{title}': {e}")
-        
-        return "Историческое событие, о котором сохранились сведения."
-    
-    def get_historical_event_for_category(self, category: str) -> Tuple[str, Optional[int], str, str, str]:
-        """
-        Получаем историческое событие "В этот день" для текущей даты
-        Возвращает: (title, year, description, url, fact)
-        """
-        try:
-            now = datetime.now(TIMEZONE)
-            day = now.day
-            month = now.month
-            
-            logger.info(f"Поиск исторических событий за {day} {MONTHS_RU[month]} в категории: {category}")
-            
-            # Ищем события через API
-            events = self.search_historical_events(day, month, category)
-            
-            # Фильтруем уже использованные
-            available_events = [
-                event for event in events 
-                if event['title'] not in self.used_events[category]
-            ]
-            
-            # Если все использованы, очищаем историю
-            if not available_events and events:
-                logger.info(f"Все события в категории '{category}' использованы, очищаем историю")
-                self.used_events[category] = set()
-                available_events = events
-            
-            # Если ничего не нашли, возвращаем ошибку
-            if not available_events:
-                logger.error(f"Не найдено исторических событий за {day} {MONTHS_RU[month]} в категории {category}")
-                return (
-                    f"Не удалось найти событие в категории '{category}'",
-                    None,
-                    f"Не найдено событий за {day} {MONTHS_RU_LOWER[month]}",
-                    "",
-                    f"К сожалению, не удалось найти историческое событие в категории '{category}' для этой даты."
-                )
-            
-            # Выбираем случайное событие
-            event = random.choice(available_events)
-            
-            # Добавляем в использованные
-            self.used_events[category].add(event['title'])
-            
-            logger.info(f"Выбрано историческое событие: {event['title']} ({event['year']} год)")
-            logger.info(f"Факт: {event.get('fact', 'Нет факта')[:100]}...")
-            
-            return (
-                event['title'],
-                event['year'],
-                event['description'],
-                event['url'],
-                event.get('fact', f"{event['title']} ({event['year']} год).")
-            )
-            
-        except Exception as e:
-            logger.error(f"Ошибка получения исторического события: {e}")
-            return (
-                f"Ошибка поиска события",
-                None,
-                f"Произошла ошибка при обращении к API Википедии: {str(e)}",
-                "",
-                f"К сожалению, произошла ошибка при поиске исторического события."
-            )
-    
-    def create_event_message(self, category: str) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-        """Создаем сообщение с историческим событием 'В этот день' в формате HTML"""
-        day, month_ru, current_year = self.get_todays_date_parts()
-        
-        # Получаем событие через API
-        title, event_year, description, url, fact = self.get_historical_event_for_category(category)
-        
-        # Проверяем, есть ли ошибка
-        if "Не удалось" in title or "Ошибка" in title:
-            # Форматируем сообщение об ошибке
-            message = f"""Рубрика "Когда-то что-то🤔": {day} {month_ru}\n\n"""
-            message += f"❌ <b>Не удалось найти событие</b>\n\n"
-            message += f"Категория: {CATEGORY_EMOJIS.get(category, '📌')} {category}\n\n"
-            message += f"{fact}\n\n"
-            message += f"Попробуйте другую категорию или проверьте позже."
-            
-            # Только кнопки обратной связи
-            keyboard = [
-                [
-                    InlineKeyboardButton("👍 Понравилось", callback_data=f"feedback_like_{category}"),
-                    InlineKeyboardButton("👎 Не понравилось", callback_data=f"feedback_dislike_{category}")
-                ],
-                [
-                    InlineKeyboardButton("⏭️ Пропустить", callback_data=f"feedback_skip_{category}")
-                ]
-            ]
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            return message, reply_markup
-        
-        # Форматируем нормальное сообщение
-        message = f"<b>В ЭТОТ ДЕНЬ: {day} {month_ru} {event_year} года</b>\n\n"
-        
-        category_emoji = CATEGORY_EMOJIS.get(category, '📌')
-        category_description = CATEGORY_DESCRIPTIONS.get(category, '')
-        
-        message += f"{category_emoji} {category_description}\n\n"
-        
-        # Экранируем HTML-сущности
-        safe_fact = html.escape(fact)
-        message += f"{safe_fact}\n\n"
-        
-        if description and description not in fact:
-            if len(description) > 300:
-                description = description[:300] + '...'
-            safe_description = html.escape(description)
-            message += f"{safe_description}\n\n"
-        
-        if url:
-            safe_url = html.escape(url)
-            message += f'📖 <a href="{safe_url}">Подробнее на Википедии</a>'
-        
-        # Кнопки обратной связи
-        keyboard = [
-            [
-                InlineKeyboardButton("👍 Понравилось", callback_data=f"feedback_like_{category}"),
-                InlineKeyboardButton("👎 Не понравилось", callback_data=f"feedback_dislike_{category}")
-            ],
-            [
-                InlineKeyboardButton("⏭️ Пропустить", callback_data=f"feedback_skip_{category}")
-            ]
-        ]
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        return message, reply_markup
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
@@ -1050,6 +121,11 @@ def restricted(func):
             return None
         return await func(update, context, *args, **kwargs)
     return wrapped
+
+def is_safe_text(text: str) -> bool:
+    """Проверка текста на наличие запрещенных тем"""
+    t = text.lower()
+    return not any(word in t for word in FORBIDDEN_KEYWORDS)
 
 def get_greeting_by_meeting_day() -> str:
     """Специальные приветствия для дней планёрок со ссылкой на Zoom"""
@@ -1109,16 +185,13 @@ class BotConfig:
                         data["allowed_users"] = ["Stiff_OWi", "gshabanov"]
                     if "active_reminders" not in data:
                         data["active_reminders"] = {}
-                    if "event_current_index" not in data:
-                        data["event_current_index"] = 0
                     return data
             except Exception as e:
                 logger.error(f"Ошибка загрузки конфига: {e}")
         return {
             "chat_id": None,
             "allowed_users": ["Stiff_OWi", "gshabanov"],
-            "active_reminders": {},
-            "event_current_index": 0
+            "active_reminders": {}
         }
     
     def save(self) -> None:
@@ -1177,34 +250,72 @@ class BotConfig:
     def clear_active_reminders(self) -> None:
         self.data["active_reminders"] = {}
         self.save()
-    
-    @property
-    def event_current_index(self) -> int:
-        return self.data.get("event_current_index", 0)
-    
-    @event_current_index.setter
-    def event_current_index(self, value: int) -> None:
-        self.data["event_current_index"] = value
-        self.save()
-    
-    def increment_event_index(self) -> int:
-        """Увеличиваем индекс событий и возвращаем новый"""
-        current = self.event_current_index
-        new_index = (current + 1) % len(EVENT_CATEGORIES)
-        self.event_current_index = new_index
-        logger.info(f"Индекс событий увеличен: {current} -> {new_index}")
-        return new_index
-    
-    def get_event_scheduler(self) -> EventScheduler:
-        """Получаем планировщик исторических событий"""
-        scheduler = EventScheduler()
-        scheduler.current_index = self.event_current_index
-        return scheduler
 
 # ========== ФУНКЦИИ ДЛЯ ИСТОРИЧЕСКИХ СОБЫТИЙ "В ЭТОТ ДЕНЬ" ==========
 
+def get_on_this_day_events(day: int, month: int) -> List[HistoricalEvent]:
+    """Получаем исторические события "В этот день" через Wikipedia API"""
+    try:
+        params = {
+            "action": "query",
+            "format": "json",
+            "prop": "onthisday",
+            "onthistype": "events",
+            "onthisday": f"{month:02d}-{day:02d}"
+        }
+
+        response = requests.get(
+            WIKIPEDIA_API_URL,
+            params=params,
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        results: List[HistoricalEvent] = []
+
+        for item in data.get("query", {}).get("onthisday", {}).get("events", []):
+            text = item.get("text", "")
+            if not is_safe_text(text):
+                continue
+
+            pages = item.get("pages", [])
+            if not pages:
+                continue
+
+            title = pages[0]["title"]
+            url = f"https://ru.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
+
+            results.append({
+                "title": title,
+                "year": item["year"],
+                "text": text,
+                "url": url
+            })
+
+        return results
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения событий 'В этот день': {e}")
+        return []
+
+def build_event_message(event: HistoricalEvent) -> str:
+    """Создаем сообщение с историческим событием"""
+    now = datetime.now(TIMEZONE)
+    day = now.day
+    month = MONTHS_RU[now.month]
+
+    fact = html.escape(f"В {event['year']} году — {event['text']}")
+
+    return (
+        f"<b>В ЭТОТ ДЕНЬ — {day} {month}</b>\n\n"
+        f"{fact}\n\n"
+        f"📖 <a href=\"{event['url']}\">Подробнее на Википедии</a>"
+    )
+
 async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка ежедневного исторического события 'В этот день' в формате HTML"""
+    """Отправка ежедневного исторического события 'В этот день'"""
     try:
         config = BotConfig()
         chat_id = config.chat_id
@@ -1217,26 +328,28 @@ async def send_daily_event(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        event_scheduler = config.get_event_scheduler()
-        
-        category = event_scheduler.get_next_category()
-        logger.info(f"ОТПРАВКА события 'В этот день' категории: {category}")
-        
-        message, keyboard = event_scheduler.create_event_message(category)
-        
+        now = datetime.now(TIMEZONE)
+        events = get_on_this_day_events(now.day, now.month)
+
+        if not events:
+            logger.warning(f"Не найдено безопасных событий за {now.day} {MONTHS_RU[now.month]}")
+            # Планируем следующее событие
+            await schedule_next_event(context)
+            return
+
+        event = random.choice(events)
+        message = build_event_message(event)
+
         await context.bot.send_message(
             chat_id=chat_id,
             text=message,
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False,
-            reply_markup=keyboard
+            disable_web_page_preview=False
         )
+
+        logger.info(f"✅ Событие 'В этот день' отправлено: {event['year']} - {event['title']}")
         
-        event_scheduler.increment_category()
-        config.event_current_index = event_scheduler.current_index
-        
-        logger.info(f"✅ Событие 'В этот день' отправлено: {category}")
-        
+        # Планируем следующее событие
         await schedule_next_event(context)
         
     except Exception as e:
@@ -1257,151 +370,48 @@ async def send_event_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     try:
-        event_scheduler = config.get_event_scheduler()
-        
-        category = event_scheduler.get_next_category()
-        logger.info(f"ОТПРАВКА ПО КОМАНДЕ события 'В этот день' категории: {category}")
-        
-        message, keyboard = event_scheduler.create_event_message(category)
-        
+        now = datetime.now(TIMEZONE)
+        events = get_on_this_day_events(now.day, now.month)
+
+        if not events:
+            await update.message.reply_text("❌ Не найдено безопасных исторических событий на сегодня")
+            return
+
+        event = random.choice(events)
+        message = build_event_message(event)
+
         await context.bot.send_message(
             chat_id=chat_id,
             text=message,
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=False,
-            reply_markup=keyboard
+            disable_web_page_preview=False
         )
-        
-        event_scheduler.increment_category()
-        config.event_current_index = event_scheduler.current_index
-        
-        logger.info(f"✅ Событие 'В этот день' отправлено по команде: {category}")
+
+        logger.info(f"✅ Событие 'В этот день' отправлено по команде: {event['year']} - {event['title']}")
         
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка при отправке события: {str(e)}")
         logger.error(f"Ошибка в команде /eventnow: {e}")
 
-async def show_next_event_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показать следующую категорию событий 'В этот день'"""
-    config = BotConfig()
-    event_scheduler = config.get_event_scheduler()
-    
-    current_category = event_scheduler.get_next_category()
-    
-    now = datetime.now(TIMEZONE)
-    day = now.day
-    month_ru = MONTHS_RU[now.month]
-    weekday = now.weekday()
-    
-    next_time = calculate_next_event_time()
-    moscow_time = next_time.astimezone(TIMEZONE)
-    
-    category_stats_message = event_scheduler.get_category_stats_message()
-    
-    day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Саббота", "Воскресенье"]
-    current_day_name = day_names[weekday]
-    
-    if weekday in DAY_CATEGORY_PREFERENCES:
-        preferred = DAY_CATEGORY_PREFERENCES[weekday]
-        preferred_emojis = [CATEGORY_EMOJIS.get(cat, '') for cat in preferred]
-        preferred_str = ', '.join([f"{emoji} {cat}" for emoji, cat in zip(preferred_emojis, preferred)])
-        day_info = f"\n📅 *Сегодня {current_day_name}* - предпочтительные категории: {preferred_str}"
-    else:
-        day_info = f"\n📅 *Сегодня {current_day_name}*"
-    
-    month = now.month
-    if month in SEASONAL_PREFERENCES:
-        seasonal = SEASONAL_PREFERENCES[month]
-        seasonal_emojis = [CATEGORY_EMOJIS.get(cat, '') for cat in seasonal]
-        seasonal_str = ', '.join([f"{emoji} {cat}" for emoji, cat in zip(seasonal_emojis, seasonal)])
-        month_info = f"\n🌦️ *Сезонные предпочтения ({MONTHS_RU_LOWER[month]}):* {seasonal_str}"
-    else:
-        month_info = ""
-    
-    current_emoji = CATEGORY_EMOJIS.get(current_category, '📌')
-    
-    response = (
-        f"📊 *Система категорий 'В ЭТОТ ДЕНЬ':*\n\n"
-        f"🗓️ *Исторические события за:* {day} {month_ru}\n"
-        f"{day_info}"
-        f"{month_info}\n\n"
-        f"🎯 *Текущая категория:* {current_emoji} {current_category.upper()}\n"
-        f"⏰ *Следующая отправка:* {moscow_time.strftime('%d.%m.%Y в %H:%M')} по МСК\n\n"
-        f"{category_stats_message}"
-    )
-    
-    await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
-
-@restricted
-async def show_category_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показать детальную статистику категорий (только для разрешенных пользователей)"""
-    config = BotConfig()
-    event_scheduler = config.get_event_scheduler()
-    
-    stats_message = event_scheduler.get_category_stats_message()
-    
-    await update.message.reply_text(stats_message, parse_mode=ParseMode.MARKDOWN)
-
-async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка обратной связи по категориям"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    logger.info(f"Получен фидбэк: {data}")
-    
-    if data.startswith("feedback_"):
-        try:
-            parts = data.split("_")
-            if len(parts) >= 3:
-                feedback_type = parts[1]
-                category = "_".join(parts[2:])
-                
-                config = BotConfig()
-                event_scheduler = config.get_event_scheduler()
-                
-                event_scheduler.record_category_feedback(category, feedback_type)
-                
-                emoji = "👍" if feedback_type == "like" else "👎" if feedback_type == "dislike" else "⏭️"
-                feedback_texts = {
-                    "like": "понравилось",
-                    "dislike": "не понравилось",
-                    "skip": "пропущено"
-                }
-                
-                category_emoji = CATEGORY_EMOJIS.get(category, '📌')
-                response = f"{emoji} Спасибо! Ваш отзыв ({feedback_texts.get(feedback_type, '')}) записан для категории {category_emoji} {category}."
-                
-                await query.edit_message_text(
-                    text=query.message.text + f"\n\n{response}",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=None
-                )
-            else:
-                await query.answer("❌ Ошибка обработки фидбэка", show_alert=True)
-                
-        except Exception as e:
-            logger.error(f"Ошибка обработки фидбэка: {e}")
-            await query.answer("❌ Произошла ошибка", show_alert=True)
-
 def calculate_next_event_time() -> datetime:
     """Рассчитать время следующей отправки события"""
-    now = datetime.now(pytz.UTC)
+    now = datetime.now(TIMEZONE)
     
-    if now.weekday() in EVENT_DAYS:
-        reminder_time = now.replace(
-            hour=EVENT_SEND_TIME["hour"],
-            minute=EVENT_SEND_TIME["minute"],
-            second=0,
-            microsecond=0
-        )
-        if now < reminder_time:
-            return reminder_time
+    # Сегодняшнее время отправки
+    today_target = now.replace(
+        hour=EVENT_SEND_TIME["hour"],
+        minute=EVENT_SEND_TIME["minute"],
+        second=0,
+        microsecond=0
+    )
 
-    days_ahead = 1
-    max_days = 365
-    while days_ahead <= max_days:
-        next_day = now + timedelta(days=days_ahead)
+    # Если сегодня рабочий день и время еще не наступило
+    if now < today_target and now.weekday() in EVENT_DAYS:
+        return today_target
+
+    # Ищем следующий рабочий день
+    for i in range(1, 8):
+        next_day = now + timedelta(days=i)
         if next_day.weekday() in EVENT_DAYS:
             return next_day.replace(
                 hour=EVENT_SEND_TIME["hour"],
@@ -1409,9 +419,8 @@ def calculate_next_event_time() -> datetime:
                 second=0,
                 microsecond=0
             )
-        days_ahead += 1
     
-    raise ValueError(f"Не найден подходящий день за {max_days} дней")
+    raise ValueError("Не найден подходящий день для отправки событий")
 
 async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запланировать следующую отправку события 'В этот день'"""
@@ -1428,7 +437,7 @@ async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        now = datetime.now(pytz.UTC)
+        now = datetime.now(TIMEZONE)
         delay = (next_time - now).total_seconds()
 
         if delay > 0:
@@ -1445,12 +454,7 @@ async def schedule_next_event(context: ContextTypes.DEFAULT_TYPE) -> None:
                     name=job_name
                 )
 
-                logger.info(f"Следующая отправка события 'В этот день' запланирована на {next_time} UTC")
-                logger.info(f"Это будет в {(next_time + timedelta(hours=3)).strftime('%H:%M')} по МСК")
-                
-                event_scheduler = config.get_event_scheduler()
-                next_category = event_scheduler.get_next_category()
-                logger.info(f"Следующая категория: {next_category}")
+                logger.info(f"Следующая отправка события 'В этот день' запланирована на {next_time}")
             else:
                 logger.info(f"Отправка события на {next_time} уже запланирована")
         else:
@@ -1834,25 +838,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Понедельник\n• Среда\n• Пятница\n"
         f"⏰ <b>Время:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n\n"
         "📅 <b>Рубрика 'В ЭТОТ ДЕНЬ':</b>\n"
-        f"• Отправляется: Пн-Пт в 10:00 по МСК\n"
-        f"• <b>Адаптивная система категорий</b>\n"
-        f"• <b>Только API Википедии</b> - без локальной базы\n"
-        f"• Категории: {', '.join([c.capitalize() for c in EVENT_CATEGORIES])}\n"
-        f"• <b>Улучшенный поиск</b> по точной дате + fallback\n"
-        f"• <b>Кэширование запросов</b> для скорости\n\n"
+        f"• Отправляется: Пн-Пт в {EVENT_SEND_TIME['hour']:02d}:{EVENT_SEND_TIME['minute']:02d} по МСК\n"
+        f"• <b>Официальный Wikipedia API</b> - события 'On this day'\n"
+        f"• <b>Безопасный контент</b> - фильтрация войн и смертей\n"
+        f"• <b>Простая и надежная система</b>\n\n"
         "🔧 <b>Доступные команды:</b>\n"
         "/info - информация о боте\n"
         "/jobs - список запланированных задач\n"
         "/test - тестовое напоминание (через 5 сек)\n"
         "/testnow - мгновенное тестовое напоминание\n"
-        "/eventnow - отправить событие 'В этот день' сейчас\n"
-        "/nextevent - следующая категория событий\n\n"
+        "/eventnow - отправить событие 'В этот день' сейчас\n\n"
         "👮♂️ <b>Команды для администраторов:</b>\n"
         "/setchat - установить чат для уведомлений\n"
         "/adduser @username - добавить пользователя\n"
         "/removeuser @username - удалить пользователя\n"
         "/users - список пользователей\n"
-        "/stats - статистика категорий (только для админов)\n"
         "/cancelall - отменить все напоминания",
         parse_mode=ParseMode.HTML
     )
@@ -1918,52 +918,29 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     zoom_info = f"\n🎥 <b>Zoom-ссылка:</b> {'установлена ✅' if ZOOM_LINK and ZOOM_LINK != DEFAULT_ZOOM_LINK else 'не установлена ⚠️'}"
     
-    event_scheduler = config.get_event_scheduler()
-    next_event_category = event_scheduler.get_next_category()
-    next_event_emoji = CATEGORY_EMOJIS.get(next_event_category, '📌')
-    
     now = datetime.now(TIMEZONE)
-    weekday = now.weekday()
-    month = now.month
-    
     day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Саббота", "Воскресенье"]
-    current_day = day_names[weekday]
-    
-    context_info = ""
-    if weekday in DAY_CATEGORY_PREFERENCES:
-        preferred = DAY_CATEGORY_PREFERENCES[weekday]
-        context_info = f"\n📅 <b>Сегодня {current_day}</b> - предпочтения: {', '.join(preferred)}"
-    
-    if month in SEASONAL_PREFERENCES:
-        seasonal = SEASONAL_PREFERENCES[month]
-        context_info += f"\n🌦️ <b>Сезон ({MONTHS_RU_LOWER[month]}):</b> предпочтение к {', '.join(seasonal[:2])}"
-    
-    event_info = f"\n📅 <b>Следующее событие 'В этот день':</b> {next_event_emoji} {next_event_category.capitalize()}"
+    current_day = day_names[now.weekday()]
     
     await update.message.reply_text(
         f"📊 <b>Информация о боте:</b>\n\n"
         f"{status}\n"
         f"📅 <b>Дни планёрок:</b> понедельник, среда, пятница\n"
         f"⏰ <b>Время планёрок:</b> {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК\n"
-        f"📅 <b>События 'В этот день':</b> Пн-Пт в 10:00 по МСК\n"
-        f"🎯 <b>Система категорий:</b> адаптивный выбор\n"
-        f"🌐 <b>Источник данных:</b> только Wikipedia API\n"
-        f"🔍 <b>Поиск:</b> по точной дате + fallback\n"
-        f"💾 <b>Кэширование:</b> включено (1 час)\n"
-        f"⏱️ <b>Таймаут запросов:</b> {REQUEST_TIMEOUT} секунд\n"
+        f"📅 <b>События 'В этот день':</b> Пн-Пт в {EVENT_SEND_TIME['hour']:02d}:{EVENT_SEND_TIME['minute']:02d} по МСК\n"
+        f"🌐 <b>Источник данных:</b> Wikipedia 'On this day' API\n"
+        f"🛡️ <b>Фильтрация:</b> без войн и смертей\n"
         f"👥 <b>Разрешённые пользователи:</b> {len(config.allowed_users)}\n"
         f"📋 <b>Активные напоминания:</b> {len(config.active_reminders)}\n"
         f"⏳ <b>Задачи планёрок:</b> {meeting_job_count}\n"
         f"📅 <b>Задачи событий:</b> {event_job_count}\n"
         f"➡️ <b>Следующая планёрка:</b> {next_meeting_time}\n"
         f"➡️ <b>Следующее событие:</b> {next_event_time}"
-        f"{context_info}"
-        f"{zoom_info}"
-        f"{event_info}\n\n"
-        f"Используйте /stats для статистики категорий (админы)\n"
+        f"{zoom_info}\n\n"
+        f"📅 <b>Сегодня:</b> {current_day}, {now.day} {MONTHS_RU[now.month]} {now.year}\n\n"
         f"Используйте /users для списка пользователей\n"
         f"Используйте /jobs для списка задач\n"
-        f"Используйте /nextevent для следующей категории событий",
+        f"Используйте /eventnow для отправки события сейчас",
         parse_mode=ParseMode.HTML
     )
 
@@ -2332,19 +1309,14 @@ def main() -> None:
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("setchat", set_chat))
         application.add_handler(CommandHandler("info", show_info))
-        application.add_handler(CommandHandler("stats", show_category_stats))
         application.add_handler(CommandHandler("test", test_reminder))
         application.add_handler(CommandHandler("testnow", test_now))
         application.add_handler(CommandHandler("eventnow", send_event_now))
-        application.add_handler(CommandHandler("nextevent", show_next_event_category))
         application.add_handler(CommandHandler("jobs", list_jobs))
         application.add_handler(CommandHandler("adduser", add_user))
         application.add_handler(CommandHandler("removeuser", remove_user))
         application.add_handler(CommandHandler("users", list_users))
         application.add_handler(CommandHandler("cancelall", cancel_all))
-
-        # Обработчик фидбэка для категорий
-        application.add_handler(CallbackQueryHandler(handle_feedback_callback, pattern="^feedback_"))
 
         # Добавляем ConversationHandler
         application.add_handler(conv_handler)
@@ -2379,21 +1351,11 @@ def main() -> None:
         
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"⏰ Планёрки: {', '.join(['Пн', 'Ср', 'Пт'])} в {MEETING_TIME['hour']:02d}:{MEETING_TIME['minute']:02d} по МСК")
-        logger.info(f"📅 Рубрика 'В ЭТОТ ДЕНЬ': Пн-Пт в 10:00 по МСК (07:00 UTC)")
+        logger.info(f"📅 Рубрика 'В ЭТОТ ДЕНЬ': Пн-Пт в {EVENT_SEND_TIME['hour']:02d}:{EVENT_SEND_TIME['minute']:02d} по МСК")
         logger.info(f"🗓️ Сегодня: {current_day}, {day} {month_ru} {year}")
-        logger.info(f"🌐 Источник данных: только Wikipedia API")
-        logger.info(f"🔍 Улучшенный поиск: по точной дате + fallback")
-        logger.info(f"💾 Кэширование: включено (1 час)")
-        logger.info(f"🎯 Адаптивная система категорий")
+        logger.info(f"🌐 Источник данных: Wikipedia 'On this day' API")
+        logger.info(f"🛡️ Фильтрация: без войн и смертей")
         logger.info(f"👥 Разрешённые пользователи: {', '.join(BotConfig().allowed_users)}")
-        
-        if weekday in DAY_CATEGORY_PREFERENCES:
-            preferred = DAY_CATEGORY_PREFERENCES[weekday]
-            logger.info(f"📅 Предпочтения для {current_day}: {', '.join(preferred)}")
-        
-        if now.month in SEASONAL_PREFERENCES:
-            seasonal = SEASONAL_PREFERENCES[now.month]
-            logger.info(f"🌦️ Сезонные предпочтения ({MONTHS_RU_LOWER[now.month]}): {', '.join(seasonal)}")
         
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
