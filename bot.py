@@ -53,18 +53,18 @@ class HelpSystem:
         """Загрузить данные помощи"""
         default_data = {
             "files": {
-                "спич_main": {
+                "speech_main": {
                     "name": "Спич main",
                     "description": "Основной спич для команды",
                     "file_id": None,
-                    "category": "документы",
+                    "category": "documents",
                     "added_date": None
                 },
-                "спич_мероприятия": {
+                "speech_events": {
                     "name": "Спич мероприятия",
                     "description": "Спич для мероприятий и встреч",
                     "file_id": None,
-                    "category": "документы",
+                    "category": "documents",
                     "added_date": None
                 }
             },
@@ -86,11 +86,11 @@ class HelpSystem:
                 }
             },
             "categories": {
-                "документы": {
+                "documents": {
                     "name": "📄 Документы",
                     "description": "Корпоративные документы и спичи"
                 },
-                "ссылки": {
+                "links": {
                     "name": "🔗 Полезные ссылки",
                     "description": "Важные внутренние ресурсы"
                 }
@@ -164,7 +164,7 @@ class HelpSystem:
         """Получить меню категории"""
         keyboard = []
         
-        if category_id == "документы":
+        if category_id == "documents":
             # Показываем файлы
             for file_id, file_data in self.data["files"].items():
                 if file_data["category"] == category_id:
@@ -175,7 +175,7 @@ class HelpSystem:
                         )
                     ])
         
-        elif category_id == "ссылки":
+        elif category_id == "links":
             # Показываем ссылки
             for link_id, link_data in self.data["links"].items():
                 keyboard.append([
@@ -197,9 +197,8 @@ class HelpSystem:
         keyboard = [
             [InlineKeyboardButton("➕ Добавить файл", callback_data="add_file")],
             [InlineKeyboardButton("🗑️ Удалить файл", callback_data="delete_file")],
-            [InlineKeyboardButton("✏️ Редактировать файл", callback_data="edit_file")],
             [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
+            [InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main")]
         ]
         
         return InlineKeyboardMarkup(keyboard)
@@ -225,13 +224,13 @@ class HelpSystem:
     def add_file(self, file_id: str, file_name: str, description: str) -> bool:
         """Добавить новый файл"""
         try:
-            file_key = file_name.lower().replace(' ', '_')
+            file_key = file_name.lower().replace(' ', '_').replace('(', '').replace(')', '')
             
             self.data["files"][file_key] = {
                 "name": file_name,
                 "description": description,
                 "file_id": file_id,
-                "category": "документы",
+                "category": "documents",
                 "added_date": datetime.now().isoformat()
             }
             
@@ -264,7 +263,7 @@ help_system = HelpSystem()
 # ========== КОМАНДЫ ПОЛЬЗОВАТЕЛЕЙ ==========
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /помощь"""
+    """Обработчик команды /help"""
     text = (
         "📚 *ЦЕНТР ПОМОЩИ СОТРУДНИКАМ*\n\n"
         "Здесь вы найдете все необходимые материалы для работы:\n\n"
@@ -283,7 +282,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Обработчик команды /start"""
     await update.message.reply_text(
         "👋 *Добро пожаловать в бот-помощник!*\n\n"
-        "Используйте /помощь для доступа ко всем рабочим материалам.",
+        "Используйте /help для доступа ко всем рабочим материалам.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -364,12 +363,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text = (
                 f"🔗 *{link_data['name']}*\n\n"
                 f"{link_data['description']}\n\n"
-                f"Ссылка: {link_data['url']}"
+                f"*Ссылка:* {link_data['url']}"
             )
             
             keyboard = [
                 [InlineKeyboardButton("🌐 Открыть ссылку", url=link_data["url"])],
-                [InlineKeyboardButton("🔙 Назад", callback_data="cat_ссылки")]
+                [InlineKeyboardButton("🔙 Назад", callback_data="cat_links")]
             ]
             
             await query.edit_message_text(
@@ -482,7 +481,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             
             for file_id, file_data in help_system.data["files"].items():
                 added_date = file_data.get("added_date", "неизвестно")
-                text += f"• {file_data['name']} (добавлен: {added_date[:10]})\n"
+                if added_date:
+                    added_date = added_date[:10]
+                text += f"• {file_data['name']} (добавлен: {added_date})\n"
             
             keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="settings")]]
             
@@ -605,10 +606,9 @@ def main() -> None:
         # Создаем приложение
         application = Application.builder().token(TOKEN).build()
         
-        # Команды пользователей
+        # Команды пользователей - ТОЛЬКО ЛАТИНСКИЕ БУКВЫ!
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("помощь", help_command))
         
         # Обработчик callback-кнопок
         application.add_handler(CallbackQueryHandler(handle_callback))
@@ -629,12 +629,6 @@ def main() -> None:
         )
         
         application.add_handler(conv_handler)
-        
-        # Обработчик документов вне диалога
-        application.add_handler(MessageHandler(
-            filters.Document.ALL & filters.ChatType.PRIVATE,
-            lambda update, context: None  # Игнорируем, если не в процессе добавления
-        ))
         
         # Логирование при запуске
         logger.info("🤖 Бот помощи запущен!")
