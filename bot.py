@@ -125,7 +125,7 @@ class HelpSystem:
         
         return {
             "admins": ["Stiff_OWi", "gshabanov"],  # Список админов
-            "pending_file": {}  # Временные данные для добавления файлов
+            "pending_files": {}  # Временные данные для добавления файлов (user_id -> данные)
         }
     
     def save_data(self) -> None:
@@ -144,7 +144,7 @@ class HelpSystem:
         except Exception as e:
             logger.error(f"Ошибка сохранения пользовательских данных: {e}")
     
-    def get_main_menu(self) -> List[List[InlineKeyboardButton]]:
+    def get_main_menu(self) -> InlineKeyboardMarkup:
         """Получить главное меню"""
         keyboard = []
         
@@ -221,10 +221,23 @@ class HelpSystem:
         
         return InlineKeyboardMarkup(keyboard)
     
-    def add_file(self, file_id: str, file_name: str, description: str) -> bool:
+    def add_file(self, user_id: int, file_id: str, file_name: str, description: str) -> bool:
         """Добавить новый файл"""
         try:
+            # Очищаем временные данные пользователя
+            if str(user_id) in self.user_data["pending_files"]:
+                del self.user_data["pending_files"][str(user_id)]
+                self.save_user_data()
+            
+            # Создаем ключ для файла
             file_key = file_name.lower().replace(' ', '_').replace('(', '').replace(')', '')
+            
+            # Если ключ уже существует, добавляем номер
+            original_key = file_key
+            counter = 1
+            while file_key in self.data["files"]:
+                file_key = f"{original_key}_{counter}"
+                counter += 1
             
             self.data["files"][file_key] = {
                 "name": file_name,
@@ -255,6 +268,34 @@ class HelpSystem:
     def is_admin(self, username: str) -> bool:
         """Проверить, является ли пользователь админом"""
         return username in self.user_data["admins"]
+    
+    def start_adding_file(self, user_id: int) -> None:
+        """Начать процесс добавления файла для пользователя"""
+        self.user_data["pending_files"][str(user_id)] = {
+            "state": "waiting_file"
+        }
+        self.save_user_data()
+    
+    def save_file_data(self, user_id: int, file_id: str, file_name: str) -> None:
+        """Сохранить данные файла для пользователя"""
+        if str(user_id) in self.user_data["pending_files"]:
+            self.user_data["pending_files"][str(user_id)] = {
+                "state": "waiting_name",
+                "file_id": file_id,
+                "file_name": file_name
+            }
+            self.save_user_data()
+    
+    def save_file_name(self, user_id: int, display_name: str) -> None:
+        """Сохранить название файла для пользователя"""
+        if str(user_id) in self.user_data["pending_files"]:
+            self.user_data["pending_files"][str(user_id)]["state"] = "waiting_description"
+            self.user_data["pending_files"][str(user_id)]["display_name"] = display_name
+            self.save_user_data()
+    
+    def get_pending_file(self, user_id: int) -> Optional[Dict]:
+        """Получить данные о файле в процессе добавления"""
+        return self.user_data["pending_files"].get(str(user_id))
 
 # ========== ИНИЦИАЛИЗАЦИЯ СИСТЕМЫ ПОМОЩИ ==========
 
@@ -295,6 +336,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     data = query.data
     user = query.from_user.username
+    user_id = query.from_user.id
     
     # Главное меню
     if data == "back_to_main":
@@ -392,17 +434,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Добавление файла
     elif data == "add_file":
         if help_system.is_admin(user):
-            help_system.user_data["pending_file"] = {"user_id": query.from_user.id}
-            help_system.save_user_data()
+            # Начинаем процесс добавления файла
+            help_system.start_adding_file(user_id)
             
-            await query.edit_message_text(
-                text="📤 *Добавление нового файла*\n\n"
-                     "1. Отправьте мне файл (PDF, Word, Excel и т.д.)\n"
-                     "2. Затем укажите название файла\n"
-                     "3. Добавьте описание\n\n"
-                     "❌ *Отмена:* /cancel",
+            text = (
+                "📤 *Добавление нового файла*\n\n"
+                "1. *Отправьте мне файл* (PDF, Word, Excel, картинку и т.д.)\n"
+                "2. Затем я спрошу название файла\n"
+                "3. Добавьте описание\n\n"
+                "❌ Для отмены отправьте /cancel"
+            )
+            
+            # Отправляем новое сообщение с инструкцией
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=text,
                 parse_mode=ParseMode.MARKDOWN
             )
+            
+            # Закрываем старое меню
+            await query.edit_message_reply_markup(reply_markup=None)
+            
         else:
             await query.answer("❌ У вас нет прав доступа!", show_alert=True)
     
@@ -495,104 +547,120 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # ========== ОБРАБОТЧИКИ ДЛЯ ДОБАВЛЕНИЯ ФАЙЛОВ ==========
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик получения документа для добавления"""
     user = update.message.from_user.username
+    user_id = update.message.from_user.id
     
     if not help_system.is_admin(user):
         await update.message.reply_text("❌ У вас нет прав для добавления файлов.")
-        return ConversationHandler.END
+        return
     
-    pending = help_system.user_data["pending_file"]
+    pending_data = help_system.get_pending_file(user_id)
     
-    if pending.get("user_id") != update.message.from_user.id:
-        return ConversationHandler.END
+    if not pending_data or pending_data.get("state") != "waiting_file":
+        # Пользователь не в процессе добавления файла
+        return
     
     # Сохраняем информацию о файле
     document = update.message.document
-    pending["file_id"] = document.file_id
-    pending["file_name"] = document.file_name or "Без названия"
-    help_system.save_user_data()
+    file_id = document.file_id
+    file_name = document.file_name or "Без названия"
+    
+    help_system.save_file_data(user_id, file_id, file_name)
     
     await update.message.reply_text(
-        f"📁 *Файл получен:* {pending['file_name']}\n\n"
+        f"📁 *Файл получен:* {file_name}\n\n"
         f"Теперь введите *название файла* для отображения в меню:\n\n"
         f"❌ *Отмена:* /cancel",
         parse_mode=ParseMode.MARKDOWN
     )
-    
-    return ADDING_FILE_NAME
 
-async def handle_file_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик ввода названия файла"""
-    pending = help_system.user_data["pending_file"]
-    
-    if pending.get("user_id") != update.message.from_user.id:
-        return ConversationHandler.END
-    
-    pending["display_name"] = update.message.text
-    help_system.save_user_data()
-    
-    await update.message.reply_text(
-        f"✅ *Название сохранено:* {pending['display_name']}\n\n"
-        f"Теперь введите *описание файла*:\n\n"
-        f"❌ *Отмена:* /cancel",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    return ADDING_FILE_DESCRIPTION
-
-async def handle_file_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик ввода описания файла"""
-    pending = help_system.user_data["pending_file"]
-    
-    if pending.get("user_id") != update.message.from_user.id:
-        return ConversationHandler.END
-    
-    description = update.message.text
-    
-    # Добавляем файл в систему
-    success = help_system.add_file(
-        file_id=pending["file_id"],
-        file_name=pending["display_name"],
-        description=description
-    )
-    
-    if success:
-        await update.message.reply_text(
-            f"✅ *Файл успешно добавлен!*\n\n"
-            f"📁 *Название:* {pending['display_name']}\n"
-            f"📝 *Описание:* {description}\n\n"
-            f"Файл теперь доступен в разделе 📄 Документы.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    else:
-        await update.message.reply_text(
-            "❌ *Ошибка при добавлении файла*\n\n"
-            "Попробуйте еще раз или обратитесь к разработчику.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    # Очищаем временные данные
-    help_system.user_data["pending_file"] = {}
-    help_system.save_user_data()
-    
-    return ConversationHandler.END
-
-async def cancel_add_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отмена добавления файла"""
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик текстовых сообщений для добавления файла"""
     user = update.message.from_user.username
+    user_id = update.message.from_user.id
     
-    if help_system.is_admin(user):
-        help_system.user_data["pending_file"] = {}
+    if not help_system.is_admin(user):
+        return
+    
+    pending_data = help_system.get_pending_file(user_id)
+    
+    if not pending_data:
+        # Пользователь не в процессе добавления файла
+        return
+    
+    text = update.message.text
+    
+    # Если пользователь отменяет
+    if text.lower() == "/cancel":
+        help_system.user_data["pending_files"].pop(str(user_id), None)
         help_system.save_user_data()
+        await update.message.reply_text("❌ Добавление файла отменено.")
+        return
+    
+    state = pending_data.get("state")
+    
+    if state == "waiting_name":
+        # Пользователь отправляет название файла
+        help_system.save_file_name(user_id, text)
         
         await update.message.reply_text(
-            "❌ *Добавление файла отменено.*",
+            f"✅ *Название сохранено:* {text}\n\n"
+            f"Теперь введите *описание файла*:\n\n"
+            f"❌ *Отмена:* /cancel",
             parse_mode=ParseMode.MARKDOWN
         )
     
-    return ConversationHandler.END
+    elif state == "waiting_description":
+        # Пользователь отправляет описание файла
+        file_id = pending_data.get("file_id")
+        display_name = pending_data.get("display_name")
+        
+        if file_id and display_name:
+            # Добавляем файл в систему
+            success = help_system.add_file(user_id, file_id, display_name, text)
+            
+            if success:
+                await update.message.reply_text(
+                    f"✅ *Файл успешно добавлен!*\n\n"
+                    f"📁 *Название:* {display_name}\n"
+                    f"📝 *Описание:* {text}\n\n"
+                    f"Файл теперь доступен в разделе 📄 Документы.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ *Ошибка при добавлении файла*\n\n"
+                    "Попробуйте еще раз или обратитесь к разработчику.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        else:
+            await update.message.reply_text(
+                "❌ *Ошибка: данные файла потеряны*\n\n"
+                "Пожалуйста, начните процесс добавления заново.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+# ========== ОБРАБОТЧИК КОМАНДЫ ОТМЕНЫ ==========
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /cancel"""
+    user = update.message.from_user.username
+    user_id = update.message.from_user.id
+    
+    if not help_system.is_admin(user):
+        return
+    
+    # Удаляем данные о процессе добавления файла
+    if str(user_id) in help_system.user_data["pending_files"]:
+        help_system.user_data["pending_files"].pop(str(user_id))
+        help_system.save_user_data()
+    
+    await update.message.reply_text(
+        "❌ *Добавление файла отменено.*",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 # ========== ГЛАВНАЯ ФУНКЦИЯ ==========
 
@@ -609,26 +677,21 @@ def main() -> None:
         # Команды пользователей - ТОЛЬКО ЛАТИНСКИЕ БУКВЫ!
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("cancel", cancel_command))
         
         # Обработчик callback-кнопок
         application.add_handler(CallbackQueryHandler(handle_callback))
         
-        # ConversationHandler для добавления файлов
-        conv_handler = ConversationHandler(
-            entry_points=[CallbackQueryHandler(handle_callback, pattern="^add_file$")],
-            states={
-                ADDING_FILE_NAME: [
-                    MessageHandler(filters.Document.ALL, handle_document),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_name)
-                ],
-                ADDING_FILE_DESCRIPTION: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_description)
-                ],
-            },
-            fallbacks=[CommandHandler("cancel", cancel_add_file)],
-        )
+        # Обработчики для добавления файлов
+        application.add_handler(MessageHandler(
+            filters.Document.ALL & filters.ChatType.PRIVATE,
+            handle_document
+        ))
         
-        application.add_handler(conv_handler)
+        application.add_handler(MessageHandler(
+            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            handle_text
+        ))
         
         # Логирование при запуске
         logger.info("🤖 Бот помощи запущен!")
