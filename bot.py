@@ -1,12 +1,16 @@
 import os
 import json
+import random
 import logging
 import asyncio
-import random
+import re
+import html
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
 import pytz
+import aiohttp
+import feedparser
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -14,16 +18,13 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
+    JobQueue,
     MessageHandler,
     filters,
-    ConversationHandler,
-    JobQueue
 )
 
 # ========== КОНСТАНТЫ ==========
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-# Zoom ссылки
 DEFAULT_ZOOM_LINK = "https://us04web.zoom.us/j/1234567890?pwd=example"
 ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", DEFAULT_ZOOM_LINK)
 INDUSTRY_ZOOM_LINK = os.getenv("INDUSTRY_MEETING_LINK", DEFAULT_ZOOM_LINK)
@@ -34,27 +35,55 @@ WIKI_LINK = os.getenv("WIKI_LINK", "https://wiki.example.com")
 HELPY_BOT_LINK = os.getenv("HELPY_BOT_LINK", "https://t.me/helpy_bot")
 
 # Файлы бота
+CONFIG_FILE = "bot_config.json"
 HELP_DATA_FILE = "help_data.json"
-USER_DATA_FILE = "user_data.json"
-
-# Настройка времени
-TIMEZONE = pytz.timezone("Europe/Moscow")
 
 # Время планёрки (9:15 по Москве)
 MEETING_TIME = {"hour": 9, "minute": 15}
-MEETING_DAYS = [0, 2, 4]  # Пн=0, Ср=2, Пт=4
+TIMEZONE = pytz.timezone("Europe/Moscow")
+
+# Дни недели для планёрки (понедельник=0, среда=2, пятница=4)
+MEETING_DAYS = [0, 2, 4]
+
+# Время отправки утреннего приветствия с гороскопом (9:00 по МСК, Пн-Пт)
+MORNING_GREETING_TIME = {"hour": 9, "minute": 0}
+MORNING_DAYS = [0, 1, 2, 3, 4]  # Пн-Пт
 
 # Время отраслевой встречи (вторник 12:00 по МСК)
 INDUSTRY_MEETING_TIME = {"hour": 12, "minute": 0}
 INDUSTRY_MEETING_DAY = [1]  # Вторник
 
-# Тексты для напоминаний
+# Знаки зодиака с русскими переводами
+ZODIAC_SIGNS = {
+    'aries': {'ru': '♈ Овен', 'emoji': '♈', 'en': 'Aries'},
+    'taurus': {'ru': '♉ Телец', 'emoji': '♉', 'en': 'Taurus'},
+    'gemini': {'ru': '♊ Близнецы', 'emoji': '♊', 'en': 'Gemini'},
+    'cancer': {'ru': '♋ Рак', 'emoji': '♋', 'en': 'Cancer'},
+    'leo': {'ru': '♌ Лев', 'emoji': '♌', 'en': 'Leo'},
+    'virgo': {'ru': '♍ Дева', 'emoji': '♍', 'en': 'Virgo'},
+    'libra': {'ru': '♎ Весы', 'emoji': '♎', 'en': 'Libra'},
+    'scorpio': {'ru': '♏ Скорпион', 'emoji': '♏', 'en': 'Scorpio'},
+    'sagittarius': {'ru': '♐ Стрелец', 'emoji': '♐', 'en': 'Sagittarius'},
+    'capricorn': {'ru': '♑ Козерог', 'emoji': '♑', 'en': 'Capricorn'},
+    'aquarius': {'ru': '♒ Водолей', 'emoji': '♒', 'en': 'Aquarius'},
+    'pisces': {'ru': '♓ Рыбы', 'emoji': '♓', 'en': 'Pisces'}
+}
+
+# Утренние приветствия
+MORNING_GREETINGS = [
+    "Оу, еще спишь? 😴 Давай посмотрим, что говорят звезды о тебе сегодня! ✨",
+    "☀️ Хочешь узнать, что приготовили для тебя звезды? 🔮",
+    "👋 Готов(а) узнать свой гороскоп на сегодня? Давай заглянем в будущее! 🌟"
+]
+
+# Тексты для планёрок
 PLANERKA_TEXTS = [
     "🎯 𝗣ЛАНЁРКА\n\n📋 Повестка дня:\n• Отчёт по задачам\n• Планы на день\n• Вопросы и обсуждения\n\n🕐 Начало: 9:30 по МСК\n📍 Формат: Zoom-конференция\n\n🔗 Подключаемся: {zoom_link} | 👈",
     "🎯 𝗣ЛАНЁРКА\n\n✨ Что будет:\n• Обсуждение текущих задач\n• Координация командной работы\n• Решение операционных вопросов\n\n⏰ Время: 9:30 (МСК)\n💻 Онлайн в Zoom\n\n🔗 Всех ждём! {zoom_link} ← переход",
     "🎯 𝗣ЛАНЁРКА\n\n📊 На сегодня:\n• Статус по проектам\n• Приоритеты дня\n• Синхронизация команд\n\n🕐 Старт: 9:30 по Москве\n🎥 Конференция Zoom\n\n🔗 Присоединяйтесь: {zoom_link} | 👈"
 ]
 
+# Текст для отраслевой встречи
 INDUSTRY_MEETING_TEXTS = [
     "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n🎯 Что делаем:\n• Обсудим итоги за неделю\n• Новые тренды и инсайты\n• Обмен опытом с коллегами\n• Запланируем мероприятия на следующую\n\n🕐 Начало: 12:00 по МСК\n📍 Формат: Zoom-конференция\n\n🔗 Всех причастных ждём! {zoom_link} | 👈",
     "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n📊 Сегодня на повестке:\n• Анализ недельных результатов\n• Выявление ключевых трендов\n• Коллективный разбор кейсов\n• Планирование активностей\n\n🕐 Старт: 12:00 (МСК)\n🎥 Онлайн в Zoom\n\n🔗 Присоединяйтесь: {zoom_link} ← переход",
@@ -84,34 +113,247 @@ logger = logging.getLogger(__name__)
 # Состояния для диалогов
 ADDING_FILE_NAME, ADDING_FILE_DESCRIPTION = range(2)
 
-# ========== КЛАСС ДЛЯ ХРАНЕНИЯ ДАННЫХ ==========
+# ========== ПАРСЕР ГОРОСКОПОВ ==========
+
+class HoroscopeParser:
+    """Парсер гороскопов из различных источников"""
+    
+    def __init__(self):
+        self.sources = {
+            'rambler': {
+                'base_url': 'https://horoscopes.rambler.ru/rss/{sign}/',
+                'type': 'rss'
+            },
+            'mail_ru': {
+                'base_url': 'https://horo.mail.ru/rss/{sign}/today.xml',
+                'type': 'rss'
+            },
+            'yandex': {
+                'base_url': 'https://news.yandex.ru/horoscope/index.rss',
+                'type': 'rss_multi'
+            },
+            'astrology_com': {
+                'base_url': 'https://www.astrology.com/horoscope/daily/today.html?rss=true',
+                'type': 'rss_multi'
+            }
+        }
+        
+        # Маппинг для разных источников
+        self.sign_mapping = {
+            'aries': {'rambler': 'oven', 'mail_ru': 'oven', 'yandex': 'Овен'},
+            'taurus': {'rambler': 'telec', 'mail_ru': 'telec', 'yandex': 'Телец'},
+            'gemini': {'rambler': 'bliznecy', 'mail_ru': 'bliznecy', 'yandex': 'Близнецы'},
+            'cancer': {'rambler': 'rak', 'mail_ru': 'rak', 'yandex': 'Рак'},
+            'leo': {'rambler': 'lev', 'mail_ru': 'lev', 'yandex': 'Лев'},
+            'virgo': {'rambler': 'deva', 'mail_ru': 'deva', 'yandex': 'Дева'},
+            'libra': {'rambler': 'vesy', 'mail_ru': 'vesy', 'yandex': 'Весы'},
+            'scorpio': {'rambler': 'skorpion', 'mail_ru': 'skorpion', 'yandex': 'Скорпион'},
+            'sagittarius': {'rambler': 'strelec', 'mail_ru': 'strelec', 'yandex': 'Стрелец'},
+            'capricorn': {'rambler': 'kozerog', 'mail_ru': 'kozerog', 'yandex': 'Козерог'},
+            'aquarius': {'rambler': 'vodoley', 'mail_ru': 'vodoley', 'yandex': 'Водолей'},
+            'pisces': {'rambler': 'ryby', 'mail_ru': 'ryby', 'yandex': 'Рыбы'}
+        }
+    
+    async def _clean_text(self, text: str) -> str:
+        """Очистка текста от HTML тегов и лишних символов"""
+        if not text:
+            return ""
+        
+        # Удаляем HTML теги
+        text = re.sub(r'<[^>]+>', '', text)
+        
+        # Заменяем HTML сущности
+        text = html.unescape(text)
+        
+        # Удаляем лишние пробелы и переносы
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Ограничиваем длину
+        if len(text) > 1000:
+            text = text[:997] + "..."
+        
+        return text
+    
+    async def parse_rambler_horoscope(self, sign: str) -> Optional[Dict]:
+        """Парсим гороскоп с Rambler"""
+        try:
+            sign_key = self.sign_mapping[sign]['rambler']
+            url = self.sources['rambler']['base_url'].format(sign=sign_key)
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as response:
+                    if response.status != 200:
+                        return None
+                    
+                    content = await response.text()
+                    feed = feedparser.parse(content)
+                    
+                    if not feed.entries:
+                        return None
+                    
+                    entry = feed.entries[0]
+                    prediction = await self._clean_text(entry.get('summary', ''))
+                    
+                    if not prediction:
+                        return None
+                    
+                    return {
+                        'sign': ZODIAC_SIGNS[sign]['ru'],
+                        'date': datetime.now(TIMEZONE).strftime('%d.%m.%Y'),
+                        'prediction': prediction,
+                        'source': 'Rambler',
+                        'url': entry.get('link', '')
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Ошибка парсинга Rambler для {sign}: {e}")
+            return None
+    
+    async def parse_mail_ru_horoscope(self, sign: str) -> Optional[Dict]:
+        """Парсим гороскоп с Mail.ru"""
+        try:
+            sign_key = self.sign_mapping[sign]['mail_ru']
+            url = self.sources['mail_ru']['base_url'].format(sign=sign_key)
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as response:
+                    if response.status != 200:
+                        return None
+                    
+                    content = await response.text()
+                    feed = feedparser.parse(content)
+                    
+                    if not feed.entries:
+                        return None
+                    
+                    entry = feed.entries[0]
+                    prediction = await self._clean_text(entry.get('summary', ''))
+                    
+                    if not prediction:
+                        return None
+                    
+                    return {
+                        'sign': ZODIAC_SIGNS[sign]['ru'],
+                        'date': datetime.now(TIMEZONE).strftime('%d.%m.%Y'),
+                        'prediction': prediction,
+                        'source': 'Mail.ru',
+                        'url': entry.get('link', '')
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Ошибка парсинга Mail.ru для {sign}: {e}")
+            return None
+    
+    async def parse_yandex_horoscope(self, sign: str) -> Optional[Dict]:
+        """Парсим гороскоп с Яндекс"""
+        try:
+            url = self.sources['yandex']['base_url']
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as response:
+                    if response.status != 200:
+                        return None
+                    
+                    content = await response.text()
+                    feed = feedparser.parse(content)
+                    
+                    if not feed.entries:
+                        return None
+                    
+                    sign_ru = self.sign_mapping[sign]['yandex']
+                    
+                    for entry in feed.entries:
+                        title = entry.get('title', '')
+                        if sign_ru in title:
+                            prediction = await self._clean_text(entry.get('summary', ''))
+                            if prediction:
+                                return {
+                                    'sign': ZODIAC_SIGNS[sign]['ru'],
+                                    'date': datetime.now(TIMEZONE).strftime('%d.%m.%Y'),
+                                    'prediction': prediction,
+                                    'source': 'Яндекс',
+                                    'url': entry.get('link', '')
+                                }
+                    
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Ошибка парсинга Яндекс для {sign}: {e}")
+            return None
+    
+    async def get_horoscope(self, sign: str) -> Optional[Dict]:
+        """Получить гороскоп для указанного знака"""
+        try:
+            # Пробуем разные источники в порядке приоритета
+            sources = [
+                self.parse_rambler_horoscope,
+                self.parse_mail_ru_horoscope,
+                self.parse_yandex_horoscope
+            ]
+            
+            for source_func in sources:
+                try:
+                    horoscope = await source_func(sign)
+                    if horoscope:
+                        logger.info(f"Успешно получен гороскоп для {sign} из {horoscope['source']}")
+                        return horoscope
+                except Exception as e:
+                    logger.debug(f"Источник не сработал: {e}")
+                    continue
+            
+            logger.warning(f"Не удалось получить гороскоп для {sign} из всех источников")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения гороскопа для {sign}: {e}")
+            return None
+
+# Глобальный парсер
+horoscope_parser = HoroscopeParser()
+
+# ========== КЛАСС КОНФИГА ==========
 
 class BotConfig:
     """Класс для управления конфигурацией бота"""
     
     def __init__(self):
-        self.data_file = USER_DATA_FILE
+        self.config_file = CONFIG_FILE
         self.help_data_file = HELP_DATA_FILE
-        self.data = self._load_data()
+        self.data = self._load_config()
         self.help_data = self._load_help_data()
     
-    def _load_data(self) -> Dict[str, Any]:
+    def _load_config(self) -> Dict[str, Any]:
         """Загрузить основные данные"""
-        if os.path.exists(self.data_file):
+        if os.path.exists(self.config_file):
             try:
-                with open(self.data_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if "allowed_users" not in data:
+                        data["allowed_users"] = ["Stiff_OWi", "gshabanov"]
+                    if "active_reminders" not in data:
+                        data["active_reminders"] = {}
+                    if "pending_files" not in data:
+                        data["pending_files"] = {}
+                    if "admins" not in data:
+                        data["admins"] = ["Stiff_OWi", "gshabanov"]
+                    if "chat_id" not in data:
+                        data["chat_id"] = None
+                    if "user_zodiacs" not in data:
+                        data["user_zodiacs"] = {}
+                    return data
             except Exception as e:
-                logger.error(f"Ошибка загрузки данных: {e}")
-        
+                logger.error(f"Ошибка загрузки конфига: {e}")
         return {
             "chat_id": None,
+            "allowed_users": ["Stiff_OWi", "gshabanov"],
             "admins": ["Stiff_OWi", "gshabanov"],
-            "pending_files": {}
+            "active_reminders": {},
+            "pending_files": {},
+            "user_zodiacs": {}
         }
     
     def _load_help_data(self) -> Dict[str, Any]:
-        """Загрузить данные помощи - ТЕПЕРЬ БЕЗ ЗАГЛУШЕК ДОКУМЕНТОВ"""
+        """Загрузить данные помощи"""
         default_data = {
             "files": {},  # Пустой словарь - файлы будут добавляться через бота
             "links": {
@@ -166,10 +408,10 @@ class BotConfig:
     def save(self) -> None:
         """Сохранить основные данные"""
         try:
-            with open(self.data_file, 'w', encoding='utf-8') as f:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.error(f"Ошибка сохранения данных: {e}")
+            logger.error(f"Ошибка сохранения конфига: {e}")
     
     def save_help_data(self) -> None:
         """Сохранить данные помощи"""
@@ -189,11 +431,41 @@ class BotConfig:
         self.save()
     
     @property
+    def allowed_users(self) -> List[str]:
+        return self.data.get("allowed_users", [])
+    
+    @property
     def admins(self) -> List[str]:
         return self.data.get("admins", [])
     
     def is_admin(self, username: str) -> bool:
         return username in self.admins
+    
+    def add_allowed_user(self, username: str) -> bool:
+        if username not in self.allowed_users:
+            self.data["allowed_users"].append(username)
+            self.save()
+            return True
+        return False
+    
+    def remove_allowed_user(self, username: str) -> bool:
+        if username in self.allowed_users:
+            self.data["allowed_users"].remove(username)
+            self.save()
+            return True
+        return False
+    
+    @property
+    def user_zodiacs(self) -> Dict[str, str]:
+        """Словарь user_id -> знак зодиака"""
+        return self.data.get("user_zodiacs", {})
+    
+    def set_user_zodiac(self, user_id: int, zodiac: str) -> None:
+        self.data["user_zodiacs"][str(user_id)] = zodiac
+        self.save()
+    
+    def get_user_zodiac(self, user_id: int) -> Optional[str]:
+        return self.data.get("user_zodiacs", {}).get(str(user_id))
     
     def get_pending_file(self, user_id: int) -> Optional[Dict]:
         return self.data["pending_files"].get(str(user_id))
@@ -261,11 +533,277 @@ class BotConfig:
             return True
         return False
 
-# ========== ИНИЦИАЛИЗАЦИЯ КОНФИГА ==========
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
-config = BotConfig()
+def get_jobs_from_queue(job_queue: JobQueue):
+    """Получить список задач с поддержкой разных версий PTB"""
+    try:
+        return job_queue.get_jobs()
+    except AttributeError:
+        try:
+            return job_queue.jobs()
+        except AttributeError as e:
+            logger.error(f"Не удалось получить задачи из JobQueue: {e}")
+            return []
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ НАПОМИНАНИЙ ==========
+# Декоратор для проверки прав пользователя
+def restricted(func):
+    @wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        username = update.effective_user.username
+        config = BotConfig()
+        allowed_users = config.allowed_users
+        
+        if username not in allowed_users:
+            if update.callback_query:
+                await update.callback_query.answer("❌ У вас нет прав для этой операции", show_alert=True)
+            else:
+                await update.message.reply_text("❌ У вас нет прав для этой команды")
+            return None
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
+# ========== ФУНКЦИИ ДЛЯ ГОРОСКОПОВ ==========
+
+def create_zodiac_keyboard() -> InlineKeyboardMarkup:
+    """Создаем клавиатуру со знаками зодиака в 3 колонки"""
+    keyboard = []
+    signs_list = list(ZODIAC_SIGNS.items())
+    
+    # Разбиваем на 3 колонки по 4 знака
+    for i in range(0, len(signs_list), 4):
+        row = []
+        for j in range(4):
+            if i + j < len(signs_list):
+                sign_key, sign_data = signs_list[i + j]
+                row.append(
+                    InlineKeyboardButton(
+                        f"{sign_data['emoji']}",
+                        callback_data=f"horoscope_{sign_key}"
+                    )
+                )
+        keyboard.append(row)
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def build_horoscope_message(horoscope: Dict) -> str:
+    """Создаем красивое сообщение с гороскопом"""
+    horoscope_text = (
+        f"✨ <b>ГОРОСКОП НА СЕГОДНЯ</b> ✨\n\n"
+        f"<b>{horoscope['sign']}</b>\n"
+        f"📅 {horoscope['date']}\n\n"
+        f"🔮 <b>Предсказание:</b>\n"
+        f"{horoscope['prediction']}\n\n"
+        f"📌 <i>Источник: {horoscope['source']}</i>\n\n"
+        f"<i>Хорошего дня! 🌟</i>"
+    )
+    
+    return horoscope_text
+
+async def send_horoscope(chat_id: int, horoscope: Dict, context: ContextTypes.DEFAULT_TYPE, 
+                        user_id: Optional[int] = None) -> None:
+    """Отправляет гороскоп"""
+    try:
+        # Строим текстовое сообщение
+        message_text = build_horoscope_message(horoscope)
+        
+        # Отправляем сообщение
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=message_text,
+            parse_mode=ParseMode.HTML
+        )
+        
+        if user_id:
+            logger.info(f"✅ Гороскоп отправлен пользователю {user_id} ({horoscope['sign']})")
+        else:
+            logger.info(f"✅ Гороскоп отправлен в чат {chat_id} ({horoscope['sign']})")
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки гороскопа: {e}")
+        fallback_text = build_horoscope_message(horoscope)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=fallback_text,
+            parse_mode=ParseMode.HTML
+        )
+
+async def get_backup_horoscope(sign: str) -> Dict:
+    """Резервный гороскоп, если парсинг не работает"""
+    predictions = [
+        "Сегодня звезды благоволят вам. Ожидайте приятных сюрпризов!",
+        "День подходит для новых начинаний. Доверяйте своей интуиции.",
+        "Сегодня хороший день для общения и знакомств.",
+        "Время для творчества и самовыражения.",
+        "Финансовая удача сегодня на вашей стороне.",
+        "День гармонии и спокойствия. Наслаждайтесь моментом.",
+        "Сегодня вы сможете решить давние проблемы.",
+        "Удачный день для планирования будущего.",
+        "Ждите интересных предложений сегодня.",
+        "День полон возможностей - будьте внимательны!"
+    ]
+    
+    return {
+        'sign': ZODIAC_SIGNS[sign]['ru'],
+        'date': datetime.now(TIMEZONE).strftime('%d.%m.%Y'),
+        'prediction': random.choice(predictions),
+        'source': 'Резервный гороскоп',
+        'url': ''
+    }
+
+# ========== УТРЕННЯЯ РАССЫЛКА ГОРОСКОПОВ ==========
+
+async def send_morning_horoscopes(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправка утренних гороскопов для всех пользователей"""
+    try:
+        config = BotConfig()
+        chat_id = config.chat_id
+
+        if not chat_id:
+            logger.error("Chat ID не установлен для утренней рассылки!")
+            await schedule_next_morning(context)
+            return
+        
+        # Отправляем утреннее приветствие
+        greeting = random.choice(MORNING_GREETINGS)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=greeting,
+            parse_mode=ParseMode.HTML
+        )
+
+        logger.info(f"✅ Утреннее приветствие отправлено в чат {chat_id}")
+        
+        # Ждем 1 секунду перед отправкой гороскопов
+        await asyncio.sleep(1)
+        
+        # Получаем всех пользователей с их знаками зодиака
+        user_zodiacs = config.user_zodiacs
+        
+        if not user_zodiacs:
+            logger.warning("Нет пользователей с выбранными знаками зодиака")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="📝 <i>Напоминание: выберите свой знак зодиака с помощью /start, чтобы получать персональные гороскопы!</i>",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            logger.info(f"Отправляю гороскопы для {len(user_zodiacs)} пользователей")
+            
+            # Для каждого пользователя отправляем его персональный гороскоп
+            for user_id_str, sign_key in user_zodiacs.items():
+                try:
+                    # Получаем гороскоп через парсинг
+                    horoscope = await horoscope_parser.get_horoscope(sign_key)
+                    
+                    # Если парсинг не вернул данные, используем резервный
+                    if not horoscope:
+                        horoscope = await get_backup_horoscope(sign_key)
+                        logger.warning(f"Используется резервный гороскоп для {sign_key}")
+                    
+                    # Отправляем гороскоп в групповой чат
+                    await send_horoscope(
+                        chat_id=chat_id,
+                        horoscope=horoscope,
+                        context=context,
+                        user_id=int(user_id_str) if user_id_str.isdigit() else None
+                    )
+                    
+                    # Небольшая задержка между отправками
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка отправки гороскопа для пользователя {user_id_str}: {e}")
+                    continue
+        
+        logger.info(f"✅ Утренние гороскопы отправлены в чат {chat_id}")
+        
+        # Планируем следующую рассылку
+        await schedule_next_morning(context)
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки утренних гороскопов: {e}")
+        await schedule_next_morning(context)
+
+def calculate_next_morning_time() -> datetime:
+    """Рассчитать время следующей утренней рассылки"""
+    now = datetime.now(TIMEZONE)
+    
+    # Сегодняшнее время отправки
+    today_target = now.replace(
+        hour=MORNING_GREETING_TIME["hour"],
+        minute=MORNING_GREETING_TIME["minute"],
+        second=0,
+        microsecond=0
+    )
+
+    # Если сегодня рабочий день и время еще не наступило
+    if now < today_target and now.weekday() in MORNING_DAYS:
+        return today_target
+
+    # Ищем следующий рабочий день
+    for i in range(1, 8):
+        next_day = now + timedelta(days=i)
+        if next_day.weekday() in MORNING_DAYS:
+            return next_day.replace(
+                hour=MORNING_GREETING_TIME["hour"],
+                minute=MORNING_GREETING_TIME["minute"],
+                second=0,
+                microsecond=0
+            )
+    
+    raise ValueError("Не найден подходящий день для утренней рассылки")
+
+async def schedule_next_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запланировать следующую утреннюю рассылку"""
+    try:
+        next_time = calculate_next_morning_time()
+        config = BotConfig()
+        chat_id = config.chat_id
+
+        if not chat_id:
+            logger.warning("Chat ID не установлен, планирование утренних рассылок отложено")
+            context.application.job_queue.run_once(
+                lambda ctx: asyncio.create_task(schedule_next_morning(ctx)),
+                3600
+            )
+            return
+
+        now = datetime.now(TIMEZONE)
+        delay = (next_time - now).total_seconds()
+
+        if delay > 0:
+            job_name = f"morning_horoscopes_{next_time.strftime('%Y%m%d_%H%M')}"
+            
+            existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
+                            if j.name == job_name]
+            
+            if not existing_jobs:
+                context.application.job_queue.run_once(
+                    send_morning_horoscopes,
+                    delay,
+                    chat_id=chat_id,
+                    name=job_name
+                )
+
+                logger.info(f"Следующая утренняя рассылка запланирована на {next_time}")
+            else:
+                logger.info(f"Утренняя рассылка на {next_time} уже запланирована")
+        else:
+            logger.warning(f"Время утренней рассылки уже прошло ({next_time}), планируем на следующий день")
+            context.application.job_queue.run_once(
+                lambda ctx: asyncio.create_task(schedule_next_morning(ctx)),
+                60
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка планирования утренней рассылки: {e}")
+        context.application.job_queue.run_once(
+            lambda ctx: asyncio.create_task(schedule_next_morning(ctx)),
+            300
+        )
+
+# ========== ФУНКЦИИ ДЛЯ НАПОМИНАНИЙ ==========
 
 def get_planerka_text() -> str:
     """Получить текст для планёрки"""
@@ -352,6 +890,7 @@ def calculate_next_industry_meeting_time() -> datetime:
 async def send_planerka_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправка напоминания о планёрке"""
     try:
+        config = BotConfig()
         chat_id = config.chat_id
 
         if not chat_id:
@@ -363,7 +902,6 @@ async def send_planerka_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         
         keyboard = [
             [
-                InlineKeyboardButton("✅ Я буду", callback_data="planerka_attend"),
                 InlineKeyboardButton("❌ Отменить планёрку", callback_data="planerka_cancel")
             ]
         ]
@@ -389,6 +927,7 @@ async def schedule_next_planerka(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запланировать следующую планёрку"""
     try:
         next_time = calculate_next_planerka_time()
+        config = BotConfig()
         chat_id = config.chat_id
 
         if not chat_id:
@@ -406,7 +945,8 @@ async def schedule_next_planerka(context: ContextTypes.DEFAULT_TYPE) -> None:
             job_name = f"planerka_reminder_{next_time.strftime('%Y%m%d_%H%M')}"
             
             # Проверяем, нет ли уже такой задачи
-            existing_jobs = context.application.job_queue.get_jobs_by_name(job_name)
+            existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
+                            if j.name == job_name]
             
             if not existing_jobs:
                 context.application.job_queue.run_once(
@@ -436,6 +976,7 @@ async def schedule_next_planerka(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def send_industry_meeting_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправка напоминания об отраслевой встрече"""
     try:
+        config = BotConfig()
         chat_id = config.chat_id
 
         if not chat_id:
@@ -447,7 +988,6 @@ async def send_industry_meeting_reminder(context: ContextTypes.DEFAULT_TYPE) -> 
         
         keyboard = [
             [
-                InlineKeyboardButton("✅ Я буду", callback_data="industry_attend"),
                 InlineKeyboardButton("❌ Отменить встречу", callback_data="industry_cancel")
             ]
         ]
@@ -473,6 +1013,7 @@ async def schedule_next_industry_meeting(context: ContextTypes.DEFAULT_TYPE) -> 
     """Запланировать следующую отраслевую встречу"""
     try:
         next_time = calculate_next_industry_meeting_time()
+        config = BotConfig()
         chat_id = config.chat_id
 
         if not chat_id:
@@ -490,7 +1031,8 @@ async def schedule_next_industry_meeting(context: ContextTypes.DEFAULT_TYPE) -> 
             job_name = f"industry_meeting_{next_time.strftime('%Y%m%d_%H%M')}"
             
             # Проверяем, нет ли уже такой задачи
-            existing_jobs = context.application.job_queue.get_jobs_by_name(job_name)
+            existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
+                            if j.name == job_name]
             
             if not existing_jobs:
                 context.application.job_queue.run_once(
@@ -609,20 +1151,18 @@ def get_help_delete_files_menu() -> InlineKeyboardMarkup:
 
 # ========== КОМАНДЫ ==========
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /start"""
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик /start - выбор знака зодиака"""
     await update.message.reply_text(
-        "👋 *Добро пожаловать в бот-помощник!*\n\n"
-        "Доступные команды:\n"
-        "/help - Центр помощи с файлами и ссылками\n"
-        "/setchat - Установить чат для рассылки напоминаний\n"
-        "/testplanerka - Тест напоминания о планёрке\n"
-        "/testindustry - Тест напоминания об отраслевой встрече",
-        parse_mode=ParseMode.MARKDOWN
+        "🔮 <b>Выберите ваш знак зодиака:</b>\n\n"
+        "Бот запомнит ваш выбор и будет отправлять персональный гороскоп каждое утро в 9:00!",
+        reply_markup=create_zodiac_keyboard(),
+        parse_mode=ParseMode.HTML
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /help"""
+    config = BotConfig()
     files_count = len(config.help_data["files"])
     
     text = (
@@ -639,27 +1179,41 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def setchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Установка группового чата для рассылки"""
+    config = BotConfig()
     config.chat_id = update.effective_chat.id
     
     await update.message.reply_text(
-        f"✅ *Чат установлен!*\n\n"
-        f"Теперь бот будет отправлять напоминания:\n"
+        f"✅ <b>Чат установлен!</b>\n\n"
+        f"Теперь бот будет отправлять:\n"
+        f"• Утренние гороскопы в 9:00 (Пн-Пт)\n"
         f"• Планёрки: Пн, Ср, Пт в 9:15 по МСК\n"
         f"• Отраслевые встречи: Вт в 12:00 по МСК\n\n"
-        f"ID чата: `{update.effective_chat.id}`",
-        parse_mode=ParseMode.MARKDOWN
+        f"<i>Попросите всех участников выбрать знак зодиака с помощью /start</i>",
+        parse_mode=ParseMode.HTML
     )
     
     logger.info(f"Установлен чат {update.effective_chat.id}")
     
     # Запускаем планировщики
+    await schedule_next_morning(context)
     await schedule_next_planerka(context)
     await schedule_next_industry_meeting(context)
 
+async def test_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Тестовая отправка утренней рассылки"""
+    config = BotConfig()
+    if not config.chat_id:
+        await update.message.reply_text("❌ Сначала установите чат командой /setchat")
+        return
+    
+    await update.message.reply_text("⏳ <b>Отправляю тестовую утреннюю рассылку...</b>", parse_mode=ParseMode.HTML)
+    await send_morning_horoscopes(context)
+
 async def test_planerka_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Тестовая отправка напоминания о планёрке"""
+    config = BotConfig()
     chat_id = config.chat_id
     if not chat_id:
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
@@ -670,6 +1224,7 @@ async def test_planerka_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def test_industry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Тестовая отправка напоминания об отраслевой встрече"""
+    config = BotConfig()
     chat_id = config.chat_id
     if not chat_id:
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
@@ -680,6 +1235,63 @@ async def test_industry_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ========== ОБРАБОТЧИКИ КНОПОК ==========
 
+async def handle_horoscope_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка выбора знака зодиака (для персонального выбора)"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    config = BotConfig()
+    
+    # Показываем "загрузку"
+    await query.edit_message_text(
+        text="🔮 <i>Спрашиваю у звезд...</i>",
+        parse_mode=ParseMode.HTML
+    )
+    
+    try:
+        # Получаем выбранный знак из callback_data
+        sign_key = query.data.replace("horoscope_", "")
+        
+        if sign_key not in ZODIAC_SIGNS:
+            await query.edit_message_text(
+                text="❌ Ошибка: неверный знак зодиака",
+                parse_mode=ParseMode.HTML
+            )
+            return
+        
+        # Получаем гороскоп через парсинг
+        horoscope = await horoscope_parser.get_horoscope(sign_key)
+        
+        # Если парсинг не вернул данные, используем резервный
+        if not horoscope:
+            horoscope = await get_backup_horoscope(sign_key)
+            logger.warning(f"API не вернуло гороскоп, используется резервный для {sign_key}")
+        
+        # Сохраняем выбор пользователя
+        config.set_user_zodiac(user_id, sign_key)
+        
+        # Отправляем гороскоп
+        await send_horoscope(
+            chat_id=user_id,
+            horoscope=horoscope,
+            context=context,
+            user_id=user_id
+        )
+        
+        # Удаляем сообщение с выбором знака
+        try:
+            await query.delete_message()
+        except:
+            pass
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки гороскопа: {e}")
+        await query.edit_message_text(
+            text="❌ Произошла ошибка при получении гороскопа. Попробуйте позже.",
+            parse_mode=ParseMode.HTML
+        )
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик всех callback-кнопок"""
     query = update.callback_query
@@ -688,16 +1300,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data
     user = query.from_user.username
     user_id = query.from_user.id
+    config = BotConfig()
     
     # ========== ОБРАБОТКА НАПОМИНАНИЙ ==========
     
-    if data == "planerka_attend":
-        user_name = query.from_user.first_name
-        await query.edit_message_text(
-            text=f"{query.message.text}\n\n✅ <b>{user_name} будет на планёрке</b>",
-            parse_mode=ParseMode.HTML
-        )
-    elif data == "planerka_cancel":
+    if data == "planerka_cancel":
         keyboard = [
             [InlineKeyboardButton(reason, callback_data=f"cancel_planerka_{i}")]
             for i, reason in enumerate(CANCELLATION_OPTIONS)
@@ -712,12 +1319,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=ParseMode.HTML
         )
     
-    elif data == "industry_attend":
-        user_name = query.from_user.first_name
-        await query.edit_message_text(
-            text=f"{query.message.text}\n\n✅ <b>{user_name} будет на встрече</b>",
-            parse_mode=ParseMode.HTML
-        )
     elif data == "industry_cancel":
         keyboard = [
             [InlineKeyboardButton(reason, callback_data=f"cancel_industry_{i}")]
@@ -730,6 +1331,58 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(
             text="<b>Выберите причину отмены отраслевой встречи:</b>",
             reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
+    
+    # Обработка причин отмены планёрки
+    elif data.startswith("cancel_planerka_"):
+        try:
+            reason_index = int(data.replace("cancel_planerka_", ""))
+            reason = CANCELLATION_OPTIONS[reason_index]
+            
+            await query.edit_message_text(
+                text=f"<b>Планёрка отменена!</b>\n\nПричина: {reason}\n\n"
+                     f"Следующая планёрка запланирована на {calculate_next_planerka_time().strftime('%A, %d %B в %H:%M')}",
+                parse_mode=ParseMode.HTML
+            )
+            logger.info(f"Планёрка отменена пользователем {user}. Причина: {reason}")
+        except (ValueError, IndexError) as e:
+            logger.error(f"Ошибка обработки отмены планёрки: {e}")
+            await query.answer("Ошибка при обработке запроса", show_alert=True)
+    
+    # Обработка причин отмены отраслевой встречи
+    elif data.startswith("cancel_industry_"):
+        try:
+            reason_index = int(data.replace("cancel_industry_", ""))
+            reason = INDUSTRY_CANCELLATION_OPTIONS[reason_index]
+            
+            await query.edit_message_text(
+                text=f"<b>Отраслевая встреча отменена!</b>\n\nПричина: {reason}\n\n"
+                     f"Следующая встреча запланирована на {calculate_next_industry_meeting_time().strftime('%A, %d %B в %H:%M')}",
+                parse_mode=ParseMode.HTML
+            )
+            logger.info(f"Отраслевая встреча отменена пользователем {user}. Причина: {reason}")
+        except (ValueError, IndexError) as e:
+            logger.error(f"Ошибка обработки отмены встречи: {e}")
+            await query.answer("Ошибка при обработке запроса", show_alert=True)
+    
+    # Кнопка "Назад" для отмены планёрки
+    elif data == "cancel_back_planerka":
+        await query.edit_message_text(
+            text=query.message.text,  # Восстанавливаем оригинальное сообщение
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отменить планёрку", callback_data="planerka_cancel")]
+            ]),
+            parse_mode=ParseMode.HTML
+        )
+    
+    # Кнопка "Назад" для отмены отраслевой встречи
+    elif data == "cancel_back_industry":
+        await query.edit_message_text(
+            text=query.message.text,  # Восстанавливаем оригинальное сообщение
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отменить встречу", callback_data="industry_cancel")]
+            ]),
             parse_mode=ParseMode.HTML
         )
     
@@ -956,6 +1609,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик получения документа для добавления"""
+    config = BotConfig()
     user = update.message.from_user.username
     user_id = update.message.from_user.id
     
@@ -985,6 +1639,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик текстовых сообщений для добавления файла"""
+    config = BotConfig()
     user = update.message.from_user.username
     user_id = update.message.from_user.id
     
@@ -1053,6 +1708,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /cancel"""
+    config = BotConfig()
     user = update.message.from_user.username
     user_id = update.message.from_user.id
     
@@ -1072,24 +1728,24 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ========== ГЛАВНАЯ ФУНКЦИЯ ==========
 
 def main() -> None:
-    """Запуск бота"""
     if not TOKEN:
-        logger.error("❌ Токен бота не найден! Установите TELEGRAM_BOT_TOKEN")
+        logger.error("❌ Токен бота не найден!")
         return
     
     try:
-        # Создаем приложение
         application = Application.builder().token(TOKEN).build()
         
-        # Команды пользователей
-        application.add_handler(CommandHandler("start", start_command))
+        # Основные обработчики
+        application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(CommandHandler("setchat", setchat_command))
+        application.add_handler(CommandHandler("setchat", set_chat))
+        application.add_handler(CommandHandler("testmorning", test_morning))
         application.add_handler(CommandHandler("testplanerka", test_planerka_command))
         application.add_handler(CommandHandler("testindustry", test_industry_command))
         application.add_handler(CommandHandler("cancel", cancel_command))
         
-        # Обработчик callback-кнопок
+        # Обработчики callback
+        application.add_handler(CallbackQueryHandler(handle_horoscope_callback, pattern="^horoscope_"))
         application.add_handler(CallbackQueryHandler(handle_callback))
         
         # Обработчики для добавления файлов
@@ -1103,22 +1759,35 @@ def main() -> None:
             handle_text
         ))
         
+        # Запуск планировщиков
+        application.job_queue.run_once(
+            lambda ctx: asyncio.create_task(schedule_next_morning(ctx)),
+            3
+        )
+        
         # Логирование при запуске
-        logger.info("🤖 Бот помощи и напоминаний запущен!")
-        logger.info(f"📁 Файлов в базе: {len(config.help_data['files'])}")
-        logger.info(f"🔗 Ссылок в базе: {len(config.help_data['links'])}")
-        logger.info(f"👑 Админы: {', '.join(config.admins)}")
+        logger.info("🤖 Бот запущен и готов к работе!")
+        logger.info(f"✨ Утренние гороскопы: Пн-Пт в 9:00 по МСК")
+        logger.info(f"📡 Парсинг гороскопов из RSS/XML источников")
         logger.info(f"🏢 Планёрки: Пн, Ср, Пт в 9:15 по МСК")
         logger.info(f"🎯 Отраслевые встречи: Вт в 12:00 по МСК")
+        logger.info(f"📚 Система помощи с файлами и ссылками")
         
-        # Если чат уже установлен, запускаем планировщики
+        # Создаем экземпляр конфига для инициализации
+        config = BotConfig()
+        
+        # Если чат уже установлен, запускаем дополнительные планировщики
         if config.chat_id:
             logger.info(f"Чат установлен: {config.chat_id}")
-            # Используем asyncio.create_task для запуска в фоне
-            application.create_task(schedule_next_planerka(application))
-            application.create_task(schedule_next_industry_meeting(application))
+            application.job_queue.run_once(
+                lambda ctx: asyncio.create_task(schedule_next_planerka(ctx)),
+                3
+            )
+            application.job_queue.run_once(
+                lambda ctx: asyncio.create_task(schedule_next_industry_meeting(ctx)),
+                3
+            )
         
-        # Запуск бота
         application.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
