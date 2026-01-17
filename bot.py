@@ -4,10 +4,9 @@ import random
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Tuple, Union
+from typing import Optional, Dict, Any, List, Tuple
 from functools import wraps
 import pytz
-from enum import Enum
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode
@@ -17,7 +16,9 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     JobQueue,
-    ConversationHandler
+    ConversationHandler,
+    MessageHandler,
+    filters
 )
 
 # ========== КОНСТАНТЫ ==========
@@ -86,6 +87,22 @@ DEFAULT_CATEGORIES = {
     CONFIRM_DELETE_LINK,
     CONFIRM_DELETE_CATEGORY
 ) = range(16)
+
+# Опции отмены встреч
+CANCELLATION_OPTIONS = [
+    "Все вопросы решены, планёрка не нужна",
+    "Ключевые участники отсутствуют",
+    "Перенесём на другой день",
+]
+
+INDUSTRY_CANCELLATION_OPTIONS = [
+    "Основные спикеры не смогут участвовать",
+    "Переносим на другую дату",
+    "Актуальные вопросы решены вне встречи",
+]
+
+SELECTING_REASON = 16
+SELECTING_INDUSTRY_REASON = 17
 
 # Настройка логирования
 logging.basicConfig(
@@ -1351,6 +1368,139 @@ async def send_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"Ошибка при отправке напоминания об отраслевой встрече: {e}")
 
+# ========== ФУНКЦИИ ДЛЯ ОТМЕНЫ ВСТРЕЧ ==========
+
+async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["original_message_id"] = query.message.message_id
+    context.user_data["original_chat_id"] = query.message.chat_id
+
+    keyboard = [
+        [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
+        for i, option in enumerate(CANCELLATION_OPTIONS)
+    ]
+
+    await query.edit_message_text(
+        text="📝 Выберите причину отмены планёрки:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    return SELECTING_REASON
+
+async def cancel_industry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["original_message_id"] = query.message.message_id
+    context.user_data["original_chat_id"] = query.message.chat_id
+    context.user_data["meeting_type"] = "industry"
+
+    keyboard = [
+        [InlineKeyboardButton(option, callback_data=f"industry_reason_{i}")]
+        for i, option in enumerate(INDUSTRY_CANCELLATION_OPTIONS)
+    ]
+
+    await query.edit_message_text(
+        text="📝 Выберите причину отмены отраслевой встречи:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    return SELECTING_INDUSTRY_REASON
+
+async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        reason_index = int(query.data.split("_")[1])
+        reason = CANCELLATION_OPTIONS[reason_index]
+        
+        context.user_data["selected_reason"] = reason
+        context.user_data["reason_index"] = reason_index
+        
+        final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
+        
+        config = BotConfig()
+        original_message_id = context.user_data.get("original_message_id")
+        
+        if original_message_id:
+            for job in get_jobs_from_queue(context.application.job_queue):
+                if job.name in config.active_reminders:
+                    reminder_data = config.active_reminders[job.name]
+                    if str(reminder_data.get("message_id")) == str(original_message_id):
+                        job.schedule_removal()
+                        config.remove_active_reminder(job.name)
+                        break
+        
+        await query.edit_message_text(
+            text=final_message,
+            parse_mode=ParseMode.HTML
+        )
+        
+        logger.info(f"Планёрка отменена @{query.from_user.username} — {reason}")
+        
+        context.user_data.clear()
+        
+    except Exception as e:
+        logger.error(f"Ошибка отмены планёрки: {e}")
+        await query.message.reply_text("❌ Произошла ошибка")
+    
+    return ConversationHandler.END
+
+async def select_industry_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        reason_index = int(query.data.split("_")[2])
+        reason = INDUSTRY_CANCELLATION_OPTIONS[reason_index]
+        
+        context.user_data["selected_reason"] = reason
+        context.user_data["reason_index"] = reason_index
+        
+        final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил отраслевую встречу\n\n📝 <b>Причина:</b> {reason}"
+        
+        config = BotConfig()
+        original_message_id = context.user_data.get("original_message_id")
+        
+        if original_message_id:
+            for job in get_jobs_from_queue(context.application.job_queue):
+                if job.name in config.active_reminders:
+                    reminder_data = config.active_reminders[job.name]
+                    if str(reminder_data.get("message_id")) == str(original_message_id):
+                        job.schedule_removal()
+                        config.remove_active_reminder(job.name)
+                        break
+        
+        await query.edit_message_text(
+            text=final_message,
+            parse_mode=ParseMode.HTML
+        )
+        
+        logger.info(f"Отраслевая встреча отменена @{query.from_user.username} — {reason}")
+        
+        context.user_data.clear()
+        
+    except Exception as e:
+        logger.error(f"Ошибка отмены отраслевой встречи: {e}")
+        await query.message.reply_text("❌ Произошла ошибка")
+    
+    return ConversationHandler.END
+
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message:
+        await update.message.reply_text("❌ Диалог отменен.")
+    elif update.callback_query:
+        await update.callback_query.answer("Диалог отменен", show_alert=True)
+        await update.callback_query.edit_message_text("❌ Диалог отменен.")
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ========== ФУНКЦИИ ПЛАНИРОВАНИЯ ==========
+
 def calculate_next_industry_time() -> datetime:
     """Рассчитать время следующей отраслевой встречи"""
     now = datetime.now(TIMEZONE)
@@ -1428,18 +1578,64 @@ async def schedule_next_industry_reminder(context: ContextTypes.DEFAULT_TYPE) ->
             300
         )
 
-# ========== ОТМЕНА ВСТРЕЧ (существующий функционал) ==========
+def calculate_next_reminder() -> datetime:
+    """Рассчитать время следующего напоминания о планёрке"""
+    now = datetime.now(TIMEZONE)
+    current_weekday = now.weekday()
 
-# [Остальной код для отмены встреч остается без изменений]
-# ... (все функции от cancel_meeting_callback до calculate_next_reminder остаются как были)
+    if current_weekday in MEETING_DAYS:
+        reminder_time = now.replace(
+            hour=MEETING_TIME['hour'],
+            minute=MEETING_TIME['minute'],
+            second=0,
+            microsecond=0
+        )
+        if now < reminder_time:
+            return reminder_time
 
-# Для краткости не дублирую весь код отмены встреч, так как он не изменился
-# Вставьте сюда код функций:
-# cancel_meeting_callback, cancel_industry_callback, select_reason_callback, 
-# select_industry_reason_callback, cancel_conversation, calculate_next_reminder, 
-# schedule_next_reminder
+    days_ahead = 1
+    while days_ahead <= 7:
+        next_day = now + timedelta(days=days_ahead)
+        if next_day.weekday() in MEETING_DAYS:
+            return next_day.replace(
+                hour=MEETING_TIME['hour'],
+                minute=MEETING_TIME['minute'],
+                second=0,
+                microsecond=0
+            )
+        days_ahead += 1
+    
+    raise ValueError("Не найден подходящий день для планёрки")
 
-# ========== ОСНОВНЫЕ КОМАНДЫ ==========
+async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запланировать следующее напоминание о планёрке"""
+    next_time = calculate_next_reminder()
+    config = BotConfig()
+    chat_id = config.chat_id
+
+    if not chat_id:
+        logger.warning("Chat ID не установлен")
+        return
+
+    now = datetime.now(TIMEZONE)
+    delay = (next_time - now).total_seconds()
+
+    if delay > 0:
+        job_name = f"meeting_reminder_{next_time.strftime('%Y%m%d_%H%M')}"
+        
+        existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
+                        if j.name == job_name]
+        
+        if not existing_jobs:
+            context.application.job_queue.run_once(
+                send_reminder,
+                delay,
+                chat_id=chat_id,
+                name=job_name
+            )
+            logger.info(f"Напоминание о планёрке запланировано на {next_time}")
+
+# ========== ОСНОВНЫЕ КОМАНДЫ (продолжение) ==========
 
 @restricted
 async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1548,63 +1744,6 @@ async def test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("⏳ <b>Отправляю тестовое уведомление об отраслевой встрече...</b>", parse_mode=ParseMode.HTML)
     await send_industry_reminder(context)
 
-def calculate_next_reminder() -> datetime:
-    """Рассчитать время следующего напоминания о планёрке"""
-    now = datetime.now(TIMEZONE)
-    current_weekday = now.weekday()
-
-    if current_weekday in MEETING_DAYS:
-        reminder_time = now.replace(
-            hour=MEETING_TIME['hour'],
-            minute=MEETING_TIME['minute'],
-            second=0,
-            microsecond=0
-        )
-        if now < reminder_time:
-            return reminder_time
-
-    days_ahead = 1
-    while days_ahead <= 7:
-        next_day = now + timedelta(days=days_ahead)
-        if next_day.weekday() in MEETING_DAYS:
-            return next_day.replace(
-                hour=MEETING_TIME['hour'],
-                minute=MEETING_TIME['minute'],
-                second=0,
-                microsecond=0
-            )
-        days_ahead += 1
-    
-    raise ValueError("Не найден подходящий день для планёрки")
-
-async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запланировать следующее напоминание о планёрке"""
-    next_time = calculate_next_reminder()
-    config = BotConfig()
-    chat_id = config.chat_id
-
-    if not chat_id:
-        logger.warning("Chat ID не установлен")
-        return
-
-    now = datetime.now(TIMEZONE)
-    delay = (next_time - now).total_seconds()
-
-    if delay > 0:
-        job_name = f"meeting_reminder_{next_time.strftime('%Y%m%d_%H%M')}"
-        
-        existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
-                        if j.name == job_name]
-        
-        if not existing_jobs:
-            context.application.job_queue.run_once(
-                send_reminder,
-                delay,
-                chat_id=chat_id,
-                name=job_name
-            )
-            logger.info(f"Напоминание о планёрке запланировано на {next_time}")
-
 def main() -> None:
     if not TOKEN:
         logger.error("❌ Токен бота не найден!")
@@ -1670,7 +1809,7 @@ def main() -> None:
             ],
         )
 
-        # ConversationHandler для отмены встреч (существующий)
+        # ConversationHandler для отмены встреч
         cancel_conv_handler = ConversationHandler(
             entry_points=[
                 CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$"),
