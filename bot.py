@@ -931,9 +931,20 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     caption=f"📄 <b>{file_name}</b>\n\n{description}",
                     parse_mode=ParseMode.HTML
                 )
+                await query.answer(f"📄 Файл '{file_name}' отправлен вам в личные сообщения", show_alert=True)
             except Exception as e:
                 logger.error(f"Ошибка отправки файла: {e}")
                 await query.answer("❌ Не удалось отправить файл", show_alert=True)
+        
+        # Возвращаемся в меню документов
+        keyboard = create_documents_keyboard(config, username)
+        await query.edit_message_text(
+            "📄 <b>Документы</b>\n\n"
+            "Выберите документ:",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+        return DOCUMENTS_MENU
     
     elif query.data.startswith("link_"):
         link_key = query.data.replace("link_", "")
@@ -945,13 +956,20 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             link_url = link_data.get("url", "#")
             description = link_data.get("description", "Без описания")
             
-            await query.message.reply_text(
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Открыть ссылку", url=link_url)],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="help_links")]
+            ])
+            
+            await query.edit_message_text(
                 f"🔗 <b>{link_name}</b>\n\n"
                 f"{description}\n\n"
-                f"<a href=\"{link_url}\">Перейти по ссылке →</a>",
+                f"Ссылка: {link_url}",
+                reply_markup=keyboard,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=False
             )
+            return LINKS_MENU
     
     elif query.data.startswith("team_member_"):
         member_id = query.data.replace("team_member_", "")
@@ -961,13 +979,20 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             # Формируем карточку сотрудника
             card_text = format_team_member_card(member_data)
             
-            await query.message.reply_text(
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data="help_team")]
+            ])
+            
+            await query.edit_message_text(
                 card_text,
+                reply_markup=keyboard,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=False
             )
+            return TEAM_MENU
         else:
             await query.answer("❌ Сотрудник не найден", show_alert=True)
+            return TEAM_MENU
     
     elif query.data == "team_management":
         if not config.is_admin(username):
@@ -1110,6 +1135,14 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return DELETE_MEMBER_MENU
     
+    # Если callback не обработан, возвращаемся в главное меню
+    keyboard = create_help_keyboard()
+    await query.edit_message_text(
+        "📋 <b>Главное меню помощи</b>\n\n"
+        "Выберите раздел:",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML
+    )
     return MAIN_HELP_MENU
 
 def format_team_member_card(member_data: Dict) -> str:
@@ -1590,6 +1623,7 @@ async def handle_file_description(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML
             )
+            return DOCUMENTS_MENU
         else:
             await update.message.reply_text("❌ Не удалось добавить файл")
     
@@ -2497,19 +2531,19 @@ def main() -> None:
         help_conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler("help", help_command),
-                CallbackQueryHandler(handle_help_callback, pattern="^help_"),
-                CallbackQueryHandler(handle_help_callback, pattern="^file_"),
-                CallbackQueryHandler(handle_help_callback, pattern="^link_"),
-                CallbackQueryHandler(handle_help_callback, pattern="^team_"),
-                CallbackQueryHandler(handle_help_callback, pattern="^add_"),
-                CallbackQueryHandler(handle_help_callback, pattern="^delete_"),
-                CallbackQueryHandler(handle_help_callback, pattern="^edit_"),
-                CallbackQueryHandler(handle_add_member_confirm, pattern="^add_member_"),
             ],
             states={
                 # Основные состояния
                 MAIN_HELP_MENU: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^help_|^file_|^link_|^team_|^add_|^delete_|^edit_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^help_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^file_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^link_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^add_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^edit_"),
+                    CallbackQueryHandler(handle_add_member_confirm, pattern="^add_member_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^no_members$"),
                 ],
                 
                 # Документы
@@ -2536,6 +2570,9 @@ def main() -> None:
                 # Команда
                 TEAM_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^team_member_|^team_management$|^help_back$"),
+                ],
+                VIEW_TEAM_MEMBER: [
+                    CallbackQueryHandler(handle_help_callback, pattern="^help_back$"),
                 ],
                 
                 # Настройки
@@ -2589,8 +2626,13 @@ def main() -> None:
                 EDIT_MEMBER_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^edit_member_select_|^team_management$"),
                 ],
+                EDIT_MEMBER_SELECT: [
+                    CallbackQueryHandler(handle_edit_member_field, pattern="^edit_field_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_edit_member$"),
+                ],
                 EDIT_MEMBER_FIELD: [
-                    CallbackQueryHandler(handle_edit_member_field, pattern="^edit_field_|^team_edit_member$"),
+                    CallbackQueryHandler(handle_edit_member_field, pattern="^edit_field_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_edit_member$"),
                 ],
                 EDIT_MEMBER_VALUE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_member_value),
@@ -2636,7 +2678,6 @@ def main() -> None:
             },
             fallbacks=[
                 CommandHandler("cancel", cancel_conversation),
-                CallbackQueryHandler(cancel_conversation, pattern="^cancel_conversation$"),
             ],
         )
 
