@@ -87,49 +87,38 @@ INDUSTRY_CANCELLATION_OPTIONS = [
     "Актуальные вопросы решены вне встречи",
 ]
 
-# Состояния для ConversationHandler
-(
-    # Основные состояния
-    MAIN_HELP_MENU,
-    
-    # Состояния для документов
-    DOCUMENTS_MENU,
-    ADD_FILE_NAME,
-    ADD_FILE_DESCRIPTION,
-    DELETE_FILE_MENU,
-    
-    # Состояния для ссылок
-    LINKS_MENU,
-    
-    # Состояния для команды
-    TEAM_MENU,
-    
-    # Состояния для настроек
-    SETTINGS_MENU,
-    
-    # Состояния для управления командой (админы)
-    TEAM_MANAGEMENT,
-    ADD_MEMBER_NAME,
-    ADD_MEMBER_POSITION,
-    ADD_MEMBER_CITY,
-    ADD_MEMBER_YEAR,
-    ADD_MEMBER_RESPONSIBILITIES,
-    ADD_MEMBER_CONTACT_TOPICS,
-    ADD_MEMBER_ABOUT,
-    ADD_MEMBER_TELEGRAM,
-    ADD_MEMBER_CONFIRM,
-    EDIT_MEMBER_MENU,
-    EDIT_MEMBER_FIELD,
-    EDIT_MEMBER_VALUE,
-    DELETE_MEMBER_MENU,
-    DELETE_MEMBER_CONFIRM,
-    
-    # Состояния для отмены встреч
-    SELECTING_REASON,
-    SELECTING_INDUSTRY_REASON,
-    SELECTING_DATE,
-    CONFIRM_RESCHEDULE,
-) = range(30)
+# Состояния для ConversationHandler - всего 30 состояний
+MAIN_HELP_MENU = 0
+DOCUMENTS_MENU = 1
+ADD_FILE_NAME = 2
+ADD_FILE_DESCRIPTION = 3
+DELETE_FILE_MENU = 4
+LINKS_MENU = 5
+TEAM_MENU = 6
+SETTINGS_MENU = 7
+TEAM_MANAGEMENT = 8
+ADD_MEMBER_NAME = 9
+ADD_MEMBER_POSITION = 10
+ADD_MEMBER_CITY = 11
+ADD_MEMBER_YEAR = 12
+ADD_MEMBER_RESPONSIBILITIES = 13
+ADD_MEMBER_CONTACT_TOPICS = 14
+ADD_MEMBER_ABOUT = 15
+ADD_MEMBER_TELEGRAM = 16
+ADD_MEMBER_CONFIRM = 17
+EDIT_MEMBER_MENU = 18
+EDIT_MEMBER_FIELD = 19
+EDIT_MEMBER_VALUE = 20
+DELETE_MEMBER_MENU = 21
+DELETE_MEMBER_CONFIRM = 22
+SELECTING_REASON = 23
+SELECTING_INDUSTRY_REASON = 24
+SELECTING_DATE = 25
+CONFIRM_RESCHEDULE = 26
+# Резервные состояния для будущего расширения
+RESERVED_1 = 27
+RESERVED_2 = 28
+RESERVED_3 = 29
 
 # Настройка логирования
 logging.basicConfig(
@@ -578,7 +567,7 @@ class BotConfig:
         return False
     
     def get_team_member(self, member_id: str) -> Optional[Dict]:
-        """Получить данные члена команды"""
+        """Получить данные члена команда"""
         return self.team_data["members"].get(member_id)
     
     def get_all_team_members(self) -> Dict[str, Dict]:
