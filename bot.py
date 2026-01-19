@@ -116,6 +116,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ========== КЛАСС ДЛЯ УПРАВЛЕНИЯ ЗАДАЧАМИ ==========
+
+class JobManager:
+    """Менеджер для отслеживания и управления задачами"""
+    
+    def __init__(self):
+        self.active_jobs = {}
+    
+    def add_job(self, job_name: str, job):
+        """Добавить задачу в отслеживание"""
+        self.active_jobs[job_name] = {
+            'job': job,
+            'created_at': datetime.now(TIMEZONE)
+        }
+        logger.info(f"Задача добавлена: {job_name}")
+    
+    def remove_job(self, job_name: str) -> bool:
+        """Удалить задачу"""
+        if job_name in self.active_jobs:
+            del self.active_jobs[job_name]
+            logger.info(f"Задача удалена: {job_name}")
+            return True
+        return False
+    
+    def get_job(self, job_name: str):
+        """Получить задачу по имени"""
+        return self.active_jobs.get(job_name)
+    
+    def get_all_jobs(self) -> List[Dict]:
+        """Получить все задачи"""
+        return [{'name': name, **data} for name, data in self.active_jobs.items()]
+    
+    def clear(self):
+        """Очистить все задачи"""
+        self.active_jobs.clear()
+        logger.info("Все задачи очищены")
+
+job_manager = JobManager()
+
+
 # ========== GIGACHAT КЛИЕНТ ==========
 
 class GigaChatClient:
@@ -253,6 +294,7 @@ class GigaChatClient:
         return random.choice(fallback_messages)
 
 gigachat_client = GigaChatClient()
+
 
 # ========== КЛАСС КОНФИГА ==========
 
@@ -535,17 +577,19 @@ class BotConfig:
     def get_all_team_members(self) -> Dict[str, Dict]:
         return self.team_data["members"]
 
+
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def get_jobs_from_queue(job_queue: JobQueue):
+    """Получение задач из JobQueue для python-telegram-bot 20.x"""
     try:
-        return job_queue.get_jobs()
-    except AttributeError:
-        try:
-            return job_queue.jobs()
-        except AttributeError as e:
-            logger.error(f"Не удалось получить задачи из JobQueue: {e}")
-            return []
+        # В python-telegram-bot 20.x+ нужно использовать JobQueue.run_repeating
+        # и сохранять ссылки на задачи при их создании
+        jobs = job_manager.get_all_jobs()
+        return [job['job'] for job in jobs if 'job' in job]
+    except Exception as e:
+        logger.error(f"Не удалось получить задачи из JobQueue: {e}")
+        return []
 
 def restricted(func):
     @wraps(func)
@@ -655,6 +699,7 @@ def format_date_for_display(date: datetime) -> str:
 def format_date_button(date: datetime) -> str:
     return date.strftime("%d.%m.%Y")
 
+
 # ========== ФУНКЦИЯ ДЛЯ ПРИВЕТСТВИЯ НОВЫХ СОТРУДНИКОВ ==========
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -689,6 +734,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.info(f"Приветствие отправлено для {mention}")
         except Exception as e:
             logger.error(f"Ошибка отправки приветствия: {e}")
+
 
 # ========== КЛАВИАТУРЫ ==========
 
@@ -884,6 +930,7 @@ def create_industry_cancel_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("❌ Нет, оставить", callback_data="cancel_industry_cancel")]
     ]
     return InlineKeyboardMarkup(keyboard)
+
 
 # ========== ФУНКЦИИ ДЛЯ КОМАНДЫ HELP ==========
 
@@ -1290,6 +1337,7 @@ def format_team_member_card(member_data: Dict) -> str:
     
     return card
 
+
 # ========== ОБРАБОТЧИКИ ДЛЯ ДОБАВЛЕНИЯ СОТРУДНИКА ==========
 
 async def handle_add_member_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1533,6 +1581,7 @@ async def handle_add_member_confirm(update: Update, context: ContextTypes.DEFAUL
     
     return ADD_MEMBER_CONFIRM
 
+
 # ========== ОБРАБОТЧИКИ ДЛЯ РЕДАКТИРОВАНИЯ СОТРУДНИКА ==========
 
 async def handle_edit_member_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1651,6 +1700,7 @@ async def handle_edit_member_value(update: Update, context: ContextTypes.DEFAULT
     
     return EDIT_MEMBER_VALUE
 
+
 # ========== ОБРАБОТЧИКИ ДЛЯ ФАЙЛОВ ==========
 
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1721,6 +1771,7 @@ async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await update.message.reply_text("❌ Операция отменена.")
     return ConversationHandler.END
 
+
 # ========== ФУНКЦИИ ПЛАНЁРОК ==========
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1786,6 +1837,7 @@ async def send_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     except Exception as e:
         logger.error(f"Ошибка при отправке напоминания об отраслевой встрече: {e}")
+
 
 # ========== ФУНКЦИИ ДЛЯ ОТМЕНЫ ВСТРЕЧ ==========
 
@@ -1906,6 +1958,14 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
         reason_index = int(query.data.split("_")[1])
         reason = CANCELLATION_OPTIONS[reason_index]
         
+        # === FIX 2: Сохраняем выбранную дату для использования в сообщении ===
+        if "selected_date" in context.user_data:
+            selected_date = context.user_data["selected_date"]
+            formatted_date = format_date_for_display(selected_date)
+            # Модифицируем причину, если выбрана дата
+            if reason_index == 2:  # "Перенесём на другой день"
+                reason = f"Планерка перенесена на {formatted_date}"
+        
         context.user_data["selected_reason"] = reason
         context.user_data["reason_index"] = reason_index
         
@@ -1932,6 +1992,12 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
             return SELECTING_DATE
         
         else:
+            # Если дата была выбрана ранее, используем её в сообщении
+            if "selected_date" in context.user_data:
+                selected_date = context.user_data["selected_date"]
+                formatted_date = format_date_for_display(selected_date)
+                reason = f"Планерка перенесена на {formatted_date}"
+            
             final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
             
             config = BotConfig()
@@ -2109,19 +2175,21 @@ async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFA
             new_job_name = f"{meeting_type}_rescheduled_{selected_date.strftime('%Y%m%d_%H%M')}"
             
             if meeting_type == "planerka":
-                context.application.job_queue.run_once(
+                job = context.application.job_queue.run_once(
                     send_reminder,
                     delay,
                     chat_id=config.chat_id,
                     name=new_job_name
                 )
+                job_manager.add_job(new_job_name, job)
             else:
-                context.application.job_queue.run_once(
+                job = context.application.job_queue.run_once(
                     send_industry_reminder,
                     delay,
                     chat_id=config.chat_id,
                     name=new_job_name
                 )
+                job_manager.add_job(new_job_name, job)
             
             config.add_rescheduled_meeting(
                 original_job=job_name,
@@ -2176,7 +2244,14 @@ async def cancel_reschedule_callback(update: Update, context: ContextTypes.DEFAU
     reason_index = context.user_data.get("reason_index", 0)
     
     if meeting_type == "planerka":
-        reason = CANCELLATION_OPTIONS[reason_index]
+        # === FIX 2: Используем выбранную дату в сообщении об отмене ===
+        if "selected_date" in context.user_data:
+            selected_date = context.user_data["selected_date"]
+            formatted_date = format_date_for_display(selected_date)
+            reason = f"Планерка перенесена на {formatted_date}"
+        else:
+            reason = CANCELLATION_OPTIONS[reason_index]
+        
         final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
         
         config = BotConfig()
@@ -2239,6 +2314,7 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.clear()
     return ConversationHandler.END
 
+
 # ========== ФУНКЦИИ ПЛАНИРОВАНИЯ ==========
 
 def calculate_next_industry_time() -> datetime:
@@ -2290,12 +2366,13 @@ async def schedule_next_industry_reminder(context: ContextTypes.DEFAULT_TYPE) ->
                             if j.name == job_name]
             
             if not existing_jobs:
-                context.application.job_queue.run_once(
+                job = context.application.job_queue.run_once(
                     send_industry_reminder,
                     delay,
                     chat_id=chat_id,
                     name=job_name
                 )
+                job_manager.add_job(job_name, job)
                 logger.info(f"Напоминание об отраслевой встрече запланировано на {next_time}")
             else:
                 logger.info(f"Отраслевая встреча на {next_time} уже запланирована")
@@ -2360,13 +2437,15 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
                         if j.name == job_name]
         
         if not existing_jobs:
-            context.application.job_queue.run_once(
+            job = context.application.job_queue.run_once(
                 send_reminder,
                 delay,
                 chat_id=chat_id,
                 name=job_name
             )
+            job_manager.add_job(job_name, job)
             logger.info(f"Напоминание о планёрке запланировано на {next_time}")
+
 
 # ========== ОСНОВНЫЕ КОМАНДЫ ==========
 
@@ -2533,6 +2612,7 @@ async def test_planerka(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text("⏳ <b>Отправляю тестовое уведомление о планёрке...</b>", parse_mode=ParseMode.HTML)
     await send_reminder(context)
+
 
 def main() -> None:
     if not TOKEN:
