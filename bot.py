@@ -3,6 +3,8 @@ import json
 import random
 import logging
 import asyncio
+import requests
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from functools import wraps
@@ -26,6 +28,13 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEFAULT_ZOOM_LINK = "https://us04web.zoom.us/j/1234567890?pwd=example"
 ZOOM_LINK = os.getenv("ZOOM_MEETING_LINK", DEFAULT_ZOOM_LINK)
 INDUSTRY_ZOOM_LINK = os.getenv("INDUSTRY_MEETING_LINK", DEFAULT_ZOOM_LINK)
+
+# GigaChat API настройки
+GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
+GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET")
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+GIGACHAT_AUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+GIGACHAT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
 
 # Приватные ссылки для помощи
 YA_CRM_LINK = os.getenv("YA_CRM_LINK", "https://crm.example.com")
@@ -123,7 +132,7 @@ INDUSTRY_CANCELLATION_OPTIONS = [
     SELECTING_INDUSTRY_REASON,
     SELECTING_DATE,
     CONFIRM_RESCHEDULE,
-) = range(33)
+) = range(32)
 
 # Настройка логирования
 logging.basicConfig(
@@ -131,6 +140,147 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ========== GIGACHAT КЛИЕНТ ==========
+
+class GigaChatClient:
+    """Клиент для работы с GigaChat API"""
+    
+    def __init__(self):
+        self.client_id = GIGACHAT_CLIENT_ID
+        self.client_secret = GIGACHAT_CLIENT_SECRET
+        self.scope = GIGACHAT_SCOPE
+        self.access_token = None
+        self.token_expires = None
+    
+    def _get_access_token(self) -> Optional[str]:
+        """Получение access token для GigaChat API"""
+        try:
+            if self.access_token and self.token_expires and datetime.now() < self.token_expires:
+                return self.access_token
+            
+            auth_data = {
+                "scope": self.scope
+            }
+            
+            response = requests.post(
+                GIGACHAT_AUTH_URL,
+                data=auth_data,
+                auth=(self.client_id, self.client_secret),
+                verify=False,  # Отключаем проверку SSL для тестов
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                    "RqUID": str(uuid.uuid4())
+                }
+            )
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                self.access_token = token_data.get("access_token")
+                expires_in = token_data.get("expires_in", 1800)  # 30 минут по умолчанию
+                self.token_expires = datetime.now() + timedelta(seconds=expires_in - 60)  # Запас 1 минута
+                logger.info("GigaChat токен успешно получен")
+                return self.access_token
+            else:
+                logger.error(f"Ошибка получения токена GigaChat: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Исключение при получении токена GigaChat: {e}")
+            return None
+    
+    def generate_welcome_message(self, username: str, first_name: str = None, last_name: str = None) -> Optional[str]:
+        """Генерация приветственного сообщения через GigaChat"""
+        try:
+            access_token = self._get_access_token()
+            if not access_token:
+                logger.warning("Не удалось получить токен GigaChat, используем шаблонное приветствие")
+                return self._get_fallback_welcome(username)
+            
+            # Формируем промпт
+            user_info = ""
+            if first_name:
+                user_info += f"Имя: {first_name} "
+            if last_name:
+                user_info += f"Фамилия: {last_name}"
+            
+            prompt = f"""
+            Ты — дружелюбный корпоративный бот-помощник в IT-компании.
+            Тебе нужно поприветствовать нового сотрудника в рабочем чате Telegram.
+            
+            Информация о новом сотруднике:
+            - Username: @{username}
+            {f"- Имя: {first_name}" if first_name else ""}
+            {f"- Фамилия: {last_name}" if last_name else ""}
+            
+            Требования к приветствию:
+            1. Обращение через @{username} если есть, или по имени
+            2. Тёплый, но профессиональный тон
+            3. 2-3 предложения максимум
+            4. Упомяни, что есть бот-помощник (команда /help)
+            5. Добавь 1-2 релевантных эмодзи
+            6. Пожелай успехов в работе
+            7. Не используй markdown, только plain text
+            8. Обращайся на "ты"
+            9. Пример стиля: "Привет, @username! 👋 Рады видеть тебя в нашей команде! Желаем успешного старта и крутых результатов. Если нужна помощь с командами или расписанием — жми /help, помогу чем смогу. Удачи! 🚀"
+            
+            Сгенерируй уникальное, персонализированное приветствие.
+            """
+            
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": "GigaChat",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt.strip()
+                    }
+                ],
+                "temperature": 0.7,
+                "max_tokens": 150
+            }
+            
+            response = requests.post(
+                GIGACHAT_API_URL,
+                json=payload,
+                headers=headers,
+                verify=False
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                message = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                
+                if message:
+                    logger.info(f"GigaChat сгенерировал приветствие для @{username}")
+                    return message
+                else:
+                    logger.warning("GigaChat вернул пустое сообщение")
+                    return self._get_fallback_welcome(username)
+            else:
+                logger.error(f"Ошибка GigaChat API: {response.status_code} - {response.text}")
+                return self._get_fallback_welcome(username)
+                
+        except Exception as e:
+            logger.error(f"Ошибка генерации приветствия GigaChat: {e}")
+            return self._get_fallback_welcome(username)
+    
+    def _get_fallback_welcome(self, username: str) -> str:
+        """Шаблонное приветствие на случай ошибки GigaChat"""
+        fallback_messages = [
+            f"Привет, @{username}! 👋 Рады видеть тебя в нашей команде! Желаем успешного старта и крутых результатов. Если нужна помощь с командами или расписанием — жми /help, помогу чем смогу. Удачи! 🚀",
+            f"Добро пожаловать, @{username}! 🎉 Очень рады новому участнику в команде. Желаем быстрой адаптации и интересных задач. Кстати, я тут помогаю с оргвопросами — команда /help покажет все возможности. Вперёд к победам! 💪",
+            f"@{username}, приветствуем! 🌟 Рады, что ты с нами. Пусть рабочие дни будут продуктивными, а задачи — решаемыми. Если что-то понадобится, кроме помощи коллег, — /help к твоим услугам. Успехов! ✨"
+        ]
+        return random.choice(fallback_messages)
+
+# Создаем глобальный экземпляр клиента GigaChat
+gigachat_client = GigaChatClient()
 
 # ========== КЛАСС КОНФИГА ==========
 
@@ -568,6 +718,48 @@ def format_date_for_display(date: datetime) -> str:
 def format_date_button(date: datetime) -> str:
     """Форматировать дату для кнопки"""
     return date.strftime("%d.%m.%Y %H:%M")
+
+# ========== ФУНКЦИЯ ДЛЯ ПРИВЕТСТВИЯ НОВЫХ СОТРУДНИКОВ ==========
+
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Приветствие нового сотрудника через GigaChat"""
+    config = BotConfig()
+    
+    # Проверяем, установлен ли чат для бота
+    if not config.chat_id:
+        logger.warning("Chat ID не установлен, пропускаем приветствие")
+        return
+    
+    for new_member in update.message.new_chat_members:
+        # Пропускаем самого бота
+        if new_member.id == context.bot.id:
+            continue
+        
+        # Получаем информацию о пользователе
+        username = new_member.username if new_member.username else ""
+        first_name = new_member.first_name if new_member.first_name else None
+        last_name = new_member.last_name if new_member.last_name else None
+        
+        # Формируем обращение
+        if username:
+            mention = f"@{username}"
+        else:
+            mention = first_name if first_name else "Новый коллега"
+        
+        # Генерируем приветствие через GigaChat
+        logger.info(f"Генерируем приветствие для нового пользователя: {username or first_name}")
+        welcome_text = gigachat_client.generate_welcome_message(
+            username=username,
+            first_name=first_name,
+            last_name=last_name
+        )
+        
+        # Отправляем приветствие в чат
+        try:
+            await update.message.reply_text(welcome_text)
+            logger.info(f"Приветствие отправлено для {mention}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки приветствия: {e}")
 
 # ========== КЛАВИАТУРЫ ==========
 
@@ -1302,7 +1494,7 @@ async def handle_add_member_contact_topics(update: Update, context: ContextTypes
             )
             return ADD_MEMBER_CONTACT_TOPICS
     
-    return ADD_MEMBER_CONTACT_TOPics
+    return ADD_MEMBER_CONTACT_TOPICS
 
 async def handle_add_member_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка информации о себе"""
@@ -2387,7 +2579,8 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"✅ <b>Чат установлен:</b> {chat_title}\n\n"
         f"Теперь бот будет отправлять:\n"
         f"• Планёрки (9:30, Пн/Ср/Пт)\n"
-        f"• Отраслевые встречи (12:00, Вт)\n\n"
+        f"• Отраслевые встречи (12:00, Вт)\n"
+        f"• Автоматические приветствия новых сотрудников\n\n"
         f"👑 <b>Права на отмену:</b> только разрешенные пользователи",
         parse_mode=ParseMode.HTML
     )
@@ -2438,6 +2631,9 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_count = len(allowed_users)
     admins_count = len(config.admins)
     
+    # Проверяем наличие GigaChat настроек
+    gigachat_status = "✅ настроен" if GIGACHAT_CLIENT_ID and GIGACHAT_CLIENT_SECRET else "❌ не настроен"
+    
     await update.message.reply_text(
         f"📊 <b>Информация о боте:</b>\n\n"
         f"{status}\n\n"
@@ -2446,7 +2642,8 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Отраслевые: 12:00 (Вт) {'✅ сегодня' if is_industry_day else '❌ не сегодня'}\n\n"
         f"🔗 <b>Настройка ссылок:</b>\n"
         f"• Планёрки: {zoom_status}\n"
-        f"• Отраслевые: {industry_zoom_status}\n\n"
+        f"• Отраслевые: {industry_zoom_status}\n"
+        f"• GigaChat API: {gigachat_status}\n\n"
         f"📋 <b>Активные задачи:</b>\n"
         f"• Планёрки: {meeting_jobs}\n"
         f"• Отраслевые: {industry_jobs}\n"
@@ -2523,6 +2720,12 @@ def main() -> None:
     if not TOKEN:
         logger.error("❌ Токен бота не найден!")
         return
+    
+    # Проверяем наличие GigaChat настроек
+    if not GIGACHAT_CLIENT_ID or not GIGACHAT_CLIENT_SECRET:
+        logger.warning("⚠️ GigaChat API не настроен. Приветствия будут использовать шаблонные сообщения.")
+    else:
+        logger.info("✅ GigaChat API настроен, приветствия будут генерироваться нейросетью")
     
     try:
         application = Application.builder().token(TOKEN).build()
@@ -2694,6 +2897,9 @@ def main() -> None:
         
         # Добавляем ConversationHandler для отмены встреч
         application.add_handler(cancel_conv_handler)
+        
+        # Добавляем обработчик новых участников чата для приветствия
+        application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
 
         # Запуск планировщиков
         application.job_queue.run_once(
@@ -2713,6 +2919,8 @@ def main() -> None:
         logger.info(f"📅 Планёрки: Пн/Ср/Пт в 9:30 по МСК")
         logger.info(f"🏢 Отраслевые встречи: Вт в 12:00 по МСК")
         logger.info(f"🔄 Система отмены и переноса встреч активирована")
+        logger.info(f"👋 Автоматическое приветствие новых сотрудников активировано")
+        logger.info(f"🤖 GigaChat API: {'НАСТРОЕН' if GIGACHAT_CLIENT_ID and GIGACHAT_CLIENT_SECRET else 'НЕ НАСТРОЕН'}")
         logger.info(f"🔒 Отменять встречи могут только разрешенные пользователи: {', '.join(config.allowed_users)}")
         logger.info(f"📚 Система помощи с полным управлением ресурсами активирована")
         logger.info(f"👥 Модуль 'О команде' с админ-управлением готов")
