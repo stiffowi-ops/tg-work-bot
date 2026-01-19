@@ -1302,7 +1302,7 @@ async def handle_add_member_contact_topics(update: Update, context: ContextTypes
             )
             return ADD_MEMBER_CONTACT_TOPICS
     
-    return ADD_MEMBER_CONTACT_TOPICS
+    return ADD_MEMBER_CONTACT_TOPics
 
 async def handle_add_member_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработка информации о себе"""
