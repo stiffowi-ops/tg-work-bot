@@ -55,9 +55,12 @@ MONTHS_RU = {
     9: "СЕНТЯБРЯ", 10: "ОКТЯБРЯ", 11: "НОЯБРЯ", 12: "ДЕКАБРЯ"
 }
 
+# Русские названия дней недели
+WEEKDAYS_RU = ["ПОНЕДЕЛЬНИК", "ВТОРНИК", "СРЕДА", "ЧЕТВЕРГ", "ПЯТНИЦА", "СУББОТА", "ВОСКРЕСЕНЬЕ"]
+
 # Текст для отраслевой встречи
 INDUSTRY_MEETING_TEXTS = [
-    "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n🎯 Что делаем:\n• Обсудим итоги за неделю\n• Новые тренды и инсайты\n• Обмен опытом с коллегами\n• Запланируем мероприятия на следующую\n\n🕐 Начало: 12:00 по МСК\n📍 Формат: Zoom-конференция\n\n🔗 Всех причастных ждём! {zoom_link} | 👈",
+    "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n🎯 Что делаем:\n• Обсудим итоги за недели\n• Новые тренды и инсайты\n• Обмен опытом с коллегами\n• Запланируем мероприятия на следующую\n\n🕐 Начало: 12:00 по МСК\n📍 Формат: Zoom-конференция\n\n🔗 Всех причастных ждём! {zoom_link} | 👈",
     "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n📊 Сегодня на повестке:\n• Анализ недельных результатов\n• Выявление ключевых трендов\n• Коллективный разбор кейсов\n• Планирование активностей\n\n🕐 Старт: 12:00 (МСК)\n🎥 Онлайн в Zoom\n\n🔗 Присоединяйтесь: {zoom_link} ← переход",
     "🏢 𝗢ТРАСЛЕВАЯ ВСТРЕЧА\n\n✨ На повестке дня:\n• Итоги рабочей недели\n• Прогнозы и инсайты\n•Планы на неделю\n\n⏰ Время: 12:00 по Москве\n💻 Платформа: Zoom\n\n🔗 Подключайтесь: {zoom_link} | 👈"
 ]
@@ -118,7 +121,9 @@ INDUSTRY_CANCELLATION_OPTIONS = [
     # Состояния для отмены встреч
     SELECTING_REASON,
     SELECTING_INDUSTRY_REASON,
-) = range(28)
+    SELECTING_DATE,
+    CONFIRM_RESCHEDULE,
+) = range(32)
 
 # Настройка логирования
 logging.basicConfig(
@@ -154,6 +159,8 @@ class BotConfig:
                         data["admins"] = ["Stiff_OWi", "gshabanov"]
                     if "chat_id" not in data:
                         data["chat_id"] = None
+                    if "rescheduled_meetings" not in data:
+                        data["rescheduled_meetings"] = {}
                     return data
             except Exception as e:
                 logger.error(f"Ошибка загрузки конфига: {e}")
@@ -161,7 +168,8 @@ class BotConfig:
             "chat_id": None,
             "allowed_users": ["Stiff_OWi", "gshabanov"],
             "admins": ["Stiff_OWi", "gshabanov"],
-            "active_reminders": {}
+            "active_reminders": {},
+            "rescheduled_meetings": {}
         }
     
     def _load_help_data(self) -> Dict[str, Any]:
@@ -270,6 +278,10 @@ class BotConfig:
     def admins(self) -> List[str]:
         return self.data.get("admins", [])
     
+    def is_allowed(self, username: str) -> bool:
+        """Проверяет, разрешен ли пользователь"""
+        return username in self.allowed_users
+    
     def is_admin(self, username: str) -> bool:
         return username in self.admins
     
@@ -309,6 +321,32 @@ class BotConfig:
     def clear_active_reminders(self) -> None:
         self.data["active_reminders"] = {}
         self.save()
+    
+    @property
+    def rescheduled_meetings(self) -> Dict[str, Dict]:
+        return self.data.get("rescheduled_meetings", {})
+    
+    def add_rescheduled_meeting(self, original_job: str, new_time: datetime, meeting_type: str, 
+                               rescheduled_by: str, original_message_id: int) -> None:
+        """Добавить информацию о перенесенной встрече"""
+        meeting_id = f"rescheduled_{int(datetime.now().timestamp())}"
+        
+        self.data["rescheduled_meetings"][meeting_id] = {
+            "original_job": original_job,
+            "new_time": new_time.isoformat(),
+            "meeting_type": meeting_type,
+            "rescheduled_by": rescheduled_by,
+            "original_message_id": original_message_id,
+            "rescheduled_at": datetime.now(TIMEZONE).isoformat(),
+            "status": "scheduled"
+        }
+        self.save()
+    
+    def update_rescheduled_meeting_status(self, meeting_id: str, status: str) -> None:
+        """Обновить статус перенесенной встречи"""
+        if meeting_id in self.data["rescheduled_meetings"]:
+            self.data["rescheduled_meetings"][meeting_id]["status"] = status
+            self.save()
     
     # Методы для работы с файлами
     def add_file(self, file_id: str, file_name: str, description: str) -> bool:
@@ -445,7 +483,7 @@ def get_industry_meeting_text() -> str:
 def get_greeting_by_meeting_day() -> str:
     """Специальные приветствия для дней планёрок"""
     weekday = datetime.now(TIMEZONE).weekday()
-    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Саббота", "Воскресенье"]
+    day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     current_day = day_names_ru[weekday]
     
     if ZOOM_LINK == DEFAULT_ZOOM_LINK:
@@ -474,6 +512,62 @@ def get_greeting_by_meeting_day() -> str:
         return random.choice(greetings[weekday])
     else:
         return f"👋 Доброе утро! Сегодня <i>{current_day}</i>.\n\n📋 <i>Напоминаю о планёрке в 9:30 по МСК</i>.{zoom_note}"
+
+def get_available_dates(meeting_type: str, start_from: datetime = None) -> List[datetime]:
+    """Получить доступные даты для переноса встречи"""
+    if not start_from:
+        start_from = datetime.now(TIMEZONE)
+    
+    available_dates = []
+    
+    if meeting_type == "planerka":
+        # Для планёрки ищем ближайшие дни планёрок (пн, ср, пт)
+        days_ahead = 1
+        while len(available_dates) < 5:  # Показываем 5 ближайших доступных дат
+            check_date = start_from + timedelta(days=days_ahead)
+            if check_date.weekday() in MEETING_DAYS:
+                # Устанавливаем время планёрки (9:15)
+                meeting_time = check_date.replace(
+                    hour=MEETING_TIME['hour'],
+                    minute=MEETING_TIME['minute'],
+                    second=0,
+                    microsecond=0
+                )
+                available_dates.append(meeting_time)
+            days_ahead += 1
+    
+    elif meeting_type == "industry":
+        # Для отраслевой встречи ищем ближайшие вторники
+        days_ahead = 1
+        while len(available_dates) < 5:
+            check_date = start_from + timedelta(days=days_ahead)
+            if check_date.weekday() in INDUSTRY_MEETING_DAY:
+                # Устанавливаем время отраслевой встречи (12:00)
+                meeting_time = check_date.replace(
+                    hour=INDUSTRY_MEETING_TIME['hour'],
+                    minute=INDUSTRY_MEETING_TIME['minute'],
+                    second=0,
+                    microsecond=0
+                )
+                available_dates.append(meeting_time)
+            days_ahead += 1
+    
+    return available_dates
+
+def format_date_for_display(date: datetime) -> str:
+    """Форматировать дату для отображения"""
+    weekday = WEEKDAYS_RU[date.weekday()]
+    day = date.day
+    month = MONTHS_RU[date.month]
+    year = date.year
+    
+    time_str = date.strftime("%H:%M")
+    
+    return f"{weekday}, {day} {month} {year} в {time_str}"
+
+def format_date_button(date: datetime) -> str:
+    """Форматировать дату для кнопки"""
+    return date.strftime("%d.%m.%Y %H:%M")
 
 # ========== КЛАВИАТУРЫ ==========
 
@@ -649,6 +743,33 @@ def create_confirm_delete_keyboard(member_id: str) -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("✅ Да, удалить", callback_data=f"delete_confirm_yes_{member_id}")],
         [InlineKeyboardButton("❌ Нет, отмена", callback_data=f"delete_confirm_no_{member_id}")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def create_date_selection_keyboard(meeting_type: str, available_dates: List[datetime]) -> InlineKeyboardMarkup:
+    """Создать клавиатуру для выбора даты переноса"""
+    keyboard = []
+    
+    for i, date in enumerate(available_dates):
+        date_str = format_date_button(date)
+        display_date = format_date_for_display(date)
+        callback_data = f"reschedule_date_{meeting_type}_{date_str}"
+        
+        keyboard.append([InlineKeyboardButton(f"📅 {display_date}", callback_data=callback_data)])
+    
+    keyboard.append([InlineKeyboardButton("↩️ Назад", callback_data=f"cancel_back_{meeting_type}")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def create_confirm_reschedule_keyboard(meeting_type: str, selected_date: datetime, job_name: str) -> InlineKeyboardMarkup:
+    """Создать клавиатуру для подтверждения переноса"""
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Да, перенести", 
+                               callback_data=f"confirm_reschedule_{meeting_type}_{selected_date.strftime('%Y%m%d_%H%M')}_{job_name}"),
+            InlineKeyboardButton("❌ Нет, отмена", 
+                               callback_data=f"cancel_reschedule_{meeting_type}")
+        ]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -1480,7 +1601,7 @@ async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await update.message.reply_text("❌ Операция отменена.")
     return ConversationHandler.END
 
-# ========== ФУНКЦИИ ПЛАНЁРОК (остаются без изменений) ==========
+# ========== ФУНКЦИИ ПЛАНЁРОК ==========
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправка напоминания о планёрке"""
@@ -1492,7 +1613,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     keyboard = [
-        [InlineKeyboardButton("Отменить планёрку", callback_data="cancel_meeting")]
+        [InlineKeyboardButton("❌ Отменить планёрку", callback_data="cancel_meeting")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1525,7 +1646,7 @@ async def send_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     keyboard = [
-        [InlineKeyboardButton("Отменить встречу", callback_data="cancel_industry")]
+        [InlineKeyboardButton("❌ Отменить встречу", callback_data="cancel_industry")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1553,9 +1674,18 @@ async def send_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    
+    config = BotConfig()
+    username = query.from_user.username
+    
+    # Проверяем, разрешен ли пользователь отменять встречи
+    if not config.is_allowed(username):
+        await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
+        return ConversationHandler.END
 
     context.user_data["original_message_id"] = query.message.message_id
     context.user_data["original_chat_id"] = query.message.chat_id
+    context.user_data["meeting_type"] = "planerka"
 
     keyboard = [
         [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
@@ -1572,6 +1702,14 @@ async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_
 async def cancel_industry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    
+    config = BotConfig()
+    username = query.from_user.username
+    
+    # Проверяем, разрешен ли пользователь отменять встречи
+    if not config.is_allowed(username):
+        await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
+        return ConversationHandler.END
 
     context.user_data["original_message_id"] = query.message.message_id
     context.user_data["original_chat_id"] = query.message.chat_id
@@ -1593,6 +1731,14 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     
+    config = BotConfig()
+    username = query.from_user.username
+    
+    # Проверяем, разрешен ли пользователь отменять встречи
+    if not config.is_allowed(username):
+        await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
+        return ConversationHandler.END
+    
     try:
         reason_index = int(query.data.split("_")[1])
         reason = CANCELLATION_OPTIONS[reason_index]
@@ -1600,6 +1746,336 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["selected_reason"] = reason
         context.user_data["reason_index"] = reason_index
         
+        # Если выбрана опция "Перенесём на другой день", показываем выбор даты
+        if reason_index == 2:  # "Перенесём на другой день"
+            meeting_type = context.user_data.get("meeting_type", "planerka")
+            
+            # Получаем доступные даты для переноса
+            available_dates = get_available_dates(meeting_type)
+            
+            if not available_dates:
+                await query.edit_message_text(
+                    text="❌ Нет доступных дат для переноса встречи.",
+                    parse_mode=ParseMode.HTML
+                )
+                return ConversationHandler.END
+            
+            keyboard = create_date_selection_keyboard(meeting_type, available_dates)
+            
+            await query.edit_message_text(
+                text="📅 Выберите дату для переноса встречи:",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+            
+            return SELECTING_DATE
+        
+        else:
+            # Для других причин - сразу отменяем
+            final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
+            
+            config = BotConfig()
+            original_message_id = context.user_data.get("original_message_id")
+            
+            if original_message_id:
+                for job in get_jobs_from_queue(context.application.job_queue):
+                    if job.name in config.active_reminders:
+                        reminder_data = config.active_reminders[job.name]
+                        if str(reminder_data.get("message_id")) == str(original_message_id):
+                            job.schedule_removal()
+                            config.remove_active_reminder(job.name)
+                            break
+            
+            await query.edit_message_text(
+                text=final_message,
+                parse_mode=ParseMode.HTML
+            )
+            
+            logger.info(f"Планёрка отменена @{query.from_user.username} — {reason}")
+            
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Ошибка отмены планёрки: {e}")
+        await query.message.reply_text("❌ Произошла ошибка")
+    
+    return SELECTING_REASON
+
+async def select_industry_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    
+    config = BotConfig()
+    username = query.from_user.username
+    
+    # Проверяем, разрешен ли пользователь отменять встречи
+    if not config.is_allowed(username):
+        await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
+        return ConversationHandler.END
+    
+    try:
+        reason_index = int(query.data.split("_")[2])
+        reason = INDUSTRY_CANCELLATION_OPTIONS[reason_index]
+        
+        context.user_data["selected_reason"] = reason
+        context.user_data["reason_index"] = reason_index
+        
+        # Если выбрана опция "Переносим на другую дату", показываем выбор даты
+        if reason_index == 1:  # "Переносим на другую дату"
+            meeting_type = context.user_data.get("meeting_type", "industry")
+            
+            # Получаем доступные даты для переноса
+            available_dates = get_available_dates(meeting_type)
+            
+            if not available_dates:
+                await query.edit_message_text(
+                    text="❌ Нет доступных дат для переноса встречи.",
+                    parse_mode=ParseMode.HTML
+                )
+                return ConversationHandler.END
+            
+            keyboard = create_date_selection_keyboard(meeting_type, available_dates)
+            
+            await query.edit_message_text(
+                text="📅 Выберите дату для переноса отраслевой встречи:",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+            
+            return SELECTING_DATE
+        
+        else:
+            # Для других причин - сразу отменяем
+            final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил отраслевую встречу\n\n📝 <b>Причина:</b> {reason}"
+            
+            config = BotConfig()
+            original_message_id = context.user_data.get("original_message_id")
+            
+            if original_message_id:
+                for job in get_jobs_from_queue(context.application.job_queue):
+                    if job.name in config.active_reminders:
+                        reminder_data = config.active_reminders[job.name]
+                        if str(reminder_data.get("message_id")) == str(original_message_id):
+                            job.schedule_removal()
+                            config.remove_active_reminder(job.name)
+                            break
+            
+            await query.edit_message_text(
+                text=final_message,
+                parse_mode=ParseMode.HTML
+            )
+            
+            logger.info(f"Отраслевая встреча отменена @{query.from_user.username} — {reason}")
+            
+            context.user_data.clear()
+            return ConversationHandler.END
+        
+    except Exception as e:
+        logger.error(f"Ошибка отмены отраслевой встречи: {e}")
+        await query.message.reply_text("❌ Произошла ошибка")
+    
+    return SELECTING_INDUSTRY_REASON
+
+async def select_date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка выбора даты для переноса"""
+    query = update.callback_query
+    await query.answer()
+    
+    config = BotConfig()
+    username = query.from_user.username
+    
+    # Проверяем, разрешен ли пользователь отменять встречи
+    if not config.is_allowed(username):
+        await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
+        return ConversationHandler.END
+    
+    try:
+        # Парсим данные из callback
+        parts = query.data.split("_")
+        meeting_type = parts[2]
+        date_str = parts[3] + "_" + parts[4]  # Дата и время
+        
+        # Преобразуем строку обратно в datetime
+        selected_date = datetime.strptime(date_str, "%d.%m.%Y_%H:%M")
+        selected_date = TIMEZONE.localize(selected_date)
+        
+        # Сохраняем выбранную дату
+        context.user_data["selected_date"] = selected_date
+        context.user_data["meeting_type"] = meeting_type
+        
+        # Находим оригинальную задачу
+        config = BotConfig()
+        original_message_id = context.user_data.get("original_message_id")
+        job_name = None
+        
+        if original_message_id:
+            for job in get_jobs_from_queue(context.application.job_queue):
+                if job.name in config.active_reminders:
+                    reminder_data = config.active_reminders[job.name]
+                    if str(reminder_data.get("message_id")) == str(original_message_id):
+                        job_name = job.name
+                        break
+        
+        if not job_name:
+            await query.edit_message_text(
+                text="❌ Не удалось найти запланированную встречу.",
+                parse_mode=ParseMode.HTML
+            )
+            return ConversationHandler.END
+        
+        # Показываем подтверждение
+        formatted_date = format_date_for_display(selected_date)
+        
+        meeting_type_text = "планёрку" if meeting_type == "planerka" else "отраслевую встречу"
+        
+        keyboard = create_confirm_reschedule_keyboard(meeting_type, selected_date, job_name)
+        
+        await query.edit_message_text(
+            text=f"📋 <b>Подтверждение переноса</b>\n\n"
+                 f"Вы действительно хотите перенести {meeting_type_text} на:\n\n"
+                 f"<b>{formatted_date}</b>?\n\n"
+                 f"<i>После подтверждения встреча будет запланирована на новое время.</i>",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+        
+        return CONFIRM_RESCHEDULE
+        
+    except Exception as e:
+        logger.error(f"Ошибка выбора даты: {e}")
+        await query.edit_message_text(
+            text="❌ Произошла ошибка при выборе даты.",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+
+async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Подтверждение переноса встречи"""
+    query = update.callback_query
+    await query.answer()
+    
+    config = BotConfig()
+    username = query.from_user.username
+    
+    # Проверяем, разрешен ли пользователь отменять встречи
+    if not config.is_allowed(username):
+        await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
+        return ConversationHandler.END
+    
+    try:
+        parts = query.data.split("_")
+        meeting_type = parts[2]
+        date_str = parts[3] + "_" + parts[4]
+        job_name = parts[5]
+        
+        # Преобразуем строку обратно в datetime
+        selected_date = datetime.strptime(date_str, "%Y%m%d_%H%M")
+        selected_date = TIMEZONE.localize(selected_date)
+        
+        config = BotConfig()
+        username = query.from_user.username or "Пользователь"
+        original_message_id = context.user_data.get("original_message_id")
+        reason = context.user_data.get("selected_reason", "Перенос на другую дату")
+        
+        # Удаляем оригинальную задачу
+        job_found = False
+        for job in get_jobs_from_queue(context.application.job_queue):
+            if job.name == job_name:
+                job.schedule_removal()
+                config.remove_active_reminder(job.name)
+                job_found = True
+                break
+        
+        if not job_found:
+            await query.edit_message_text(
+                text="❌ Не удалось найти запланированную встречу для переноса.",
+                parse_mode=ParseMode.HTML
+            )
+            return ConversationHandler.END
+        
+        # Создаем новую задачу на выбранную дату
+        now = datetime.now(TIMEZONE)
+        delay = (selected_date - now).total_seconds()
+        
+        if delay > 0:
+            new_job_name = f"{meeting_type}_rescheduled_{selected_date.strftime('%Y%m%d_%H%M')}"
+            
+            # Запланировать новую встречу
+            if meeting_type == "planerka":
+                context.application.job_queue.run_once(
+                    send_reminder,
+                    delay,
+                    chat_id=config.chat_id,
+                    name=new_job_name
+                )
+            else:
+                context.application.job_queue.run_once(
+                    send_industry_reminder,
+                    delay,
+                    chat_id=config.chat_id,
+                    name=new_job_name
+                )
+            
+            # Сохраняем информацию о перенесенной встрече
+            config.add_rescheduled_meeting(
+                original_job=job_name,
+                new_time=selected_date,
+                meeting_type=meeting_type,
+                rescheduled_by=username,
+                original_message_id=original_message_id
+            )
+            
+            formatted_date = format_date_for_display(selected_date)
+            meeting_type_text = "планёрка" if meeting_type == "planerka" else "отраслевая встреча"
+            
+            await query.edit_message_text(
+                text=f"✅ <b>{meeting_type_text.capitalize()} перенесена!</b>\n\n"
+                     f"📅 <b>Новая дата:</b> {formatted_date}\n"
+                     f"👤 <b>Перенес:</b> @{username}\n"
+                     f"📝 <b>Причина:</b> {reason}",
+                parse_mode=ParseMode.HTML
+            )
+            
+            logger.info(f"{meeting_type_text.capitalize()} перенесена @{username} на {selected_date}")
+            
+        else:
+            await query.edit_message_text(
+                text="❌ Выбранная дата уже прошла. Пожалуйста, выберите другую дату.",
+                parse_mode=ParseMode.HTML
+            )
+            # Возвращаем к выбору даты
+            return SELECTING_DATE
+        
+    except Exception as e:
+        logger.error(f"Ошибка переноса встречи: {e}")
+        await query.edit_message_text(
+            text="❌ Произошла ошибка при переносе встречи.",
+            parse_mode=ParseMode.HTML
+        )
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_reschedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отмена переноса встречи"""
+    query = update.callback_query
+    await query.answer()
+    
+    config = BotConfig()
+    username = query.from_user.username
+    
+    # Проверяем, разрешен ли пользователь отменять встречи
+    if not config.is_allowed(username):
+        await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
+        return ConversationHandler.END
+    
+    meeting_type = context.user_data.get("meeting_type", "planerka")
+    reason_index = context.user_data.get("reason_index", 0)
+    
+    # Возвращаемся к выбору причины
+    if meeting_type == "planerka":
+        reason = CANCELLATION_OPTIONS[reason_index]
         final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
         
         config = BotConfig()
@@ -1619,27 +2095,10 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode=ParseMode.HTML
         )
         
-        logger.info(f"Планёрка отменена @{query.from_user.username} — {reason}")
+        logger.info(f"Планёрка отменена @{query.from_user.username}")
         
-        context.user_data.clear()
-        
-    except Exception as e:
-        logger.error(f"Ошибка отмены планёрки: {e}")
-        await query.message.reply_text("❌ Произошла ошибка")
-    
-    return ConversationHandler.END
-
-async def select_industry_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    try:
-        reason_index = int(query.data.split("_")[2])
+    elif meeting_type == "industry":
         reason = INDUSTRY_CANCELLATION_OPTIONS[reason_index]
-        
-        context.user_data["selected_reason"] = reason
-        context.user_data["reason_index"] = reason_index
-        
         final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил отраслевую встречу\n\n📝 <b>Причина:</b> {reason}"
         
         config = BotConfig()
@@ -1659,13 +2118,53 @@ async def select_industry_reason_callback(update: Update, context: ContextTypes.
             parse_mode=ParseMode.HTML
         )
         
-        logger.info(f"Отраслевая встреча отменена @{query.from_user.username} — {reason}")
+        logger.info(f"Отраслевая встреча отменена @{query.from_user.username}")
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Возврат назад из выбора даты"""
+    query = update.callback_query
+    await query.answer()
+    
+    config = BotConfig()
+    username = query.from_user.username
+    
+    # Проверяем, разрешен ли пользователь отменять встречи
+    if not config.is_allowed(username):
+        await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
+        return ConversationHandler.END
+    
+    meeting_type = query.data.replace("cancel_back_", "")
+    
+    if meeting_type == "planerka":
+        # Возвращаемся к выбору причины для планёрки
+        keyboard = [
+            [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
+            for i, option in enumerate(CANCELLATION_OPTIONS)
+        ]
         
-        context.user_data.clear()
+        await query.edit_message_text(
+            text="📝 Выберите причину отмены планёрки:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         
-    except Exception as e:
-        logger.error(f"Ошибка отмены отраслевой встречи: {e}")
-        await query.message.reply_text("❌ Произошла ошибка")
+        return SELECTING_REASON
+    
+    elif meeting_type == "industry":
+        # Возвращаемся к выбору причины для отраслевой встречи
+        keyboard = [
+            [InlineKeyboardButton(option, callback_data=f"industry_reason_{i}")]
+            for i, option in enumerate(INDUSTRY_CANCELLATION_OPTIONS)
+        ]
+        
+        await query.edit_message_text(
+            text="📝 Выберите причину отмены отраслевой встречи:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        return SELECTING_INDUSTRY_REASON
     
     return ConversationHandler.END
 
@@ -1823,7 +2322,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 <b>Бот для планёрок, отраслевых встреч и управления ресурсами!</b>\n\n"
         f"📅 <b>Планёрки:</b>\n"
         f"• Пн, Ср, Пт в 9:30 по МСК\n"
-        f"• Возможность отмены\n\n"
+        f"• Возможность отмены и переноса (только для разрешенных пользователей)\n\n"
         f"📅 <b>Отраслевые встречи:</b>\n"
         f"• Вт в 12:00 по МСК\n"
         f"• Обсуждение трендов и инсайтов\n"
@@ -1837,7 +2336,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"/help - главное меню помощи\n"
         f"/info - информация о боте\n"
         f"/setchat - установить чат\n"
-        f"/testindustry - тест отраслевой встречи\n",
+        f"/testindustry - тест отраслевой встречи\n"
+        f"/testplanerka - тест планёрки\n",
         parse_mode=ParseMode.HTML
     )
 
@@ -1853,7 +2353,8 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"✅ <b>Чат установлен:</b> {chat_title}\n\n"
         f"Теперь бот будет отправлять:\n"
         f"• Планёрки (9:30, Пн/Ср/Пт)\n"
-        f"• Отраслевые встречи (12:00, Вт)\n",
+        f"• Отраслевые встречи (12:00, Вт)\n\n"
+        f"👑 <b>Права на отмену:</b> только разрешенные пользователи",
         parse_mode=ParseMode.HTML
     )
 
@@ -1874,10 +2375,11 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     meeting_jobs = len([j for j in all_jobs if j.name and j.name.startswith("meeting_reminder_")])
     industry_jobs = len([j for j in all_jobs if j.name and j.name.startswith("industry_meeting_")])
+    rescheduled_jobs = len([j for j in all_jobs if j.name and "rescheduled" in j.name])
     
     now = datetime.now(TIMEZONE)
     weekday = now.weekday()
-    day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Саббота", "Воскресенье"]
+    day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     current_day = day_names[weekday]
     
     is_meeting_day = weekday in MEETING_DAYS
@@ -1892,6 +2394,16 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     links_count = len(config.help_data.get("links", {}))
     team_count = len(config.get_all_team_members())
     
+    # Статистика перенесенных встреч
+    rescheduled_count = len(config.rescheduled_meetings)
+    active_rescheduled = len([m for m in config.rescheduled_meetings.values() 
+                             if m.get("status") == "scheduled"])
+    
+    # Информация о разрешенных пользователях
+    allowed_users = config.allowed_users
+    allowed_count = len(allowed_users)
+    admins_count = len(config.admins)
+    
     await update.message.reply_text(
         f"📊 <b>Информация о боте:</b>\n\n"
         f"{status}\n\n"
@@ -1903,7 +2415,14 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Отраслевые: {industry_zoom_status}\n\n"
         f"📋 <b>Активные задачи:</b>\n"
         f"• Планёрки: {meeting_jobs}\n"
-        f"• Отраслевые: {industry_jobs}\n\n"
+        f"• Отраслевые: {industry_jobs}\n"
+        f"• Перенесенные: {rescheduled_jobs}\n\n"
+        f"🔄 <b>Перенесенные встречи:</b>\n"
+        f"• Всего: {rescheduled_count}\n"
+        f"• Активные: {active_rescheduled}\n\n"
+        f"👥 <b>Права доступа:</b>\n"
+        f"• Разрешенных пользователей: {allowed_count}\n"
+        f"• Администраторов: {admins_count}\n\n"
         f"📚 <b>Ресурсы:</b>\n"
         f"• Файлов: {files_count}\n"
         f"• Ссылок: {links_count}\n"
@@ -1929,12 +2448,18 @@ async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Определяем тип задачи для иконки
         if "meeting_reminder" in job_name:
             icon = "🤝"
+            type_text = "Планёрка"
         elif "industry_meeting" in job_name:
             icon = "🏢"
+            type_text = "Отраслевая"
+        elif "rescheduled" in job_name:
+            icon = "🔄"
+            type_text = "Перенесенная"
         else:
             icon = "🔧"
+            type_text = "Другая"
         
-        message += f"{icon} {next_time.strftime('%d.%m.%Y %H:%M')} - {job_name[:30]}\n"
+        message += f"{icon} {next_time.strftime('%d.%m.%Y %H:%M')} - {type_text} ({job_name[:25]})\n"
     
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
@@ -1948,6 +2473,17 @@ async def test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text("⏳ <b>Отправляю тестовое уведомление об отраслевой встрече...</b>", parse_mode=ParseMode.HTML)
     await send_industry_reminder(context)
+
+@restricted
+async def test_planerka(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Тестовая отправка планёрки"""
+    config = BotConfig()
+    if not config.chat_id:
+        await update.message.reply_text("❌ Сначала установите чат командой /setchat")
+        return
+
+    await update.message.reply_text("⏳ <b>Отправляю тестовое уведомление о планёрке...</b>", parse_mode=ParseMode.HTML)
+    await send_reminder(context)
 
 def main() -> None:
     if not TOKEN:
@@ -2074,7 +2610,7 @@ def main() -> None:
             ],
         )
 
-        # ConversationHandler для отмены встреч
+        # ConversationHandler для отмены и переноса встреч
         cancel_conv_handler = ConversationHandler(
             entry_points=[
                 CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$"),
@@ -2083,9 +2619,19 @@ def main() -> None:
             states={
                 SELECTING_REASON: [
                     CallbackQueryHandler(select_reason_callback, pattern="^reason_[0-9]+$"),
+                    CallbackQueryHandler(cancel_back_callback, pattern="^cancel_back_planerka$"),
                 ],
                 SELECTING_INDUSTRY_REASON: [
                     CallbackQueryHandler(select_industry_reason_callback, pattern="^industry_reason_[0-9]+$"),
+                    CallbackQueryHandler(cancel_back_callback, pattern="^cancel_back_industry$"),
+                ],
+                SELECTING_DATE: [
+                    CallbackQueryHandler(select_date_callback, pattern="^reschedule_date_"),
+                    CallbackQueryHandler(cancel_back_callback, pattern="^cancel_back_"),
+                ],
+                CONFIRM_RESCHEDULE: [
+                    CallbackQueryHandler(confirm_reschedule_callback, pattern="^confirm_reschedule_"),
+                    CallbackQueryHandler(cancel_reschedule_callback, pattern="^cancel_reschedule_"),
                 ],
             },
             fallbacks=[
@@ -2099,6 +2645,7 @@ def main() -> None:
         application.add_handler(CommandHandler("setchat", set_chat))
         application.add_handler(CommandHandler("info", show_info))
         application.add_handler(CommandHandler("testindustry", test_industry))
+        application.add_handler(CommandHandler("testplanerka", test_planerka))
         application.add_handler(CommandHandler("jobs", list_jobs))
         
         # Добавляем ConversationHandler для помощи
@@ -2120,9 +2667,12 @@ def main() -> None:
 
         # Логирование при запуске
         now = datetime.now(TIMEZONE)
+        config = BotConfig()
         logger.info("🤖 Бот запущен и готов к работе!")
         logger.info(f"📅 Планёрки: Пн/Ср/Пт в 9:30 по МСК")
         logger.info(f"🏢 Отраслевые встречи: Вт в 12:00 по МСК")
+        logger.info(f"🔄 Система отмены и переноса встреч активирована")
+        logger.info(f"🔒 Отменять встречи могут только разрешенные пользователи: {', '.join(config.allowed_users)}")
         logger.info(f"📚 Система помощи с полным управлением ресурсами активирована")
         logger.info(f"👥 Модуль 'О команде' с админ-управлением готов")
         logger.info(f"🔗 Ссылка для планёрок: {'Настроена' if ZOOM_LINK != DEFAULT_ZOOM_LINK else 'НЕ настроена'}")
