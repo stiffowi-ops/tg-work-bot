@@ -125,11 +125,12 @@ class JobManager:
     def __init__(self):
         self.active_jobs = {}
     
-    def add_job(self, job_name: str, job):
+    def add_job(self, job_name: str, job, job_data: Dict = None):
         """Добавить задачу в отслеживание"""
         self.active_jobs[job_name] = {
             'job': job,
-            'created_at': datetime.now(TIMEZONE)
+            'created_at': datetime.now(TIMEZONE),
+            'data': job_data or {}
         }
         logger.info(f"Задача добавлена: {job_name}")
     
@@ -153,6 +154,13 @@ class JobManager:
         """Очистить все задачи"""
         self.active_jobs.clear()
         logger.info("Все задачи очищены")
+    
+    def get_job_by_message_id(self, message_id: str) -> Optional[Dict]:
+        """Найти задачу по ID сообщения"""
+        for job_name, job_data in self.active_jobs.items():
+            if 'data' in job_data and job_data['data'].get('message_id') == message_id:
+                return {'name': job_name, **job_data}
+        return None
 
 job_manager = JobManager()
 
@@ -580,13 +588,11 @@ class BotConfig:
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
-def get_jobs_from_queue(job_queue: JobQueue):
-    """Получение задач из JobQueue для python-telegram-bot 20.x"""
+def get_jobs_from_queue() -> List:
+    """Получение задач из JobQueue через JobManager"""
     try:
-        # В python-telegram-bot 20.x+ нужно использовать JobQueue.run_repeating
-        # и сохранять ссылки на задачи при их создании
-        jobs = job_manager.get_all_jobs()
-        return [job['job'] for job in jobs if 'job' in job]
+        jobs_data = job_manager.get_all_jobs()
+        return [job_data['job'] for job_data in jobs_data if 'job' in job_data]
     except Exception as e:
         logger.error(f"Не удалось получить задачи из JobQueue: {e}")
         return []
@@ -1800,6 +1806,15 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         job_name = context.job.name if hasattr(context, 'job') and context.job else f"manual_{datetime.now().timestamp()}"
         config.add_active_reminder(message.message_id, chat_id, job_name)
+        
+        # Сохраняем данные задачи в JobManager
+        job_data = {
+            'message_id': message.message_id,
+            'chat_id': chat_id,
+            'type': 'planerka'
+        }
+        if hasattr(context, 'job') and context.job:
+            job_manager.add_job(job_name, context.job, job_data)
 
         logger.info(f"Отправлено напоминание в чат {chat_id}, сообщение {message.message_id}")
 
@@ -1832,6 +1847,15 @@ async def send_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         job_name = context.job.name if hasattr(context, 'job') and context.job else f"industry_{datetime.now().timestamp()}"
         config.add_active_reminder(message.message_id, chat_id, job_name)
+        
+        # Сохраняем данные задачи в JobManager
+        job_data = {
+            'message_id': message.message_id,
+            'chat_id': chat_id,
+            'type': 'industry'
+        }
+        if hasattr(context, 'job') and context.job:
+            job_manager.add_job(job_name, context.job, job_data)
 
         logger.info(f"Отправлено напоминание об отраслевой встрече в чат {chat_id}")
 
@@ -1908,15 +1932,28 @@ async def cancel_industry_confirm_callback(update: Update, context: ContextTypes
         await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
         return ConversationHandler.END
     
-    original_message_id = context.user_data.get("original_message_id")
+    original_message_id = str(context.user_data.get("original_message_id"))
     
     if original_message_id:
-        for job in get_jobs_from_queue(context.application.job_queue):
-            if job.name in config.active_reminders:
-                reminder_data = config.active_reminders[job.name]
-                if str(reminder_data.get("message_id")) == str(original_message_id):
-                    job.schedule_removal()
-                    config.remove_active_reminder(job.name)
+        # Ищем задачу через JobManager
+        job_data = job_manager.get_job_by_message_id(original_message_id)
+        if job_data:
+            job = job_data.get('job')
+            job_name = job_data.get('name')
+            if job and job_name:
+                job.schedule_removal()
+                job_manager.remove_job(job_name)
+                config.remove_active_reminder(job_name)
+        else:
+            # Пробуем найти через active_reminders
+            for job_name, reminder_data in config.active_reminders.items():
+                if str(reminder_data.get("message_id")) == original_message_id:
+                    # Ищем задачу в JobManager по имени
+                    job_data = job_manager.get_job(job_name)
+                    if job_data and 'job' in job_data:
+                        job_data['job'].schedule_removal()
+                        job_manager.remove_job(job_name)
+                    config.remove_active_reminder(job_name)
                     break
     
     await query.edit_message_text(
@@ -2001,15 +2038,28 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
             final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
             
             config = BotConfig()
-            original_message_id = context.user_data.get("original_message_id")
+            original_message_id = str(context.user_data.get("original_message_id"))
             
             if original_message_id:
-                for job in get_jobs_from_queue(context.application.job_queue):
-                    if job.name in config.active_reminders:
-                        reminder_data = config.active_reminders[job.name]
-                        if str(reminder_data.get("message_id")) == str(original_message_id):
-                            job.schedule_removal()
-                            config.remove_active_reminder(job.name)
+                # Ищем задачу через JobManager
+                job_data = job_manager.get_job_by_message_id(original_message_id)
+                if job_data:
+                    job = job_data.get('job')
+                    job_name = job_data.get('name')
+                    if job and job_name:
+                        job.schedule_removal()
+                        job_manager.remove_job(job_name)
+                        config.remove_active_reminder(job_name)
+                else:
+                    # Пробуем найти через active_reminders
+                    for job_name, reminder_data in config.active_reminders.items():
+                        if str(reminder_data.get("message_id")) == original_message_id:
+                            # Ищем задачу в JobManager по имени
+                            job_data = job_manager.get_job(job_name)
+                            if job_data and 'job' in job_data:
+                                job_data['job'].schedule_removal()
+                                job_manager.remove_job(job_name)
+                            config.remove_active_reminder(job_name)
                             break
             
             await query.edit_message_text(
@@ -2068,16 +2118,14 @@ async def select_date_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["meeting_type"] = meeting_type
         
         config = BotConfig()
-        original_message_id = context.user_data.get("original_message_id")
+        original_message_id = str(context.user_data.get("original_message_id"))
         job_name = None
         
         if original_message_id:
-            for job in get_jobs_from_queue(context.application.job_queue):
-                if job.name in config.active_reminders:
-                    reminder_data = config.active_reminders[job.name]
-                    if str(reminder_data.get("message_id")) == str(original_message_id):
-                        job_name = job.name
-                        break
+            # Ищем задачу через JobManager
+            job_data = job_manager.get_job_by_message_id(original_message_id)
+            if job_data:
+                job_name = job_data.get('name')
         
         if not job_name:
             await query.edit_message_text(
@@ -2154,12 +2202,13 @@ async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFA
         
         job_found = False
         if job_name:
-            for job in get_jobs_from_queue(context.application.job_queue):
-                if job.name == job_name:
-                    job.schedule_removal()
-                    config.remove_active_reminder(job.name)
-                    job_found = True
-                    break
+            # Ищем задачу в JobManager
+            job_data = job_manager.get_job(job_name)
+            if job_data and 'job' in job_data:
+                job_data['job'].schedule_removal()
+                job_manager.remove_job(job_name)
+                config.remove_active_reminder(job_name)
+                job_found = True
         
         if not job_found:
             await query.edit_message_text(
@@ -2255,15 +2304,28 @@ async def cancel_reschedule_callback(update: Update, context: ContextTypes.DEFAU
         final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
         
         config = BotConfig()
-        original_message_id = context.user_data.get("original_message_id")
+        original_message_id = str(context.user_data.get("original_message_id"))
         
         if original_message_id:
-            for job in get_jobs_from_queue(context.application.job_queue):
-                if job.name in config.active_reminders:
-                    reminder_data = config.active_reminders[job.name]
-                    if str(reminder_data.get("message_id")) == str(original_message_id):
-                        job.schedule_removal()
-                        config.remove_active_reminder(job.name)
+            # Ищем задачу через JobManager
+            job_data = job_manager.get_job_by_message_id(original_message_id)
+            if job_data:
+                job = job_data.get('job')
+                job_name = job_data.get('name')
+                if job and job_name:
+                    job.schedule_removal()
+                    job_manager.remove_job(job_name)
+                    config.remove_active_reminder(job_name)
+            else:
+                # Пробуем найти через active_reminders
+                for job_name, reminder_data in config.active_reminders.items():
+                    if str(reminder_data.get("message_id")) == original_message_id:
+                        # Ищем задачу в JobManager по имени
+                        job_data = job_manager.get_job(job_name)
+                        if job_data and 'job' in job_data:
+                            job_data['job'].schedule_removal()
+                            job_manager.remove_job(job_name)
+                        config.remove_active_reminder(job_name)
                         break
         
         await query.edit_message_text(
@@ -2362,10 +2424,8 @@ async def schedule_next_industry_reminder(context: ContextTypes.DEFAULT_TYPE) ->
         if delay > 0:
             job_name = f"industry_meeting_{next_time.strftime('%Y%m%d_%H%M')}"
             
-            existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
-                            if j.name == job_name]
-            
-            if not existing_jobs:
+            # Проверяем через JobManager
+            if not job_manager.get_job(job_name):
                 job = context.application.job_queue.run_once(
                     send_industry_reminder,
                     delay,
@@ -2433,10 +2493,8 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     if delay > 0:
         job_name = f"meeting_reminder_{next_time.strftime('%Y%m%d_%H%M')}"
         
-        existing_jobs = [j for j in get_jobs_from_queue(context.application.job_queue) 
-                        if j.name == job_name]
-        
-        if not existing_jobs:
+        # Проверяем через JobManager
+        if not job_manager.get_job(job_name):
             job = context.application.job_queue.run_once(
                 send_reminder,
                 delay,
@@ -2503,7 +2561,7 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         status = "❌ <b>Чат не установлен</b>. Используйте /setchat"
 
-    all_jobs = get_jobs_from_queue(context.application.job_queue)
+    all_jobs = get_jobs_from_queue()
     
     meeting_jobs = len([j for j in all_jobs if j.name and j.name.startswith("meeting_reminder_")])
     industry_jobs = len([j for j in all_jobs if j.name and j.name.startswith("industry_meeting_")])
@@ -2564,32 +2622,48 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    jobs = get_jobs_from_queue(context.application.job_queue)
+    jobs_data = job_manager.get_all_jobs()
     
-    if not jobs:
+    if not jobs_data:
         await update.message.reply_text("📭 <b>Нет запланированных задач.</b>", parse_mode=ParseMode.HTML)
         return
     
     message = "📋 <b>Запланированные задачи:</b>\n\n"
     
-    for job in sorted(jobs, key=lambda j: j.next_t):
-        next_time = job.next_t.astimezone(TIMEZONE)
-        job_name = job.name or "Без имени"
-        
-        if "meeting_reminder" in job_name:
-            icon = "🤝"
-            type_text = "Планёрка"
-        elif "industry_meeting" in job_name:
-            icon = "🏢"
-            type_text = "Отраслевая"
-        elif "rescheduled" in job_name:
-            icon = "🔄"
-            type_text = "Перенесенная"
-        else:
-            icon = "🔧"
-            type_text = "Другая"
-        
-        message += f"{icon} {next_time.strftime('%d.%m.%Y %H:%M')} - {type_text} ({job_name[:25]})\n"
+    for job_data in jobs_data:
+        job = job_data.get('job')
+        if not job:
+            continue
+            
+        try:
+            job_name = job_data.get('name', 'Без имени')
+            
+            # Пытаемся получить время выполнения
+            time_str = "Время не определено"
+            if hasattr(job, 'next_t') and job.next_t:
+                try:
+                    next_time = job.next_t.astimezone(TIMEZONE)
+                    time_str = next_time.strftime('%d.%m.%Y %H:%M')
+                except Exception as e:
+                    logger.warning(f"Не удалось получить время задачи {job_name}: {e}")
+            
+            if "meeting_reminder" in job_name:
+                icon = "🤝"
+                type_text = "Планёрка"
+            elif "industry_meeting" in job_name:
+                icon = "🏢"
+                type_text = "Отраслевая"
+            elif "rescheduled" in job_name:
+                icon = "🔄"
+                type_text = "Перенесенная"
+            else:
+                icon = "🔧"
+                type_text = "Другая"
+            
+            message += f"{icon} {time_str} - {type_text} ({job_name[:25]})\n"
+            
+        except Exception as e:
+            logger.error(f"Ошибка форматирования задачи: {e}")
     
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
