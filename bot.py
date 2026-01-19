@@ -123,7 +123,7 @@ INDUSTRY_CANCELLATION_OPTIONS = [
     SELECTING_INDUSTRY_REASON,
     SELECTING_DATE,
     CONFIRM_RESCHEDULE,
-) = range(32)
+) = range(33)
 
 # Настройка логирования
 logging.basicConfig(
