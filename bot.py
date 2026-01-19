@@ -103,14 +103,12 @@ INDUSTRY_CANCELLATION_OPTIONS = [
     
     # Состояния для команды
     TEAM_MENU,
-    VIEW_TEAM_MEMBER,
     
     # Состояния для настроек
     SETTINGS_MENU,
     
     # Состояния для управления командой (админы)
     TEAM_MANAGEMENT,
-    ADD_MEMBER_START,
     ADD_MEMBER_NAME,
     ADD_MEMBER_POSITION,
     ADD_MEMBER_CITY,
@@ -121,7 +119,6 @@ INDUSTRY_CANCELLATION_OPTIONS = [
     ADD_MEMBER_TELEGRAM,
     ADD_MEMBER_CONFIRM,
     EDIT_MEMBER_MENU,
-    EDIT_MEMBER_SELECT,
     EDIT_MEMBER_FIELD,
     EDIT_MEMBER_VALUE,
     DELETE_MEMBER_MENU,
@@ -132,7 +129,7 @@ INDUSTRY_CANCELLATION_OPTIONS = [
     SELECTING_INDUSTRY_REASON,
     SELECTING_DATE,
     CONFIRM_RESCHEDULE,
-) = range(32)
+) = range(30)
 
 # Настройка логирования
 logging.basicConfig(
@@ -2774,9 +2771,6 @@ def main() -> None:
                 TEAM_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^team_member_|^team_management$|^help_back$"),
                 ],
-                VIEW_TEAM_MEMBER: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^help_back$"),
-                ],
                 
                 # Настройки
                 SETTINGS_MENU: [
@@ -2828,10 +2822,6 @@ def main() -> None:
                 # Редактирование сотрудника
                 EDIT_MEMBER_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^edit_member_select_|^team_management$"),
-                ],
-                EDIT_MEMBER_SELECT: [
-                    CallbackQueryHandler(handle_edit_member_field, pattern="^edit_field_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^team_edit_member$"),
                 ],
                 EDIT_MEMBER_FIELD: [
                     CallbackQueryHandler(handle_edit_member_field, pattern="^edit_field_"),
