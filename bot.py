@@ -108,10 +108,6 @@ DELETE_MEMBER_CONFIRM = 22
 SELECTING_REASON = 23
 SELECTING_DATE = 24
 CONFIRM_RESCHEDULE = 25
-RESERVED_1 = 26
-RESERVED_2 = 27
-RESERVED_3 = 28
-RESERVED_4 = 29
 
 # Настройка логирования
 logging.basicConfig(
@@ -657,7 +653,7 @@ def format_date_for_display(date: datetime) -> str:
     return f"{weekday}, {day} {month} {year} в {time_str}"
 
 def format_date_button(date: datetime) -> str:
-    return date.strftime("%d.%m.%Y %H:%M")
+    return date.strftime("%d.%m.%Y")
 
 # ========== ФУНКЦИЯ ДЛЯ ПРИВЕТСТВИЯ НОВЫХ СОТРУДНИКОВ ==========
 
@@ -874,7 +870,7 @@ def create_confirm_reschedule_keyboard(meeting_type: str, selected_date: datetim
     keyboard = [
         [
             InlineKeyboardButton("✅ Да, перенести", 
-                               callback_data=f"confirm_reschedule_{meeting_type}_{selected_date.strftime('%Y%m%d_%H%M')}_{job_name}"),
+                               callback_data=f"confirm_reschedule_{meeting_type}_{selected_date.strftime('%Y%m%d')}_{job_name}"),
             InlineKeyboardButton("❌ Нет, отмена", 
                                callback_data=f"cancel_reschedule_{meeting_type}")
         ]
@@ -882,7 +878,7 @@ def create_confirm_reschedule_keyboard(meeting_type: str, selected_date: datetim
     return InlineKeyboardMarkup(keyboard)
 
 def create_industry_cancel_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура для отмены отраслевой встречи (без причин)"""
+    """Клавиатура для отмены отраслевой встречи"""
     keyboard = [
         [InlineKeyboardButton("✅ Да, отменить встречу", callback_data="cancel_industry_confirm")],
         [InlineKeyboardButton("❌ Нет, оставить", callback_data="cancel_industry_cancel")]
@@ -941,6 +937,13 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     elif query.data == "help_settings":
         if not config.is_admin(username):
             await query.answer("❌ У вас нет прав доступа к настройкам", show_alert=True)
+            keyboard = create_help_keyboard()
+            await query.edit_message_text(
+                "📋 <b>Главное меню помощи</b>\n\n"
+                "Выберите раздел:",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
             return MAIN_HELP_MENU
         
         keyboard = create_settings_keyboard(config, username)
@@ -1243,6 +1246,10 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode=ParseMode.HTML
         )
         return DELETE_MEMBER_MENU
+    
+    elif query.data == "no_members":
+        await query.answer("👥 Пока нет добавленных сотрудников", show_alert=True)
+        return TEAM_MENU
     
     keyboard = create_help_keyboard()
     await query.edit_message_text(
@@ -1757,7 +1764,7 @@ async def send_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     keyboard = [
-        [InlineKeyboardButton("❌ Отменить встречу", callback_data="cancel_industry_meeting")]
+        [InlineKeyboardButton("❌ Отменить встречу", callback_data="cancel_industry")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1862,7 +1869,7 @@ async def cancel_industry_confirm_callback(update: Update, context: ContextTypes
     
     await query.edit_message_text(
         text=f"❌ @{username} отменил отраслевую встречу\n\n"
-             "Встреча отменена без переноса.",
+             "Встреча отменена, следите за расписанием.",
         parse_mode=ParseMode.HTML
     )
     
@@ -1968,14 +1975,23 @@ async def select_date_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     
     try:
         parts = query.data.split("_")
+        if len(parts) < 4:
+            raise ValueError("Неверный формат callback данных")
+            
         meeting_type = parts[2]
-        date_str = parts[3] + "_" + parts[4]
+        date_str = parts[3]
         
         try:
-            selected_date = datetime.strptime(date_str, "%d.%m.%Y_%H:%M")
+            selected_date = datetime.strptime(date_str, "%d.%m.%Y")
+            selected_date = selected_date.replace(
+                hour=MEETING_TIME['hour'] if meeting_type == "planerka" else INDUSTRY_MEETING_TIME['hour'],
+                minute=MEETING_TIME['minute'] if meeting_type == "planerka" else INDUSTRY_MEETING_TIME['minute'],
+                second=0,
+                microsecond=0
+            )
             selected_date = TIMEZONE.localize(selected_date)
-        except ValueError:
-            logger.error(f"Неверный формат даты: {date_str}")
+        except ValueError as e:
+            logger.error(f"Неверный формат даты: {date_str}, ошибка: {e}")
             await query.edit_message_text(
                 text="❌ Неверный формат даты.",
                 parse_mode=ParseMode.HTML
@@ -2022,7 +2038,7 @@ async def select_date_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return CONFIRM_RESCHEDULE
         
     except Exception as e:
-        logger.error(f"Ошибка выбора даты: {e}")
+        logger.error(f"Ошибка выбора даты: {e}", exc_info=True)
         await query.edit_message_text(
             text="❌ Произошла ошибка при выборе даты.",
             parse_mode=ParseMode.HTML
@@ -2042,15 +2058,24 @@ async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFA
     
     try:
         parts = query.data.split("_")
+        if len(parts) < 4:
+            raise ValueError("Неверный формат callback данных")
+            
         meeting_type = parts[2]
-        date_str = parts[3] + "_" + parts[4]
-        job_name = parts[5]
+        date_str = parts[3]
+        job_name = parts[4] if len(parts) > 4 else None
         
         try:
-            selected_date = datetime.strptime(date_str, "%Y%m%d_%H%M")
+            selected_date = datetime.strptime(date_str, "%Y%m%d")
+            selected_date = selected_date.replace(
+                hour=MEETING_TIME['hour'] if meeting_type == "planerka" else INDUSTRY_MEETING_TIME['hour'],
+                minute=MEETING_TIME['minute'] if meeting_type == "planerka" else INDUSTRY_MEETING_TIME['minute'],
+                second=0,
+                microsecond=0
+            )
             selected_date = TIMEZONE.localize(selected_date)
-        except ValueError:
-            logger.error(f"Неверный формат даты: {date_str}")
+        except ValueError as e:
+            logger.error(f"Неверный формат даты: {date_str}, ошибка: {e}")
             await query.edit_message_text(
                 text="❌ Неверный формат даты.",
                 parse_mode=ParseMode.HTML
@@ -2062,12 +2087,13 @@ async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFA
         reason = context.user_data.get("selected_reason", "Перенос на другую дату")
         
         job_found = False
-        for job in get_jobs_from_queue(context.application.job_queue):
-            if job.name == job_name:
-                job.schedule_removal()
-                config.remove_active_reminder(job.name)
-                job_found = True
-                break
+        if job_name:
+            for job in get_jobs_from_queue(context.application.job_queue):
+                if job.name == job_name:
+                    job.schedule_removal()
+                    config.remove_active_reminder(job.name)
+                    job_found = True
+                    break
         
         if not job_found:
             await query.edit_message_text(
@@ -2126,7 +2152,7 @@ async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFA
             return SELECTING_DATE
         
     except Exception as e:
-        logger.error(f"Ошибка переноса встречи: {e}")
+        logger.error(f"Ошибка переноса встречи: {e}", exc_info=True)
         await query.edit_message_text(
             text="❌ Произошла ошибка при переносе встречи.",
             parse_mode=ParseMode.HTML
@@ -2528,19 +2554,11 @@ def main() -> None:
             ],
             states={
                 MAIN_HELP_MENU: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^help_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^file_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^link_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^team_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^add_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^delete_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^edit_"),
-                    CallbackQueryHandler(handle_add_member_confirm, pattern="^add_member_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^no_members$"),
+                    CallbackQueryHandler(handle_help_callback),
                 ],
                 
                 DOCUMENTS_MENU: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^file_|^add_file$|^help_back$"),
+                    CallbackQueryHandler(handle_help_callback),
                 ],
                 ADD_FILE_NAME: [
                     MessageHandler(filters.Document.ALL, handle_file_upload),
@@ -2551,23 +2569,23 @@ def main() -> None:
                     CommandHandler("cancel", cancel_upload),
                 ],
                 DELETE_FILE_MENU: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^delete_file_|^help_settings$"),
+                    CallbackQueryHandler(handle_help_callback),
                 ],
                 
                 LINKS_MENU: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^link_|^help_back$"),
+                    CallbackQueryHandler(handle_help_callback),
                 ],
                 
                 TEAM_MENU: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^team_member_|^team_management$|^help_back$"),
+                    CallbackQueryHandler(handle_help_callback),
                 ],
                 
                 SETTINGS_MENU: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^delete_file_menu$|^help_back$"),
+                    CallbackQueryHandler(handle_help_callback),
                 ],
                 
                 TEAM_MANAGEMENT: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^team_add_member$|^team_edit_member$|^team_delete_member$|^help_team$"),
+                    CallbackQueryHandler(handle_help_callback),
                 ],
                 
                 ADD_MEMBER_NAME: [
@@ -2603,15 +2621,14 @@ def main() -> None:
                     CommandHandler("cancel", cancel_upload),
                 ],
                 ADD_MEMBER_CONFIRM: [
-                    CallbackQueryHandler(handle_add_member_confirm, pattern="^add_member_"),
+                    CallbackQueryHandler(handle_add_member_confirm),
                 ],
                 
                 EDIT_MEMBER_MENU: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^edit_member_select_|^team_management$"),
+                    CallbackQueryHandler(handle_help_callback),
                 ],
                 EDIT_MEMBER_FIELD: [
-                    CallbackQueryHandler(handle_edit_member_field, pattern="^edit_field_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^team_edit_member$"),
+                    CallbackQueryHandler(handle_edit_member_field),
                 ],
                 EDIT_MEMBER_VALUE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_member_value),
@@ -2619,10 +2636,10 @@ def main() -> None:
                 ],
                 
                 DELETE_MEMBER_MENU: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^delete_member_select_|^team_management$"),
+                    CallbackQueryHandler(handle_help_callback),
                 ],
                 DELETE_MEMBER_CONFIRM: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^delete_confirm_"),
+                    CallbackQueryHandler(handle_help_callback),
                 ],
             },
             fallbacks=[
@@ -2634,11 +2651,11 @@ def main() -> None:
         cancel_conv_handler = ConversationHandler(
             entry_points=[
                 CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$"),
-                CallbackQueryHandler(cancel_industry_callback, pattern="^cancel_industry_meeting$")
+                CallbackQueryHandler(cancel_industry_callback, pattern="^cancel_industry$")
             ],
             states={
                 SELECTING_REASON: [
-                    CallbackQueryHandler(select_reason_callback, pattern="^reason_[0-9]+$"),
+                    CallbackQueryHandler(select_reason_callback, pattern="^reason_"),
                     CallbackQueryHandler(cancel_back_callback, pattern="^cancel_back_planerka$"),
                 ],
                 SELECTING_DATE: [
