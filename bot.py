@@ -81,13 +81,7 @@ CANCELLATION_OPTIONS = [
     "Перенесём на другой день",
 ]
 
-INDUSTRY_CANCELLATION_OPTIONS = [
-    "Основные спикеры не смогут участвовать",
-    "Переносим на другую дату",
-    "Актуальные вопросы решены вне встречи",
-]
-
-# Состояния для ConversationHandler - всего 30 состояний
+# Состояния для ConversationHandler
 MAIN_HELP_MENU = 0
 DOCUMENTS_MENU = 1
 ADD_FILE_NAME = 2
@@ -112,13 +106,12 @@ EDIT_MEMBER_VALUE = 20
 DELETE_MEMBER_MENU = 21
 DELETE_MEMBER_CONFIRM = 22
 SELECTING_REASON = 23
-SELECTING_INDUSTRY_REASON = 24
-SELECTING_DATE = 25
-CONFIRM_RESCHEDULE = 26
-# Резервные состояния для будущего расширения
-RESERVED_1 = 27
-RESERVED_2 = 28
-RESERVED_3 = 29
+SELECTING_DATE = 24
+CONFIRM_RESCHEDULE = 25
+RESERVED_1 = 26
+RESERVED_2 = 27
+RESERVED_3 = 28
+RESERVED_4 = 29
 
 # Настройка логирования
 logging.basicConfig(
@@ -153,7 +146,7 @@ class GigaChatClient:
                 GIGACHAT_AUTH_URL,
                 data=auth_data,
                 auth=(self.client_id, self.client_secret),
-                verify=False,  # Отключаем проверку SSL для тестов
+                verify=False,
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Accept": "application/json",
@@ -164,8 +157,8 @@ class GigaChatClient:
             if response.status_code == 200:
                 token_data = response.json()
                 self.access_token = token_data.get("access_token")
-                expires_in = token_data.get("expires_in", 1800)  # 30 минут по умолчанию
-                self.token_expires = datetime.now() + timedelta(seconds=expires_in - 60)  # Запас 1 минута
+                expires_in = token_data.get("expires_in", 1800)
+                self.token_expires = datetime.now() + timedelta(seconds=expires_in - 60)
                 logger.info("GigaChat токен успешно получен")
                 return self.access_token
             else:
@@ -184,7 +177,6 @@ class GigaChatClient:
                 logger.warning("Не удалось получить токен GigaChat, используем шаблонное приветствие")
                 return self._get_fallback_welcome(username)
             
-            # Формируем промпт
             user_info = ""
             if first_name:
                 user_info += f"Имя: {first_name} "
@@ -209,7 +201,6 @@ class GigaChatClient:
             6. Пожелай успехов в работе
             7. Не используй markdown, только plain text
             8. Обращайся на "ты"
-            9. Пример стиля: "Привет, @username! 👋 Рады видеть тебя в нашей команде! Желаем успешного старта и крутых результатов. Если нужна помощь с командами или расписанием — жми /help, помогу чем смогу. Удачи! 🚀"
             
             Сгенерируй уникальное, персонализированное приветствие.
             """
@@ -265,7 +256,6 @@ class GigaChatClient:
         ]
         return random.choice(fallback_messages)
 
-# Создаем глобальный экземпляр клиента GigaChat
 gigachat_client = GigaChatClient()
 
 # ========== КЛАСС КОНФИГА ==========
@@ -282,7 +272,6 @@ class BotConfig:
         self.team_data = self._load_team_data()
     
     def _load_config(self) -> Dict[str, Any]:
-        """Загрузить основные данные"""
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
@@ -309,9 +298,8 @@ class BotConfig:
         }
     
     def _load_help_data(self) -> Dict[str, Any]:
-        """Загрузить данные помощи"""
         default_data = {
-            "files": {},  # Пустой словарь - файлы будут добавляться через бота
+            "files": {},
             "links": {
                 "ya_crm": {
                     "name": "🌐 YA CRM",
@@ -336,7 +324,6 @@ class BotConfig:
                 with open(self.help_data_file, 'r', encoding='utf-8') as f:
                     loaded_data = json.load(f)
                     
-                    # Обновляем ссылки из переменных окружения
                     if "links" in loaded_data:
                         if "ya_crm" in loaded_data["links"]:
                             loaded_data["links"]["ya_crm"]["url"] = YA_CRM_LINK
@@ -352,17 +339,15 @@ class BotConfig:
         return default_data
     
     def _load_team_data(self) -> Dict[str, Any]:
-        """Загрузить данные о команде"""
         default_data = {
-            "members": {},  # Словарь для хранения карточек сотрудников
-            "last_id": 0    # Счетчик для генерации ID
+            "members": {},
+            "last_id": 0
         }
         
         if os.path.exists(self.team_data_file):
             try:
                 with open(self.team_data_file, 'r', encoding='utf-8') as f:
                     loaded_data = json.load(f)
-                    # Проверяем наличие обязательных полей
                     if "members" not in loaded_data:
                         loaded_data["members"] = {}
                     if "last_id" not in loaded_data:
@@ -374,7 +359,6 @@ class BotConfig:
         return default_data
     
     def save(self) -> None:
-        """Сохранить основные данные"""
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
@@ -382,7 +366,6 @@ class BotConfig:
             logger.error(f"Ошибка сохранения конфига: {e}")
     
     def save_help_data(self) -> None:
-        """Сохранить данные помощи"""
         try:
             with open(self.help_data_file, 'w', encoding='utf-8') as f:
                 json.dump(self.help_data, f, ensure_ascii=False, indent=2)
@@ -390,7 +373,6 @@ class BotConfig:
             logger.error(f"Ошибка сохранения данных помощи: {e}")
     
     def save_team_data(self) -> None:
-        """Сохранить данные команды"""
         try:
             with open(self.team_data_file, 'w', encoding='utf-8') as f:
                 json.dump(self.team_data, f, ensure_ascii=False, indent=2)
@@ -415,7 +397,6 @@ class BotConfig:
         return self.data.get("admins", [])
     
     def is_allowed(self, username: str) -> bool:
-        """Проверяет, разрешен ли пользователь"""
         return username in self.allowed_users
     
     def is_admin(self, username: str) -> bool:
@@ -464,7 +445,6 @@ class BotConfig:
     
     def add_rescheduled_meeting(self, original_job: str, new_time: datetime, meeting_type: str, 
                                rescheduled_by: str, original_message_id: int) -> None:
-        """Добавить информацию о перенесенной встрече"""
         meeting_id = f"rescheduled_{int(datetime.now().timestamp())}"
         
         self.data["rescheduled_meetings"][meeting_id] = {
@@ -479,19 +459,14 @@ class BotConfig:
         self.save()
     
     def update_rescheduled_meeting_status(self, meeting_id: str, status: str) -> None:
-        """Обновить статус перенесенной встречи"""
         if meeting_id in self.data["rescheduled_meetings"]:
             self.data["rescheduled_meetings"][meeting_id]["status"] = status
             self.save()
     
-    # Методы для работы с файлами
     def add_file(self, file_id: str, file_name: str, description: str) -> bool:
-        """Добавить новый файл"""
         try:
-            # Создаем ключ для файла
             file_key = file_name.lower().replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_').replace('\\', '_')
             
-            # Если ключ уже существует, добавляем номер
             original_key = file_key
             counter = 1
             while file_key in self.help_data["files"]:
@@ -514,7 +489,6 @@ class BotConfig:
             return False
     
     def delete_file(self, file_id: str) -> bool:
-        """Удалить файл"""
         if file_id in self.help_data["files"]:
             deleted_name = self.help_data["files"][file_id]["name"]
             del self.help_data["files"][file_id]
@@ -523,19 +497,14 @@ class BotConfig:
             return True
         return False
     
-    # Методы для работы с командой
     def add_team_member(self, member_data: Dict) -> str:
-        """Добавить нового члена команды"""
         try:
-            # Генерируем ID
             self.team_data["last_id"] += 1
             member_id = str(self.team_data["last_id"])
             
-            # Сохраняем дату добавления
             member_data["added_date"] = datetime.now().isoformat()
             member_data["last_updated"] = datetime.now().isoformat()
             
-            # Добавляем в данные
             self.team_data["members"][member_id] = member_data
             
             self.save_team_data()
@@ -547,7 +516,6 @@ class BotConfig:
             return ""
     
     def update_team_member(self, member_id: str, field: str, value: str) -> bool:
-        """Обновить поле члена команды"""
         if member_id in self.team_data["members"]:
             self.team_data["members"][member_id][field] = value
             self.team_data["members"][member_id]["last_updated"] = datetime.now().isoformat()
@@ -557,7 +525,6 @@ class BotConfig:
         return False
     
     def delete_team_member(self, member_id: str) -> bool:
-        """Удалить члена команды"""
         if member_id in self.team_data["members"]:
             deleted_name = self.team_data["members"][member_id].get("name", "Без имени")
             del self.team_data["members"][member_id]
@@ -567,17 +534,14 @@ class BotConfig:
         return False
     
     def get_team_member(self, member_id: str) -> Optional[Dict]:
-        """Получить данные члена команда"""
         return self.team_data["members"].get(member_id)
     
     def get_all_team_members(self) -> Dict[str, Dict]:
-        """Получить всех членов команды"""
         return self.team_data["members"]
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def get_jobs_from_queue(job_queue: JobQueue):
-    """Получить список задач с поддержкой разных версий PTB"""
     try:
         return job_queue.get_jobs()
     except AttributeError:
@@ -587,7 +551,6 @@ def get_jobs_from_queue(job_queue: JobQueue):
             logger.error(f"Не удалось получить задачи из JobQueue: {e}")
             return []
 
-# Декоратор для проверки прав пользователя
 def restricted(func):
     @wraps(func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
@@ -605,7 +568,6 @@ def restricted(func):
     return wrapped
 
 def get_industry_meeting_text() -> str:
-    """Получаем текст для отраслевой встречи с ссылкой"""
     zoom_link = INDUSTRY_ZOOM_LINK
     
     if zoom_link == DEFAULT_ZOOM_LINK:
@@ -617,7 +579,6 @@ def get_industry_meeting_text() -> str:
     return text.format(zoom_link=zoom_link_formatted)
 
 def get_greeting_by_meeting_day() -> str:
-    """Специальные приветствия для дней планёрок"""
     weekday = datetime.now(TIMEZONE).weekday()
     day_names_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     current_day = day_names_ru[weekday]
@@ -650,19 +611,16 @@ def get_greeting_by_meeting_day() -> str:
         return f"👋 Доброе утро! Сегодня <i>{current_day}</i>.\n\n📋 <i>Напоминаю о планёрке в 9:30 по МСК</i>.{zoom_note}"
 
 def get_available_dates(meeting_type: str, start_from: datetime = None) -> List[datetime]:
-    """Получить доступные даты для переноса встречи"""
     if not start_from:
         start_from = datetime.now(TIMEZONE)
     
     available_dates = []
     
     if meeting_type == "planerka":
-        # Для планёрки ищем ближайшие дни планёрок (пн, ср, пт)
         days_ahead = 1
-        while len(available_dates) < 5:  # Показываем 5 ближайших доступных дат
+        while len(available_dates) < 5:
             check_date = start_from + timedelta(days=days_ahead)
             if check_date.weekday() in MEETING_DAYS:
-                # Устанавливаем время планёрки (9:15)
                 meeting_time = check_date.replace(
                     hour=MEETING_TIME['hour'],
                     minute=MEETING_TIME['minute'],
@@ -673,12 +631,10 @@ def get_available_dates(meeting_type: str, start_from: datetime = None) -> List[
             days_ahead += 1
     
     elif meeting_type == "industry":
-        # Для отраслевой встречи ищем ближайшие вторники
         days_ahead = 1
         while len(available_dates) < 5:
             check_date = start_from + timedelta(days=days_ahead)
             if check_date.weekday() in INDUSTRY_MEETING_DAY:
-                # Устанавливаем время отраслевой встречи (12:00)
                 meeting_time = check_date.replace(
                     hour=INDUSTRY_MEETING_TIME['hour'],
                     minute=INDUSTRY_MEETING_TIME['minute'],
@@ -691,7 +647,6 @@ def get_available_dates(meeting_type: str, start_from: datetime = None) -> List[
     return available_dates
 
 def format_date_for_display(date: datetime) -> str:
-    """Форматировать дату для отображения"""
     weekday = WEEKDAYS_RU[date.weekday()]
     day = date.day
     month = MONTHS_RU[date.month]
@@ -702,37 +657,30 @@ def format_date_for_display(date: datetime) -> str:
     return f"{weekday}, {day} {month} {year} в {time_str}"
 
 def format_date_button(date: datetime) -> str:
-    """Форматировать дату для кнопки"""
     return date.strftime("%d.%m.%Y %H:%M")
 
 # ========== ФУНКЦИЯ ДЛЯ ПРИВЕТСТВИЯ НОВЫХ СОТРУДНИКОВ ==========
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Приветствие нового сотрудника через GigaChat"""
     config = BotConfig()
     
-    # Проверяем, установлен ли чат для бота
     if not config.chat_id:
         logger.warning("Chat ID не установлен, пропускаем приветствие")
         return
     
     for new_member in update.message.new_chat_members:
-        # Пропускаем самого бота
         if new_member.id == context.bot.id:
             continue
         
-        # Получаем информацию о пользователе
         username = new_member.username if new_member.username else ""
         first_name = new_member.first_name if new_member.first_name else None
         last_name = new_member.last_name if new_member.last_name else None
         
-        # Формируем обращение
         if username:
             mention = f"@{username}"
         else:
             mention = first_name if first_name else "Новый коллега"
         
-        # Генерируем приветствие через GigaChat
         logger.info(f"Генерируем приветствие для нового пользователя: {username or first_name}")
         welcome_text = gigachat_client.generate_welcome_message(
             username=username,
@@ -740,7 +688,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             last_name=last_name
         )
         
-        # Отправляем приветствие в чат
         try:
             await update.message.reply_text(welcome_text)
             logger.info(f"Приветствие отправлено для {mention}")
@@ -750,7 +697,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ========== КЛАВИАТУРЫ ==========
 
 def create_help_keyboard() -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для главного меню помощи"""
     keyboard = [
         [InlineKeyboardButton("📄 Документы", callback_data="help_documents")],
         [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help_links")],
@@ -760,7 +706,6 @@ def create_help_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def create_documents_keyboard(config: BotConfig, username: str = None) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для документов"""
     keyboard = []
     files = config.help_data.get("files", {})
     
@@ -772,7 +717,6 @@ def create_documents_keyboard(config: BotConfig, username: str = None) -> Inline
             )
         ])
     
-    # Кнопка добавления файла (только для админов)
     if username and config.is_admin(username):
         keyboard.append([InlineKeyboardButton("➕ Добавить файл", callback_data="add_file")])
     
@@ -781,7 +725,6 @@ def create_documents_keyboard(config: BotConfig, username: str = None) -> Inline
     return InlineKeyboardMarkup(keyboard)
 
 def create_links_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для ссылок"""
     keyboard = []
     links = config.help_data.get("links", {})
     
@@ -798,7 +741,6 @@ def create_links_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def create_team_keyboard(config: BotConfig, username: str = None) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для команды"""
     keyboard = []
     members = config.get_all_team_members()
     
@@ -807,7 +749,6 @@ def create_team_keyboard(config: BotConfig, username: str = None) -> InlineKeybo
     else:
         for member_id, member_data in members.items():
             name = member_data.get('name', 'Без имени')
-            # Обрезаем имя если слишком длинное
             display_name = name[:30] + "..." if len(name) > 30 else name
             keyboard.append([
                 InlineKeyboardButton(
@@ -816,7 +757,6 @@ def create_team_keyboard(config: BotConfig, username: str = None) -> InlineKeybo
                 )
             ])
     
-    # Кнопка управления командой (только для админов)
     if username and config.is_admin(username):
         keyboard.append([InlineKeyboardButton("⚙️ Управление командой", callback_data="team_management")])
     
@@ -825,10 +765,8 @@ def create_team_keyboard(config: BotConfig, username: str = None) -> InlineKeybo
     return InlineKeyboardMarkup(keyboard)
 
 def create_settings_keyboard(config: BotConfig, username: str = None) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для настроек"""
     keyboard = []
     
-    # Кнопки только для админов
     if username and config.is_admin(username):
         keyboard.append([InlineKeyboardButton("🗑️ Удалить файл", callback_data="delete_file_menu")])
     
@@ -837,7 +775,6 @@ def create_settings_keyboard(config: BotConfig, username: str = None) -> InlineK
     return InlineKeyboardMarkup(keyboard)
 
 def create_delete_file_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для удаления файлов"""
     keyboard = []
     files = config.help_data.get("files", {})
     
@@ -854,7 +791,6 @@ def create_delete_file_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def create_team_management_keyboard() -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для управления командой (админы)"""
     keyboard = [
         [InlineKeyboardButton("➕ Добавить сотрудника", callback_data="team_add_member")],
         [InlineKeyboardButton("✏️ Редактировать карточку", callback_data="team_edit_member")],
@@ -864,7 +800,6 @@ def create_team_management_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def create_edit_member_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для выбора сотрудника для редактирования"""
     keyboard = []
     members = config.get_all_team_members()
     
@@ -883,7 +818,6 @@ def create_edit_member_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def create_edit_field_keyboard() -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для выбора поля для редактирования"""
     keyboard = [
         [InlineKeyboardButton("👤 Имя", callback_data="edit_field_name")],
         [InlineKeyboardButton("💼 Должность", callback_data="edit_field_position")],
@@ -898,7 +832,6 @@ def create_edit_field_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def create_delete_member_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для выбора сотрудника для удаления"""
     keyboard = []
     members = config.get_all_team_members()
     
@@ -917,7 +850,6 @@ def create_delete_member_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def create_confirm_delete_keyboard(member_id: str) -> InlineKeyboardMarkup:
-    """Создаем клавиатуру для подтверждения удаления"""
     keyboard = [
         [InlineKeyboardButton("✅ Да, удалить", callback_data=f"delete_confirm_yes_{member_id}")],
         [InlineKeyboardButton("❌ Нет, отмена", callback_data=f"delete_confirm_no_{member_id}")]
@@ -925,7 +857,6 @@ def create_confirm_delete_keyboard(member_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def create_date_selection_keyboard(meeting_type: str, available_dates: List[datetime]) -> InlineKeyboardMarkup:
-    """Создать клавиатуру для выбора даты переноса"""
     keyboard = []
     
     for i, date in enumerate(available_dates):
@@ -940,7 +871,6 @@ def create_date_selection_keyboard(meeting_type: str, available_dates: List[date
     return InlineKeyboardMarkup(keyboard)
 
 def create_confirm_reschedule_keyboard(meeting_type: str, selected_date: datetime, job_name: str) -> InlineKeyboardMarkup:
-    """Создать клавиатуру для подтверждения переноса"""
     keyboard = [
         [
             InlineKeyboardButton("✅ Да, перенести", 
@@ -951,10 +881,17 @@ def create_confirm_reschedule_keyboard(meeting_type: str, selected_date: datetim
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def create_industry_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для отмены отраслевой встречи (без причин)"""
+    keyboard = [
+        [InlineKeyboardButton("✅ Да, отменить встречу", callback_data="cancel_industry_confirm")],
+        [InlineKeyboardButton("❌ Нет, оставить", callback_data="cancel_industry_cancel")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 # ========== ФУНКЦИИ ДЛЯ КОМАНДЫ HELP ==========
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик /help - главное меню помощи"""
     keyboard = create_help_keyboard()
     
     await update.message.reply_text(
@@ -965,7 +902,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка callback от меню помощи"""
     query = update.callback_query
     await query.answer()
     
@@ -1079,7 +1015,6 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode=ParseMode.HTML
             )
             
-            # Возвращаемся в меню настроек
             keyboard = create_settings_keyboard(config, username)
             await query.message.reply_text(
                 "⚙️ <b>Настройки</b>\n\n"
@@ -1114,7 +1049,6 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 logger.error(f"Ошибка отправки файла: {e}")
                 await query.answer("❌ Не удалось отправить файл", show_alert=True)
         
-        # Возвращаемся в меню документов
         keyboard = create_documents_keyboard(config, username)
         await query.edit_message_text(
             "📄 <b>Документы</b>\n\n"
@@ -1154,7 +1088,6 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         member_data = config.get_team_member(member_id)
         
         if member_data:
-            # Формируем карточку сотрудника
             card_text = format_team_member_card(member_data)
             
             keyboard = InlineKeyboardMarkup([
@@ -1289,7 +1222,6 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode=ParseMode.HTML
             )
             
-            # Возвращаемся в меню управления командой
             keyboard = create_team_management_keyboard()
             await query.message.reply_text(
                 "⚙️ <b>Управление командой</b>\n\n"
@@ -1303,7 +1235,6 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return DELETE_MEMBER_CONFIRM
     
     elif query.data.startswith("delete_confirm_no_"):
-        # Возвращаемся в меню удаления
         keyboard = create_delete_member_keyboard(config)
         await query.edit_message_text(
             "🗑️ <b>Удаление сотрудника</b>\n\n"
@@ -1313,7 +1244,6 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return DELETE_MEMBER_MENU
     
-    # Если callback не обработан, возвращаемся в главное меню
     keyboard = create_help_keyboard()
     await query.edit_message_text(
         "📋 <b>Главное меню помощи</b>\n\n"
@@ -1324,7 +1254,6 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     return MAIN_HELP_MENU
 
 def format_team_member_card(member_data: Dict) -> str:
-    """Форматирует карточку сотрудника"""
     name = member_data.get("name", "Не указано")
     position = member_data.get("position", "Не указано")
     city = member_data.get("city", "Не указано")
@@ -1357,7 +1286,6 @@ def format_team_member_card(member_data: Dict) -> str:
 # ========== ОБРАБОТЧИКИ ДЛЯ ДОБАВЛЕНИЯ СОТРУДНИКА ==========
 
 async def handle_add_member_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка имени сотрудника"""
     if update.message:
         name = update.message.text.strip()
         if name:
@@ -1378,7 +1306,6 @@ async def handle_add_member_name(update: Update, context: ContextTypes.DEFAULT_T
     return ADD_MEMBER_NAME
 
 async def handle_add_member_position(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка должности сотрудника"""
     if update.message:
         position = update.message.text.strip()
         if position:
@@ -1399,7 +1326,6 @@ async def handle_add_member_position(update: Update, context: ContextTypes.DEFAU
     return ADD_MEMBER_POSITION
 
 async def handle_add_member_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка города сотрудника"""
     if update.message:
         city = update.message.text.strip()
         if city:
@@ -1420,7 +1346,6 @@ async def handle_add_member_city(update: Update, context: ContextTypes.DEFAULT_T
     return ADD_MEMBER_CITY
 
 async def handle_add_member_year(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка года прихода в компанию"""
     if update.message:
         year = update.message.text.strip()
         if year and year.isdigit() and len(year) == 4:
@@ -1441,7 +1366,6 @@ async def handle_add_member_year(update: Update, context: ContextTypes.DEFAULT_T
     return ADD_MEMBER_YEAR
 
 async def handle_add_member_responsibilities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка сферы ответственности"""
     if update.message:
         responsibilities = update.message.text.strip()
         if responsibilities:
@@ -1462,7 +1386,6 @@ async def handle_add_member_responsibilities(update: Update, context: ContextTyp
     return ADD_MEMBER_RESPONSIBILITIES
 
 async def handle_add_member_contact_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка вопросов для обращений"""
     if update.message:
         contact_topics = update.message.text.strip()
         if contact_topics:
@@ -1483,7 +1406,6 @@ async def handle_add_member_contact_topics(update: Update, context: ContextTypes
     return ADD_MEMBER_CONTACT_TOPICS
 
 async def handle_add_member_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка информации о себе"""
     if update.message:
         about = update.message.text.strip()
         if about:
@@ -1504,17 +1426,14 @@ async def handle_add_member_about(update: Update, context: ContextTypes.DEFAULT_
     return ADD_MEMBER_ABOUT
 
 async def handle_add_member_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка Telegram username"""
     if update.message:
         telegram = update.message.text.strip()
         
-        # Добавляем @ если его нет
         if telegram and not telegram.startswith("@"):
             telegram = "@" + telegram
         
         context.user_data["new_member"]["telegram"] = telegram if telegram else "Не указано"
         
-        # Показываем превью карточки для подтверждения
         config = BotConfig()
         username = update.effective_user.username
         
@@ -1543,7 +1462,6 @@ async def handle_add_member_telegram(update: Update, context: ContextTypes.DEFAU
     return ADD_MEMBER_TELEGRAM
 
 async def handle_add_member_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Подтверждение добавления сотрудника"""
     query = update.callback_query
     await query.answer()
     
@@ -1579,10 +1497,8 @@ async def handle_add_member_confirm(update: Update, context: ContextTypes.DEFAUL
                 parse_mode=ParseMode.HTML
             )
         
-        # Очищаем временные данные
         context.user_data.clear()
         
-        # Возвращаемся в меню управления командой
         keyboard = create_team_management_keyboard()
         await query.message.reply_text(
             "⚙️ <b>Управление командой</b>\n\n"
@@ -1599,7 +1515,6 @@ async def handle_add_member_confirm(update: Update, context: ContextTypes.DEFAUL
             parse_mode=ParseMode.HTML
         )
         
-        # Возвращаемся в меню управления командой
         keyboard = create_team_management_keyboard()
         await query.message.reply_text(
             "⚙️ <b>Управление командой</b>\n\n"
@@ -1614,7 +1529,6 @@ async def handle_add_member_confirm(update: Update, context: ContextTypes.DEFAUL
 # ========== ОБРАБОТЧИКИ ДЛЯ РЕДАКТИРОВАНИЯ СОТРУДНИКА ==========
 
 async def handle_edit_member_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка выбора поля для редактирования"""
     query = update.callback_query
     await query.answer()
     
@@ -1661,7 +1575,6 @@ async def handle_edit_member_field(update: Update, context: ContextTypes.DEFAULT
     return EDIT_MEMBER_FIELD
 
 async def handle_edit_member_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка нового значения поля"""
     if update.message:
         new_value = update.message.text.strip()
         field_key = context.user_data.get("edit_field_key")
@@ -1677,7 +1590,6 @@ async def handle_edit_member_value(update: Update, context: ContextTypes.DEFAULT
             return ConversationHandler.END
         
         if field_key and member_id and new_value:
-            # Для года проверяем формат
             if field_key == "year":
                 if not (new_value.isdigit() and len(new_value) == 4):
                     await update.message.reply_text(
@@ -1686,7 +1598,6 @@ async def handle_edit_member_value(update: Update, context: ContextTypes.DEFAULT
                     )
                     return EDIT_MEMBER_VALUE
             
-            # Для Telegram добавляем @ если нужно
             if field_key == "telegram" and new_value and not new_value.startswith("@"):
                 new_value = "@" + new_value
             
@@ -1696,7 +1607,6 @@ async def handle_edit_member_value(update: Update, context: ContextTypes.DEFAULT
                     parse_mode=ParseMode.HTML
                 )
                 
-                # Показываем обновленную карточку
                 member_data = config.get_team_member(member_id)
                 if member_data:
                     card_text = format_team_member_card(member_data)
@@ -1713,7 +1623,6 @@ async def handle_edit_member_value(update: Update, context: ContextTypes.DEFAULT
                         disable_web_page_preview=False
                     )
                 else:
-                    # Возвращаемся в меню управления командой
                     keyboard = create_team_management_keyboard()
                     await update.message.reply_text(
                         "⚙️ <b>Управление командой</b>\n\n"
@@ -1722,7 +1631,6 @@ async def handle_edit_member_value(update: Update, context: ContextTypes.DEFAULT
                         parse_mode=ParseMode.HTML
                     )
                 
-                # Очищаем временные данные
                 context.user_data.pop("edit_field_key", None)
                 context.user_data.pop("edit_field_name", None)
                 
@@ -1739,7 +1647,6 @@ async def handle_edit_member_value(update: Update, context: ContextTypes.DEFAULT
 # ========== ОБРАБОТЧИКИ ДЛЯ ФАЙЛОВ ==========
 
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка загрузки файла"""
     config = BotConfig()
     user_id = update.effective_user.id
     username = update.effective_user.username
@@ -1749,12 +1656,10 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     
     if update.message.document:
-        # Получаем файл
         document = update.message.document
         file_id = document.file_id
         file_name = document.file_name or f"file_{document.file_id[:8]}.bin"
         
-        # Сохраняем информацию о файле
         context.user_data["file_id"] = file_id
         context.user_data["file_name"] = file_name
         
@@ -1769,7 +1674,6 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ADD_FILE_NAME
 
 async def handle_file_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка описания файла"""
     config = BotConfig()
     user_id = update.effective_user.id
     username = update.effective_user.username
@@ -1790,10 +1694,8 @@ async def handle_file_description(update: Update, context: ContextTypes.DEFAULT_
                 parse_mode=ParseMode.HTML
             )
             
-            # Очищаем временные данные
             context.user_data.clear()
             
-            # Возвращаемся в меню документов
             keyboard = create_documents_keyboard(config, username)
             await update.message.reply_text(
                 "📄 <b>Документы</b>\n\n"
@@ -1808,7 +1710,6 @@ async def handle_file_description(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отмена загрузки файла или добавления сотрудника"""
     context.user_data.clear()
     await update.message.reply_text("❌ Операция отменена.")
     return ConversationHandler.END
@@ -1816,7 +1717,6 @@ async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 # ========== ФУНКЦИИ ПЛАНЁРОК ==========
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка напоминания о планёрке"""
     config = BotConfig()
     chat_id = config.chat_id
 
@@ -1849,7 +1749,6 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"Ошибка при отправке напоминания: {e}")
 
 async def send_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправка напоминания об отраслевой встрече"""
     config = BotConfig()
     chat_id = config.chat_id
 
@@ -1858,7 +1757,7 @@ async def send_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     keyboard = [
-        [InlineKeyboardButton("❌ Отменить встречу", callback_data="cancel_industry")]
+        [InlineKeyboardButton("❌ Отменить встречу", callback_data="cancel_industry_meeting")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1890,7 +1789,6 @@ async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_
     config = BotConfig()
     username = query.from_user.username
     
-    # Проверяем, разрешен ли пользователь отменять встречи
     if not config.is_allowed(username):
         await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
         return ConversationHandler.END
@@ -1912,13 +1810,13 @@ async def cancel_meeting_callback(update: Update, context: ContextTypes.DEFAULT_
     return SELECTING_REASON
 
 async def cancel_industry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка нажатия на кнопку отмены отраслевой встречи"""
     query = update.callback_query
     await query.answer()
     
     config = BotConfig()
     username = query.from_user.username
     
-    # Проверяем, разрешен ли пользователь отменять встречи
     if not config.is_allowed(username):
         await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
         return ConversationHandler.END
@@ -1927,17 +1825,64 @@ async def cancel_industry_callback(update: Update, context: ContextTypes.DEFAULT
     context.user_data["original_chat_id"] = query.message.chat_id
     context.user_data["meeting_type"] = "industry"
 
-    keyboard = [
-        [InlineKeyboardButton(option, callback_data=f"industry_reason_{i}")]
-        for i, option in enumerate(INDUSTRY_CANCELLATION_OPTIONS)
-    ]
-
+    keyboard = create_industry_cancel_keyboard()
+    
     await query.edit_message_text(
-        text="📝 Выберите причину отмены отраслевой встречи:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        text="❓ <b>Подтверждение отмены</b>\n\n"
+             "Вы уверены, что хотите отменить отраслевую встречу?\n\n"
+             "<i>Уведомление об отмене будет отправлено в чат.</i>",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML
     )
+    
+    return CONFIRM_RESCHEDULE
 
-    return SELECTING_INDUSTRY_REASON
+async def cancel_industry_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Подтверждение отмены отраслевой встречи"""
+    query = update.callback_query
+    await query.answer()
+    
+    config = BotConfig()
+    username = query.from_user.username or "Пользователь"
+    
+    if not config.is_allowed(username):
+        await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
+        return ConversationHandler.END
+    
+    original_message_id = context.user_data.get("original_message_id")
+    
+    if original_message_id:
+        for job in get_jobs_from_queue(context.application.job_queue):
+            if job.name in config.active_reminders:
+                reminder_data = config.active_reminders[job.name]
+                if str(reminder_data.get("message_id")) == str(original_message_id):
+                    job.schedule_removal()
+                    config.remove_active_reminder(job.name)
+                    break
+    
+    await query.edit_message_text(
+        text=f"❌ @{username} отменил отраслевую встречу\n\n"
+             "Встреча отменена без переноса.",
+        parse_mode=ParseMode.HTML
+    )
+    
+    logger.info(f"Отраслевая встреча отменена @{username}")
+    
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_industry_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отмена отмены отраслевой встречи"""
+    query = update.callback_query
+    await query.answer("Отмена отменена. Встреча остаётся в расписании.")
+    
+    await query.edit_message_text(
+        text="✅ Отраслевая встреча остаётся в расписании.",
+        parse_mode=ParseMode.HTML
+    )
+    
+    context.user_data.clear()
+    return ConversationHandler.END
 
 async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -1946,7 +1891,6 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
     config = BotConfig()
     username = query.from_user.username
     
-    # Проверяем, разрешен ли пользователь отменять встречи
     if not config.is_allowed(username):
         await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
         return ConversationHandler.END
@@ -1958,11 +1902,9 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["selected_reason"] = reason
         context.user_data["reason_index"] = reason_index
         
-        # Если выбрана опция "Перенесём на другой день", показываем выбор даты
         if reason_index == 2:  # "Перенесём на другой день"
             meeting_type = context.user_data.get("meeting_type", "planerka")
             
-            # Получаем доступные даты для переноса
             available_dates = get_available_dates(meeting_type)
             
             if not available_dates:
@@ -1983,7 +1925,6 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
             return SELECTING_DATE
         
         else:
-            # Для других причин - сразу отменяем
             final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
             
             config = BotConfig()
@@ -2014,109 +1955,36 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
     
     return SELECTING_REASON
 
-async def select_industry_reason_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    config = BotConfig()
-    username = query.from_user.username
-    
-    # Проверяем, разрешен ли пользователь отменять встречи
-    if not config.is_allowed(username):
-        await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
-        return ConversationHandler.END
-    
-    try:
-        reason_index = int(query.data.split("_")[2])
-        reason = INDUSTRY_CANCELLATION_OPTIONS[reason_index]
-        
-        context.user_data["selected_reason"] = reason
-        context.user_data["reason_index"] = reason_index
-        
-        # Если выбрана опция "Переносим на другую дату", показываем выбор даты
-        if reason_index == 1:  # "Переносим на другую дату"
-            meeting_type = context.user_data.get("meeting_type", "industry")
-            
-            # Получаем доступные даты для переноса
-            available_dates = get_available_dates(meeting_type)
-            
-            if not available_dates:
-                await query.edit_message_text(
-                    text="❌ Нет доступных дат для переноса встречи.",
-                    parse_mode=ParseMode.HTML
-                )
-                return ConversationHandler.END
-            
-            keyboard = create_date_selection_keyboard(meeting_type, available_dates)
-            
-            await query.edit_message_text(
-                text="📅 Выберите дату для переноса отраслевой встречи:",
-                reply_markup=keyboard,
-                parse_mode=ParseMode.HTML
-            )
-            
-            return SELECTING_DATE
-        
-        else:
-            # Для других причин - сразу отменяем
-            final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил отраслевую встречу\n\n📝 <b>Причина:</b> {reason}"
-            
-            config = BotConfig()
-            original_message_id = context.user_data.get("original_message_id")
-            
-            if original_message_id:
-                for job in get_jobs_from_queue(context.application.job_queue):
-                    if job.name in config.active_reminders:
-                        reminder_data = config.active_reminders[job.name]
-                        if str(reminder_data.get("message_id")) == str(original_message_id):
-                            job.schedule_removal()
-                            config.remove_active_reminder(job.name)
-                            break
-            
-            await query.edit_message_text(
-                text=final_message,
-                parse_mode=ParseMode.HTML
-            )
-            
-            logger.info(f"Отраслевая встреча отменена @{query.from_user.username} — {reason}")
-            
-            context.user_data.clear()
-            return ConversationHandler.END
-        
-    except Exception as e:
-        logger.error(f"Ошибка отмены отраслевой встречи: {e}")
-        await query.message.reply_text("❌ Произошла ошибка")
-    
-    return SELECTING_INDUSTRY_REASON
-
 async def select_date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка выбора даты для переноса"""
     query = update.callback_query
     await query.answer()
     
     config = BotConfig()
     username = query.from_user.username
     
-    # Проверяем, разрешен ли пользователь отменять встречи
     if not config.is_allowed(username):
         await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
         return ConversationHandler.END
     
     try:
-        # Парсим данные из callback
         parts = query.data.split("_")
         meeting_type = parts[2]
-        date_str = parts[3] + "_" + parts[4]  # Дата и время
+        date_str = parts[3] + "_" + parts[4]
         
-        # Преобразуем строку обратно в datetime
-        selected_date = datetime.strptime(date_str, "%d.%m.%Y_%H:%M")
-        selected_date = TIMEZONE.localize(selected_date)
+        try:
+            selected_date = datetime.strptime(date_str, "%d.%m.%Y_%H:%M")
+            selected_date = TIMEZONE.localize(selected_date)
+        except ValueError:
+            logger.error(f"Неверный формат даты: {date_str}")
+            await query.edit_message_text(
+                text="❌ Неверный формат даты.",
+                parse_mode=ParseMode.HTML
+            )
+            return ConversationHandler.END
         
-        # Сохраняем выбранную дату
         context.user_data["selected_date"] = selected_date
         context.user_data["meeting_type"] = meeting_type
         
-        # Находим оригинальную задачу
         config = BotConfig()
         original_message_id = context.user_data.get("original_message_id")
         job_name = None
@@ -2136,7 +2004,6 @@ async def select_date_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return ConversationHandler.END
         
-        # Показываем подтверждение
         formatted_date = format_date_for_display(selected_date)
         
         meeting_type_text = "планёрку" if meeting_type == "planerka" else "отраслевую встречу"
@@ -2163,14 +2030,12 @@ async def select_date_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
 async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Подтверждение переноса встречи"""
     query = update.callback_query
     await query.answer()
     
     config = BotConfig()
     username = query.from_user.username
     
-    # Проверяем, разрешен ли пользователь отменять встречи
     if not config.is_allowed(username):
         await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
         return ConversationHandler.END
@@ -2181,16 +2046,21 @@ async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFA
         date_str = parts[3] + "_" + parts[4]
         job_name = parts[5]
         
-        # Преобразуем строку обратно в datetime
-        selected_date = datetime.strptime(date_str, "%Y%m%d_%H%M")
-        selected_date = TIMEZONE.localize(selected_date)
+        try:
+            selected_date = datetime.strptime(date_str, "%Y%m%d_%H%M")
+            selected_date = TIMEZONE.localize(selected_date)
+        except ValueError:
+            logger.error(f"Неверный формат даты: {date_str}")
+            await query.edit_message_text(
+                text="❌ Неверный формат даты.",
+                parse_mode=ParseMode.HTML
+            )
+            return ConversationHandler.END
         
-        config = BotConfig()
         username = query.from_user.username or "Пользователь"
         original_message_id = context.user_data.get("original_message_id")
         reason = context.user_data.get("selected_reason", "Перенос на другую дату")
         
-        # Удаляем оригинальную задачу
         job_found = False
         for job in get_jobs_from_queue(context.application.job_queue):
             if job.name == job_name:
@@ -2206,14 +2076,12 @@ async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFA
             )
             return ConversationHandler.END
         
-        # Создаем новую задачу на выбранную дату
         now = datetime.now(TIMEZONE)
         delay = (selected_date - now).total_seconds()
         
         if delay > 0:
             new_job_name = f"{meeting_type}_rescheduled_{selected_date.strftime('%Y%m%d_%H%M')}"
             
-            # Запланировать новую встречу
             if meeting_type == "planerka":
                 context.application.job_queue.run_once(
                     send_reminder,
@@ -2229,7 +2097,6 @@ async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFA
                     name=new_job_name
                 )
             
-            # Сохраняем информацию о перенесенной встрече
             config.add_rescheduled_meeting(
                 original_job=job_name,
                 new_time=selected_date,
@@ -2256,7 +2123,6 @@ async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFA
                 text="❌ Выбранная дата уже прошла. Пожалуйста, выберите другую дату.",
                 parse_mode=ParseMode.HTML
             )
-            # Возвращаем к выбору даты
             return SELECTING_DATE
         
     except Exception as e:
@@ -2270,14 +2136,12 @@ async def confirm_reschedule_callback(update: Update, context: ContextTypes.DEFA
     return ConversationHandler.END
 
 async def cancel_reschedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отмена переноса встречи"""
     query = update.callback_query
     await query.answer()
     
     config = BotConfig()
     username = query.from_user.username
     
-    # Проверяем, разрешен ли пользователь отменять встречи
     if not config.is_allowed(username):
         await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
         return ConversationHandler.END
@@ -2285,7 +2149,6 @@ async def cancel_reschedule_callback(update: Update, context: ContextTypes.DEFAU
     meeting_type = context.user_data.get("meeting_type", "planerka")
     reason_index = context.user_data.get("reason_index", 0)
     
-    # Возвращаемся к выбору причины
     if meeting_type == "planerka":
         reason = CANCELLATION_OPTIONS[reason_index]
         final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
@@ -2308,42 +2171,17 @@ async def cancel_reschedule_callback(update: Update, context: ContextTypes.DEFAU
         )
         
         logger.info(f"Планёрка отменена @{query.from_user.username}")
-        
-    elif meeting_type == "industry":
-        reason = INDUSTRY_CANCELLATION_OPTIONS[reason_index]
-        final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил отраслевую встречу\n\n📝 <b>Причина:</b> {reason}"
-        
-        config = BotConfig()
-        original_message_id = context.user_data.get("original_message_id")
-        
-        if original_message_id:
-            for job in get_jobs_from_queue(context.application.job_queue):
-                if job.name in config.active_reminders:
-                    reminder_data = config.active_reminders[job.name]
-                    if str(reminder_data.get("message_id")) == str(original_message_id):
-                        job.schedule_removal()
-                        config.remove_active_reminder(job.name)
-                        break
-        
-        await query.edit_message_text(
-            text=final_message,
-            parse_mode=ParseMode.HTML
-        )
-        
-        logger.info(f"Отраслевая встреча отменена @{query.from_user.username}")
     
     context.user_data.clear()
     return ConversationHandler.END
 
 async def cancel_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Возврат назад из выбора даты"""
     query = update.callback_query
     await query.answer()
     
     config = BotConfig()
     username = query.from_user.username
     
-    # Проверяем, разрешен ли пользователь отменять встречи
     if not config.is_allowed(username):
         await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
         return ConversationHandler.END
@@ -2351,7 +2189,6 @@ async def cancel_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     meeting_type = query.data.replace("cancel_back_", "")
     
     if meeting_type == "planerka":
-        # Возвращаемся к выбору причины для планёрки
         keyboard = [
             [InlineKeyboardButton(option, callback_data=f"reason_{i}")]
             for i, option in enumerate(CANCELLATION_OPTIONS)
@@ -2363,20 +2200,6 @@ async def cancel_back_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         
         return SELECTING_REASON
-    
-    elif meeting_type == "industry":
-        # Возвращаемся к выбору причины для отраслевой встречи
-        keyboard = [
-            [InlineKeyboardButton(option, callback_data=f"industry_reason_{i}")]
-            for i, option in enumerate(INDUSTRY_CANCELLATION_OPTIONS)
-        ]
-        
-        await query.edit_message_text(
-            text="📝 Выберите причину отмены отраслевой встречи:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        
-        return SELECTING_INDUSTRY_REASON
     
     return ConversationHandler.END
 
@@ -2393,10 +2216,8 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ========== ФУНКЦИИ ПЛАНИРОВАНИЯ ==========
 
 def calculate_next_industry_time() -> datetime:
-    """Рассчитать время следующей отраслевой встречи"""
     now = datetime.now(TIMEZONE)
     
-    # Сегодняшнее время отправки
     today_target = now.replace(
         hour=INDUSTRY_MEETING_TIME["hour"],
         minute=INDUSTRY_MEETING_TIME["minute"],
@@ -2404,11 +2225,9 @@ def calculate_next_industry_time() -> datetime:
         microsecond=0
     )
 
-    # Если сегодня вторник и время еще не наступило
     if now < today_target and now.weekday() in INDUSTRY_MEETING_DAY:
         return today_target
 
-    # Ищем следующий вторник
     for i in range(1, 8):
         next_day = now + timedelta(days=i)
         if next_day.weekday() in INDUSTRY_MEETING_DAY:
@@ -2422,7 +2241,6 @@ def calculate_next_industry_time() -> datetime:
     raise ValueError("Не найден подходящий день для отраслевой встречи")
 
 async def schedule_next_industry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запланировать следующее напоминание об отраслевой встрече"""
     try:
         next_time = calculate_next_industry_time()
         config = BotConfig()
@@ -2470,7 +2288,6 @@ async def schedule_next_industry_reminder(context: ContextTypes.DEFAULT_TYPE) ->
         )
 
 def calculate_next_reminder() -> datetime:
-    """Рассчитать время следующего напоминания о планёрке"""
     now = datetime.now(TIMEZONE)
     current_weekday = now.weekday()
 
@@ -2499,7 +2316,6 @@ def calculate_next_reminder() -> datetime:
     raise ValueError("Не найден подходящий день для планёрки")
 
 async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запланировать следующее напоминание о планёрке"""
     next_time = calculate_next_reminder()
     config = BotConfig()
     chat_id = config.chat_id
@@ -2529,7 +2345,6 @@ async def schedule_next_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ========== ОСНОВНЫЕ КОМАНДЫ ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик /start"""
     await update.message.reply_text(
         "🤖 <b>Бот для планёрок, отраслевых встреч и управления ресурсами!</b>\n\n"
         f"📅 <b>Планёрки:</b>\n"
@@ -2575,7 +2390,6 @@ async def set_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Информация о боте"""
     config = BotConfig()
     chat_id = config.chat_id
 
@@ -2598,26 +2412,21 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     is_meeting_day = weekday in MEETING_DAYS
     is_industry_day = weekday in INDUSTRY_MEETING_DAY
     
-    # Проверяем настройку ссылок
     zoom_status = "✅" if ZOOM_LINK != DEFAULT_ZOOM_LINK else "❌"
     industry_zoom_status = "✅" if INDUSTRY_ZOOM_LINK != DEFAULT_ZOOM_LINK else "❌"
     
-    # Статистика ресурсов
     files_count = len(config.help_data.get("files", {}))
     links_count = len(config.help_data.get("links", {}))
     team_count = len(config.get_all_team_members())
     
-    # Статистика перенесенных встреч
     rescheduled_count = len(config.rescheduled_meetings)
     active_rescheduled = len([m for m in config.rescheduled_meetings.values() 
                              if m.get("status") == "scheduled"])
     
-    # Информация о разрешенных пользователях
     allowed_users = config.allowed_users
     allowed_count = len(allowed_users)
     admins_count = len(config.admins)
     
-    # Проверяем наличие GigaChat настроек
     gigachat_status = "✅ настроен" if GIGACHAT_CLIENT_ID and GIGACHAT_CLIENT_SECRET else "❌ не настроен"
     
     await update.message.reply_text(
@@ -2662,7 +2471,6 @@ async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         next_time = job.next_t.astimezone(TIMEZONE)
         job_name = job.name or "Без имени"
         
-        # Определяем тип задачи для иконки
         if "meeting_reminder" in job_name:
             icon = "🤝"
             type_text = "Планёрка"
@@ -2682,7 +2490,6 @@ async def list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Тестовая отправка отраслевой встречи"""
     config = BotConfig()
     if not config.chat_id:
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
@@ -2693,7 +2500,6 @@ async def test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @restricted
 async def test_planerka(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Тестовая отправка планёрки"""
     config = BotConfig()
     if not config.chat_id:
         await update.message.reply_text("❌ Сначала установите чат командой /setchat")
@@ -2707,7 +2513,6 @@ def main() -> None:
         logger.error("❌ Токен бота не найден!")
         return
     
-    # Проверяем наличие GigaChat настроек
     if not GIGACHAT_CLIENT_ID or not GIGACHAT_CLIENT_SECRET:
         logger.warning("⚠️ GigaChat API не настроен. Приветствия будут использовать шаблонные сообщения.")
     else:
@@ -2716,13 +2521,12 @@ def main() -> None:
     try:
         application = Application.builder().token(TOKEN).build()
 
-        # ConversationHandler для помощи (главный)
+        # ConversationHandler для помощи
         help_conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler("help", help_command),
             ],
             states={
-                # Основные состояния
                 MAIN_HELP_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^help_"),
                     CallbackQueryHandler(handle_help_callback, pattern="^file_"),
@@ -2735,7 +2539,6 @@ def main() -> None:
                     CallbackQueryHandler(handle_help_callback, pattern="^no_members$"),
                 ],
                 
-                # Документы
                 DOCUMENTS_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^file_|^add_file$|^help_back$"),
                 ],
@@ -2751,27 +2554,22 @@ def main() -> None:
                     CallbackQueryHandler(handle_help_callback, pattern="^delete_file_|^help_settings$"),
                 ],
                 
-                # Ссылки
                 LINKS_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^link_|^help_back$"),
                 ],
                 
-                # Команда
                 TEAM_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^team_member_|^team_management$|^help_back$"),
                 ],
                 
-                # Настройки
                 SETTINGS_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^delete_file_menu$|^help_back$"),
                 ],
                 
-                # Управление командой (админы)
                 TEAM_MANAGEMENT: [
                     CallbackQueryHandler(handle_help_callback, pattern="^team_add_member$|^team_edit_member$|^team_delete_member$|^help_team$"),
                 ],
                 
-                # Добавление сотрудника
                 ADD_MEMBER_NAME: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_name),
                     CommandHandler("cancel", cancel_upload),
@@ -2808,7 +2606,6 @@ def main() -> None:
                     CallbackQueryHandler(handle_add_member_confirm, pattern="^add_member_"),
                 ],
                 
-                # Редактирование сотрудника
                 EDIT_MEMBER_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^edit_member_select_|^team_management$"),
                 ],
@@ -2821,7 +2618,6 @@ def main() -> None:
                     CommandHandler("cancel", cancel_upload),
                 ],
                 
-                # Удаление сотрудника
                 DELETE_MEMBER_MENU: [
                     CallbackQueryHandler(handle_help_callback, pattern="^delete_member_select_|^team_management$"),
                 ],
@@ -2838,16 +2634,12 @@ def main() -> None:
         cancel_conv_handler = ConversationHandler(
             entry_points=[
                 CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$"),
-                CallbackQueryHandler(cancel_industry_callback, pattern="^cancel_industry$")
+                CallbackQueryHandler(cancel_industry_callback, pattern="^cancel_industry_meeting$")
             ],
             states={
                 SELECTING_REASON: [
                     CallbackQueryHandler(select_reason_callback, pattern="^reason_[0-9]+$"),
                     CallbackQueryHandler(cancel_back_callback, pattern="^cancel_back_planerka$"),
-                ],
-                SELECTING_INDUSTRY_REASON: [
-                    CallbackQueryHandler(select_industry_reason_callback, pattern="^industry_reason_[0-9]+$"),
-                    CallbackQueryHandler(cancel_back_callback, pattern="^cancel_back_industry$"),
                 ],
                 SELECTING_DATE: [
                     CallbackQueryHandler(select_date_callback, pattern="^reschedule_date_"),
@@ -2856,6 +2648,8 @@ def main() -> None:
                 CONFIRM_RESCHEDULE: [
                     CallbackQueryHandler(confirm_reschedule_callback, pattern="^confirm_reschedule_"),
                     CallbackQueryHandler(cancel_reschedule_callback, pattern="^cancel_reschedule_"),
+                    CallbackQueryHandler(cancel_industry_confirm_callback, pattern="^cancel_industry_confirm$"),
+                    CallbackQueryHandler(cancel_industry_cancel_callback, pattern="^cancel_industry_cancel$"),
                 ],
             },
             fallbacks=[
