@@ -2823,11 +2823,14 @@ def main() -> None:
             persistent=False,
         )
 
-        # ConversationHandler для отмены встреч
+        # ОТДЕЛЬНЫЕ ОБРАБОТЧИКИ для кнопок отмены встреч
+        application.add_handler(CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$"))
+        application.add_handler(CallbackQueryHandler(cancel_industry_callback, pattern="^cancel_industry$"))
+        
+        # ConversationHandler для отмены встреч (используется только для многошаговых диалогов)
         cancel_conv_handler = ConversationHandler(
             entry_points=[
-                CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$"),
-                CallbackQueryHandler(cancel_industry_callback, pattern="^cancel_industry$")
+                # Здесь пусто - входные точки обрабатываются отдельными обработчиками выше
             ],
             states={
                 SELECTING_REASON: [
@@ -2863,8 +2866,11 @@ def main() -> None:
         # Добавляем ConversationHandler для помощи ПЕРВЫМ
         application.add_handler(help_conv_handler)
         
-        # Добавляем ConversationHandler для отмены встреч
+        # Добавляем ConversationHandler для отмены встреч ПОСЛЕ
         application.add_handler(cancel_conv_handler)
+        
+        # Общий обработчик для оставшихся callback-запросов (должен быть последним)
+        application.add_handler(CallbackQueryHandler(handle_help_callback))
         
         # Добавляем обработчик новых участников чата для приветствия
         application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
