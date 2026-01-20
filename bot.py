@@ -264,23 +264,26 @@ def kb_reschedule_dates(from_d: date):
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.effective_chat or not update.effective_user:
         return False
-
     member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
     return member.status in ("administrator", "creator")
 
 # ---------------- MANUAL RESCHEDULE STATE ----------------
-
 WAITING_DATE_FLAG = "waiting_reschedule_date"
 
-# ---------------- JOB 09:15 ----------------
+# ---------------- CORE SENDERS ----------------
 
-async def send_915(context: ContextTypes.DEFAULT_TYPE):
+async def send_standup_message(context: ContextTypes.DEFAULT_TYPE, force: bool = False):
+    """
+    Общая логика отправки.
+    force=True -> шлем всегда (для теста).
+    force=False -> шлем только по правилам (как в 09:15).
+    """
     today_d = datetime.now(MOSCOW_TZ).date()
 
     chat_ids = db_list_chats()
     if not chat_ids:
         logger.warning("No chats for notifications. Add via /setchat.")
-        return
+        return False
 
     weekday_due = today_d.weekday() in (0, 2, 4)
     state = db_get_state(today_d)
@@ -289,9 +292,9 @@ async def send_915(context: ContextTypes.DEFAULT_TYPE):
     due_orig_isos = db_get_due_reschedules(today_d)
     reschedule_due = len(due_orig_isos) > 0
 
-    if not standard_due and not reschedule_due:
-        logger.info("09:15: nothing to send today (%s)", today_d.isoformat())
-        return
+    if not force and not standard_due and not reschedule_due:
+        logger.info("Nothing to send today (%s) under rules", today_d.isoformat())
+        return False
 
     resched_from_dates: list[date] = []
     if reschedule_due:
@@ -313,20 +316,33 @@ async def send_915(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_cancel_menu(),
             )
         except Exception as e:
-            logger.exception("Cannot send 09:15 message to %s: %s", chat_id, e)
+            logger.exception("Cannot send standup to %s: %s", chat_id, e)
 
     if reschedule_due:
         db_mark_reschedules_sent(due_orig_isos)
 
-    logger.info(
-        "09:15 sent to %d chats. standard_due=%s reschedules=%d",
-        len(chat_ids), standard_due, len(due_orig_isos)
-    )
+    return True
+
+
+async def job_send_915(context: ContextTypes.DEFAULT_TYPE):
+    # Авто в 09:15 по расписанию
+    await send_standup_message(context, force=False)
 
 # ---------------- COMMANDS ----------------
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong 🏓")
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.effective_user.first_name if update.effective_user else "коллеги"
+    text = (
+        f"Привет, {name}! 👋\n\n"
+        f"Я бот для уведомлений о планёрке.\n\n"
+        f"Команды:\n"
+        f"• /setchat — подключить этот чат к рассылке (только админы)\n"
+        f"• /unsetchat — отключить этот чат от рассылки (только админы)\n"
+        f"• /test915 — проверить логику «как в 09:15» (только админы)\n"
+        f"• /force — принудительно отправить сообщение планёрки (только админы)\n\n"
+        f"Авто-уведомления: ПН/СР/ПТ в 09:15 (МСК) + переносы."
+    )
+    await update.message.reply_text(text)
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
@@ -354,19 +370,40 @@ async def cmd_test915(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         await update.message.reply_text("Недостаточно прав.")
         return
-    await send_915(context)
-    await update.message.reply_text("Ок, отправил тестовую 09:15-рассылку (по правилам на сегодня).")
+
+    sent = await send_standup_message(context, force=False)
+    if sent:
+        await update.message.reply_text("✅ Ок, отправил тест «как в 09:15» (по правилам на сегодня).")
+    else:
+        await update.message.reply_text(
+            "ℹ️ По правилам на сегодня уведомление не должно отправляться "
+            "(не ПН/СР/ПТ и нет переноса на сегодня). "
+            "Для теста используйте /force."
+        )
+
+async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("Недостаточно прав.")
+        return
+
+    chat_ids = db_list_chats()
+    if not chat_ids:
+        await update.message.reply_text("Сначала подключи чат командой /setchat.")
+        return
+
+    await send_standup_message(context, force=True)
+    await update.message.reply_text("🚀 Готово! Принудительно отправил сообщение планёрки в подключённые чаты.")
 
 # ---------------- CALLBACKS ----------------
 
 async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if not await is_admin(update, context):
         await query.answer("Только администраторы могут отменять/переносить.", show_alert=True)
         return
 
+    await query.answer()
     await query.edit_message_reply_markup(reply_markup=kb_cancel_options())
 
 async def cb_cancel_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -503,10 +540,11 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     # команды
-    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("setchat", cmd_setchat))
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
     app.add_handler(CommandHandler("test915", cmd_test915))
+    app.add_handler(CommandHandler("force", cmd_force))
 
     # callbacks
     app.add_handler(CallbackQueryHandler(cb_cancel_open, pattern=r"^cancel:open$"))
@@ -519,9 +557,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # JobQueue: ежедневная отправка в 09:15 (МСК)
-    # PTB job_queue живёт внутри app.job_queue
     run_time = dtime(hour=9, minute=15, tzinfo=MOSCOW_TZ)
-    app.job_queue.run_daily(send_915, time=run_time, name="standup_915")
+    app.job_queue.run_daily(job_send_915, time=run_time, name="standup_915")
 
     logger.info("Bot started. Daily job at 09:15 MSK")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
