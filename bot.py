@@ -82,32 +82,10 @@ CANCELLATION_OPTIONS = [
 ]
 
 # Состояния для ConversationHandler
-MAIN_HELP_MENU = 0
-DOCUMENTS_MENU = 1
-ADD_FILE_NAME = 2
-ADD_FILE_DESCRIPTION = 3
-DELETE_FILE_MENU = 4
-LINKS_MENU = 5
-TEAM_MENU = 6
-SETTINGS_MENU = 7
-TEAM_MANAGEMENT = 8
-ADD_MEMBER_NAME = 9
-ADD_MEMBER_POSITION = 10
-ADD_MEMBER_CITY = 11
-ADD_MEMBER_YEAR = 12
-ADD_MEMBER_RESPONSIBILITIES = 13
-ADD_MEMBER_CONTACT_TOPICS = 14
-ADD_MEMBER_ABOUT = 15
-ADD_MEMBER_TELEGRAM = 16
-ADD_MEMBER_CONFIRM = 17
-EDIT_MEMBER_MENU = 18
-EDIT_MEMBER_FIELD = 19
-EDIT_MEMBER_VALUE = 20
-DELETE_MEMBER_MENU = 21
-DELETE_MEMBER_CONFIRM = 22
-SELECTING_REASON = 23
-SELECTING_DATE = 24
-CONFIRM_RESCHEDULE = 25
+MAIN_HELP_MENU, DOCUMENTS_MENU, ADD_FILE_NAME, ADD_FILE_DESCRIPTION, DELETE_FILE_MENU, LINKS_MENU, TEAM_MENU, SETTINGS_MENU, TEAM_MANAGEMENT, ADD_MEMBER_NAME, ADD_MEMBER_POSITION, ADD_MEMBER_CITY, ADD_MEMBER_YEAR, ADD_MEMBER_RESPONSIBILITIES, ADD_MEMBER_CONTACT_TOPICS, ADD_MEMBER_ABOUT, ADD_MEMBER_TELEGRAM, ADD_MEMBER_CONFIRM, EDIT_MEMBER_MENU, EDIT_MEMBER_FIELD, EDIT_MEMBER_VALUE, DELETE_MEMBER_MENU, DELETE_MEMBER_CONFIRM = range(23)
+
+# Состояния для отмены встреч
+SELECTING_REASON, SELECTING_DATE, CONFIRM_RESCHEDULE = range(23, 26)
 
 # Настройка логирования
 logging.basicConfig(
@@ -155,7 +133,7 @@ class JobManager:
         self.active_jobs.clear()
         logger.info("Все задачи очищены")
     
-    def get_job_by_message_id(self, message_id: str) -> Optional[Dict]:
+    def get_job_by_message_id(self, message_id: int) -> Optional[Dict]:
         """Найти задачу по ID сообщения"""
         for job_name, job_data in self.active_jobs.items():
             if 'data' in job_data and job_data['data'].get('message_id') == message_id:
@@ -940,7 +918,8 @@ def create_industry_cancel_keyboard() -> InlineKeyboardMarkup:
 
 # ========== ФУНКЦИИ ДЛЯ КОМАНДЫ HELP ==========
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик команды /help"""
     keyboard = create_help_keyboard()
     
     await update.message.reply_text(
@@ -952,12 +931,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     return MAIN_HELP_MENU
 
 async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработчик всех callback-запросов меню помощи"""
     query = update.callback_query
     await query.answer()
     
     config = BotConfig()
     username = query.from_user.username
     
+    # Главное меню
     if query.data == "help_documents":
         keyboard = create_documents_keyboard(config, username)
         await query.edit_message_text(
@@ -1019,6 +1000,7 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return MAIN_HELP_MENU
     
+    # Документы
     elif query.data == "add_file":
         if not config.is_admin(username):
             await query.answer("❌ У вас нет прав для добавления файлов", show_alert=True)
@@ -1027,7 +1009,8 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(
             "📄 <b>Добавление файла</b>\n\n"
             "Отправьте мне файл (документ, изображение и т.д.), который хотите добавить.\n\n"
-            "После отправки файла я спрошу у вас описание для него.",
+            "После отправки файла я спрошу у вас описание для него.\n\n"
+            "❌ <i>Для отмены отправьте команду /cancel</i>",
             parse_mode=ParseMode.HTML
         )
         return ADD_FILE_NAME
@@ -1115,6 +1098,7 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return DOCUMENTS_MENU
     
+    # Ссылки
     elif query.data.startswith("link_"):
         link_key = query.data.replace("link_", "")
         links = config.help_data.get("links", {})
@@ -1140,6 +1124,7 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return LINKS_MENU
     
+    # Команда
     elif query.data.startswith("team_member_"):
         member_id = query.data.replace("team_member_", "")
         member_data = config.get_team_member(member_id)
@@ -1162,6 +1147,11 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("❌ Сотрудник не найден", show_alert=True)
             return TEAM_MENU
     
+    elif query.data == "no_members":
+        await query.answer("👥 Пока нет добавленных сотрудников", show_alert=True)
+        return TEAM_MENU
+    
+    # Управление командой
     elif query.data == "team_management":
         if not config.is_admin(username):
             await query.answer("❌ У вас нет прав для управления командой", show_alert=True)
@@ -1176,6 +1166,7 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return TEAM_MANAGEMENT
     
+    # Добавление сотрудника
     elif query.data == "team_add_member":
         if not config.is_admin(username):
             await query.answer("❌ У вас нет прав для добавления сотрудников", show_alert=True)
@@ -1184,11 +1175,13 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["new_member"] = {}
         await query.edit_message_text(
             "👤 <b>Добавление нового сотрудника</b>\n\n"
-            "Введите имя и фамилию сотрудника:",
+            "Введите имя и фамилию сотрудника:\n\n"
+            "❌ <i>Для отмены отправьте команду /cancel</i>",
             parse_mode=ParseMode.HTML
         )
         return ADD_MEMBER_NAME
     
+    # Редактирование сотрудника
     elif query.data == "team_edit_member":
         if not config.is_admin(username):
             await query.answer("❌ У вас нет прав для редактирования сотрудников", show_alert=True)
@@ -1212,6 +1205,7 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return EDIT_MEMBER_MENU
     
+    # Удаление сотрудника
     elif query.data == "team_delete_member":
         if not config.is_admin(username):
             await query.answer("❌ У вас нет прав для удаления сотрудников", show_alert=True)
@@ -1235,6 +1229,7 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return DELETE_MEMBER_MENU
     
+    # Выбор сотрудника для редактирования
     elif query.data.startswith("edit_member_select_"):
         member_id = query.data.replace("edit_member_select_", "")
         context.user_data["edit_member_id"] = member_id
@@ -1248,6 +1243,43 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return EDIT_MEMBER_FIELD
     
+    # Выбор поля для редактирования
+    elif query.data.startswith("edit_field_"):
+        field_map = {
+            "edit_field_name": ("👤 Имя", "name"),
+            "edit_field_position": ("💼 Должность", "position"),
+            "edit_field_city": ("🏙️ Город", "city"),
+            "edit_field_year": ("📅 Год в компании", "year"),
+            "edit_field_responsibilities": ("🎯 Ответственность", "responsibilities"),
+            "edit_field_contact_topics": ("💬 Вопросы для обращений", "contact_topics"),
+            "edit_field_about": ("📝 О себе", "about"),
+            "edit_field_telegram": ("📱 Telegram", "telegram")
+        }
+        
+        if query.data in field_map:
+            field_name, field_key = field_map[query.data]
+            context.user_data["edit_field_key"] = field_key
+            context.user_data["edit_field_name"] = field_name
+            
+            member_id = context.user_data.get("edit_member_id")
+            member_data = config.get_team_member(member_id)
+            
+            if member_data:
+                current_value = member_data.get(field_key, "Не указано")
+                
+                await query.edit_message_text(
+                    f"✏️ <b>Редактирование: {field_name}</b>\n\n"
+                    f"Текущее значение: <i>{current_value}</i>\n\n"
+                    f"Введите новое значение:\n\n"
+                    f"❌ <i>Для отмены отправьте команду /cancel</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                return EDIT_MEMBER_VALUE
+            else:
+                await query.answer("❌ Сотрудник не найден", show_alert=True)
+                return EDIT_MEMBER_FIELD
+    
+    # Выбор сотрудника для удаления
     elif query.data.startswith("delete_member_select_"):
         member_id = query.data.replace("delete_member_select_", "")
         member_data = config.get_team_member(member_id)
@@ -1270,6 +1302,7 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("❌ Сотрудник не найден", show_alert=True)
             return DELETE_MEMBER_MENU
     
+    # Подтверждение удаления сотрудника
     elif query.data.startswith("delete_confirm_yes_"):
         member_id = query.data.replace("delete_confirm_yes_", "")
         
@@ -1301,53 +1334,57 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return DELETE_MEMBER_MENU
     
-    elif query.data == "no_members":
-        await query.answer("👥 Пока нет добавленных сотрудников", show_alert=True)
-        return TEAM_MENU
-    
-    # Обработка редактирования полей
-    elif query.data.startswith("edit_field_"):
-        config = BotConfig()
-        username = query.from_user.username
+    # Подтверждение добавления сотрудника
+    elif query.data == "add_member_confirm":
+        member_data = context.user_data.get("new_member", {})
         
-        if not config.is_admin(username):
-            await query.answer("❌ У вас нет прав для редактирования сотрудников", show_alert=True)
-            return EDIT_MEMBER_FIELD
-        
-        field_map = {
-            "edit_field_name": ("👤 Имя", "name"),
-            "edit_field_position": ("💼 Должность", "position"),
-            "edit_field_city": ("🏙️ Город", "city"),
-            "edit_field_year": ("📅 Год в компании", "year"),
-            "edit_field_responsibilities": ("🎯 Ответственность", "responsibilities"),
-            "edit_field_contact_topics": ("💬 Вопросы для обращений", "contact_topics"),
-            "edit_field_about": ("📝 О себе", "about"),
-            "edit_field_telegram": ("📱 Telegram", "telegram")
-        }
-        
-        if query.data in field_map:
-            field_name, field_key = field_map[query.data]
-            context.user_data["edit_field_key"] = field_key
-            context.user_data["edit_field_name"] = field_name
+        if member_data:
+            member_id = config.add_team_member(member_data)
             
-            member_id = context.user_data.get("edit_member_id")
-            member_data = config.get_team_member(member_id)
-            
-            if member_data:
-                current_value = member_data.get(field_key, "Не указано")
-                
+            if member_id:
                 await query.edit_message_text(
-                    f"✏️ <b>Редактирование: {field_name}</b>\n\n"
-                    f"Текущее значение: <i>{current_value}</i>\n\n"
-                    f"Введите новое значение:",
+                    f"✅ <b>Сотрудник успешно добавлен!</b>\n\n"
+                    f"Имя: {member_data.get('name', 'Не указано')}\n"
+                    f"ID карточки: {member_id}",
                     parse_mode=ParseMode.HTML
                 )
-                return EDIT_MEMBER_VALUE
             else:
-                await query.answer("❌ Сотрудник не найден", show_alert=True)
-                return EDIT_MEMBER_FIELD
+                await query.edit_message_text(
+                    "❌ Не удалось добавить сотрудника. Попробуйте еще раз.",
+                    parse_mode=ParseMode.HTML
+                )
+        else:
+            await query.edit_message_text(
+                "❌ Данные сотрудника не найдены. Попробуйте еще раз.",
+                parse_mode=ParseMode.HTML
+            )
         
-        return EDIT_MEMBER_FIELD
+        context.user_data.clear()
+        
+        keyboard = create_team_management_keyboard()
+        await query.message.reply_text(
+            "⚙️ <b>Управление командой</b>\n\n"
+            "Выберите действие:",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+        return TEAM_MANAGEMENT
+    
+    elif query.data == "add_member_cancel":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "❌ Добавление сотрудника отменено.",
+            parse_mode=ParseMode.HTML
+        )
+        
+        keyboard = create_team_management_keyboard()
+        await query.message.reply_text(
+            "⚙️ <b>Управление командой</b>\n\n"
+            "Выберите действие:",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+        return TEAM_MANAGEMENT
     
     # Если callback не распознан, возвращаем в главное меню
     keyboard = create_help_keyboard()
@@ -1399,7 +1436,8 @@ async def handle_add_member_name(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data["new_member"]["name"] = name
             
             await update.message.reply_text(
-                "💼 Теперь введите должность сотрудника:",
+                "💼 Теперь введите должность сотрудника:\n\n"
+                "❌ <i>Для отмены отправьте команду /cancel</i>",
                 parse_mode=ParseMode.HTML
             )
             return ADD_MEMBER_POSITION
@@ -1419,7 +1457,8 @@ async def handle_add_member_position(update: Update, context: ContextTypes.DEFAU
             context.user_data["new_member"]["position"] = position
             
             await update.message.reply_text(
-                "🏙️ Теперь введите город проживания:",
+                "🏙️ Теперь введите город проживания:\n\n"
+                "❌ <i>Для отмены отправьте команду /cancel</i>",
                 parse_mode=ParseMode.HTML
             )
             return ADD_MEMBER_CITY
@@ -1439,7 +1478,8 @@ async def handle_add_member_city(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data["new_member"]["city"] = city
             
             await update.message.reply_text(
-                "📅 Теперь введите год прихода в компанию (например: 2022):",
+                "📅 Теперь введите год прихода в компанию (например: 2022):\n\n"
+                "❌ <i>Для отмены отправьте команду /cancel</i>",
                 parse_mode=ParseMode.HTML
             )
             return ADD_MEMBER_YEAR
@@ -1459,7 +1499,8 @@ async def handle_add_member_year(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data["new_member"]["year"] = year
             
             await update.message.reply_text(
-                "🎯 Теперь введите сферу ответственности (можно несколько пунктов через запятую):",
+                "🎯 Теперь введите сферу ответственности (можно несколько пунктов через запятую):\n\n"
+                "❌ <i>Для отмены отправьте команду /cancel</i>",
                 parse_mode=ParseMode.HTML
             )
             return ADD_MEMBER_RESPONSIBILITIES
@@ -1479,7 +1520,8 @@ async def handle_add_member_responsibilities(update: Update, context: ContextTyp
             context.user_data["new_member"]["responsibilities"] = responsibilities
             
             await update.message.reply_text(
-                "💬 Теперь введите, по каким вопросам можно обращаться (можно несколько пунктов через запятую):",
+                "💬 Теперь введите, по каким вопросам можно обращаться (можно несколько пунктов через запятую):\n\n"
+                "❌ <i>Для отмены отправьте команду /cancel</i>",
                 parse_mode=ParseMode.HTML
             )
             return ADD_MEMBER_CONTACT_TOPICS
@@ -1499,7 +1541,8 @@ async def handle_add_member_contact_topics(update: Update, context: ContextTypes
             context.user_data["new_member"]["contact_topics"] = contact_topics
             
             await update.message.reply_text(
-                "📝 Теперь кратко опишите сотрудника (хобби, интересы, факты):",
+                "📝 Теперь кратко опишите сотрудника (хобби, интересы, факты):\n\n"
+                "❌ <i>Для отмены отправьте команду /cancel</i>",
                 parse_mode=ParseMode.HTML
             )
             return ADD_MEMBER_ABOUT
@@ -1519,7 +1562,8 @@ async def handle_add_member_about(update: Update, context: ContextTypes.DEFAULT_
             context.user_data["new_member"]["about"] = about
             
             await update.message.reply_text(
-                "📱 Теперь введите Telegram username (например: @username или просто username):",
+                "📱 Теперь введите Telegram username (например: @username или просто username):\n\n"
+                "❌ <i>Для отмены отправьте команду /cancel</i>",
                 parse_mode=ParseMode.HTML
             )
             return ADD_MEMBER_TELEGRAM
@@ -1567,71 +1611,6 @@ async def handle_add_member_telegram(update: Update, context: ContextTypes.DEFAU
         return ADD_MEMBER_CONFIRM
     
     return ADD_MEMBER_TELEGRAM
-
-async def handle_add_member_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    config = BotConfig()
-    username = query.from_user.username
-    
-    if not config.is_admin(username):
-        await query.answer("❌ У вас нет прав для добавления сотрудников", show_alert=True)
-        context.user_data.clear()
-        return ConversationHandler.END
-    
-    if query.data == "add_member_confirm":
-        member_data = context.user_data.get("new_member", {})
-        
-        if member_data:
-            member_id = config.add_team_member(member_data)
-            
-            if member_id:
-                await query.edit_message_text(
-                    f"✅ <b>Сотрудник успешно добавлен!</b>\n\n"
-                    f"Имя: {member_data.get('name', 'Не указано')}\n"
-                    f"ID карточки: {member_id}",
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                await query.edit_message_text(
-                    "❌ Не удалось добавить сотрудника. Попробуйте еще раз.",
-                    parse_mode=ParseMode.HTML
-                )
-        else:
-            await query.edit_message_text(
-                "❌ Данные сотрудника не найдены. Попробуйте еще раз.",
-                parse_mode=ParseMode.HTML
-            )
-        
-        context.user_data.clear()
-        
-        keyboard = create_team_management_keyboard()
-        await query.message.reply_text(
-            "⚙️ <b>Управление командой</b>\n\n"
-            "Выберите действие:",
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML
-        )
-        return TEAM_MANAGEMENT
-    
-    elif query.data == "add_member_cancel":
-        context.user_data.clear()
-        await query.edit_message_text(
-            "❌ Добавление сотрудника отменено.",
-            parse_mode=ParseMode.HTML
-        )
-        
-        keyboard = create_team_management_keyboard()
-        await query.message.reply_text(
-            "⚙️ <b>Управление командой</b>\n\n"
-            "Выберите действие:",
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML
-        )
-        return TEAM_MANAGEMENT
-    
-    return ADD_MEMBER_CONFIRM
 
 
 # ========== ОБРАБОТЧИКИ ДЛЯ РЕДАКТИРОВАНИЯ СОТРУДНИКА ==========
@@ -1711,7 +1690,6 @@ async def handle_edit_member_value(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     config = BotConfig()
-    user_id = update.effective_user.id
     username = update.effective_user.username
     
     if not config.is_admin(username):
@@ -1728,17 +1706,22 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         await update.message.reply_text(
             f"📄 Файл <b>{file_name}</b> получен.\n\n"
-            "Теперь отправьте описание для этого файла:",
+            "Теперь отправьте описание для этого файла:\n\n"
+            "❌ <i>Для отмены отправьте команду /cancel</i>",
             parse_mode=ParseMode.HTML
         )
         
         return ADD_FILE_DESCRIPTION
-    
-    return ADD_FILE_NAME
+    else:
+        await update.message.reply_text(
+            "❌ Пожалуйста, отправьте файл (документ, изображение и т.д.).\n\n"
+            "❌ <i>Для отмены отправьте команду /cancel</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return ADD_FILE_NAME
 
 async def handle_file_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     config = BotConfig()
-    user_id = update.effective_user.id
     username = update.effective_user.username
     
     if not config.is_admin(username):
@@ -1772,10 +1755,26 @@ async def handle_file_description(update: Update, context: ContextTypes.DEFAULT_
     
     return ConversationHandler.END
 
-async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+
+# ========== ФУНКЦИИ ОТМЕНЫ ==========
+
+async def cancel_operation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отмена текущей операции и возврат в главное меню"""
     context.user_data.clear()
-    await update.message.reply_text("❌ Операция отменена.")
-    return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "❌ Операция отменена.",
+        parse_mode=ParseMode.HTML
+    )
+    
+    keyboard = create_help_keyboard()
+    await update.message.reply_text(
+        "📋 <b>Главное меню помощи</b>\n\n"
+        "Выберите раздел:",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML
+    )
+    return MAIN_HELP_MENU
 
 
 # ========== ФУНКЦИИ ПЛАНЁРОК ==========
@@ -1932,7 +1931,7 @@ async def cancel_industry_confirm_callback(update: Update, context: ContextTypes
         await query.answer("❌ У вас нет прав для отмены встреч", show_alert=True)
         return ConversationHandler.END
     
-    original_message_id = str(context.user_data.get("original_message_id"))
+    original_message_id = context.user_data.get("original_message_id")
     
     if original_message_id:
         # Ищем задачу через JobManager
@@ -1947,7 +1946,7 @@ async def cancel_industry_confirm_callback(update: Update, context: ContextTypes
         else:
             # Пробуем найти через active_reminders
             for job_name, reminder_data in config.active_reminders.items():
-                if str(reminder_data.get("message_id")) == original_message_id:
+                if reminder_data.get("message_id") == original_message_id:
                     # Ищем задачу в JobManager по имени
                     job_data = job_manager.get_job(job_name)
                     if job_data and 'job' in job_data:
@@ -1995,14 +1994,6 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
         reason_index = int(query.data.split("_")[1])
         reason = CANCELLATION_OPTIONS[reason_index]
         
-        # === FIX 2: Сохраняем выбранную дату для использования в сообщении ===
-        if "selected_date" in context.user_data:
-            selected_date = context.user_data["selected_date"]
-            formatted_date = format_date_for_display(selected_date)
-            # Модифицируем причину, если выбрана дата
-            if reason_index == 2:  # "Перенесём на другой день"
-                reason = f"Планерка перенесена на {formatted_date}"
-        
         context.user_data["selected_reason"] = reason
         context.user_data["reason_index"] = reason_index
         
@@ -2029,16 +2020,10 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
             return SELECTING_DATE
         
         else:
-            # Если дата была выбрана ранее, используем её в сообщении
-            if "selected_date" in context.user_data:
-                selected_date = context.user_data["selected_date"]
-                formatted_date = format_date_for_display(selected_date)
-                reason = f"Планерка перенесена на {formatted_date}"
-            
             final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
             
             config = BotConfig()
-            original_message_id = str(context.user_data.get("original_message_id"))
+            original_message_id = context.user_data.get("original_message_id")
             
             if original_message_id:
                 # Ищем задачу через JobManager
@@ -2053,7 +2038,7 @@ async def select_reason_callback(update: Update, context: ContextTypes.DEFAULT_T
                 else:
                     # Пробуем найти через active_reminders
                     for job_name, reminder_data in config.active_reminders.items():
-                        if str(reminder_data.get("message_id")) == original_message_id:
+                        if reminder_data.get("message_id") == original_message_id:
                             # Ищем задачу в JobManager по имени
                             job_data = job_manager.get_job(job_name)
                             if job_data and 'job' in job_data:
@@ -2117,23 +2102,25 @@ async def select_date_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["selected_date"] = selected_date
         context.user_data["meeting_type"] = meeting_type
         
-        config = BotConfig()
-        original_message_id = str(context.user_data.get("original_message_id"))
-        job_name = None
+        # Ищем задачу по ID сообщения
+        original_message_id = context.user_data.get("original_message_id")
+        job_data = job_manager.get_job_by_message_id(original_message_id)
         
-        if original_message_id:
-            # Ищем задачу через JobManager
-            job_data = job_manager.get_job_by_message_id(original_message_id)
-            if job_data:
-                job_name = job_data.get('name')
+        if not job_data:
+            # Пробуем найти через active_reminders
+            for job_name, reminder_data in config.active_reminders.items():
+                if reminder_data.get("message_id") == original_message_id:
+                    job_data = job_manager.get_job(job_name)
+                    break
         
-        if not job_name:
+        if not job_data:
             await query.edit_message_text(
                 text="❌ Не удалось найти запланированную встречу.",
                 parse_mode=ParseMode.HTML
             )
             return ConversationHandler.END
         
+        job_name = job_data.get('name')
         formatted_date = format_date_for_display(selected_date)
         
         meeting_type_text = "планёрку" if meeting_type == "planerka" else "отраслевую встречу"
@@ -2293,18 +2280,12 @@ async def cancel_reschedule_callback(update: Update, context: ContextTypes.DEFAU
     reason_index = context.user_data.get("reason_index", 0)
     
     if meeting_type == "planerka":
-        # === FIX 2: Используем выбранную дату в сообщении об отмене ===
-        if "selected_date" in context.user_data:
-            selected_date = context.user_data["selected_date"]
-            formatted_date = format_date_for_display(selected_date)
-            reason = f"Планерка перенесена на {formatted_date}"
-        else:
-            reason = CANCELLATION_OPTIONS[reason_index]
+        reason = CANCELLATION_OPTIONS[reason_index]
         
         final_message = f"❌ @{query.from_user.username or 'Пользователь'} отменил планёрку\n\n📝 <b>Причина:</b> {reason}"
         
         config = BotConfig()
-        original_message_id = str(context.user_data.get("original_message_id"))
+        original_message_id = context.user_data.get("original_message_id")
         
         if original_message_id:
             # Ищем задачу через JobManager
@@ -2319,7 +2300,7 @@ async def cancel_reschedule_callback(update: Update, context: ContextTypes.DEFAU
             else:
                 # Пробуем найти через active_reminders
                 for job_name, reminder_data in config.active_reminders.items():
-                    if str(reminder_data.get("message_id")) == original_message_id:
+                    if reminder_data.get("message_id") == original_message_id:
                         # Ищем задачу в JobManager по имени
                         job_data = job_manager.get_job(job_name)
                         if job_data and 'job' in job_data:
@@ -2701,7 +2682,7 @@ def main() -> None:
     try:
         application = Application.builder().token(TOKEN).build()
 
-        # Упрощенный ConversationHandler для помощи
+        # ConversationHandler для помощи (основной)
         help_conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler("help", help_command),
@@ -2711,10 +2692,15 @@ def main() -> None:
                     CallbackQueryHandler(handle_help_callback, pattern="^help_"),
                     CallbackQueryHandler(handle_help_callback, pattern="^file_"),
                     CallbackQueryHandler(handle_help_callback, pattern="^link_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^team_member_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_"),
                     CallbackQueryHandler(handle_help_callback, pattern="^add_file$"),
                     CallbackQueryHandler(handle_help_callback, pattern="^delete_file_"),
                     CallbackQueryHandler(handle_help_callback, pattern="^no_members$"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^add_member_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^edit_member_select_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^edit_field_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_member_select_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_confirm_"),
                 ],
                 
                 DOCUMENTS_MENU: [
@@ -2726,12 +2712,12 @@ def main() -> None:
                 
                 ADD_FILE_NAME: [
                     MessageHandler(filters.Document.ALL, handle_file_upload),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 ADD_FILE_DESCRIPTION: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_description),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 DELETE_FILE_MENU: [
@@ -2759,61 +2745,55 @@ def main() -> None:
                 TEAM_MANAGEMENT: [
                     CallbackQueryHandler(handle_help_callback, pattern="^team_"),
                     CallbackQueryHandler(handle_help_callback, pattern="^help_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^add_member_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^delete_member_select_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^delete_confirm_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^edit_member_select_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^edit_field_"),
                 ],
                 
                 ADD_MEMBER_NAME: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_name),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 ADD_MEMBER_POSITION: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_position),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 ADD_MEMBER_CITY: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_city),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 ADD_MEMBER_YEAR: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_year),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 ADD_MEMBER_RESPONSIBILITIES: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_responsibilities),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 ADD_MEMBER_CONTACT_TOPICS: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_contact_topics),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 ADD_MEMBER_ABOUT: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_about),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 ADD_MEMBER_TELEGRAM: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_telegram),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 ADD_MEMBER_CONFIRM: [
-                    CallbackQueryHandler(handle_add_member_confirm, pattern="^add_member_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^add_member_"),
                 ],
                 
                 EDIT_MEMBER_MENU: [
-                    CallbackQueryHandler(handle_help_callback, pattern="^team_"),
                     CallbackQueryHandler(handle_help_callback, pattern="^edit_member_select_"),
-                    CallbackQueryHandler(handle_help_callback, pattern="^edit_field_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_"),
                 ],
                 
                 EDIT_MEMBER_FIELD: [
@@ -2823,7 +2803,7 @@ def main() -> None:
                 
                 EDIT_MEMBER_VALUE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_member_value),
-                    CommandHandler("cancel", cancel_upload),
+                    CommandHandler("cancel", cancel_operation),
                 ],
                 
                 DELETE_MEMBER_MENU: [
@@ -2833,16 +2813,17 @@ def main() -> None:
                 
                 DELETE_MEMBER_CONFIRM: [
                     CallbackQueryHandler(handle_help_callback, pattern="^delete_confirm_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_"),
                 ],
             },
             fallbacks=[
-                CommandHandler("cancel", cancel_upload),
+                CommandHandler("cancel", cancel_operation),
             ],
             name="help_conversation",
             persistent=False,
         )
 
-        # ConversationHandler для отмены и переноса встреч
+        # ConversationHandler для отмены встреч
         cancel_conv_handler = ConversationHandler(
             entry_points=[
                 CallbackQueryHandler(cancel_meeting_callback, pattern="^cancel_meeting$"),
@@ -2867,9 +2848,11 @@ def main() -> None:
             fallbacks=[
                 CommandHandler("cancel", cancel_conversation),
             ],
+            name="cancel_conversation",
+            persistent=False,
         )
 
-        # Основные обработчики
+        # Основные обработчики команд
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("setchat", set_chat))
         application.add_handler(CommandHandler("info", show_info))
@@ -2882,9 +2865,6 @@ def main() -> None:
         
         # Добавляем ConversationHandler для отмены встреч
         application.add_handler(cancel_conv_handler)
-        
-        # Отдельный обработчик для callback-запросов, которые не попадают в ConversationHandler
-        application.add_handler(CallbackQueryHandler(handle_help_callback, pattern=".*"))
         
         # Добавляем обработчик новых участников чата для приветствия
         application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
