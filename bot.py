@@ -3,7 +3,7 @@ import re
 import random
 import sqlite3
 import logging
-from datetime import datetime, date, timedelta, time as dtime
+from datetime import datetime, date, timedelta
 
 import pytz
 from dotenv import load_dotenv
@@ -12,6 +12,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ForceReply,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -56,7 +57,7 @@ def db_init():
         )
     """)
 
-    # отмены стандартной планерки на конкретный день
+    # отмены стандартной планерки на конкретный день (по дате)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS standup_state (
             standup_date TEXT PRIMARY KEY,
@@ -76,6 +77,35 @@ def db_init():
         )
     """)
 
+    # метаданные (например, защита "отправили уже сегодня")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS standup_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    con.commit()
+    con.close()
+
+
+def db_get_meta(key: str) -> str | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT value FROM standup_meta WHERE key=?", (key,))
+    row = cur.fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def db_set_meta(key: str, value: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO standup_meta(key, value)
+        VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    """, (key, value))
     con.commit()
     con.close()
 
@@ -183,12 +213,17 @@ def db_mark_reschedules_sent(original_isos: list[str]):
     con.commit()
     con.close()
 
+
 # ---------------- TEXT ----------------
 
 DAY_RU = {
     0: "понедельник",
+    1: "вторник",
     2: "среда",
+    3: "четверг",
     4: "пятница",
+    5: "суббота",
+    6: "воскресенье",
 }
 
 GREETINGS = [
@@ -267,16 +302,19 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
     return member.status in ("administrator", "creator")
 
-# ---------------- MANUAL RESCHEDULE STATE ----------------
+
+# ---------------- MANUAL INPUT (ForceReply) ----------------
 WAITING_DATE_FLAG = "waiting_reschedule_date"
+WAITING_PROMPT_MSG_ID = "waiting_prompt_message_id"
+
 
 # ---------------- CORE SENDERS ----------------
 
-async def send_standup_message(context: ContextTypes.DEFAULT_TYPE, force: bool = False):
+async def send_standup_message(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> bool:
     """
     Общая логика отправки.
-    force=True -> шлем всегда (для теста).
-    force=False -> шлем только по правилам (как в 09:15).
+    force=True -> шлём всегда (для теста).
+    force=False -> шлём только по правилам (как в 09:15).
     """
     today_d = datetime.now(MOSCOW_TZ).date()
 
@@ -324,9 +362,32 @@ async def send_standup_message(context: ContextTypes.DEFAULT_TYPE, force: bool =
     return True
 
 
-async def job_send_915(context: ContextTypes.DEFAULT_TYPE):
-    # Авто в 09:15 по расписанию
-    await send_standup_message(context, force=False)
+async def check_and_send_915(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Надёжная отправка строго по Москве:
+    - job крутится каждую минуту
+    - если сейчас 09:15 МСК и сегодня ещё не отправляли — отправляем
+    """
+    now_msk = datetime.now(MOSCOW_TZ)
+    today_iso = now_msk.date().isoformat()
+
+    if not (now_msk.hour == 9 and now_msk.minute == 15):
+        return
+
+    last_sent = db_get_meta("last_auto_sent_date")
+    if last_sent == today_iso:
+        return
+
+    sent = await send_standup_message(context, force=False)
+    if sent:
+        db_set_meta("last_auto_sent_date", today_iso)
+        logger.info("Auto standup sent at 09:15 MSK (%s)", today_iso)
+    else:
+        # если по правилам сегодня нечего отправлять — всё равно не хотим пытаться снова каждую минуту
+        # чтобы не спамить логами/не грузить. Отмечаем, что "проверили" день.
+        db_set_meta("last_auto_sent_date", today_iso)
+        logger.info("09:15 MSK reached but nothing to send; marking checked (%s)", today_iso)
+
 
 # ---------------- COMMANDS ----------------
 
@@ -427,21 +488,23 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_d = datetime.now(MOSCOW_TZ).date()
 
     if reason_key == "no_topics":
-        db_set_canceled(today_d, "Нет срочных тем для обсуждения")
+        reason_text = "Нет срочных тем для обсуждения"
+        db_set_canceled(today_d, reason_text)
         await query.edit_message_reply_markup(reply_markup=None)
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="✅ Планёрка сегодня отменена.\nПричина: нет срочных тем для обсуждения 💤",
+            text=f"✅ Сегодняшняя планёрка отменена\nПричина: {reason_text}",
         )
         await query.answer("Отменено.")
         return
 
     if reason_key == "tech":
-        db_set_canceled(today_d, "Перенос по техническим причинам")
+        reason_text = "Перенесём по техническим причинам"
+        db_set_canceled(today_d, reason_text)
         await query.edit_message_reply_markup(reply_markup=None)
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="✅ Планёрка сегодня отменена/перенесена.\nПричина: технические причины 🛠️",
+            text=f"✅ Сегодняшняя планёрка отменена\nПричина: {reason_text}",
         )
         await query.answer("Ок.")
         return
@@ -474,9 +537,9 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=(
-            f"✅ Планёрка сегодня перенесена.\n"
+            "✅ Сегодняшняя планёрка перенесена\n"
             f"Новая дата: {picked} 📌\n"
-            f"Уведомление придёт в {picked} в 09:15 (МСК)."
+            "Следите за расписанием или чатом"
         )
     )
     await query.answer("Перенесено.")
@@ -487,12 +550,18 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Только администраторы.", show_alert=True)
         return
 
+    # Включаем режим ожидания даты и отправляем ForceReply
     context.chat_data[WAITING_DATE_FLAG] = True
+
     await query.answer()
-    await context.bot.send_message(
+    msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text="Введите дату переноса в формате ДД.ММ.ГГ (например 22.01.26):"
+        text="Введите дату переноса в формате ДД.ММ.ГГ (например 22.01.26):",
+        reply_markup=ForceReply(selective=True),
     )
+    # сохраняем message_id, чтобы принимать только ответ на него
+    context.chat_data[WAITING_PROMPT_MSG_ID] = msg.message_id
+
 
 # ---------------- MANUAL DATE INPUT ----------------
 
@@ -503,9 +572,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.chat_data.get(WAITING_DATE_FLAG):
         return
 
+    # принимаем только ответ на наш ForceReply prompt (важно для privacy mode)
+    prompt_id = context.chat_data.get(WAITING_PROMPT_MSG_ID)
+    if prompt_id:
+        if not update.message.reply_to_message or update.message.reply_to_message.message_id != prompt_id:
+            # пользователь написал не "ответом" — попросим ответить правильно
+            return
+
     if not await is_admin(update, context):
         await update.message.reply_text("Только администраторы могут переносить планёрку.")
         context.chat_data[WAITING_DATE_FLAG] = False
+        context.chat_data.pop(WAITING_PROMPT_MSG_ID, None)
         return
 
     raw = (update.message.text or "").strip()
@@ -526,11 +603,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_set_canceled(today_d, "Перенос на другой день", reschedule_date=raw)
     db_upsert_reschedule(today_d, new_d)
 
+    # сброс ожидания
     context.chat_data[WAITING_DATE_FLAG] = False
+    context.chat_data.pop(WAITING_PROMPT_MSG_ID, None)
+
     await update.message.reply_text(
-        f"✅ Ок, перенесли планёрку.\nНовая дата: {raw} 📌\n"
-        f"Уведомление придёт в {raw} в 09:15 (МСК)."
+        "✅ Сегодняшняя планёрка перенесена\n"
+        f"Новая дата: {raw} 📌\n"
+        "Следите за расписанием или чатом"
     )
+
 
 # ---------------- APP ----------------
 
@@ -553,14 +635,13 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_reschedule_pick, pattern=r"^reschedule:pick:"))
     app.add_handler(CallbackQueryHandler(cb_reschedule_manual, pattern=r"^reschedule:manual$"))
 
-    # текст (для ручного ввода даты)
+    # текст (для ручного ввода даты — принимаем reply)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # JobQueue: ежедневная отправка в 09:15 (МСК)
-    run_time = dtime(hour=9, minute=15, tzinfo=MOSCOW_TZ)
-    app.job_queue.run_daily(job_send_915, time=run_time, name="standup_915")
+    # Надёжная отправка: проверка каждую минуту, строго по Москве, 1 раз в день
+    app.job_queue.run_repeating(check_and_send_915, interval=60, first=10, name="standup_checker")
 
-    logger.info("Bot started. Daily job at 09:15 MSK")
+    logger.info("Bot started. Checking every minute for 09:15 MSK")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
