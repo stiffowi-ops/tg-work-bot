@@ -3,6 +3,7 @@ import re
 import random
 import sqlite3
 import logging
+import time
 from datetime import datetime, date, timedelta
 
 import pytz
@@ -287,6 +288,11 @@ def kb_reschedule_dates(from_d: date):
     rows.append([InlineKeyboardButton("Назад ↩️", callback_data="cancel:open")])
     return InlineKeyboardMarkup(rows)
 
+def kb_manual_input_controls():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Отмена ввода даты ❌", callback_data="reschedule:cancel_manual")]
+    ])
+
 
 # ---------------- ADMIN CHECK ----------------
 
@@ -300,6 +306,15 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 # ---------------- MANUAL INPUT STATE ----------------
 WAITING_DATE_FLAG = "waiting_reschedule_date"
 WAITING_PROMPT_MSG_ID = "waiting_prompt_message_id"
+WAITING_USER_ID = "waiting_user_id"
+WAITING_SINCE_TS = "waiting_since_ts"  # unix timestamp
+
+
+def clear_waiting(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[WAITING_DATE_FLAG] = False
+    context.chat_data.pop(WAITING_PROMPT_MSG_ID, None)
+    context.chat_data.pop(WAITING_USER_ID, None)
+    context.chat_data.pop(WAITING_SINCE_TS, None)
 
 
 # ---------------- CORE SENDERS ----------------
@@ -363,8 +378,6 @@ async def check_and_send_915(context: ContextTypes.DEFAULT_TYPE):
         return
 
     sent = await send_standup_message(context, force=False)
-
-    # фиксируем день, чтобы не повторять попытки
     db_set_meta("last_auto_sent_date", today_iso)
 
     if sent:
@@ -444,12 +457,12 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         return
     was = bool(context.chat_data.get(WAITING_DATE_FLAG, False))
-    context.chat_data[WAITING_DATE_FLAG] = False
-    context.chat_data.pop(WAITING_PROMPT_MSG_ID, None)
+    clear_waiting(context)
     if was:
         await update.message.reply_text("✅ Состояние ожидания даты сброшено.")
     else:
         await update.message.reply_text("ℹ️ Режим ожидания даты не был активен.")
+
 
 # ---------------- CALLBACKS ----------------
 
@@ -526,7 +539,6 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Не смог распознать дату.", show_alert=True)
         return
 
-    # (опционально) чтобы не переносили в прошлое:
     if new_d <= today_d:
         await query.answer("Дата переноса должна быть в будущем.", show_alert=True)
         return
@@ -551,107 +563,114 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("❌ Только администраторы.", show_alert=True)
         return
 
+    # включаем ожидание ввода
     context.chat_data[WAITING_DATE_FLAG] = True
+    context.chat_data[WAITING_USER_ID] = update.effective_user.id
+    context.chat_data[WAITING_SINCE_TS] = int(time.time())
 
     await query.answer()
+
+    # сообщение-инструкция + кнопка отмены
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=(
             "📅 <b>Введите дату переноса</b>\n\n"
             "Формат: <b>ДД.ММ.ГГ</b>\n"
             "Пример: <code>22.01.26</code>\n\n"
-            "Ответьте на это сообщение датой:"
+            "Просто отправьте дату сообщением в чат.\n"
+            "Если передумали — нажмите «Отмена ввода даты ❌»."
         ),
         parse_mode=ParseMode.HTML,
-        reply_markup=ForceReply(selective=True, input_field_placeholder="Например: 22.01.26"),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Отмена ввода даты ❌", callback_data="reschedule:cancel_manual")]
+        ])
     )
 
     context.chat_data[WAITING_PROMPT_MSG_ID] = msg.message_id
-    logger.info("Waiting for date input in chat %s, prompt ID: %s", update.effective_chat.id, msg.message_id)
+    logger.info(
+        "Waiting for date input in chat %s, prompt ID: %s, user_id=%s",
+        update.effective_chat.id, msg.message_id, update.effective_user.id
+    )
+
+async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await is_admin(update, context):
+        await query.answer("❌ Только администраторы.", show_alert=True)
+        return
+
+    clear_waiting(context)
+    await query.answer("Ок, отменил ввод даты ✅")
+    # уберём клавиатуру у сообщения-инструкции (если можем)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="✅ Ввод даты отменён. Если нужно — нажмите «Ввести дату» ещё раз.",
+    )
 
 
 # ---------------- MANUAL DATE INPUT ----------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ввода даты вручную + логирование"""
     if not update.message or not update.effective_chat:
-        logger.info("on_text: No message or chat in update")
         return
 
     user_id = update.effective_user.id if update.effective_user else None
     chat_id = update.effective_chat.id
-    text = update.message.text or ""
+    text = (update.message.text or "").strip()
 
     logger.info("TEXT RECEIVED - Chat: %s, User: %s, Text: %r", chat_id, user_id, text)
     logger.info("WAITING_DATE_FLAG: %s", context.chat_data.get(WAITING_DATE_FLAG, False))
 
     if not context.chat_data.get(WAITING_DATE_FLAG):
-        logger.info("Not waiting for date input, ignoring")
         return
 
-    # Проверяем админа
+    # принимаем только от того, кто нажал "ввести дату"
+    waiting_user = context.chat_data.get(WAITING_USER_ID)
+    if waiting_user and user_id != waiting_user:
+        logger.info("Ignoring message from other user. waiting_user=%s got=%s", waiting_user, user_id)
+        return
+
+    # TTL 10 минут
+    since_ts = context.chat_data.get(WAITING_SINCE_TS)
+    if since_ts and int(time.time()) - int(since_ts) > 10 * 60:
+        clear_waiting(context)
+        await update.message.reply_text("⏳ Время ожидания даты истекло. Нажмите «Ввести дату» ещё раз.")
+        return
+
+    # админ-проверка (на всякий)
     if not await is_admin(update, context):
-        logger.info("User %s is not admin", user_id)
-        context.chat_data[WAITING_DATE_FLAG] = False
-        context.chat_data.pop(WAITING_PROMPT_MSG_ID, None)
+        clear_waiting(context)
         await update.message.reply_text("❌ Только администраторы могут переносить планёрку.")
         return
 
-    # Проверяем reply_to_message (важно для privacy mode)
-    prompt_id = context.chat_data.get(WAITING_PROMPT_MSG_ID)
-    if prompt_id:
-        rtm = update.message.reply_to_message
-        if not rtm or rtm.message_id != prompt_id:
-            logger.info("Message is not a reply to our prompt. prompt_id=%s", prompt_id)
-            # подсказка как ответить правильно
-            await update.message.reply_text(
-                "⚠️ Пожалуйста, ответьте на мое сообщение выше (Reply), чтобы я увидел дату.",
-                reply_to_message_id=prompt_id,
-            )
-            return
-
-    raw = text.strip()
-    logger.info("Processing date input: %r", raw)
-
-    if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", raw):
-        logger.warning("Invalid date format: %r", raw)
-        await update.message.reply_text(
-            "❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).\n\nПопробуйте ещё раз:",
-            reply_markup=ForceReply(selective=True, input_field_placeholder="ДД.ММ.ГГ"),
-        )
+    # формат даты
+    if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", text):
+        await update.message.reply_text("❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
         return
 
     try:
-        dd, mm, yy = raw.split(".")
+        dd, mm, yy = text.split(".")
         new_d = date(int("20" + yy), int(mm), int(dd))
-        logger.info("Successfully parsed date: %s", new_d.isoformat())
-    except Exception as e:
-        logger.error("Date parsing error: %s", e)
-        await update.message.reply_text(
-            "❌ Не удалось распознать дату. Убедитесь, что она существует.\n\nПопробуйте ещё раз:",
-            reply_markup=ForceReply(selective=True, input_field_placeholder="ДД.ММ.ГГ"),
-        )
+    except Exception:
+        await update.message.reply_text("❌ Не удалось распознать дату. Проверьте корректность.")
         return
 
     today_d = datetime.now(MOSCOW_TZ).date()
     if new_d <= today_d:
-        await update.message.reply_text(
-            "❌ Дата переноса должна быть в будущем.\n\nВыберите другую дату:",
-            reply_markup=ForceReply(selective=True, input_field_placeholder="ДД.ММ.ГГ"),
-        )
+        await update.message.reply_text("❌ Дата переноса должна быть в будущем.")
         return
 
-    db_set_canceled(today_d, "Перенос на другой день", reschedule_date=raw)
+    db_set_canceled(today_d, "Перенос на другой день", reschedule_date=text)
     db_upsert_reschedule(today_d, new_d)
 
-    context.chat_data[WAITING_DATE_FLAG] = False
-    context.chat_data.pop(WAITING_PROMPT_MSG_ID, None)
-
-    logger.info("Rescheduled: %s -> %s", today_d.isoformat(), new_d.isoformat())
+    clear_waiting(context)
 
     await update.message.reply_text(
         "✅ Сегодняшняя планёрка перенесена\n"
-        f"Новая дата: {raw} 📌\n"
+        f"Новая дата: {text} 📌\n"
         "Следите за расписанием или чатом"
     )
 
@@ -677,8 +696,9 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_cancel_reason, pattern=r"^cancel:reason:"))
     app.add_handler(CallbackQueryHandler(cb_reschedule_pick, pattern=r"^reschedule:pick:"))
     app.add_handler(CallbackQueryHandler(cb_reschedule_manual, pattern=r"^reschedule:manual$"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_manual_input, pattern=r"^reschedule:cancel_manual$"))
 
-    # ВАЖНО: обработчик текста должен быть последним среди message handlers
+    # текст (для ручного ввода даты)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # Надёжная отправка 09:15 МСК: проверка каждую минуту
