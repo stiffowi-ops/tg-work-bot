@@ -49,7 +49,6 @@ def db_init():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
 
-    # чаты рассылки
     cur.execute("""
         CREATE TABLE IF NOT EXISTS standup_chats (
             chat_id INTEGER PRIMARY KEY,
@@ -57,7 +56,6 @@ def db_init():
         )
     """)
 
-    # отмены стандартной планерки на конкретный день (по дате)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS standup_state (
             standup_date TEXT PRIMARY KEY,
@@ -67,7 +65,6 @@ def db_init():
         )
     """)
 
-    # переносы (из какого дня -> в какой, и отправлено ли)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS standup_reschedules (
             original_date TEXT PRIMARY KEY,
@@ -77,7 +74,6 @@ def db_init():
         )
     """)
 
-    # метаданные (например, защита "отправили уже сегодня")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS standup_meta (
             key TEXT PRIMARY KEY,
@@ -184,10 +180,6 @@ def db_upsert_reschedule(original_d: date, new_d: date):
 
 
 def db_get_due_reschedules(target_day: date) -> list[str]:
-    """
-    Возвращает список original_date ISO строк, которые должны быть отправлены сегодня
-    (new_date=today, sent=0)
-    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
@@ -259,6 +251,7 @@ def build_text(today_d: date, rescheduled_from: list[date] | None):
         f"Если нужно — можно отменить/перенести ниже 👇"
     )
 
+
 # ---------------- KEYBOARDS ----------------
 
 def kb_cancel_menu():
@@ -294,6 +287,7 @@ def kb_reschedule_dates(from_d: date):
     rows.append([InlineKeyboardButton("Назад ↩️", callback_data="cancel:open")])
     return InlineKeyboardMarkup(rows)
 
+
 # ---------------- ADMIN CHECK ----------------
 
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -303,7 +297,7 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return member.status in ("administrator", "creator")
 
 
-# ---------------- MANUAL INPUT (ForceReply) ----------------
+# ---------------- MANUAL INPUT STATE ----------------
 WAITING_DATE_FLAG = "waiting_reschedule_date"
 WAITING_PROMPT_MSG_ID = "waiting_prompt_message_id"
 
@@ -311,11 +305,6 @@ WAITING_PROMPT_MSG_ID = "waiting_prompt_message_id"
 # ---------------- CORE SENDERS ----------------
 
 async def send_standup_message(context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> bool:
-    """
-    Общая логика отправки.
-    force=True -> шлём всегда (для теста).
-    force=False -> шлём только по правилам (как в 09:15).
-    """
     today_d = datetime.now(MOSCOW_TZ).date()
 
     chat_ids = db_list_chats()
@@ -363,11 +352,6 @@ async def send_standup_message(context: ContextTypes.DEFAULT_TYPE, force: bool =
 
 
 async def check_and_send_915(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Надёжная отправка строго по Москве:
-    - job крутится каждую минуту
-    - если сейчас 09:15 МСК и сегодня ещё не отправляли — отправляем
-    """
     now_msk = datetime.now(MOSCOW_TZ)
     today_iso = now_msk.date().isoformat()
 
@@ -379,14 +363,14 @@ async def check_and_send_915(context: ContextTypes.DEFAULT_TYPE):
         return
 
     sent = await send_standup_message(context, force=False)
+
+    # фиксируем день, чтобы не повторять попытки
+    db_set_meta("last_auto_sent_date", today_iso)
+
     if sent:
-        db_set_meta("last_auto_sent_date", today_iso)
         logger.info("Auto standup sent at 09:15 MSK (%s)", today_iso)
     else:
-        # если по правилам сегодня нечего отправлять — всё равно не хотим пытаться снова каждую минуту
-        # чтобы не спамить логами/не грузить. Отмечаем, что "проверили" день.
-        db_set_meta("last_auto_sent_date", today_iso)
-        logger.info("09:15 MSK reached but nothing to send; marking checked (%s)", today_iso)
+        logger.info("09:15 MSK reached but nothing to send; marked checked (%s)", today_iso)
 
 
 # ---------------- COMMANDS ----------------
@@ -400,7 +384,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• /setchat — подключить этот чат к рассылке (только админы)\n"
         f"• /unsetchat — отключить этот чат от рассылки (только админы)\n"
         f"• /test915 — проверить логику «как в 09:15» (только админы)\n"
-        f"• /force — принудительно отправить сообщение планёрки (только админы)\n\n"
+        f"• /force — принудительно отправить сообщение планёрки (только админы)\n"
+        f"• /reset — сброс ожидания даты (только админы)\n\n"
         f"Авто-уведомления: ПН/СР/ПТ в 09:15 (МСК) + переносы."
     )
     await update.message.reply_text(text)
@@ -454,6 +439,17 @@ async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_standup_message(context, force=True)
     await update.message.reply_text("🚀 Готово! Принудительно отправил сообщение планёрки в подключённые чаты.")
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        return
+    was = bool(context.chat_data.get(WAITING_DATE_FLAG, False))
+    context.chat_data[WAITING_DATE_FLAG] = False
+    context.chat_data.pop(WAITING_PROMPT_MSG_ID, None)
+    if was:
+        await update.message.reply_text("✅ Состояние ожидания даты сброшено.")
+    else:
+        await update.message.reply_text("ℹ️ Режим ожидания даты не был активен.")
 
 # ---------------- CALLBACKS ----------------
 
@@ -530,6 +526,11 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Не смог распознать дату.", show_alert=True)
         return
 
+    # (опционально) чтобы не переносили в прошлое:
+    if new_d <= today_d:
+        await query.answer("Дата переноса должна быть в будущем.", show_alert=True)
+        return
+
     db_set_canceled(today_d, "Перенос на другой день", reschedule_date=picked)
     db_upsert_reschedule(today_d, new_d)
 
@@ -547,65 +548,106 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin(update, context):
-        await query.answer("Только администраторы.", show_alert=True)
+        await query.answer("❌ Только администраторы.", show_alert=True)
         return
 
-    # Включаем режим ожидания даты и отправляем ForceReply
     context.chat_data[WAITING_DATE_FLAG] = True
 
     await query.answer()
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text="Введите дату переноса в формате ДД.ММ.ГГ (например 22.01.26):",
-        reply_markup=ForceReply(selective=True),
+        text=(
+            "📅 <b>Введите дату переноса</b>\n\n"
+            "Формат: <b>ДД.ММ.ГГ</b>\n"
+            "Пример: <code>22.01.26</code>\n\n"
+            "Ответьте на это сообщение датой:"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=ForceReply(selective=True, input_field_placeholder="Например: 22.01.26"),
     )
-    # сохраняем message_id, чтобы принимать только ответ на него
+
     context.chat_data[WAITING_PROMPT_MSG_ID] = msg.message_id
+    logger.info("Waiting for date input in chat %s, prompt ID: %s", update.effective_chat.id, msg.message_id)
 
 
 # ---------------- MANUAL DATE INPUT ----------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ввода даты вручную + логирование"""
     if not update.message or not update.effective_chat:
+        logger.info("on_text: No message or chat in update")
         return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    chat_id = update.effective_chat.id
+    text = update.message.text or ""
+
+    logger.info("TEXT RECEIVED - Chat: %s, User: %s, Text: %r", chat_id, user_id, text)
+    logger.info("WAITING_DATE_FLAG: %s", context.chat_data.get(WAITING_DATE_FLAG, False))
 
     if not context.chat_data.get(WAITING_DATE_FLAG):
+        logger.info("Not waiting for date input, ignoring")
         return
 
-    # принимаем только ответ на наш ForceReply prompt (важно для privacy mode)
-    prompt_id = context.chat_data.get(WAITING_PROMPT_MSG_ID)
-    if prompt_id:
-        if not update.message.reply_to_message or update.message.reply_to_message.message_id != prompt_id:
-            # пользователь написал не "ответом" — попросим ответить правильно
-            return
-
+    # Проверяем админа
     if not await is_admin(update, context):
-        await update.message.reply_text("Только администраторы могут переносить планёрку.")
+        logger.info("User %s is not admin", user_id)
         context.chat_data[WAITING_DATE_FLAG] = False
         context.chat_data.pop(WAITING_PROMPT_MSG_ID, None)
+        await update.message.reply_text("❌ Только администраторы могут переносить планёрку.")
         return
 
-    raw = (update.message.text or "").strip()
+    # Проверяем reply_to_message (важно для privacy mode)
+    prompt_id = context.chat_data.get(WAITING_PROMPT_MSG_ID)
+    if prompt_id:
+        rtm = update.message.reply_to_message
+        if not rtm or rtm.message_id != prompt_id:
+            logger.info("Message is not a reply to our prompt. prompt_id=%s", prompt_id)
+            # подсказка как ответить правильно
+            await update.message.reply_text(
+                "⚠️ Пожалуйста, ответьте на мое сообщение выше (Reply), чтобы я увидел дату.",
+                reply_to_message_id=prompt_id,
+            )
+            return
+
+    raw = text.strip()
+    logger.info("Processing date input: %r", raw)
 
     if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", raw):
-        await update.message.reply_text("Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
+        logger.warning("Invalid date format: %r", raw)
+        await update.message.reply_text(
+            "❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).\n\nПопробуйте ещё раз:",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="ДД.ММ.ГГ"),
+        )
         return
 
     try:
         dd, mm, yy = raw.split(".")
         new_d = date(int("20" + yy), int(mm), int(dd))
-    except Exception:
-        await update.message.reply_text("Похоже, такой даты не существует. Попробуйте ещё раз.")
+        logger.info("Successfully parsed date: %s", new_d.isoformat())
+    except Exception as e:
+        logger.error("Date parsing error: %s", e)
+        await update.message.reply_text(
+            "❌ Не удалось распознать дату. Убедитесь, что она существует.\n\nПопробуйте ещё раз:",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="ДД.ММ.ГГ"),
+        )
         return
 
     today_d = datetime.now(MOSCOW_TZ).date()
+    if new_d <= today_d:
+        await update.message.reply_text(
+            "❌ Дата переноса должна быть в будущем.\n\nВыберите другую дату:",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="ДД.ММ.ГГ"),
+        )
+        return
 
     db_set_canceled(today_d, "Перенос на другой день", reschedule_date=raw)
     db_upsert_reschedule(today_d, new_d)
 
-    # сброс ожидания
     context.chat_data[WAITING_DATE_FLAG] = False
     context.chat_data.pop(WAITING_PROMPT_MSG_ID, None)
+
+    logger.info("Rescheduled: %s -> %s", today_d.isoformat(), new_d.isoformat())
 
     await update.message.reply_text(
         "✅ Сегодняшняя планёрка перенесена\n"
@@ -627,6 +669,7 @@ def main():
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
     app.add_handler(CommandHandler("test915", cmd_test915))
     app.add_handler(CommandHandler("force", cmd_force))
+    app.add_handler(CommandHandler("reset", cmd_reset))
 
     # callbacks
     app.add_handler(CallbackQueryHandler(cb_cancel_open, pattern=r"^cancel:open$"))
@@ -635,10 +678,10 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_reschedule_pick, pattern=r"^reschedule:pick:"))
     app.add_handler(CallbackQueryHandler(cb_reschedule_manual, pattern=r"^reschedule:manual$"))
 
-    # текст (для ручного ввода даты — принимаем reply)
+    # ВАЖНО: обработчик текста должен быть последним среди message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # Надёжная отправка: проверка каждую минуту, строго по Москве, 1 раз в день
+    # Надёжная отправка 09:15 МСК: проверка каждую минуту
     app.job_queue.run_repeating(check_and_send_915, interval=60, first=10, name="standup_checker")
 
     logger.info("Bot started. Checking every minute for 09:15 MSK")
