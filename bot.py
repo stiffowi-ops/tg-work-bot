@@ -1,55 +1,62 @@
 import os
-import asyncio
-import logging
-import random
 import re
+import random
 import sqlite3
-from datetime import datetime, date, timedelta
+import logging
+from datetime import datetime, date, timedelta, time as dtime
 
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+import pytz
+from dotenv import load_dotenv
 
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+load_dotenv()
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
-# ----------------- ЛОГИ -----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("tg-bot")
+logger = logging.getLogger("standup-bot")
 
-# ----------------- ENV -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 if not BOT_TOKEN:
-    raise RuntimeError("Переменная окружения BOT_TOKEN не задана")
+    raise RuntimeError("BOT_TOKEN is not set")
 if not ZOOM_URL:
-    raise RuntimeError("Переменная окружения ZOOM_URL не задана")
+    raise RuntimeError("ZOOM_URL is not set")
 
-# Таймзона
-TZ = "Europe/Moscow"
+MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
-# ----------------- DB -----------------
+# ---------------- DB ----------------
+
 def db_init():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
 
-    # Отмена "сегодняшней" стандартной планёрки (если сегодня ПН/СР/ПТ)
+    # чаты рассылки
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS standup_chats (
+            chat_id INTEGER PRIMARY KEY,
+            added_at TEXT NOT NULL
+        )
+    """)
+
+    # отмены стандартной планерки на конкретный день
     cur.execute("""
         CREATE TABLE IF NOT EXISTS standup_state (
             standup_date TEXT PRIMARY KEY,
@@ -59,15 +66,7 @@ def db_init():
         )
     """)
 
-    # Чаты для рассылки (/setchat)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS standup_chats (
-            chat_id INTEGER PRIMARY KEY,
-            added_at TEXT NOT NULL
-        )
-    """)
-
-    # Переносы: из какой даты в какую, и отправлено ли уведомление в новую дату
+    # переносы (из какого дня -> в какой, и отправлено ли)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS standup_reschedules (
             original_date TEXT PRIMARY KEY,
@@ -77,35 +76,6 @@ def db_init():
         )
     """)
 
-    con.commit()
-    con.close()
-
-
-def db_get_state(d: date):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "SELECT canceled, reason, reschedule_date FROM standup_state WHERE standup_date=?",
-        (d.isoformat(),),
-    )
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return {"canceled": 0, "reason": None, "reschedule_date": None}
-    return {"canceled": row[0], "reason": row[1], "reschedule_date": row[2]}
-
-
-def db_set_canceled(d: date, reason: str, reschedule_date: str | None = None):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO standup_state (standup_date, canceled, reason, reschedule_date)
-        VALUES (?, 1, ?, ?)
-        ON CONFLICT(standup_date) DO UPDATE SET
-            canceled=1,
-            reason=excluded.reason,
-            reschedule_date=excluded.reschedule_date
-    """, (d.isoformat(), reason, reschedule_date))
     con.commit()
     con.close()
 
@@ -139,6 +109,35 @@ def db_list_chats() -> list[int]:
     return [r[0] for r in rows]
 
 
+def db_get_state(d: date):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT canceled, reason, reschedule_date FROM standup_state WHERE standup_date=?",
+        (d.isoformat(),),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return {"canceled": 0, "reason": None, "reschedule_date": None}
+    return {"canceled": row[0], "reason": row[1], "reschedule_date": row[2]}
+
+
+def db_set_canceled(d: date, reason: str, reschedule_date: str | None = None):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO standup_state (standup_date, canceled, reason, reschedule_date)
+        VALUES (?, 1, ?, ?)
+        ON CONFLICT(standup_date) DO UPDATE SET
+            canceled=1,
+            reason=excluded.reason,
+            reschedule_date=excluded.reschedule_date
+    """, (d.isoformat(), reason, reschedule_date))
+    con.commit()
+    con.close()
+
+
 def db_upsert_reschedule(original_d: date, new_d: date):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -154,22 +153,22 @@ def db_upsert_reschedule(original_d: date, new_d: date):
     con.close()
 
 
-def db_get_due_reschedules(target_day: date) -> list[tuple[str, str]]:
+def db_get_due_reschedules(target_day: date) -> list[str]:
     """
-    Возвращает [(original_date_iso, new_date_iso), ...] для переносов,
-    которые должны быть отправлены сегодня (new_date=today, sent=0).
+    Возвращает список original_date ISO строк, которые должны быть отправлены сегодня
+    (new_date=today, sent=0)
     """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT original_date, new_date
+        SELECT original_date
         FROM standup_reschedules
         WHERE sent=0 AND new_date = ?
         ORDER BY original_date ASC
     """, (target_day.isoformat(),))
     rows = cur.fetchall()
     con.close()
-    return [(r[0], r[1]) for r in rows]
+    return [r[0] for r in rows]
 
 
 def db_mark_reschedules_sent(original_isos: list[str]):
@@ -184,13 +183,8 @@ def db_mark_reschedules_sent(original_isos: list[str]):
     con.commit()
     con.close()
 
+# ---------------- TEXT ----------------
 
-# ----------------- FSM -----------------
-class RescheduleFSM(StatesGroup):
-    waiting_for_date = State()
-
-
-# ----------------- ТЕКСТЫ -----------------
 DAY_RU = {
     0: "понедельник",
     2: "среда",
@@ -213,19 +207,14 @@ GREETINGS = [
 def today_label_ru(d: date) -> str:
     return DAY_RU.get(d.weekday(), "сегодня")
 
-def build_text(
-    today_d: date,
-    rescheduled_from: list[date] | None = None,
-) -> str:
+def build_text(today_d: date, rescheduled_from: list[date] | None):
     greet = random.choice(GREETINGS)
     dow = today_label_ru(today_d)
 
     extra = ""
     if rescheduled_from:
         items = ", ".join(x.strftime("%d.%m.%y") for x in rescheduled_from)
-        extra = (
-            f"\n\n📌 <b>Также сегодня пройдёт перенесённая планёрка</b> (перенос(ы) с дат: {items})."
-        )
+        extra = f"\n\n📌 <b>Также сегодня пройдёт перенесённая планёрка</b> (перенос(ы) с дат: {items})."
 
     return (
         f"{greet}\n\n"
@@ -235,22 +224,20 @@ def build_text(
         f"Если нужно — можно отменить/перенести ниже 👇"
     )
 
+# ---------------- KEYBOARDS ----------------
 
-# ----------------- КЛАВИАТУРЫ -----------------
 def kb_cancel_menu():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Отменить/перенести планёрку 🧩", callback_data="cancel:open")
-    kb.adjust(1)
-    return kb.as_markup()
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Отменить/перенести планёрку 🧩", callback_data="cancel:open")]
+    ])
 
 def kb_cancel_options():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="1) Нет срочных тем 💤", callback_data="cancel:reason:no_topics")
-    kb.button(text="2) Технические причины 🛠️", callback_data="cancel:reason:tech")
-    kb.button(text="3) Перенести на другой день 📆", callback_data="cancel:reason:move")
-    kb.button(text="4) Не отменять ✅", callback_data="cancel:close")
-    kb.adjust(1)
-    return kb.as_markup()
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1) Нет срочных тем 💤", callback_data="cancel:reason:no_topics")],
+        [InlineKeyboardButton("2) Технические причины 🛠️", callback_data="cancel:reason:tech")],
+        [InlineKeyboardButton("3) Перенести на другой день 📆", callback_data="cancel:reason:move")],
+        [InlineKeyboardButton("4) Не отменять ✅", callback_data="cancel:close")],
+    ])
 
 def next_mon_wed_fri(from_d: date, count=3):
     res = []
@@ -262,311 +249,282 @@ def next_mon_wed_fri(from_d: date, count=3):
     return res
 
 def kb_reschedule_dates(from_d: date):
-    kb = InlineKeyboardBuilder()
     options = next_mon_wed_fri(from_d, count=3)
+    rows = []
     for d in options:
         label = f"{DAY_RU.get(d.weekday(), '')[:2].upper()} {d.strftime('%d.%m.%y')}"
-        kb.button(text=label, callback_data=f"reschedule:pick:{d.strftime('%d.%m.%y')}")
-    kb.button(text="Ввести дату (ДД.ММ.ГГ) ✍️", callback_data="reschedule:manual")
-    kb.button(text="Назад ↩️", callback_data="cancel:open")
-    kb.adjust(1)
-    return kb.as_markup()
+        rows.append([InlineKeyboardButton(label, callback_data=f"reschedule:pick:{d.strftime('%d.%m.%y')}")])
 
+    rows.append([InlineKeyboardButton("Ввести дату (ДД.ММ.ГГ) ✍️", callback_data="reschedule:manual")])
+    rows.append([InlineKeyboardButton("Назад ↩️", callback_data="cancel:open")])
+    return InlineKeyboardMarkup(rows)
 
-# ----------------- ПРОВЕРКА АДМИНА -----------------
-async def is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in ("administrator", "creator")
-    except Exception:
+# ---------------- ADMIN CHECK ----------------
+
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not update.effective_chat or not update.effective_user:
         return False
 
+    member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+    return member.status in ("administrator", "creator")
 
-# ----------------- HELPERS -----------------
-def parse_ddmmyy_to_date(s: str) -> date:
-    dd, mm, yy = s.split(".")
-    return date(int("20" + yy), int(mm), int(dd))
+# ---------------- MANUAL RESCHEDULE STATE ----------------
 
-def date_to_ddmmyy(d: date) -> str:
-    return d.strftime("%d.%m.%y")
+WAITING_DATE_FLAG = "waiting_reschedule_date"
 
+# ---------------- JOB 09:15 ----------------
 
-# ----------------- РАССЫЛКА В 09:15 (ЕДИНАЯ) -----------------
-async def send_915_notification(bot: Bot):
-    """
-    Единая отправка в 09:15 МСК каждый день:
-      - если сегодня ПН/СР/ПТ и не отменено -> стандарт
-      - если сегодня есть переносы (new_date=today) -> переносы
-      - если и то, и то -> одно объединённое сообщение (без дублей)
-    """
-    today_d = datetime.now().date()
+async def send_915(context: ContextTypes.DEFAULT_TYPE):
+    today_d = datetime.now(MOSCOW_TZ).date()
 
     chat_ids = db_list_chats()
     if not chat_ids:
         logger.warning("No chats for notifications. Add via /setchat.")
         return
 
-    # что должно уйти сегодня?
     weekday_due = today_d.weekday() in (0, 2, 4)
     state = db_get_state(today_d)
     standard_due = weekday_due and state["canceled"] != 1
 
-    due_reschedules = db_get_due_reschedules(today_d)  # [(orig_iso, new_iso)]
-    reschedule_due = len(due_reschedules) > 0
+    due_orig_isos = db_get_due_reschedules(today_d)
+    reschedule_due = len(due_orig_isos) > 0
 
     if not standard_due and not reschedule_due:
         logger.info("09:15: nothing to send today (%s)", today_d.isoformat())
         return
 
-    # если есть переносы — собираем даты-источники
     resched_from_dates: list[date] = []
-    resched_original_isos: list[str] = []
     if reschedule_due:
-        for orig_iso, _new_iso in due_reschedules:
-            resched_original_isos.append(orig_iso)
+        for orig_iso in due_orig_isos:
             try:
                 resched_from_dates.append(date.fromisoformat(orig_iso))
             except Exception:
                 pass
 
-    # одно сообщение:
-    # - если есть переносы, вшиваем их в текст (и для случая "только переносы", и для "и то и то")
-    text = build_text(
-        today_d=today_d,
-        rescheduled_from=resched_from_dates if reschedule_due else None,
-    )
+    text = build_text(today_d, resched_from_dates if reschedule_due else None)
 
     for chat_id in chat_ids:
         try:
-            await bot.send_message(
+            await context.bot.send_message(
                 chat_id=chat_id,
                 text=text,
-                parse_mode="HTML",
+                parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=kb_cancel_menu(),
             )
         except Exception as e:
-            logger.exception("Cannot send 09:15 notification to chat_id=%s: %s", chat_id, e)
+            logger.exception("Cannot send 09:15 message to %s: %s", chat_id, e)
 
-    # отметим переносы отправленными (чтобы завтра/после рестарта не повторились)
     if reschedule_due:
-        db_mark_reschedules_sent(resched_original_isos)
+        db_mark_reschedules_sent(due_orig_isos)
 
     logger.info(
         "09:15 sent to %d chats. standard_due=%s reschedules=%d",
-        len(chat_ids), standard_due, len(resched_original_isos)
+        len(chat_ids), standard_due, len(due_orig_isos)
     )
 
+# ---------------- COMMANDS ----------------
 
-# ----------------- ROUTER -----------------
-router = Router()
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong 🏓")
 
-@router.message(Command("ping"))
-async def ping(message: Message):
-    await message.answer("pong 🏓")
-
-@router.message(Command("setchat"))
-async def setchat(message: Message, bot: Bot):
-    if message.chat.type == "private":
-        await message.answer("Эта команда работает только в групповом чате.")
+async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("Эта команда работает только в групповом чате.")
         return
-    if not await is_admin(bot, message.chat.id, message.from_user.id):
-        await message.answer("Только администраторы могут назначить чат для уведомлений.")
+    if not await is_admin(update, context):
+        await update.message.reply_text("Только администраторы могут назначить чат для уведомлений.")
         return
 
-    db_add_chat(message.chat.id)
-    await message.answer("✅ Готово! Этот чат добавлен для уведомлений о планёрке.")
+    db_add_chat(update.effective_chat.id)
+    await update.message.reply_text("✅ Готово! Этот чат добавлен для уведомлений о планёрке.")
 
-@router.message(Command("unsetchat"))
-async def unsetchat(message: Message, bot: Bot):
-    if message.chat.type == "private":
-        await message.answer("Эта команда работает только в групповом чате.")
+async def cmd_unsetchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("Эта команда работает только в групповом чате.")
         return
-    if not await is_admin(bot, message.chat.id, message.from_user.id):
-        await message.answer("Только администраторы могут отключить уведомления.")
-        return
-
-    db_remove_chat(message.chat.id)
-    await message.answer("🧹 Этот чат убран из рассылки уведомлений.")
-
-@router.message(Command("chats"))
-async def chats(message: Message, bot: Bot):
-    if not await is_admin(bot, message.chat.id, message.from_user.id):
-        await message.answer("Только администраторы.")
+    if not await is_admin(update, context):
+        await update.message.reply_text("Только администраторы могут отключить уведомления.")
         return
 
-    ids = db_list_chats()
-    if not ids:
-        await message.answer("Список чатов пуст. Добавь чат командой /setchat.")
+    db_remove_chat(update.effective_chat.id)
+    await update.message.reply_text("🧹 Этот чат убран из рассылки уведомлений.")
+
+async def cmd_test915(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("Недостаточно прав.")
+        return
+    await send_915(context)
+    await update.message.reply_text("Ок, отправил тестовую 09:15-рассылку (по правилам на сегодня).")
+
+# ---------------- CALLBACKS ----------------
+
+async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not await is_admin(update, context):
+        await query.answer("Только администраторы могут отменять/переносить.", show_alert=True)
         return
 
-    await message.answer("Чаты для уведомлений:\n" + "\n".join(str(i) for i in ids))
+    await query.edit_message_reply_markup(reply_markup=kb_cancel_options())
 
-@router.message(Command("test915"))
-async def test915(message: Message, bot: Bot):
-    if not await is_admin(bot, message.chat.id, message.from_user.id):
-        await message.answer("Недостаточно прав.")
-        return
-    await send_915_notification(bot)
-    await message.answer("Ок, отправил тестовую 09:15-рассылку (по правилам на сегодня).")
+async def cb_cancel_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
 
-
-@router.callback_query(F.data == "cancel:open")
-async def cancel_open(cb: CallbackQuery, bot: Bot):
-    if not cb.message:
-        return
-    if not await is_admin(bot, cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Только администраторы могут отменять/переносить.", show_alert=True)
+    if not await is_admin(update, context):
+        await query.answer("Только администраторы.", show_alert=True)
         return
 
-    await cb.message.edit_reply_markup(reply_markup=kb_cancel_options())
-    await cb.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.answer("Ок, не отменяем ✅")
 
-@router.callback_query(F.data == "cancel:close")
-async def cancel_close(cb: CallbackQuery, bot: Bot):
-    if not cb.message:
-        return
-    if not await is_admin(bot, cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Только администраторы.", show_alert=True)
-        return
+async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
 
-    await cb.message.edit_reply_markup(reply_markup=None)
-    await cb.answer("Ок, не отменяем ✅")
-
-@router.callback_query(F.data.startswith("cancel:reason:"))
-async def cancel_reason(cb: CallbackQuery, bot: Bot, state: FSMContext):
-    if not cb.message:
-        return
-    if not await is_admin(bot, cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Только администраторы.", show_alert=True)
+    if not await is_admin(update, context):
+        await query.answer("Только администраторы.", show_alert=True)
         return
 
-    reason_key = cb.data.split(":")[-1]
-    today = datetime.now().date()
+    reason_key = query.data.split(":")[-1]
+    today_d = datetime.now(MOSCOW_TZ).date()
 
     if reason_key == "no_topics":
-        db_set_canceled(today, "Нет срочных тем для обсуждения")
-        await cb.message.edit_reply_markup(reply_markup=None)
-        await bot.send_message(
-            cb.message.chat.id,
-            "✅ Планёрка сегодня отменена.\nПричина: нет срочных тем для обсуждения 💤",
+        db_set_canceled(today_d, "Нет срочных тем для обсуждения")
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="✅ Планёрка сегодня отменена.\nПричина: нет срочных тем для обсуждения 💤",
         )
-        await cb.answer("Отменено.")
+        await query.answer("Отменено.")
         return
 
     if reason_key == "tech":
-        db_set_canceled(today, "Перенос по техническим причинам")
-        await cb.message.edit_reply_markup(reply_markup=None)
-        await bot.send_message(
-            cb.message.chat.id,
-            "✅ Планёрка сегодня отменена/перенесена.\nПричина: технические причины 🛠️",
+        db_set_canceled(today_d, "Перенос по техническим причинам")
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="✅ Планёрка сегодня отменена/перенесена.\nПричина: технические причины 🛠️",
         )
-        await cb.answer("Ок.")
+        await query.answer("Ок.")
         return
 
     if reason_key == "move":
-        await cb.message.edit_reply_markup(reply_markup=kb_reschedule_dates(today))
-        await cb.answer("Выберите дату переноса 📆")
+        await query.edit_message_reply_markup(reply_markup=kb_reschedule_dates(today_d))
+        await query.answer("Выберите дату переноса 📆")
         return
 
-@router.callback_query(F.data.startswith("reschedule:pick:"))
-async def reschedule_pick(cb: CallbackQuery, bot: Bot):
-    if not cb.message:
-        return
-    if not await is_admin(bot, cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Только администраторы.", show_alert=True)
+async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await is_admin(update, context):
+        await query.answer("Только администраторы.", show_alert=True)
         return
 
-    picked = cb.data.split(":")[-1]  # dd.mm.yy
-    today = datetime.now().date()
+    picked = query.data.split(":")[-1]  # DD.MM.YY
+    today_d = datetime.now(MOSCOW_TZ).date()
 
     try:
-        new_d = parse_ddmmyy_to_date(picked)
+        dd, mm, yy = picked.split(".")
+        new_d = date(int("20" + yy), int(mm), int(dd))
     except Exception:
-        await cb.answer("Не смог распознать дату.", show_alert=True)
+        await query.answer("Не смог распознать дату.", show_alert=True)
         return
 
-    # 1) отменяем сегодня
-    db_set_canceled(today, "Перенос на другой день", reschedule_date=picked)
+    db_set_canceled(today_d, "Перенос на другой день", reschedule_date=picked)
+    db_upsert_reschedule(today_d, new_d)
 
-    # 2) сохраняем перенос (отправится автоматически в 09:15 выбранного дня)
-    db_upsert_reschedule(today, new_d)
-
-    await cb.message.edit_reply_markup(reply_markup=None)
-    await bot.send_message(
-        cb.message.chat.id,
-        f"✅ Планёрка сегодня перенесена.\nНовая дата: {picked} 📌\n"
-        f"Уведомление придёт в {picked} в 09:15 (МСК).",
+    await query.edit_message_reply_markup(reply_markup=None)
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
+            f"✅ Планёрка сегодня перенесена.\n"
+            f"Новая дата: {picked} 📌\n"
+            f"Уведомление придёт в {picked} в 09:15 (МСК)."
+        )
     )
-    await cb.answer("Перенесено.")
+    await query.answer("Перенесено.")
 
-@router.callback_query(F.data == "reschedule:manual")
-async def reschedule_manual(cb: CallbackQuery, bot: Bot, state: FSMContext):
-    if not cb.message:
-        return
-    if not await is_admin(bot, cb.message.chat.id, cb.from_user.id):
-        await cb.answer("Только администраторы.", show_alert=True)
+async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await is_admin(update, context):
+        await query.answer("Только администраторы.", show_alert=True)
         return
 
-    await state.set_state(RescheduleFSM.waiting_for_date)
-    await cb.answer()
-    await cb.message.reply("Введите дату переноса в формате ДД.ММ.ГГ (например 22.01.26):")
+    context.chat_data[WAITING_DATE_FLAG] = True
+    await query.answer()
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Введите дату переноса в формате ДД.ММ.ГГ (например 22.01.26):"
+    )
 
-@router.message(RescheduleFSM.waiting_for_date)
-async def reschedule_manual_input(message: Message, bot: Bot, state: FSMContext):
-    if not await is_admin(bot, message.chat.id, message.from_user.id):
-        await message.answer("Только администраторы могут переносить планёрку.")
-        await state.clear()
+# ---------------- MANUAL DATE INPUT ----------------
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
         return
 
-    raw = (message.text or "").strip()
+    if not context.chat_data.get(WAITING_DATE_FLAG):
+        return
+
+    if not await is_admin(update, context):
+        await update.message.reply_text("Только администраторы могут переносить планёрку.")
+        context.chat_data[WAITING_DATE_FLAG] = False
+        return
+
+    raw = (update.message.text or "").strip()
+
     if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", raw):
-        await message.answer("Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
+        await update.message.reply_text("Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
         return
 
     try:
-        new_d = parse_ddmmyy_to_date(raw)
+        dd, mm, yy = raw.split(".")
+        new_d = date(int("20" + yy), int(mm), int(dd))
     except Exception:
-        await message.answer("Похоже, такой даты не существует. Попробуйте ещё раз.")
+        await update.message.reply_text("Похоже, такой даты не существует. Попробуйте ещё раз.")
         return
 
-    today = datetime.now().date()
+    today_d = datetime.now(MOSCOW_TZ).date()
 
-    db_set_canceled(today, "Перенос на другой день", reschedule_date=raw)
-    db_upsert_reschedule(today, new_d)
+    db_set_canceled(today_d, "Перенос на другой день", reschedule_date=raw)
+    db_upsert_reschedule(today_d, new_d)
 
-    await message.answer(
+    context.chat_data[WAITING_DATE_FLAG] = False
+    await update.message.reply_text(
         f"✅ Ок, перенесли планёрку.\nНовая дата: {raw} 📌\n"
         f"Уведомление придёт в {raw} в 09:15 (МСК)."
     )
-    await state.clear()
 
+# ---------------- APP ----------------
 
-# ----------------- MAIN -----------------
-async def main():
+def main():
     db_init()
 
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    scheduler = AsyncIOScheduler(timezone=TZ)
+    # команды
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("setchat", cmd_setchat))
+    app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
+    app.add_handler(CommandHandler("test915", cmd_test915))
 
-    # ЕДИНАЯ рассылка каждый день в 09:15 (МСК)
-    scheduler.add_job(
-        send_915_notification,
-        trigger=CronTrigger(hour=9, minute=15, timezone=TZ),
-        args=[bot],
-        id="standup_915",
-        replace_existing=True,
-        misfire_grace_time=60 * 60,
-    )
+    # callbacks
+    app.add_handler(CallbackQueryHandler(cb_cancel_open, pattern=r"^cancel:open$"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_close, pattern=r"^cancel:close$"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_reason, pattern=r"^cancel:reason:"))
+    app.add_handler(CallbackQueryHandler(cb_reschedule_pick, pattern=r"^reschedule:pick:"))
+    app.add_handler(CallbackQueryHandler(cb_reschedule_manual, pattern=r"^reschedule:manual$"))
 
-    scheduler.start()
-    logger.info("Scheduler started (%s). Job: every day 09:15", TZ)
+    # текст (для ручного ввода даты)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    logger.info("Bot started (polling)")
-    await dp.start_polling(bot)
+    # JobQueue: ежедневная отправка в 09:15 (МСК)
+    # PTB job_queue живёт внутри app.job_queue
+    run_time = dtime(hour=9, minute=15, tzinfo=MOSCOW_TZ)
+    app.job_queue.run_daily(send_915, time=run_time, name="standup_915")
+
+    logger.info("Bot started. Daily job at 09:15 MSK")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
