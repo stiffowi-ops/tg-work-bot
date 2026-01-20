@@ -949,6 +949,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         reply_markup=keyboard,
         parse_mode=ParseMode.HTML
     )
+    return MAIN_HELP_MENU
 
 async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -1304,6 +1305,51 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("👥 Пока нет добавленных сотрудников", show_alert=True)
         return TEAM_MENU
     
+    # Обработка редактирования полей
+    elif query.data.startswith("edit_field_"):
+        config = BotConfig()
+        username = query.from_user.username
+        
+        if not config.is_admin(username):
+            await query.answer("❌ У вас нет прав для редактирования сотрудников", show_alert=True)
+            return EDIT_MEMBER_FIELD
+        
+        field_map = {
+            "edit_field_name": ("👤 Имя", "name"),
+            "edit_field_position": ("💼 Должность", "position"),
+            "edit_field_city": ("🏙️ Город", "city"),
+            "edit_field_year": ("📅 Год в компании", "year"),
+            "edit_field_responsibilities": ("🎯 Ответственность", "responsibilities"),
+            "edit_field_contact_topics": ("💬 Вопросы для обращений", "contact_topics"),
+            "edit_field_about": ("📝 О себе", "about"),
+            "edit_field_telegram": ("📱 Telegram", "telegram")
+        }
+        
+        if query.data in field_map:
+            field_name, field_key = field_map[query.data]
+            context.user_data["edit_field_key"] = field_key
+            context.user_data["edit_field_name"] = field_name
+            
+            member_id = context.user_data.get("edit_member_id")
+            member_data = config.get_team_member(member_id)
+            
+            if member_data:
+                current_value = member_data.get(field_key, "Не указано")
+                
+                await query.edit_message_text(
+                    f"✏️ <b>Редактирование: {field_name}</b>\n\n"
+                    f"Текущее значение: <i>{current_value}</i>\n\n"
+                    f"Введите новое значение:",
+                    parse_mode=ParseMode.HTML
+                )
+                return EDIT_MEMBER_VALUE
+            else:
+                await query.answer("❌ Сотрудник не найден", show_alert=True)
+                return EDIT_MEMBER_FIELD
+        
+        return EDIT_MEMBER_FIELD
+    
+    # Если callback не распознан, возвращаем в главное меню
     keyboard = create_help_keyboard()
     await query.edit_message_text(
         "📋 <b>Главное меню помощи</b>\n\n"
@@ -1589,52 +1635,6 @@ async def handle_add_member_confirm(update: Update, context: ContextTypes.DEFAUL
 
 
 # ========== ОБРАБОТЧИКИ ДЛЯ РЕДАКТИРОВАНИЯ СОТРУДНИКА ==========
-
-async def handle_edit_member_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    
-    config = BotConfig()
-    username = query.from_user.username
-    
-    if not config.is_admin(username):
-        await query.answer("❌ У вас нет прав для редактирования сотрудников", show_alert=True)
-        return EDIT_MEMBER_FIELD
-    
-    field_map = {
-        "edit_field_name": ("👤 Имя", "name"),
-        "edit_field_position": ("💼 Должность", "position"),
-        "edit_field_city": ("🏙️ Город", "city"),
-        "edit_field_year": ("📅 Год в компании", "year"),
-        "edit_field_responsibilities": ("🎯 Ответственность", "responsibilities"),
-        "edit_field_contact_topics": ("💬 Вопросы для обращений", "contact_topics"),
-        "edit_field_about": ("📝 О себе", "about"),
-        "edit_field_telegram": ("📱 Telegram", "telegram")
-    }
-    
-    if query.data in field_map:
-        field_name, field_key = field_map[query.data]
-        context.user_data["edit_field_key"] = field_key
-        context.user_data["edit_field_name"] = field_name
-        
-        member_id = context.user_data.get("edit_member_id")
-        member_data = config.get_team_member(member_id)
-        
-        if member_data:
-            current_value = member_data.get(field_key, "Не указано")
-            
-            await query.edit_message_text(
-                f"✏️ <b>Редактирование: {field_name}</b>\n\n"
-                f"Текущее значение: <i>{current_value}</i>\n\n"
-                f"Введите новое значение:",
-                parse_mode=ParseMode.HTML
-            )
-            return EDIT_MEMBER_VALUE
-        else:
-            await query.answer("❌ Сотрудник не найден", show_alert=True)
-            return EDIT_MEMBER_FIELD
-    
-    return EDIT_MEMBER_FIELD
 
 async def handle_edit_member_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.message:
@@ -2701,104 +2701,145 @@ def main() -> None:
     try:
         application = Application.builder().token(TOKEN).build()
 
-        # ConversationHandler для помощи
+        # Упрощенный ConversationHandler для помощи
         help_conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler("help", help_command),
             ],
             states={
                 MAIN_HELP_MENU: [
-                    CallbackQueryHandler(handle_help_callback),
+                    CallbackQueryHandler(handle_help_callback, pattern="^help_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^file_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^link_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_member_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^add_file$"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_file_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^no_members$"),
                 ],
                 
                 DOCUMENTS_MENU: [
-                    CallbackQueryHandler(handle_help_callback),
+                    CallbackQueryHandler(handle_help_callback, pattern="^help_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^file_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^add_file$"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_file_"),
                 ],
+                
                 ADD_FILE_NAME: [
                     MessageHandler(filters.Document.ALL, handle_file_upload),
                     CommandHandler("cancel", cancel_upload),
                 ],
+                
                 ADD_FILE_DESCRIPTION: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_file_description),
                     CommandHandler("cancel", cancel_upload),
                 ],
+                
                 DELETE_FILE_MENU: [
-                    CallbackQueryHandler(handle_help_callback),
+                    CallbackQueryHandler(handle_help_callback, pattern="^help_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_file_"),
                 ],
                 
                 LINKS_MENU: [
-                    CallbackQueryHandler(handle_help_callback),
+                    CallbackQueryHandler(handle_help_callback, pattern="^help_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^link_"),
                 ],
                 
                 TEAM_MENU: [
-                    CallbackQueryHandler(handle_help_callback),
+                    CallbackQueryHandler(handle_help_callback, pattern="^help_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_member_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_management$"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^no_members$"),
                 ],
                 
                 SETTINGS_MENU: [
-                    CallbackQueryHandler(handle_help_callback),
+                    CallbackQueryHandler(handle_help_callback, pattern="^help_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_file_menu$"),
                 ],
                 
                 TEAM_MANAGEMENT: [
-                    CallbackQueryHandler(handle_help_callback),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^help_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^add_member_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_member_select_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_confirm_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^edit_member_select_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^edit_field_"),
                 ],
                 
                 ADD_MEMBER_NAME: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_name),
                     CommandHandler("cancel", cancel_upload),
                 ],
+                
                 ADD_MEMBER_POSITION: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_position),
                     CommandHandler("cancel", cancel_upload),
                 ],
+                
                 ADD_MEMBER_CITY: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_city),
                     CommandHandler("cancel", cancel_upload),
                 ],
+                
                 ADD_MEMBER_YEAR: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_year),
                     CommandHandler("cancel", cancel_upload),
                 ],
+                
                 ADD_MEMBER_RESPONSIBILITIES: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_responsibilities),
                     CommandHandler("cancel", cancel_upload),
                 ],
+                
                 ADD_MEMBER_CONTACT_TOPICS: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_contact_topics),
                     CommandHandler("cancel", cancel_upload),
                 ],
+                
                 ADD_MEMBER_ABOUT: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_about),
                     CommandHandler("cancel", cancel_upload),
                 ],
+                
                 ADD_MEMBER_TELEGRAM: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_member_telegram),
                     CommandHandler("cancel", cancel_upload),
                 ],
+                
                 ADD_MEMBER_CONFIRM: [
-                    CallbackQueryHandler(handle_add_member_confirm),
+                    CallbackQueryHandler(handle_add_member_confirm, pattern="^add_member_"),
                 ],
                 
                 EDIT_MEMBER_MENU: [
-                    CallbackQueryHandler(handle_help_callback),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^edit_member_select_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^edit_field_"),
                 ],
+                
                 EDIT_MEMBER_FIELD: [
-                    CallbackQueryHandler(handle_edit_member_field),
+                    CallbackQueryHandler(handle_help_callback, pattern="^edit_field_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_"),
                 ],
+                
                 EDIT_MEMBER_VALUE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_member_value),
                     CommandHandler("cancel", cancel_upload),
                 ],
                 
                 DELETE_MEMBER_MENU: [
-                    CallbackQueryHandler(handle_help_callback),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_member_select_"),
+                    CallbackQueryHandler(handle_help_callback, pattern="^team_"),
                 ],
+                
                 DELETE_MEMBER_CONFIRM: [
-                    CallbackQueryHandler(handle_help_callback),
+                    CallbackQueryHandler(handle_help_callback, pattern="^delete_confirm_"),
                 ],
             },
             fallbacks=[
                 CommandHandler("cancel", cancel_upload),
             ],
+            name="help_conversation",
+            persistent=False,
         )
 
         # ConversationHandler для отмены и переноса встреч
@@ -2836,11 +2877,14 @@ def main() -> None:
         application.add_handler(CommandHandler("testplanerka", test_planerka))
         application.add_handler(CommandHandler("jobs", list_jobs))
         
-        # Добавляем ConversationHandler для помощи
+        # Добавляем ConversationHandler для помощи ПЕРВЫМ
         application.add_handler(help_conv_handler)
         
         # Добавляем ConversationHandler для отмены встреч
         application.add_handler(cancel_conv_handler)
+        
+        # Отдельный обработчик для callback-запросов, которые не попадают в ConversationHandler
+        application.add_handler(CallbackQueryHandler(handle_help_callback, pattern=".*"))
         
         # Добавляем обработчик новых участников чата для приветствия
         application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
