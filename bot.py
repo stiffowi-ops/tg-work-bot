@@ -109,11 +109,13 @@ def db_init():
         )
     """)
 
+    # добавили description (для новых БД)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS docs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category_id INTEGER NOT NULL,
             title TEXT NOT NULL,
+            description TEXT,
             file_id TEXT NOT NULL,
             file_unique_id TEXT,
             mime_type TEXT,
@@ -121,6 +123,13 @@ def db_init():
             FOREIGN KEY(category_id) REFERENCES doc_categories(id) ON DELETE CASCADE
         )
     """)
+
+    # миграция для старых БД: добавить description, если поля нет
+    try:
+        cur.execute("ALTER TABLE docs ADD COLUMN description TEXT")
+    except sqlite3.OperationalError:
+        # колонка уже существует или другая причина — игнорируем
+        pass
 
     # ------- HELP MENU: анкеты -------
     cur.execute("""
@@ -310,22 +319,29 @@ def db_docs_get(doc_id: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
-        "SELECT id, category_id, title, file_id, mime_type FROM docs WHERE id=?",
+        "SELECT id, category_id, title, description, file_id, mime_type FROM docs WHERE id=?",
         (doc_id,),
     )
     row = cur.fetchone()
     con.close()
     if not row:
         return None
-    return {"id": row[0], "category_id": row[1], "title": row[2], "file_id": row[3], "mime": row[4]}
+    return {
+        "id": row[0],
+        "category_id": row[1],
+        "title": row[2],
+        "description": row[3],
+        "file_id": row[4],
+        "mime": row[5],
+    }
 
-def db_docs_add_doc(category_id: int, title: str, file_id: str, file_unique_id: str | None, mime_type: str | None) -> int:
+def db_docs_add_doc(category_id: int, title: str, description: str | None, file_id: str, file_unique_id: str | None, mime_type: str | None) -> int:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        INSERT INTO docs(category_id, title, file_id, file_unique_id, mime_type, uploaded_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (category_id, title.strip(), file_id, file_unique_id, mime_type, datetime.utcnow().isoformat()))
+        INSERT INTO docs(category_id, title, description, file_id, file_unique_id, mime_type, uploaded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (category_id, title.strip(), (description or "").strip() or None, file_id, file_unique_id, mime_type, datetime.utcnow().isoformat()))
     con.commit()
     did = cur.lastrowid
     con.close()
@@ -493,8 +509,9 @@ WAITING_USER_ID = "waiting_user_id"
 WAITING_SINCE_TS = "waiting_since_ts"
 WAITING_MEETING_TYPE = "waiting_meeting_type"
 
-# docs add flow
+# docs add flow (добавили WAITING_DOC_DESC)
 WAITING_DOC_UPLOAD = "waiting_doc_upload"
+WAITING_DOC_DESC = "waiting_doc_desc"
 PENDING_DOC_INFO = "pending_doc_info"
 WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
 
@@ -511,6 +528,7 @@ def clear_waiting_date(context: ContextTypes.DEFAULT_TYPE):
 
 def clear_docs_flow(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DOC_UPLOAD] = False
+    context.chat_data[WAITING_DOC_DESC] = False
     context.chat_data.pop(PENDING_DOC_INFO, None)
     context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
 
@@ -609,7 +627,6 @@ def help_text_main(bot_username: str) -> str:
         "— 👥 Познакомиться с командой\n\n"
     )
 
-# ✅ теперь можно скрывать "⚙️ Настройки" (например в ЛС)
 def kb_help_main(include_settings: bool = True):
     rows = [
         [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
@@ -643,18 +660,49 @@ def kb_help_docs_files(category_id: int):
     rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
-def kb_help_links():
-    rows = []
+# -------- LINKS (меню + описания) --------
+
+def get_links_catalog() -> dict[str, dict]:
+    """
+    key -> {title, url, desc}
+    """
+    catalog = {}
     if YA_CRM_URL:
-        rows.append([InlineKeyboardButton("🌐 YA CRM", url=YA_CRM_URL)])
+        catalog["ya_crm"] = {
+            "title": "🌐 YA CRM",
+            "url": YA_CRM_URL,
+            "desc": "CRM-система для работы с заявками, задачами и клиентскими данными.",
+        }
     if INDUSTRY_WIKI_URL:
-        rows.append([InlineKeyboardButton("📊 WIKI Отрасли (презы и спичи)", url=INDUSTRY_WIKI_URL)])
+        catalog["industry_wiki"] = {
+            "title": "📊 WIKI Отрасли (презы и спичи)",
+            "url": INDUSTRY_WIKI_URL,
+            "desc": "Материалы по отрасли: презентации, спичи и полезные справки.",
+        }
     if HELPY_BOT_URL:
-        rows.append([InlineKeyboardButton("🛠️ Бот Helpy", url=HELPY_BOT_URL)])
-    if not rows:
+        catalog["helpy_bot"] = {
+            "title": "🛠️ Бот Helpy",
+            "url": HELPY_BOT_URL,
+            "desc": "Бот поможет с техническими вопросами, связанными с работой.",
+        }
+    return catalog
+
+def kb_help_links_menu():
+    catalog = get_links_catalog()
+    rows = []
+    if not catalog:
         rows.append([InlineKeyboardButton("— ссылки не настроены —", callback_data="noop")])
+    else:
+        for key, item in catalog.items():
+            rows.append([InlineKeyboardButton(item["title"], callback_data=f"help:links:item:{key}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
+
+def kb_help_link_card(url: str, back_to: str = "help:links"):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Открыть ссылку", url=url)],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=back_to)],
+    ])
 
 def kb_help_team(is_admin_user: bool):
     people = db_profiles_list()
@@ -718,6 +766,7 @@ def kb_pick_category_for_new_doc():
 def kb_pick_doc_to_delete():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
+    # показываем title (без desc) — desc увидят при просмотре
     cur.execute("""
         SELECT d.id, c.title, d.title
         FROM docs d
@@ -771,13 +820,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
-# ✅ /help: в группе пытаемся отправить в ЛС. Если получилось — молчим в чате.
+# /help: в группе пытаемся отправить в ЛС. Если получилось — молчим в чате.
 # Если ЛС закрыта — пишем уведомление в чат и удаляем через минуту.
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main(bot_username)
 
-    # если команда в личке — показываем меню (без настроек)
     if update.effective_chat and update.effective_chat.type == "private":
         await update.message.reply_text(
             text,
@@ -787,7 +835,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # если команда в группе — пытаемся в ЛС
     user_id = update.effective_user.id if update.effective_user else None
     if user_id:
         try:
@@ -798,7 +845,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_help_main(include_settings=False),
                 disable_web_page_preview=True,
             )
-            return  # успех — ничего в чат
+            return
         except Forbidden:
             warn_text = (
                 "⚠️ Я не могу написать вам в ЛС.\n"
@@ -818,7 +865,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.exception("Failed to DM /help: %s", e)
 
-    # fallback: если не получилось — показываем меню в группе (без настроек, чтобы не ломать логику)
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
@@ -827,7 +873,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_to_message_id=update.message.message_id,
     )
 
-# ✅ НОВОЕ: /help_admin — админское меню в группе (без ЛС)
+# /help_admin — админское меню в группе (без ЛС)
 async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main(bot_username)
@@ -1120,10 +1166,14 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Файл не найден (возможно удалён).", reply_markup=kb_help_main(include_settings=include_settings))
             return
         try:
+            caption = f"📄 <b>{doc['title']}</b>"
+            if doc.get("description"):
+                caption += f"\n\n{doc['description']}"
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
                 document=doc["file_id"],
-                caption=f"📄 {doc['title']}",
+                caption=caption,
+                parse_mode=ParseMode.HTML,
             )
         except Exception as e:
             logger.exception("send_document failed: %s", e)
@@ -1133,9 +1183,30 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "help:links":
         text = (
             "🔗 <b>Полезные ссылки</b>\n\n"
-            "Быстрый доступ к нужным ресурсам:"
+            "Выберите ресурс — покажу описание и дам кнопку «Открыть»."
         )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_links(), disable_web_page_preview=True)
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_links_menu(), disable_web_page_preview=True)
+        return
+
+    if data.startswith("help:links:item:"):
+        key = data.split(":")[-1]
+        catalog = get_links_catalog()
+        item = catalog.get(key)
+        if not item:
+            await q.answer("Ссылка не найдена.", show_alert=True)
+            return
+
+        text = (
+            f"{item['title']}\n\n"
+            f"{item['desc']}\n\n"
+            f"Ссылка: {item['url']}"
+        )
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_link_card(item["url"], back_to="help:links"),
+            disable_web_page_preview=True,
+        )
         return
 
     if data == "help:team":
@@ -1161,15 +1232,12 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:settings":
-        # В ЛС настройки не открываем (работают через /help_admin в группе)
         if is_private:
             await q.answer("⚠️ Настройки доступны только в групповом чате через /help_admin.", show_alert=True)
             return
-
         if not is_adm:
             await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
             return
-
         text = (
             "⚙️ <b>Настройки</b>\n\n"
             "Управление документами, категориями и анкетами."
@@ -1243,13 +1311,15 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "help:settings:add_doc":
             clear_docs_flow(context)
             context.chat_data[WAITING_DOC_UPLOAD] = True
+            context.chat_data[WAITING_DOC_DESC] = False
             context.chat_data[WAITING_USER_ID] = update.effective_user.id
             context.chat_data[WAITING_SINCE_TS] = int(time.time())
             await q.edit_message_text(
                 "➕ <b>Добавление файла</b>\n\n"
-                "Отправьте документ (как файл) следующим сообщением.\n"
-                "После этого выберем категорию.\n\n"
-                "Название можно указать в подписи к файлу (caption).",
+                "1) Отправьте документ (как файл) следующим сообщением.\n"
+                "   • Название можно указать в подписи к файлу (caption)\n"
+                "2) Затем бот попросит краткое описание\n"
+                "3) Потом выберем категорию",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_cancel_wizard_settings(),
             )
@@ -1280,7 +1350,14 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not pending:
                 await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
                 return
-            db_docs_add_doc(cid, pending["title"], pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
+            db_docs_add_doc(
+                cid,
+                pending["title"],
+                pending.get("description"),
+                pending["file_id"],
+                pending.get("file_unique_id"),
+                pending.get("mime"),
+            )
             clear_docs_flow(context)
             await q.edit_message_text("✅ Файл добавлен в документы.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
             return
@@ -1368,16 +1445,23 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "file_unique_id": doc.file_unique_id,
         "mime": doc.mime_type,
         "title": title[:120],
+        "description": None,
     }
     context.chat_data[PENDING_DOC_INFO] = pending
     context.chat_data[WAITING_DOC_UPLOAD] = False
 
+    # теперь просим описание
+    context.chat_data[WAITING_DOC_DESC] = True
+
     await update.message.reply_text(
-        "✅ Файл получен.\n\nТеперь выберите категорию для сохранения:",
-        reply_markup=kb_pick_category_for_new_doc(),
+        "✍️ <b>Краткое описание</b>\n\n"
+        "Отправьте 1–2 предложения, чтобы коллегам было понятно, что внутри.\n"
+        "Если описания не нужно — отправьте <code>-</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_cancel_wizard_settings(),
     )
 
-# ---------------- HANDLERS: TEXT INPUT (dates / categories / profiles) ----------------
+# ---------------- HANDLERS: TEXT INPUT (dates / categories / profiles / doc desc) ----------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
@@ -1396,6 +1480,37 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_docs_flow(context)
         clear_profile_wiz(context)
         await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help_admin.")
+        return
+
+    # ---- описание документа ----
+    if context.chat_data.get(WAITING_DOC_DESC):
+        if not await is_admin(update, context):
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут добавлять документы.")
+            return
+
+        pending = context.chat_data.get(PENDING_DOC_INFO)
+        if not pending:
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Не найден загруженный файл. Начните заново через /help_admin.")
+            return
+
+        desc = None if text == "-" else text
+        if desc is not None:
+            desc = desc.strip()
+            if len(desc) < 3:
+                await update.message.reply_text("❌ Описание слишком короткое. Напишите чуть подробнее или отправьте <code>-</code>.", parse_mode=ParseMode.HTML)
+                return
+            desc = desc[:600]
+
+        pending["description"] = desc
+        context.chat_data[PENDING_DOC_INFO] = pending
+        context.chat_data[WAITING_DOC_DESC] = False
+
+        await update.message.reply_text(
+            "✅ Описание сохранено.\n\nТеперь выберите категорию для сохранения:",
+            reply_markup=kb_pick_category_for_new_doc(),
+        )
         return
 
     # перенос даты вручную
@@ -1451,7 +1566,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending = context.chat_data.get(PENDING_DOC_INFO)
         if pending:
-            db_docs_add_doc(cid, pending["title"], pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
+            db_docs_add_doc(
+                cid,
+                pending["title"],
+                pending.get("description"),
+                pending["file_id"],
+                pending.get("file_unique_id"),
+                pending.get("mime"),
+            )
             clear_docs_flow(context)
             await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
             return
@@ -1563,7 +1685,7 @@ def main():
     # commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("help_admin", cmd_help_admin))  # ✅ добавили
+    app.add_handler(CommandHandler("help_admin", cmd_help_admin))
     app.add_handler(CommandHandler("setchat", cmd_setchat))
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
     app.add_handler(CommandHandler("force_standup", cmd_force_standup))
