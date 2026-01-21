@@ -37,6 +37,10 @@ ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
 INDUSTRY_ZOOM_URL = os.getenv("INDUSTRY_ZOOM_URL")  # отраслевая
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
+YA_CRM_URL = os.getenv("YA_CRM_URL", "")
+INDUSTRY_WIKI_URL = os.getenv("INDUSTRY_WIKI_URL", "")
+HELPY_BOT_URL = os.getenv("HELPY_BOT_URL", "")
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 if not ZOOM_URL:
@@ -55,6 +59,7 @@ def db_init():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
 
+    # рассылочные чаты
     cur.execute("""
         CREATE TABLE IF NOT EXISTS notify_chats (
             chat_id INTEGER PRIMARY KEY,
@@ -62,7 +67,7 @@ def db_init():
         )
     """)
 
-    # meeting_type: standup | industry
+    # состояния встреч
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meeting_state (
             meeting_type TEXT NOT NULL,
@@ -74,7 +79,7 @@ def db_init():
         )
     """)
 
-    # reschedule: original_date -> new_date
+    # переносы встреч
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meeting_reschedules (
             meeting_type TEXT NOT NULL,
@@ -86,10 +91,47 @@ def db_init():
         )
     """)
 
+    # мета
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+    """)
+
+    # ------- HELP MENU: документы -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS doc_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS docs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            file_id TEXT NOT NULL,
+            file_unique_id TEXT,
+            mime_type TEXT,
+            uploaded_at TEXT NOT NULL,
+            FOREIGN KEY(category_id) REFERENCES doc_categories(id) ON DELETE CASCADE
+        )
+    """)
+
+    # ------- HELP MENU: анкеты -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL,
+            year_start INTEGER NOT NULL,
+            city TEXT NOT NULL,
+            about TEXT NOT NULL,
+            topics TEXT NOT NULL,
+            tg_link TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
     """)
 
@@ -217,7 +259,140 @@ def db_mark_reschedules_sent(meeting_type: str, original_isos: list[str]):
     con.commit()
     con.close()
 
-# ---------------- TEXT ----------------
+# ---------------- HELP DB: DOCS ----------------
+
+def db_docs_list_categories() -> list[tuple[int, str]]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id, title FROM doc_categories ORDER BY title COLLATE NOCASE ASC")
+    rows = cur.fetchall()
+    con.close()
+    return [(r[0], r[1]) for r in rows]
+
+def db_docs_add_category(title: str) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO doc_categories(title, created_at) VALUES (?, ?)",
+        (title.strip(), datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    cid = cur.lastrowid
+    con.close()
+    return cid
+
+def db_docs_delete_category_if_empty(category_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM docs WHERE category_id=?", (category_id,))
+    cnt = cur.fetchone()[0]
+    if cnt != 0:
+        con.close()
+        return False
+    cur.execute("DELETE FROM doc_categories WHERE id=?", (category_id,))
+    con.commit()
+    con.close()
+    return True
+
+def db_docs_list_by_category(category_id: int) -> list[tuple[int, str]]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT id, title FROM docs WHERE category_id=? ORDER BY id DESC",
+        (category_id,),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [(r[0], r[1]) for r in rows]
+
+def db_docs_get(doc_id: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT id, category_id, title, file_id, mime_type FROM docs WHERE id=?",
+        (doc_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {"id": row[0], "category_id": row[1], "title": row[2], "file_id": row[3], "mime": row[4]}
+
+def db_docs_add_doc(category_id: int, title: str, file_id: str, file_unique_id: str | None, mime_type: str | None) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO docs(category_id, title, file_id, file_unique_id, mime_type, uploaded_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (category_id, title.strip(), file_id, file_unique_id, mime_type, datetime.utcnow().isoformat()))
+    con.commit()
+    did = cur.lastrowid
+    con.close()
+    return did
+
+def db_docs_delete_doc(doc_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM docs WHERE id=?", (doc_id,))
+    deleted = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return deleted
+
+# ---------------- HELP DB: PROFILES ----------------
+
+def db_profiles_list() -> list[tuple[int, str]]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id, full_name FROM profiles ORDER BY full_name COLLATE NOCASE ASC")
+    rows = cur.fetchall()
+    con.close()
+    return [(r[0], r[1]) for r in rows]
+
+def db_profiles_get(pid: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, full_name, year_start, city, about, topics, tg_link
+        FROM profiles
+        WHERE id=?
+    """, (pid,))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "full_name": row[1],
+        "year_start": row[2],
+        "city": row[3],
+        "about": row[4],
+        "topics": row[5],
+        "tg_link": row[6],
+    }
+
+def db_profiles_add(full_name: str, year_start: int, city: str, about: str, topics: str, tg_link: str) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO profiles(full_name, year_start, city, about, topics, tg_link, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (full_name.strip(), int(year_start), city.strip(), about.strip(), topics.strip(), tg_link.strip(), datetime.utcnow().isoformat()))
+    con.commit()
+    pid = cur.lastrowid
+    con.close()
+    return pid
+
+def db_profiles_delete(pid: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM profiles WHERE id=?", (pid,))
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+# ---------------- TEXT (meetings) ----------------
 
 DAY_RU_UPPER = {
     0: "ПОНЕДЕЛЬНИК",
@@ -242,7 +417,6 @@ STANDUP_GREETINGS = [
     "Врываемся в день мягко, но уверенно 😄☀️",
 ]
 
-
 def build_standup_text(today_d: date, zoom_url: str) -> str:
     greet = random.choice(STANDUP_GREETINGS)
     dow = DAY_RU_UPPER.get(today_d.weekday(), "СЕГОДНЯ")
@@ -254,7 +428,6 @@ def build_standup_text(today_d: date, zoom_url: str) -> str:
         f"Если нужно — можно отменить/перенести ниже 👇"
     )
 
-
 def build_industry_text(industry_zoom_url: str) -> str:
     return (
         "Коллеги, привет! ☕️✨\n"
@@ -264,13 +437,12 @@ def build_industry_text(industry_zoom_url: str) -> str:
         "Если нужно — можно отменить/перенести ниже 👇"
     )
 
-# ---------------- KEYBOARDS ----------------
+# ---------------- KEYBOARDS (meetings) ----------------
 
 def kb_cancel_menu(meeting_type: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Отменить/перенести 🧩", callback_data=f"cancel:open:{meeting_type}")]
     ])
-
 
 def kb_cancel_options(meeting_type: str):
     return InlineKeyboardMarkup([
@@ -280,7 +452,6 @@ def kb_cancel_options(meeting_type: str):
         [InlineKeyboardButton("Не отменять ✅", callback_data=f"cancel:close:{meeting_type}")],
     ])
 
-
 def next_mon_wed_fri(from_d: date, count=3):
     res = []
     d = from_d + timedelta(days=1)
@@ -289,7 +460,6 @@ def next_mon_wed_fri(from_d: date, count=3):
             res.append(d)
         d += timedelta(days=1)
     return res
-
 
 def kb_reschedule_dates(meeting_type: str, from_d: date):
     options = next_mon_wed_fri(from_d, count=3)
@@ -301,7 +471,6 @@ def kb_reschedule_dates(meeting_type: str, from_d: date):
     rows.append([InlineKeyboardButton("Ввести дату вручную ✍️", callback_data=f"reschedule:manual:{meeting_type}")])
     rows.append([InlineKeyboardButton("Назад ↩️", callback_data=f"cancel:open:{meeting_type}")])
     return InlineKeyboardMarkup(rows)
-
 
 def kb_manual_input_controls(meeting_type: str):
     return InlineKeyboardMarkup([
@@ -316,28 +485,48 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
     return member.status in ("administrator", "creator")
 
-# ---------------- MANUAL INPUT STATE ----------------
-
+# ---------------- STATES ----------------
+# meeting reschedule manual
 WAITING_DATE_FLAG = "waiting_reschedule_date"
 WAITING_USER_ID = "waiting_user_id"
 WAITING_SINCE_TS = "waiting_since_ts"
 WAITING_MEETING_TYPE = "waiting_meeting_type"
 
+# docs add flow
+WAITING_DOC_UPLOAD = "waiting_doc_upload"
+PENDING_DOC_INFO = "pending_doc_info"  # dict with file_id, file_unique_id, title, mime
+WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
+WAITING_DELETE_CATEGORY_PICK = "waiting_delete_category_pick"
 
-def clear_waiting(context: ContextTypes.DEFAULT_TYPE):
+# profiles add flow
+PROFILE_WIZ_ACTIVE = "profile_wiz_active"
+PROFILE_WIZ_STEP = "profile_wiz_step"
+PROFILE_WIZ_DATA = "profile_wiz_data"  # dict
+
+def clear_waiting_date(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DATE_FLAG] = False
     context.chat_data.pop(WAITING_USER_ID, None)
     context.chat_data.pop(WAITING_SINCE_TS, None)
     context.chat_data.pop(WAITING_MEETING_TYPE, None)
 
+def clear_docs_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[WAITING_DOC_UPLOAD] = False
+    context.chat_data.pop(PENDING_DOC_INFO, None)
+    context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
+    context.chat_data[WAITING_DELETE_CATEGORY_PICK] = False
+
+def clear_profile_wiz(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[PROFILE_WIZ_ACTIVE] = False
+    context.chat_data.pop(PROFILE_WIZ_STEP, None)
+    context.chat_data.pop(PROFILE_WIZ_DATA, None)
+
 # ---------------- DUE RULES ----------------
 
 def standup_due_on_weekday(d: date) -> bool:
-    return d.weekday() in (0, 2, 4)  # ПН/СР/ПТ
-
+    return d.weekday() in (0, 2, 4)
 
 def industry_due_on_weekday(d: date) -> bool:
-    return d.weekday() == 1  # ВТ
+    return d.weekday() == 1
 
 # ---------------- CORE SENDERS ----------------
 
@@ -363,10 +552,7 @@ async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_
     due_orig_isos = db_get_due_reschedules(meeting_type, today_d)
     reschedule_due = len(due_orig_isos) > 0
 
-    # --- "железобетон" для отраслевой ---
-    # Если сегодня обычный вторник и есть переносы на сегодня,
-    # мы отправляем ОДНО стандартное уведомление,
-    # а переносы сразу помечаем sent=1 (чтобы не было "хвостов").
+    # "железобетон" для отраслевой — переносы на обычный вторник не создают отдельной логики
     if meeting_type == MEETING_INDUSTRY and standard_due and reschedule_due:
         db_mark_reschedules_sent(meeting_type, due_orig_isos)
         due_orig_isos = []
@@ -392,7 +578,6 @@ async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_
         except Exception as e:
             logger.exception("Cannot send %s to %s: %s", meeting_type, chat_id, e)
 
-    # если отправили из-за переносов — помечаем их sent
     if reschedule_due:
         db_mark_reschedules_sent(meeting_type, due_orig_isos)
 
@@ -400,27 +585,185 @@ async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_
 
 
 async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Надёжно по Москве:
-    - Планёрка: 09:15
-    - Отраслевая: 11:30
-    """
     now_msk = datetime.now(MOSCOW_TZ)
     today_iso = now_msk.date().isoformat()
 
-    # Планёрка 09:15
     if now_msk.hour == 9 and now_msk.minute == 15:
         key = "last_auto_sent_date:standup"
         if db_get_meta(key) != today_iso:
             await send_meeting_message(MEETING_STANDUP, context, force=False)
             db_set_meta(key, today_iso)
 
-    # Отраслевая 11:30
     if now_msk.hour == 11 and now_msk.minute == 30:
         key = "last_auto_sent_date:industry"
         if db_get_meta(key) != today_iso:
             await send_meeting_message(MEETING_INDUSTRY, context, force=False)
             db_set_meta(key, today_iso)
+
+# ---------------- HELP MENUS ----------------
+
+def kb_help_main(is_admin_user: bool):
+    rows = [
+        [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
+        [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links")],
+        [InlineKeyboardButton("👥 О команде", callback_data="help:team")],
+    ]
+    if is_admin_user:
+        rows.append([InlineKeyboardButton("⚙️ Настройки (админы)", callback_data="help:settings")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_help_docs_categories(is_admin_user: bool):
+    cats = db_docs_list_categories()
+    rows = []
+    if not cats:
+        rows.append([InlineKeyboardButton("— категорий нет —", callback_data="noop")])
+    else:
+        for cid, title in cats:
+            rows.append([InlineKeyboardButton(title, callback_data=f"help:docs:cat:{cid}")])
+
+    # админские действия по документам — в настройках, но можно дать удобные кнопки тут
+    if is_admin_user:
+        rows.append([InlineKeyboardButton("➕ Добавить файл (админы)", callback_data="help:settings:add_doc")])
+        rows.append([InlineKeyboardButton("➖ Удалить файл (админы)", callback_data="help:settings:del_doc")])
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_help_docs_files(category_id: int, is_admin_user: bool):
+    items = db_docs_list_by_category(category_id)
+    rows = []
+    if not items:
+        rows.append([InlineKeyboardButton("— файлов нет —", callback_data="noop")])
+    else:
+        for did, title in items[:40]:
+            rows.append([InlineKeyboardButton(title, callback_data=f"help:docs:file:{did}")])
+
+    if is_admin_user:
+        rows.append([InlineKeyboardButton("➕ Добавить файл", callback_data="help:settings:add_doc")])
+        rows.append([InlineKeyboardButton("➖ Удалить файл", callback_data="help:settings:del_doc")])
+
+    rows.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="help:docs")])
+    rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_help_links():
+    rows = []
+    # только если задан URL — показываем кнопку
+    if YA_CRM_URL:
+        rows.append([InlineKeyboardButton("🌐 YA CRM", url=YA_CRM_URL)])
+    if INDUSTRY_WIKI_URL:
+        rows.append([InlineKeyboardButton("📊 WIKI Отрасли (презы и спичи)", url=INDUSTRY_WIKI_URL)])
+    if HELPY_BOT_URL:
+        rows.append([InlineKeyboardButton("🛠️ Бот Helpy", url=HELPY_BOT_URL)])
+    if not rows:
+        rows.append([InlineKeyboardButton("— ссылки не настроены —", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_help_team(is_admin_user: bool):
+    people = db_profiles_list()
+    rows = []
+    if not people:
+        rows.append([InlineKeyboardButton("— анкет пока нет —", callback_data="noop")])
+    else:
+        for pid, name in people[:40]:
+            rows.append([InlineKeyboardButton(name, callback_data=f"help:team:person:{pid}")])
+
+    if is_admin_user:
+        rows.append([InlineKeyboardButton("➕ Добавить анкету (админы)", callback_data="help:settings:add_profile")])
+        rows.append([InlineKeyboardButton("➖ Удалить анкету (админы)", callback_data="help:settings:del_profile")])
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_help_profile_card(profile: dict):
+    rows = []
+    tg = profile["tg_link"].strip()
+    if tg:
+        if tg.startswith("@"):
+            url = f"https://t.me/{tg[1:]}"
+        elif tg.startswith("https://t.me/") or tg.startswith("http://t.me/"):
+            url = tg
+        else:
+            # если дали username без @
+            if re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
+                url = f"https://t.me/{tg}"
+            else:
+                url = ""
+        if url:
+            rows.append([InlineKeyboardButton("🔗 Открыть Telegram", url=url)])
+    rows.append([InlineKeyboardButton("⬅️ Назад к списку", callback_data="help:team")])
+    rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_help_settings():
+    rows = [
+        [InlineKeyboardButton("➕ Добавить файл", callback_data="help:settings:add_doc")],
+        [InlineKeyboardButton("➖ Удалить файл", callback_data="help:settings:del_doc")],
+        [InlineKeyboardButton("🗂️ Редактировать категории", callback_data="help:settings:cats")],
+        [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
+        [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def kb_settings_categories():
+    cats = db_docs_list_categories()
+    rows = []
+    rows.append([InlineKeyboardButton("➕ Добавить категорию", callback_data="help:settings:cats:add")])
+    if cats:
+        rows.append([InlineKeyboardButton("➖ Удалить категорию (только пустую)", callback_data="help:settings:cats:del")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_pick_category_for_new_doc():
+    cats = db_docs_list_categories()
+    rows = []
+    for cid, title in cats:
+        rows.append([InlineKeyboardButton(title, callback_data=f"help:settings:add_doc:cat:{cid}")])
+    rows.append([InlineKeyboardButton("➕ Создать новую категорию", callback_data="help:settings:add_doc:newcat")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:settings:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_pick_doc_to_delete():
+    # показываем последние N документов
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT d.id, c.title, d.title
+        FROM docs d
+        JOIN doc_categories c ON c.id = d.category_id
+        ORDER BY d.id DESC
+        LIMIT 30
+    """)
+    rows_db = cur.fetchall()
+    con.close()
+
+    rows = []
+    if not rows_db:
+        rows.append([InlineKeyboardButton("— файлов нет —", callback_data="noop")])
+    else:
+        for did, cat_title, doc_title in rows_db:
+            rows.append([InlineKeyboardButton(f"{cat_title}: {doc_title}", callback_data=f"help:settings:del_doc:{did}")])
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_pick_profile_to_delete():
+    people = db_profiles_list()
+    rows = []
+    if not people:
+        rows.append([InlineKeyboardButton("— анкет нет —", callback_data="noop")])
+    else:
+        for pid, name in people[:40]:
+            rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:del_profile:{pid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_cancel_wizard_settings():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:cancel")]
+    ])
 
 # ---------------- COMMANDS ----------------
 
@@ -428,20 +771,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name if update.effective_user else "коллеги"
     text = (
         f"Привет, {name}! 👋\n\n"
-        "Я бот для уведомлений о встречах.\n\n"
+        "Я бот для уведомлений о встречах и справки /help.\n\n"
         "Команды:\n"
-        "• /setchat — подключить этот чат к уведомлениям (только админы)\n"
-        "• /unsetchat — отключить этот чат от уведомлений (только админы)\n"
-        "• /force_standup — принудительно отправить планёрку (только админы)\n"
-        "• /test_industry — тестовое уведомление отраслевой (только админы)\n"
-        "• /status — статус бота/встреч (только админы)\n"
-        "• /reset — сброс ожидания даты (только админы)\n\n"
+        "• /help — справка и меню\n"
+        "• /setchat — подключить чат к уведомлениям (админы)\n"
+        "• /unsetchat — отключить уведомления (админы)\n"
+        "• /force_standup — принудительно отправить планёрку (админы)\n"
+        "• /test_industry — тестовое уведомление отраслевой (админы)\n"
+        "• /status — статус (админы)\n"
+        "• /reset — сброс ожиданий (админы)\n\n"
         "Авто:\n"
         "• Планёрка — ПН/СР/ПТ 09:15 (МСК)\n"
         "• Отраслевая — ВТ 11:30 (МСК)"
     )
     await update.message.reply_text(text)
 
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_adm = await is_admin(update, context) if update.effective_chat else False
+    text = (
+        "📌 <b>Справка</b>\n\n"
+        "Выберите раздел ниже:\n"
+        "• 📄 Документы — файлы и категории\n"
+        "• 🔗 Полезные ссылки — быстрые ссылки\n"
+        "• 👥 О команде — анкеты сотрудников\n"
+        "• ⚙️ Настройки — управление (только админы)"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_main(is_adm))
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
@@ -450,10 +805,8 @@ async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         await update.message.reply_text("Только администраторы могут назначить чат для уведомлений.")
         return
-
     db_add_chat(update.effective_chat.id)
     await update.message.reply_text("✅ Готово! Этот чат добавлен в рассылку уведомлений.")
-
 
 async def cmd_unsetchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
@@ -462,10 +815,8 @@ async def cmd_unsetchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         await update.message.reply_text("Только администраторы могут отключить уведомления.")
         return
-
     db_remove_chat(update.effective_chat.id)
     await update.message.reply_text("🧹 Этот чат убран из рассылки уведомлений.")
-
 
 async def cmd_force_standup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
@@ -474,10 +825,8 @@ async def cmd_force_standup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db_list_chats():
         await update.message.reply_text("Сначала подключи чат командой /setchat.")
         return
-
     await send_meeting_message(MEETING_STANDUP, context, force=True)
     await update.message.reply_text("🚀 Отправил принудительное уведомление планёрки.")
-
 
 async def cmd_test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
@@ -486,10 +835,8 @@ async def cmd_test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db_list_chats():
         await update.message.reply_text("Сначала подключи чат командой /setchat.")
         return
-
     await send_meeting_message(MEETING_INDUSTRY, context, force=True)
     await update.message.reply_text("🚀 Отправил тестовое уведомление отраслевой встречи.")
-
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
@@ -520,7 +867,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             extra = ""
             if due_res:
-                # переносы на сегодня (ещё не отправлены/не погашены)
                 extra = f"\n  Переносы на сегодня (sent=0): {', '.join(due_res)}"
             return f"• <b>{title}</b>: ✅ активно{extra}"
 
@@ -536,45 +882,37 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🗂️ Состояние на сегодня:\n"
         f"{fmt_state('Планёрка', st_state, st_due_res)}\n"
         f"{fmt_state('Отраслевая', in_state, in_due_res)}\n\n"
-        "ℹ️ Если уведомления не приходят — проверь /setchat в нужной группе и что DB сохраняется между перезапусками."
+        "ℹ️ Для справки используйте /help"
     )
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         return
-    was = bool(context.chat_data.get(WAITING_DATE_FLAG, False))
-    clear_waiting(context)
-    if was:
-        await update.message.reply_text("✅ Состояние ожидания даты сброшено.")
-    else:
-        await update.message.reply_text("ℹ️ Режим ожидания даты не был активен.")
+    clear_waiting_date(context)
+    clear_docs_flow(context)
+    clear_profile_wiz(context)
+    await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты).")
 
-# ---------------- CALLBACKS ----------------
+# ---------------- CALLBACKS: meetings cancel/reschedule ----------------
 
 async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if not await is_admin(update, context):
         await query.answer("Только администраторы могут отменять/переносить.", show_alert=True)
         return
-
     _, _, meeting_type = query.data.split(":")
     await query.edit_message_reply_markup(reply_markup=kb_cancel_options(meeting_type))
-
 
 async def cb_cancel_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin(update, context):
         await query.answer("Только администраторы.", show_alert=True)
         return
-
     await query.edit_message_reply_markup(reply_markup=None)
     await query.answer("Ок, не отменяем ✅")
-
 
 async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -583,22 +921,16 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     parts = query.data.split(":")
-    # cancel:reason:{meeting_type}:{reason}
     meeting_type = parts[2]
     reason_key = parts[3]
-
     today_d = datetime.now(MOSCOW_TZ).date()
 
     if reason_key == "no_topics":
         reason_text = "Нет срочных тем для обсуждения"
         db_set_canceled(meeting_type, today_d, reason_text)
         await query.edit_message_reply_markup(reply_markup=None)
-
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"{title}\nПричина: {reason_text}",
-        )
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
         await query.answer("Отменено.")
         return
 
@@ -606,12 +938,8 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reason_text = "Перенесём по техническим причинам"
         db_set_canceled(meeting_type, today_d, reason_text)
         await query.edit_message_reply_markup(reply_markup=None)
-
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"{title}\nПричина: {reason_text}",
-        )
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
         await query.answer("Ок.")
         return
 
@@ -620,18 +948,15 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Выберите дату переноса 📆")
         return
 
-
 async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin(update, context):
         await query.answer("Только администраторы.", show_alert=True)
         return
 
-    # reschedule:pick:{meeting_type}:{DD.MM.YY}
     parts = query.data.split(":")
     meeting_type = parts[2]
     picked = parts[3]
-
     today_d = datetime.now(MOSCOW_TZ).date()
 
     try:
@@ -653,14 +978,9 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=(
-            f"{title}\n"
-            f"Новая дата: {picked} 📌\n"
-            "Следите за расписанием или чатом"
-        )
+        text=f"{title}\nНовая дата: {picked} 📌\nСледите за расписанием или чатом"
     )
     await query.answer("Перенесено.")
-
 
 async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -677,7 +997,6 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
     context.chat_data[WAITING_MEETING_TYPE] = meeting_type
 
     await query.answer()
-
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=(
@@ -691,81 +1010,576 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=kb_manual_input_controls(meeting_type),
     )
 
-
 async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin(update, context):
         await query.answer("❌ Только администраторы.", show_alert=True)
         return
-
-    clear_waiting(context)
+    clear_waiting_date(context)
     await query.answer("Ок, отменил ввод даты ✅")
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Ввод даты отменён.")
 
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="✅ Ввод даты отменён. Если нужно — нажмите «Ввести дату» ещё раз.",
+# ---------------- CALLBACKS: HELP ----------------
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data
+    await q.answer()
+
+    is_adm = await is_admin(update, context)
+
+    if data == "noop":
+        return
+
+    if data == "help:main":
+        text = (
+            "📌 <b>Справка</b>\n\n"
+            "Выберите раздел:\n"
+            "• 📄 Документы — файлы и категории\n"
+            "• 🔗 Полезные ссылки — быстрые ссылки\n"
+            "• 👥 О команде — анкеты сотрудников\n"
+            "• ⚙️ Настройки — управление (админы)"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_main(is_adm), disable_web_page_preview=True)
+        return
+
+    if data == "help:docs":
+        text = (
+            "📄 <b>Документы</b>\n\n"
+            "Здесь хранятся файлы по категориям.\n"
+            "Нажмите на категорию, чтобы открыть список.\n"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_categories(is_adm))
+        return
+
+    if data.startswith("help:docs:cat:"):
+        cid = int(data.split(":")[-1])
+        cats = dict(db_docs_list_categories())
+        title = cats.get(cid, "Категория")
+        text = (
+            f"📄 <b>{title}</b>\n\n"
+            "Выберите файл — бот отправит его в чат.\n"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_files(cid, is_adm))
+        return
+
+    if data.startswith("help:docs:file:"):
+        doc_id = int(data.split(":")[-1])
+        doc = db_docs_get(doc_id)
+        if not doc:
+            await q.edit_message_text("Файл не найден (возможно удалён).", reply_markup=kb_help_docs_categories(is_adm))
+            return
+        # отправляем документ в чат
+        try:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=doc["file_id"],
+                caption=f"📄 {doc['title']}",
+            )
+        except Exception as e:
+            logger.exception("send_document failed: %s", e)
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="Не смог отправить файл 😕")
+        return
+
+    if data == "help:links":
+        text = (
+            "🔗 <b>Полезные ссылки</b>\n\n"
+            "Быстрый доступ к нужным ресурсам:\n"
+            "• 🌐 YA CRM — рабочая CRM\n"
+            "• 📊 WIKI Отрасли — презентации и спичи\n"
+            "• 🛠️ Helpy — бот поддержки\n"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_links(), disable_web_page_preview=True)
+        return
+
+    if data == "help:team":
+        text = (
+            "👥 <b>О команде</b>\n\n"
+            "Здесь анкеты сотрудников.\n"
+            "Нажмите на имя — откроется карточка.\n"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_team(is_adm))
+        return
+
+    if data.startswith("help:team:person:"):
+        pid = int(data.split(":")[-1])
+        p = db_profiles_get(pid)
+        if not p:
+            await q.edit_message_text("Анкета не найдена (возможно удалена).", reply_markup=kb_help_team(is_adm))
+            return
+        card = (
+            f"👤 <b>{p['full_name']}</b>\n"
+            f"📅 Работает с: <b>{p['year_start']}</b>\n"
+            f"🏙️ Город: <b>{p['city']}</b>\n\n"
+            f"📝 <b>Кратко о себе</b>\n{p['about']}\n\n"
+            f"❓ <b>По каким вопросам обращаться</b>\n{p['topics']}\n\n"
+            f"🔗 TG: {p['tg_link']}"
+        )
+        await q.edit_message_text(card, parse_mode=ParseMode.HTML, reply_markup=kb_help_profile_card(p), disable_web_page_preview=True)
+        return
+
+    # ------- SETTINGS (admins) -------
+    if data == "help:settings":
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        text = (
+            "⚙️ <b>Настройки (админы)</b>\n\n"
+            "Управление контентом справки:\n"
+            "• Добавить/удалить файлы\n"
+            "• Редактировать категории документов\n"
+            "• Добавить/удалить анкеты сотрудников\n"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+        return
+
+    if data == "help:settings:cancel":
+        # отмена любых визардов
+        clear_docs_flow(context)
+        clear_profile_wiz(context)
+        clear_waiting_date(context)
+        await q.edit_message_text("✅ Действие отменено.", reply_markup=kb_help_settings() if is_adm else kb_help_main(is_adm))
+        return
+
+    if data == "help:settings:cats":
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        text = (
+            "🗂️ <b>Категории документов</b>\n\n"
+            "• ➕ Добавить категорию — бот попросит название\n"
+            "• ➖ Удалить категорию — удаляется только пустая\n"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_settings_categories())
+        return
+
+    if data == "help:settings:cats:add":
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        clear_docs_flow(context)
+        context.chat_data[WAITING_NEW_CATEGORY_NAME] = True
+        context.chat_data[WAITING_USER_ID] = update.effective_user.id
+        context.chat_data[WAITING_SINCE_TS] = int(time.time())
+        await q.edit_message_text(
+            "➕ <b>Добавление категории</b>\n\n"
+            "Отправьте название категории одним сообщением.\n"
+            "Пример: <code>Регламенты</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cancel_wizard_settings(),
+        )
+        return
+
+    if data == "help:settings:cats:del":
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        # показываем список категорий для удаления
+        cats = db_docs_list_categories()
+        rows = []
+        for cid, title in cats:
+            rows.append([InlineKeyboardButton(f"🗑️ {title}", callback_data=f"help:settings:cats:del:{cid}")])
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:cats")])
+        await q.edit_message_text(
+            "➖ <b>Удаление категории</b>\n\n"
+            "Удаляется только пустая категория (без файлов).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("help:settings:cats:del:"):
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        cid = int(data.split(":")[-1])
+        ok = db_docs_delete_category_if_empty(cid)
+        if ok:
+            await q.answer("Удалено ✅")
+            await q.edit_message_text("✅ Категория удалена.", reply_markup=kb_settings_categories(), parse_mode=ParseMode.HTML)
+        else:
+            await q.answer("Нельзя: категория не пустая", show_alert=True)
+        return
+
+    if data == "help:settings:add_doc":
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        clear_docs_flow(context)
+        context.chat_data[WAITING_DOC_UPLOAD] = True
+        context.chat_data[WAITING_USER_ID] = update.effective_user.id
+        context.chat_data[WAITING_SINCE_TS] = int(time.time())
+        await q.edit_message_text(
+            "➕ <b>Добавление файла</b>\n\n"
+            "Отправьте документ (как файл) следующим сообщением.\n"
+            "После этого выберем категорию.\n\n"
+            "Подсказка: название файла можно указать в подписи (caption).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cancel_wizard_settings(),
+        )
+        return
+
+    if data == "help:settings:del_doc":
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        clear_docs_flow(context)
+        await q.edit_message_text(
+            "➖ <b>Удаление файла</b>\n\n"
+            "Выберите файл из последних добавленных:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_pick_doc_to_delete(),
+        )
+        return
+
+    if data.startswith("help:settings:del_doc:"):
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        did = int(data.split(":")[-1])
+        ok = db_docs_delete_doc(did)
+        if ok:
+            await q.answer("Удалено ✅")
+            await q.edit_message_text("✅ Файл удалён.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+        else:
+            await q.answer("Не найден", show_alert=True)
+        return
+
+    # после загрузки файла: выбор категории
+    if data.startswith("help:settings:add_doc:cat:"):
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        cid = int(data.split(":")[-1])
+        pending = context.chat_data.get(PENDING_DOC_INFO)
+        if not pending:
+            await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
+            return
+        title = pending["title"]
+        db_docs_add_doc(cid, title, pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
+        clear_docs_flow(context)
+        await q.edit_message_text("✅ Файл добавлен в документы.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+        return
+
+    if data == "help:settings:add_doc:newcat":
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        pending = context.chat_data.get(PENDING_DOC_INFO)
+        if not pending:
+            await q.answer("Сначала отправьте файл.", show_alert=True)
+            return
+        context.chat_data[WAITING_NEW_CATEGORY_NAME] = True
+        context.chat_data[WAITING_USER_ID] = update.effective_user.id
+        context.chat_data[WAITING_SINCE_TS] = int(time.time())
+        await q.edit_message_text(
+            "➕ <b>Новая категория</b>\n\n"
+            "Отправьте название категории одним сообщением.\n"
+            "После этого файл будет сохранён в неё.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cancel_wizard_settings(),
+        )
+        return
+
+    if data == "help:settings:add_profile":
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        clear_profile_wiz(context)
+        context.chat_data[PROFILE_WIZ_ACTIVE] = True
+        context.chat_data[PROFILE_WIZ_STEP] = "full_name"
+        context.chat_data[PROFILE_WIZ_DATA] = {}
+        context.chat_data[WAITING_USER_ID] = update.effective_user.id
+        context.chat_data[WAITING_SINCE_TS] = int(time.time())
+        await q.edit_message_text(
+            "➕ <b>Добавление анкеты</b>\n\n"
+            "Шаг 1/6: отправьте <b>Имя и Фамилию</b>.\n"
+            "Пример: <code>Иван Петров</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cancel_wizard_settings(),
+        )
+        return
+
+    if data == "help:settings:del_profile":
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        clear_profile_wiz(context)
+        await q.edit_message_text(
+            "➖ <b>Удаление анкеты</b>\n\n"
+            "Выберите человека:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_pick_profile_to_delete(),
+        )
+        return
+
+    if data.startswith("help:settings:del_profile:"):
+        if not is_adm:
+            await q.answer("Только администраторы.", show_alert=True)
+            return
+        pid = int(data.split(":")[-1])
+        ok = db_profiles_delete(pid)
+        if ok:
+            await q.answer("Удалено ✅")
+            await q.edit_message_text("✅ Анкета удалена.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+        else:
+            await q.answer("Не найдено", show_alert=True)
+        return
+
+    # fallback
+    await q.answer()
+
+# ---------------- HANDLERS: DOCUMENT UPLOAD ----------------
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
+        return
+
+    if not context.chat_data.get(WAITING_DOC_UPLOAD):
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    waiting_user = context.chat_data.get(WAITING_USER_ID)
+    if waiting_user and user_id != waiting_user:
+        return
+
+    # проверка админа
+    if not await is_admin(update, context):
+        clear_docs_flow(context)
+        await update.message.reply_text("❌ Только администраторы могут добавлять документы.")
+        return
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    # заголовок: caption > file_name
+    title = (update.message.caption or "").strip() or (doc.file_name or "Документ")
+    pending = {
+        "file_id": doc.file_id,
+        "file_unique_id": doc.file_unique_id,
+        "mime": doc.mime_type,
+        "title": title[:120],
+    }
+    context.chat_data[PENDING_DOC_INFO] = pending
+    context.chat_data[WAITING_DOC_UPLOAD] = False
+
+    await update.message.reply_text(
+        "✅ Файл получен.\n\n"
+        "Теперь выберите категорию для сохранения:",
+        reply_markup=kb_pick_category_for_new_doc(),
     )
 
-# ---------------- MANUAL TEXT INPUT ----------------
+# ---------------- HANDLERS: TEXT INPUT (dates / categories / profiles) ----------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
         return
 
-    if not context.chat_data.get(WAITING_DATE_FLAG):
-        return
-
     user_id = update.effective_user.id if update.effective_user else None
     text = (update.message.text or "").strip()
 
+    # ограничение по пользователю, который начал визард
     waiting_user = context.chat_data.get(WAITING_USER_ID)
     if waiting_user and user_id != waiting_user:
+        # чужие сообщения не трогаем
         return
 
+    # таймаут 10 минут для визардов
     since_ts = context.chat_data.get(WAITING_SINCE_TS)
     if since_ts and int(time.time()) - int(since_ts) > 10 * 60:
-        clear_waiting(context)
-        await update.message.reply_text("⏳ Время ожидания даты истекло. Нажмите «Ввести дату» ещё раз.")
+        clear_waiting_date(context)
+        clear_docs_flow(context)
+        clear_profile_wiz(context)
+        await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
         return
 
-    if not await is_admin(update, context):
-        clear_waiting(context)
-        await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
+    # 1) ручной ввод даты переноса (встречи)
+    if context.chat_data.get(WAITING_DATE_FLAG):
+        if not await is_admin(update, context):
+            clear_waiting_date(context)
+            await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
+            return
+
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", text):
+            await update.message.reply_text("❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
+            return
+
+        try:
+            dd, mm, yy = text.split(".")
+            new_d = date(int("20" + yy), int(mm), int(dd))
+        except Exception:
+            await update.message.reply_text("❌ Не удалось распознать дату. Проверьте корректность.")
+            return
+
+        today_d = datetime.now(MOSCOW_TZ).date()
+        if new_d <= today_d:
+            await update.message.reply_text("❌ Дата переноса должна быть в будущем.")
+            return
+
+        meeting_type = context.chat_data.get(WAITING_MEETING_TYPE, MEETING_STANDUP)
+        db_set_canceled(meeting_type, today_d, "Перенос на другой день", reschedule_date=text)
+        db_upsert_reschedule(meeting_type, today_d, new_d)
+        clear_waiting_date(context)
+
+        title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
+        await update.message.reply_text(
+            f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом"
+        )
         return
 
-    if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", text):
-        await update.message.reply_text("❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
+    # 2) ввод названия категории (добавление категории или новая категория при сохранении файла)
+    if context.chat_data.get(WAITING_NEW_CATEGORY_NAME):
+        if not await is_admin(update, context):
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут управлять категориями.")
+            return
+
+        if len(text) < 2:
+            await update.message.reply_text("❌ Слишком коротко. Отправьте нормальное название категории.")
+            return
+
+        # создаём категорию (если уже есть — покажем ошибку)
+        try:
+            cid = db_docs_add_category(text)
+        except sqlite3.IntegrityError:
+            await update.message.reply_text("❌ Такая категория уже существует. Отправьте другое название.")
+            return
+
+        context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
+
+        pending = context.chat_data.get(PENDING_DOC_INFO)
+        if pending:
+            # это режим "создать категорию и сохранить файл"
+            db_docs_add_doc(cid, pending["title"], pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
+            clear_docs_flow(context)
+            await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
+            return
+
+        # иначе — просто добавили категорию из настроек
+        clear_docs_flow(context)
+        await update.message.reply_text("✅ Категория добавлена.", reply_markup=kb_help_settings())
         return
 
-    try:
-        dd, mm, yy = text.split(".")
-        new_d = date(int("20" + yy), int(mm), int(dd))
-    except Exception:
-        await update.message.reply_text("❌ Не удалось распознать дату. Проверьте корректность.")
-        return
+    # 3) анкета сотрудника — пошаговый ввод
+    if context.chat_data.get(PROFILE_WIZ_ACTIVE):
+        if not await is_admin(update, context):
+            clear_profile_wiz(context)
+            await update.message.reply_text("❌ Только администраторы могут добавлять анкеты.")
+            return
 
-    today_d = datetime.now(MOSCOW_TZ).date()
-    if new_d <= today_d:
-        await update.message.reply_text("❌ Дата переноса должна быть в будущем.")
-        return
+        step = context.chat_data.get(PROFILE_WIZ_STEP)
+        data = context.chat_data.get(PROFILE_WIZ_DATA) or {}
 
-    meeting_type = context.chat_data.get(WAITING_MEETING_TYPE, MEETING_STANDUP)
+        if step == "full_name":
+            if len(text.split()) < 2:
+                await update.message.reply_text("❌ Нужно имя и фамилия. Пример: Иван Петров")
+                return
+            data["full_name"] = text
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "year_start"
+            await update.message.reply_text(
+                "Шаг 2/6: с какого года работает?\nПример: 2022",
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
 
-    db_set_canceled(meeting_type, today_d, "Перенос на другой день", reschedule_date=text)
-    db_upsert_reschedule(meeting_type, today_d, new_d)
+        if step == "year_start":
+            if not re.fullmatch(r"\d{4}", text):
+                await update.message.reply_text("❌ Введите год 4 цифрами. Пример: 2022")
+                return
+            year = int(text)
+            cur_year = datetime.now(MOSCOW_TZ).year
+            if year < 1990 or year > cur_year:
+                await update.message.reply_text(f"❌ Год должен быть в диапазоне 1990–{cur_year}.")
+                return
+            data["year_start"] = year
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "city"
+            await update.message.reply_text(
+                "Шаг 3/6: город проживания\nПример: Москва",
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
 
-    clear_waiting(context)
+        if step == "city":
+            if len(text) < 2:
+                await update.message.reply_text("❌ Укажите город.")
+                return
+            data["city"] = text
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "about"
+            await update.message.reply_text(
+                "Шаг 4/6: кратко о себе (1–3 предложения)",
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
 
-    title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
-    await update.message.reply_text(
-        f"{title}\n"
-        f"Новая дата: {text} 📌\n"
-        "Следите за расписанием или чатом"
-    )
+        if step == "about":
+            if len(text) < 5:
+                await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
+                return
+            data["about"] = text
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "topics"
+            await update.message.reply_text(
+                "Шаг 5/6: по каким вопросам обращаться?\nПример: CRM, отчеты, отраслевые презентации",
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if step == "topics":
+            if len(text) < 3:
+                await update.message.reply_text("❌ Укажите темы/вопросы.")
+                return
+            data["topics"] = text
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "tg_link"
+            await update.message.reply_text(
+                "Шаг 6/6: ссылка на Telegram\nМожно: @username или https://t.me/username",
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if step == "tg_link":
+            # мягкая валидация
+            tg = text.strip()
+            ok = False
+            if tg.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", tg):
+                ok = True
+            if tg.startswith("https://t.me/") or tg.startswith("http://t.me/"):
+                ok = True
+            if re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
+                ok = True
+            if not ok:
+                await update.message.reply_text("❌ Не похоже на Telegram. Дайте @username или https://t.me/username")
+                return
+
+            data["tg_link"] = tg
+
+            pid = db_profiles_add(
+                full_name=data["full_name"],
+                year_start=data["year_start"],
+                city=data["city"],
+                about=data["about"],
+                topics=data["topics"],
+                tg_link=data["tg_link"],
+            )
+
+            clear_profile_wiz(context)
+
+            await update.message.reply_text(
+                f"✅ Анкета добавлена (ID {pid}).\nПосмотреть можно через /help → О команде",
+                reply_markup=kb_help_settings(),
+            )
+            return
+
+    # иначе — игнорируем (не вмешиваемся в обычный чат)
+    return
 
 # ---------------- APP ----------------
 
@@ -776,6 +1590,7 @@ def main():
 
     # commands
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("setchat", cmd_setchat))
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
     app.add_handler(CommandHandler("force_standup", cmd_force_standup))
@@ -783,7 +1598,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reset", cmd_reset))
 
-    # callbacks
+    # callbacks: meetings
     app.add_handler(CallbackQueryHandler(cb_cancel_open, pattern=r"^cancel:open:(standup|industry)$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_close, pattern=r"^cancel:close:(standup|industry)$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_reason, pattern=r"^cancel:reason:(standup|industry):(no_topics|tech|move)$"))
@@ -791,15 +1606,20 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_reschedule_manual, pattern=r"^reschedule:manual:(standup|industry)$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_manual_input, pattern=r"^reschedule:cancel_manual:(standup|industry)$"))
 
-    # manual date input
+    # callbacks: help
+    app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
+
+    # document upload (для добавления файлов)
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+
+    # text input (даты / категории / анкеты)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # schedule checks every minute (MSK logic inside)
+    # schedule checker
     app.job_queue.run_repeating(check_and_send_jobs, interval=60, first=10, name="meetings_checker")
 
-    logger.info("Bot started. Standup 09:15 MSK; Industry 11:30 MSK.")
+    logger.info("Bot started. Standup 09:15 MSK; Industry 11:30 MSK; /help enabled.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
