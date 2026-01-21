@@ -36,7 +36,9 @@ logger = logging.getLogger("meetings-bot")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
 INDUSTRY_ZOOM_URL = os.getenv("INDUSTRY_ZOOM_URL")  # отраслевая
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+
+# ✅ Поддержка DATABASE_PATH и DB_PATH
+DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH", "bot.db")
 
 YA_CRM_URL = os.getenv("YA_CRM_URL", "")
 INDUSTRY_WIKI_URL = os.getenv("INDUSTRY_WIKI_URL", "")
@@ -54,7 +56,7 @@ MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 MEETING_STANDUP = "standup"
 MEETING_INDUSTRY = "industry"
 
-# где хранить контекст, из какого чата пользователь открыл /help
+# контекст: из какого чата пользователь открывал /help
 HELP_SCOPE_CHAT_ID = "help_scope_chat_id"
 
 # ---------------- DB ----------------
@@ -112,7 +114,6 @@ def db_init():
         )
     """)
 
-    # docs + description
     cur.execute("""
         CREATE TABLE IF NOT EXISTS docs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,7 +128,7 @@ def db_init():
         )
     """)
 
-    # миграция для старых БД
+    # миграция для старых БД (если раньше не было description)
     try:
         cur.execute("ALTER TABLE docs ADD COLUMN description TEXT")
     except sqlite3.OperationalError:
@@ -496,7 +497,7 @@ def kb_manual_input_controls(meeting_type: str):
         [InlineKeyboardButton("Отмена ввода даты ❌", callback_data=f"reschedule:cancel_manual:{meeting_type}")]
     ])
 
-# ---------------- ADMIN CHECK (с учетом scope) ----------------
+# ---------------- ADMIN CHECK (scope) ----------------
 
 async def is_admin_in_chat(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -506,10 +507,8 @@ async def is_admin_in_chat(chat_id: int, user_id: int, context: ContextTypes.DEF
         return False
 
 def get_scope_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
-    # если в группе — scope это текущий чат
     if update.effective_chat and update.effective_chat.type != "private":
         return update.effective_chat.id
-    # если в ЛС — scope берём из user_data (последний чат, откуда открывали help)
     return context.user_data.get(HELP_SCOPE_CHAT_ID)
 
 async def is_admin_scoped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -521,6 +520,7 @@ async def is_admin_scoped(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return await is_admin_in_chat(scope_chat_id, update.effective_user.id, context)
 
 # ---------------- STATES ----------------
+
 WAITING_DATE_FLAG = "waiting_reschedule_date"
 WAITING_USER_ID = "waiting_user_id"
 WAITING_SINCE_TS = "waiting_since_ts"
@@ -652,7 +652,7 @@ def kb_help_main(is_admin_user: bool):
         rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")])
     return InlineKeyboardMarkup(rows)
 
-def kb_help_docs_categories(is_admin_user: bool):
+def kb_help_docs_categories():
     cats = db_docs_list_categories()
     rows = []
     if not cats:
@@ -675,7 +675,7 @@ def kb_help_docs_files(category_id: int):
     rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
-# -------- LINKS (меню + описания) --------
+# -------- LINKS (описание) --------
 
 def get_links_catalog() -> dict[str, dict]:
     catalog = {}
@@ -722,7 +722,7 @@ def kb_help_links_menu():
     if not catalog:
         rows.append([InlineKeyboardButton("— ссылки не настроены —", callback_data="noop")])
     else:
-        # “пирамида”: сверху самые длинные названия
+        # “пирамида”: сверху длинные названия
         items = sorted(catalog.items(), key=lambda kv: len(kv[1]["title"]), reverse=True)
         for key, item in items:
             rows.append([InlineKeyboardButton(item["title"], callback_data=f"help:links:item:{key}")])
@@ -735,7 +735,7 @@ def kb_help_link_card(url: str):
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:links")],
     ])
 
-def kb_help_team(is_admin_user: bool):
+def kb_help_team():
     people = db_profiles_list()
     rows = []
     if not people:
@@ -853,7 +853,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main()
 
-    # если /help вызвали в группе — запоминаем scope и шлём в ЛС
+    # /help вызван в группе -> пытаемся в ЛС, в чат НЕ пишем при успехе
     if update.effective_chat and update.effective_chat.type != "private":
         if update.effective_user:
             context.user_data[HELP_SCOPE_CHAT_ID] = update.effective_chat.id
@@ -861,7 +861,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id if update.effective_user else None
         if user_id:
             try:
-                # определяем админ ли он в этом чате (scope)
                 is_adm = await is_admin_scoped(update, context)
 
                 await context.bot.send_message(
@@ -871,12 +870,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=kb_help_main(is_admin_user=is_adm),
                     disable_web_page_preview=True,
                 )
-                # УСПЕХ — в чат ничего не пишем
                 return
+
             except Forbidden:
                 warn_text = (
                     "⚠️ Я не могу написать вам в ЛС.\n"
-                    f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start, "
+                    f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
                     "после этого снова нажмите /help в чате."
                 )
                 msg = await update.message.reply_text(
@@ -884,18 +883,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_to_message_id=update.message.message_id,
                     disable_web_page_preview=True,
                 )
+
                 context.job_queue.run_once(
                     lambda ctx: ctx.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id),
                     when=60,
                 )
                 return
+
             except Exception as e:
                 logger.exception("Failed to DM /help: %s", e)
+                return
 
-        # fallback (редко): если user_id нет
         return
 
-    # если /help в ЛС — показываем меню, но настройки только если есть scope и он админ там
+    # /help в ЛС — показываем меню, настройки только если админ в scope-чате
     is_adm = await is_admin_scoped(update, context)
     await update.message.reply_text(
         text,
@@ -1035,7 +1036,7 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_set_canceled(meeting_type, today_d, reason_text)
         await query.edit_message_reply_markup(reply_markup=None)
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
-        await context.bot.send_message(chat_id=get_scope_chat_id(update, context) or update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
         await query.answer("Отменено.")
         return
 
@@ -1044,7 +1045,7 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_set_canceled(meeting_type, today_d, reason_text)
         await query.edit_message_reply_markup(reply_markup=None)
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
-        await context.bot.send_message(chat_id=get_scope_chat_id(update, context) or update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
         await query.answer("Ок.")
         return
 
@@ -1080,13 +1081,11 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await query.edit_message_reply_markup(reply_markup=None)
 
-    scope_chat_id = get_scope_chat_id(update, context)
-    if scope_chat_id:
-        title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
-        await context.bot.send_message(
-            chat_id=scope_chat_id,
-            text=f"{title}\nНовая дата: {picked} 📌\nСледите за расписанием или чатом"
-        )
+    title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"{title}\nНовая дата: {picked} 📌\nСледите за расписанием или чатом"
+    )
     await query.answer("Перенесено.")
 
 async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1157,7 +1156,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Выберите категорию — внутри будут файлы.\n"
             "Нажмите на файл, чтобы получить его в чат."
         )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_categories(is_adm))
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_categories())
         return
 
     if data.startswith("help:docs:cat:"):
@@ -1222,14 +1221,14 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help:team":
         text = "👥 <b>Познакомиться с командой</b>\n\nВыберите человека:"
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_team(is_adm))
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_team())
         return
 
     if data.startswith("help:team:person:"):
         pid = int(data.split(":")[-1])
         p = db_profiles_get(pid)
         if not p:
-            await q.edit_message_text("Анкета не найдена (возможно удалена).", reply_markup=kb_help_team(is_adm))
+            await q.edit_message_text("Анкета не найдена (возможно удалена).", reply_markup=kb_help_team())
             return
         card = (
             f"👤 <b>{p['full_name']}</b>\n"
@@ -1244,7 +1243,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help:settings":
         if not is_adm:
-            await q.answer("⚠️ Настройки доступны администраторам выбранного чата.", show_alert=True)
+            await q.answer("⚠️ Настройки доступны администраторам.", show_alert=True)
             return
         text = (
             "⚙️ <b>Настройки</b>\n\n"
@@ -1254,7 +1253,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
         return
 
-    # настройки
+    # -------- настройки --------
     if data.startswith("help:settings:"):
         if not is_adm:
             await q.answer("⚠️ Доступно администраторам.", show_alert=True)
@@ -1322,10 +1321,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.chat_data[WAITING_SINCE_TS] = int(time.time())
             await q.edit_message_text(
                 "➕ <b>Добавление файла</b>\n\n"
-                "1) Отправьте документ (как файл) следующим сообщением.\n"
-                "   • Название можно указать в подписи (caption)\n"
-                "2) Затем бот попросит краткое описание\n"
-                "3) Потом выберем категорию",
+                "1) Отправьте документ следующим сообщением.\n"
+                "2) Затем бот попросит краткое описание.\n"
+                "3) Потом выберем категорию.\n\n"
+                "Название можно указать в подписи к файлу (caption).",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_cancel_wizard_settings(),
             )
@@ -1455,18 +1454,17 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     context.chat_data[PENDING_DOC_INFO] = pending
     context.chat_data[WAITING_DOC_UPLOAD] = False
-
     context.chat_data[WAITING_DOC_DESC] = True
 
     await update.message.reply_text(
-        "✍️ <b>Краткое описание</b>\n\n"
-        "Отправьте 1–2 предложения.\n"
+        "✍️ <b>Краткое описание документа</b>\n\n"
+        "Напишите 1–2 предложения.\n"
         "Если описания не нужно — отправьте <code>-</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=kb_cancel_wizard_settings(),
     )
 
-# ---------------- HANDLERS: TEXT INPUT (dates / categories / profiles / doc desc) ----------------
+# ---------------- HANDLERS: TEXT INPUT ----------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
@@ -1516,42 +1514,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Описание сохранено.\n\nТеперь выберите категорию:",
             reply_markup=kb_pick_category_for_new_doc(),
         )
-        return
-
-    # перенос даты вручную
-    if context.chat_data.get(WAITING_DATE_FLAG):
-        if not await is_admin_scoped(update, context):
-            clear_waiting_date(context)
-            await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
-            return
-
-        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", text):
-            await update.message.reply_text("❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
-            return
-
-        try:
-            dd, mm, yy = text.split(".")
-            new_d = date(int("20" + yy), int(mm), int(dd))
-        except Exception:
-            await update.message.reply_text("❌ Не удалось распознать дату. Проверьте корректность.")
-            return
-
-        today_d = datetime.now(MOSCOW_TZ).date()
-        if new_d <= today_d:
-            await update.message.reply_text("❌ Дата переноса должна быть в будущем.")
-            return
-
-        meeting_type = context.chat_data.get(WAITING_MEETING_TYPE, MEETING_STANDUP)
-        db_set_canceled(meeting_type, today_d, "Перенос на другой день", reschedule_date=text)
-        db_upsert_reschedule(meeting_type, today_d, new_d)
-        clear_waiting_date(context)
-
-        scope_chat_id = context.user_data.get(HELP_SCOPE_CHAT_ID)
-        if scope_chat_id:
-            title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
-            await context.bot.send_message(chat_id=scope_chat_id, text=f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
-
-        await update.message.reply_text("✅ Готово. Перенос применён.")
         return
 
     # ввод названия категории
@@ -1712,7 +1674,7 @@ def main():
     # callbacks: help
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
 
-    # document upload
+    # document upload (в ЛС тоже работает)
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
 
     # text input
@@ -1721,7 +1683,7 @@ def main():
     # schedule checker
     app.job_queue.run_repeating(check_and_send_jobs, interval=60, first=10, name="meetings_checker")
 
-    logger.info("Bot started. /help DM-first, admin settings shown only to admins of scope chat.")
+    logger.info("Bot started. DB=%s", DB_PATH)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
