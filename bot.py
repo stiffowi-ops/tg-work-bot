@@ -128,7 +128,6 @@ def db_init():
     try:
         cur.execute("ALTER TABLE docs ADD COLUMN description TEXT")
     except sqlite3.OperationalError:
-        # колонка уже существует или другая причина — игнорируем
         pass
 
     # ------- HELP MENU: анкеты -------
@@ -667,6 +666,22 @@ def get_links_catalog() -> dict[str, dict]:
     key -> {title, url, desc}
     """
     catalog = {}
+
+    # добавленная ссылка "Чекко"
+    catalog["checko"] = {
+        "title": 'Сервис "Чекко" поиск контактов',
+        "url": "https://checko.ru/",
+        "desc": (
+            "Готовишь карточку лида? Отлично! 🚀\n\n"
+            "Сервис «Чекко» поможет совершить первый шаг! 🔍\n\n"
+            "Поиск ведётся по:\n\n"
+            "• Названию компании 🏢\n"
+            "• ИНН или ОГРН 📑\n"
+            "• Фамилии ИП 👤\n\n"
+            "Нашёл контакты? Просто скопируй их и начинай прозвон! 📞✨"
+        ),
+    }
+
     if YA_CRM_URL:
         catalog["ya_crm"] = {
             "title": "🌐 YA CRM",
@@ -685,6 +700,7 @@ def get_links_catalog() -> dict[str, dict]:
             "url": HELPY_BOT_URL,
             "desc": "Бот поможет с техническими вопросами, связанными с работой.",
         }
+
     return catalog
 
 def kb_help_links_menu():
@@ -693,7 +709,9 @@ def kb_help_links_menu():
     if not catalog:
         rows.append([InlineKeyboardButton("— ссылки не настроены —", callback_data="noop")])
     else:
-        for key, item in catalog.items():
+        # сортировка: сверху вниз по длине названия (убывание) — «пирамида»
+        items = sorted(catalog.items(), key=lambda kv: len(kv[1]["title"]), reverse=True)
+        for key, item in items:
             rows.append([InlineKeyboardButton(item["title"], callback_data=f"help:links:item:{key}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
@@ -766,7 +784,6 @@ def kb_pick_category_for_new_doc():
 def kb_pick_doc_to_delete():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    # показываем title (без desc) — desc увидят при просмотре
     cur.execute("""
         SELECT d.id, c.title, d.title
         FROM docs d
@@ -820,8 +837,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
-# /help: в группе пытаемся отправить в ЛС. Если получилось — молчим в чате.
-# Если ЛС закрыта — пишем уведомление в чат и удаляем через минуту.
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main(bot_username)
@@ -873,7 +888,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_to_message_id=update.message.message_id,
     )
 
-# /help_admin — админское меню в группе (без ЛС)
 async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main(bot_username)
@@ -1196,15 +1210,20 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Ссылка не найдена.", show_alert=True)
             return
 
+        # делаем кликабельную ссылку прямо в тексте, плюс кнопка
+        url = item["url"]
+        title = item["title"]
+        desc = item["desc"]
+
         text = (
-            f"{item['title']}\n\n"
-            f"{item['desc']}\n\n"
-            f"Ссылка: {item['url']}"
+            f"<b>{title}</b>\n\n"
+            f"{desc}\n\n"
+            f'Ссылка: <a href="{url}">{url}</a>'
         )
         await q.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_link_card(item["url"], back_to="help:links"),
+            reply_markup=kb_help_link_card(url, back_to="help:links"),
             disable_web_page_preview=True,
         )
         return
@@ -1450,7 +1469,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[PENDING_DOC_INFO] = pending
     context.chat_data[WAITING_DOC_UPLOAD] = False
 
-    # теперь просим описание
     context.chat_data[WAITING_DOC_DESC] = True
 
     await update.message.reply_text(
@@ -1482,7 +1500,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help_admin.")
         return
 
-    # ---- описание документа ----
     if context.chat_data.get(WAITING_DOC_DESC):
         if not await is_admin(update, context):
             clear_docs_flow(context)
@@ -1513,7 +1530,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # перенос даты вручную
+    # остальные ветки on_text — без изменений (переносы/категории/анкеты)
+    # ... (оставлены как в предыдущей версии, сокращать нельзя — тут полный код ниже)
+
     if context.chat_data.get(WAITING_DATE_FLAG):
         if not await is_admin(update, context):
             clear_waiting_date(context)
@@ -1545,7 +1564,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
         return
 
-    # ввод названия категории
     if context.chat_data.get(WAITING_NEW_CATEGORY_NAME):
         if not await is_admin(update, context):
             clear_docs_flow(context)
@@ -1582,7 +1600,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Категория добавлена.", reply_markup=kb_help_settings())
         return
 
-    # анкета — шаги
     if context.chat_data.get(PROFILE_WIZ_ACTIVE):
         if not await is_admin(update, context):
             clear_profile_wiz(context)
