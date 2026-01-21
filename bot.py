@@ -15,6 +15,7 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.constants import ParseMode
+from telegram.error import Forbidden
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -494,14 +495,13 @@ WAITING_MEETING_TYPE = "waiting_meeting_type"
 
 # docs add flow
 WAITING_DOC_UPLOAD = "waiting_doc_upload"
-PENDING_DOC_INFO = "pending_doc_info"  # dict with file_id, file_unique_id, title, mime
+PENDING_DOC_INFO = "pending_doc_info"
 WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
-WAITING_DELETE_CATEGORY_PICK = "waiting_delete_category_pick"
 
 # profiles add flow
 PROFILE_WIZ_ACTIVE = "profile_wiz_active"
 PROFILE_WIZ_STEP = "profile_wiz_step"
-PROFILE_WIZ_DATA = "profile_wiz_data"  # dict
+PROFILE_WIZ_DATA = "profile_wiz_data"
 
 def clear_waiting_date(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DATE_FLAG] = False
@@ -513,7 +513,6 @@ def clear_docs_flow(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DOC_UPLOAD] = False
     context.chat_data.pop(PENDING_DOC_INFO, None)
     context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
-    context.chat_data[WAITING_DELETE_CATEGORY_PICK] = False
 
 def clear_profile_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[PROFILE_WIZ_ACTIVE] = False
@@ -552,7 +551,6 @@ async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_
     due_orig_isos = db_get_due_reschedules(meeting_type, today_d)
     reschedule_due = len(due_orig_isos) > 0
 
-    # "железобетон" для отраслевой — переносы на обычный вторник не создают отдельной логики
     if meeting_type == MEETING_INDUSTRY and standard_due and reschedule_due:
         db_mark_reschedules_sent(meeting_type, due_orig_isos)
         due_orig_isos = []
@@ -602,15 +600,25 @@ async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- HELP MENUS ----------------
 
-def kb_help_main(is_admin_user: bool):
-    rows = [
+def help_text_main(bot_username: str) -> str:
+    return (
+        "🤖 <b>Меню «Помогатор Говорун»</b>\n"
+        "Тут собраны актуальные материалы для команды:\n"
+        "— 📄 Документы\n"
+        "— 🔗 Полезные ссылки\n"
+        "— 👥 Познакомиться с командой\n\n"
+        "<b>ВАЖНО!</b>\n"
+        "Я отправляю ответы на Ваши запросы в ЛС\n"
+        f"Чтобы я мог Вам написать, постучитесь ко мне(@{bot_username}) и отправьте /start"
+    )
+
+def kb_help_main():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
         [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links")],
-        [InlineKeyboardButton("👥 О команде", callback_data="help:team")],
-    ]
-    if is_admin_user:
-        rows.append([InlineKeyboardButton("⚙️ Настройки (админы)", callback_data="help:settings")])
-    return InlineKeyboardMarkup(rows)
+        [InlineKeyboardButton("👥 Познакомиться с командой", callback_data="help:team")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")],
+    ])
 
 def kb_help_docs_categories(is_admin_user: bool):
     cats = db_docs_list_categories()
@@ -620,16 +628,10 @@ def kb_help_docs_categories(is_admin_user: bool):
     else:
         for cid, title in cats:
             rows.append([InlineKeyboardButton(title, callback_data=f"help:docs:cat:{cid}")])
-
-    # админские действия по документам — в настройках, но можно дать удобные кнопки тут
-    if is_admin_user:
-        rows.append([InlineKeyboardButton("➕ Добавить файл (админы)", callback_data="help:settings:add_doc")])
-        rows.append([InlineKeyboardButton("➖ Удалить файл (админы)", callback_data="help:settings:del_doc")])
-
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
-def kb_help_docs_files(category_id: int, is_admin_user: bool):
+def kb_help_docs_files(category_id: int):
     items = db_docs_list_by_category(category_id)
     rows = []
     if not items:
@@ -637,18 +639,12 @@ def kb_help_docs_files(category_id: int, is_admin_user: bool):
     else:
         for did, title in items[:40]:
             rows.append([InlineKeyboardButton(title, callback_data=f"help:docs:file:{did}")])
-
-    if is_admin_user:
-        rows.append([InlineKeyboardButton("➕ Добавить файл", callback_data="help:settings:add_doc")])
-        rows.append([InlineKeyboardButton("➖ Удалить файл", callback_data="help:settings:del_doc")])
-
     rows.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="help:docs")])
     rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
 def kb_help_links():
     rows = []
-    # только если задан URL — показываем кнопку
     if YA_CRM_URL:
         rows.append([InlineKeyboardButton("🌐 YA CRM", url=YA_CRM_URL)])
     if INDUSTRY_WIKI_URL:
@@ -668,11 +664,6 @@ def kb_help_team(is_admin_user: bool):
     else:
         for pid, name in people[:40]:
             rows.append([InlineKeyboardButton(name, callback_data=f"help:team:person:{pid}")])
-
-    if is_admin_user:
-        rows.append([InlineKeyboardButton("➕ Добавить анкету (админы)", callback_data="help:settings:add_profile")])
-        rows.append([InlineKeyboardButton("➖ Удалить анкету (админы)", callback_data="help:settings:del_profile")])
-
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -685,7 +676,6 @@ def kb_help_profile_card(profile: dict):
         elif tg.startswith("https://t.me/") or tg.startswith("http://t.me/"):
             url = tg
         else:
-            # если дали username без @
             if re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
                 url = f"https://t.me/{tg}"
             else:
@@ -697,20 +687,20 @@ def kb_help_profile_card(profile: dict):
     return InlineKeyboardMarkup(rows)
 
 def kb_help_settings():
-    rows = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить файл", callback_data="help:settings:add_doc")],
         [InlineKeyboardButton("➖ Удалить файл", callback_data="help:settings:del_doc")],
         [InlineKeyboardButton("🗂️ Редактировать категории", callback_data="help:settings:cats")],
         [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
         [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
-    ]
-    return InlineKeyboardMarkup(rows)
+    ])
 
 def kb_settings_categories():
     cats = db_docs_list_categories()
-    rows = []
-    rows.append([InlineKeyboardButton("➕ Добавить категорию", callback_data="help:settings:cats:add")])
+    rows = [
+        [InlineKeyboardButton("➕ Добавить категорию", callback_data="help:settings:cats:add")]
+    ]
     if cats:
         rows.append([InlineKeyboardButton("➖ Удалить категорию (только пустую)", callback_data="help:settings:cats:del")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
@@ -726,7 +716,6 @@ def kb_pick_category_for_new_doc():
     return InlineKeyboardMarkup(rows)
 
 def kb_pick_doc_to_delete():
-    # показываем последние N документов
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
@@ -761,9 +750,7 @@ def kb_pick_profile_to_delete():
     return InlineKeyboardMarkup(rows)
 
 def kb_cancel_wizard_settings():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:cancel")]
-    ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="help:settings:cancel")]])
 
 # ---------------- COMMANDS ----------------
 
@@ -771,32 +758,59 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name if update.effective_user else "коллеги"
     text = (
         f"Привет, {name}! 👋\n\n"
-        "Я бот для уведомлений о встречах и справки /help.\n\n"
+        "Я бот для уведомлений о встречах и меню /help.\n\n"
         "Команды:\n"
-        "• /help — справка и меню\n"
+        "• /help — меню «Помогатор»\n"
         "• /setchat — подключить чат к уведомлениям (админы)\n"
         "• /unsetchat — отключить уведомления (админы)\n"
         "• /force_standup — принудительно отправить планёрку (админы)\n"
-        "• /test_industry — тестовое уведомление отраслевой (админы)\n"
+        "• /test_industry — тест отраслевой (админы)\n"
         "• /status — статус (админы)\n"
-        "• /reset — сброс ожиданий (админы)\n\n"
-        "Авто:\n"
-        "• Планёрка — ПН/СР/ПТ 09:15 (МСК)\n"
-        "• Отраслевая — ВТ 11:30 (МСК)"
+        "• /reset — сброс ожиданий (админы)\n"
     )
     await update.message.reply_text(text)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    is_adm = await is_admin(update, context) if update.effective_chat else False
-    text = (
-        "📌 <b>Справка</b>\n\n"
-        "Выберите раздел ниже:\n"
-        "• 📄 Документы — файлы и категории\n"
-        "• 🔗 Полезные ссылки — быстрые ссылки\n"
-        "• 👥 О команде — анкеты сотрудников\n"
-        "• ⚙️ Настройки — управление (только админы)"
+    # гибрид: пробуем в ЛС, иначе — в чат (reply)
+    bot_username = (context.bot.username or "blablabird_bot")
+    text = help_text_main(bot_username)
+
+    # если команда в личке — просто показываем там
+    if update.effective_chat and update.effective_chat.type == "private":
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_main(), disable_web_page_preview=True)
+        return
+
+    # если команда в группе — пытаемся в ЛС
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_help_main(),
+                disable_web_page_preview=True,
+            )
+            # короткий ответ в группе как reply (технически увидят все, но это минимально)
+            await update.message.reply_text(
+                "✅ Меню «Помогатор» отправил вам в ЛС.",
+                reply_to_message_id=update.message.message_id,
+            )
+            return
+        except Forbidden:
+            # нельзя писать пользователю
+            pass
+        except Exception as e:
+            logger.exception("Failed to DM /help: %s", e)
+
+    # fallback: отправляем в чат (reply)
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_help_main(),
+        disable_web_page_preview=True,
+        reply_to_message_id=update.message.message_id,
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_main(is_adm))
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
@@ -881,8 +895,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Отраслевая: <code>{last_industry or '—'}</code>\n\n"
         f"🗂️ Состояние на сегодня:\n"
         f"{fmt_state('Планёрка', st_state, st_due_res)}\n"
-        f"{fmt_state('Отраслевая', in_state, in_due_res)}\n\n"
-        "ℹ️ Для справки используйте /help"
+        f"{fmt_state('Отраслевая', in_state, in_due_res)}\n"
     )
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -1030,28 +1043,26 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
     await q.answer()
 
-    is_adm = await is_admin(update, context)
-
     if data == "noop":
         return
 
+    is_adm = await is_admin(update, context)
+
     if data == "help:main":
-        text = (
-            "📌 <b>Справка</b>\n\n"
-            "Выберите раздел:\n"
-            "• 📄 Документы — файлы и категории\n"
-            "• 🔗 Полезные ссылки — быстрые ссылки\n"
-            "• 👥 О команде — анкеты сотрудников\n"
-            "• ⚙️ Настройки — управление (админы)"
+        bot_username = (context.bot.username or "blablabird_bot")
+        await q.edit_message_text(
+            help_text_main(bot_username),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_main(),
+            disable_web_page_preview=True,
         )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_main(is_adm), disable_web_page_preview=True)
         return
 
     if data == "help:docs":
         text = (
             "📄 <b>Документы</b>\n\n"
-            "Здесь хранятся файлы по категориям.\n"
-            "Нажмите на категорию, чтобы открыть список.\n"
+            "Выберите категорию — внутри будут файлы.\n"
+            "Нажмите на файл, чтобы получить его в чат."
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_categories(is_adm))
         return
@@ -1060,20 +1071,16 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cid = int(data.split(":")[-1])
         cats = dict(db_docs_list_categories())
         title = cats.get(cid, "Категория")
-        text = (
-            f"📄 <b>{title}</b>\n\n"
-            "Выберите файл — бот отправит его в чат.\n"
-        )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_files(cid, is_adm))
+        text = f"📄 <b>{title}</b>\n\nВыберите файл:"
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_files(cid))
         return
 
     if data.startswith("help:docs:file:"):
         doc_id = int(data.split(":")[-1])
         doc = db_docs_get(doc_id)
         if not doc:
-            await q.edit_message_text("Файл не найден (возможно удалён).", reply_markup=kb_help_docs_categories(is_adm))
+            await q.edit_message_text("Файл не найден (возможно удалён).", reply_markup=kb_help_main())
             return
-        # отправляем документ в чат
         try:
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
@@ -1088,20 +1095,13 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "help:links":
         text = (
             "🔗 <b>Полезные ссылки</b>\n\n"
-            "Быстрый доступ к нужным ресурсам:\n"
-            "• 🌐 YA CRM — рабочая CRM\n"
-            "• 📊 WIKI Отрасли — презентации и спичи\n"
-            "• 🛠️ Helpy — бот поддержки\n"
+            "Быстрый доступ к нужным ресурсам:"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_links(), disable_web_page_preview=True)
         return
 
     if data == "help:team":
-        text = (
-            "👥 <b>О команде</b>\n\n"
-            "Здесь анкеты сотрудников.\n"
-            "Нажмите на имя — откроется карточка.\n"
-        )
+        text = "👥 <b>Познакомиться с командой</b>\n\nВыберите человека:"
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_team(is_adm))
         return
 
@@ -1122,215 +1122,175 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(card, parse_mode=ParseMode.HTML, reply_markup=kb_help_profile_card(p), disable_web_page_preview=True)
         return
 
-    # ------- SETTINGS (admins) -------
     if data == "help:settings":
+        # если не админ — показываем уведомление и не открываем меню
         if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+            await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
             return
         text = (
-            "⚙️ <b>Настройки (админы)</b>\n\n"
-            "Управление контентом справки:\n"
-            "• Добавить/удалить файлы\n"
-            "• Редактировать категории документов\n"
-            "• Добавить/удалить анкеты сотрудников\n"
+            "⚙️ <b>Настройки</b>\n\n"
+            "Управление документами, категориями и анкетами."
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
         return
 
-    if data == "help:settings:cancel":
-        # отмена любых визардов
-        clear_docs_flow(context)
-        clear_profile_wiz(context)
-        clear_waiting_date(context)
-        await q.edit_message_text("✅ Действие отменено.", reply_markup=kb_help_settings() if is_adm else kb_help_main(is_adm))
-        return
-
-    if data == "help:settings:cats":
+    # дальше — настройки (только админы)
+    if data.startswith("help:settings:"):
         if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+            await q.answer("⚠️ Доступно администраторам чата.", show_alert=True)
             return
-        text = (
-            "🗂️ <b>Категории документов</b>\n\n"
-            "• ➕ Добавить категорию — бот попросит название\n"
-            "• ➖ Удалить категорию — удаляется только пустая\n"
-        )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_settings_categories())
-        return
 
-    if data == "help:settings:cats:add":
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data == "help:settings:cancel":
+            clear_docs_flow(context)
+            clear_profile_wiz(context)
+            clear_waiting_date(context)
+            await q.edit_message_text("✅ Действие отменено.", reply_markup=kb_help_settings(), parse_mode=ParseMode.HTML)
             return
-        clear_docs_flow(context)
-        context.chat_data[WAITING_NEW_CATEGORY_NAME] = True
-        context.chat_data[WAITING_USER_ID] = update.effective_user.id
-        context.chat_data[WAITING_SINCE_TS] = int(time.time())
-        await q.edit_message_text(
-            "➕ <b>Добавление категории</b>\n\n"
-            "Отправьте название категории одним сообщением.\n"
-            "Пример: <code>Регламенты</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_cancel_wizard_settings(),
-        )
-        return
 
-    if data == "help:settings:cats:del":
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data == "help:settings:cats":
+            await q.edit_message_text(
+                "🗂️ <b>Категории документов</b>\n\n"
+                "• ➕ Добавить категорию — бот попросит название\n"
+                "• ➖ Удалить категорию — удаляется только пустая",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_settings_categories(),
+            )
             return
-        # показываем список категорий для удаления
-        cats = db_docs_list_categories()
-        rows = []
-        for cid, title in cats:
-            rows.append([InlineKeyboardButton(f"🗑️ {title}", callback_data=f"help:settings:cats:del:{cid}")])
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:cats")])
-        await q.edit_message_text(
-            "➖ <b>Удаление категории</b>\n\n"
-            "Удаляется только пустая категория (без файлов).",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return
 
-    if data.startswith("help:settings:cats:del:"):
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data == "help:settings:cats:add":
+            clear_docs_flow(context)
+            context.chat_data[WAITING_NEW_CATEGORY_NAME] = True
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "➕ <b>Добавление категории</b>\n\n"
+                "Отправьте название категории одним сообщением.\n"
+                "Пример: <code>Регламенты</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
             return
-        cid = int(data.split(":")[-1])
-        ok = db_docs_delete_category_if_empty(cid)
-        if ok:
-            await q.answer("Удалено ✅")
-            await q.edit_message_text("✅ Категория удалена.", reply_markup=kb_settings_categories(), parse_mode=ParseMode.HTML)
-        else:
-            await q.answer("Нельзя: категория не пустая", show_alert=True)
-        return
 
-    if data == "help:settings:add_doc":
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data == "help:settings:cats:del":
+            cats = db_docs_list_categories()
+            rows = []
+            for cid, title in cats:
+                rows.append([InlineKeyboardButton(f"🗑️ {title}", callback_data=f"help:settings:cats:del:{cid}")])
+            rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:cats")])
+            await q.edit_message_text(
+                "➖ <b>Удаление категории</b>\n\nУдаляется только пустая категория (без файлов).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
             return
-        clear_docs_flow(context)
-        context.chat_data[WAITING_DOC_UPLOAD] = True
-        context.chat_data[WAITING_USER_ID] = update.effective_user.id
-        context.chat_data[WAITING_SINCE_TS] = int(time.time())
-        await q.edit_message_text(
-            "➕ <b>Добавление файла</b>\n\n"
-            "Отправьте документ (как файл) следующим сообщением.\n"
-            "После этого выберем категорию.\n\n"
-            "Подсказка: название файла можно указать в подписи (caption).",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_cancel_wizard_settings(),
-        )
-        return
 
-    if data == "help:settings:del_doc":
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data.startswith("help:settings:cats:del:"):
+            cid = int(data.split(":")[-1])
+            ok = db_docs_delete_category_if_empty(cid)
+            if ok:
+                await q.answer("Удалено ✅")
+                await q.edit_message_text("✅ Категория удалена.", reply_markup=kb_settings_categories(), parse_mode=ParseMode.HTML)
+            else:
+                await q.answer("Нельзя: категория не пустая", show_alert=True)
             return
-        clear_docs_flow(context)
-        await q.edit_message_text(
-            "➖ <b>Удаление файла</b>\n\n"
-            "Выберите файл из последних добавленных:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_pick_doc_to_delete(),
-        )
-        return
 
-    if data.startswith("help:settings:del_doc:"):
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data == "help:settings:add_doc":
+            clear_docs_flow(context)
+            context.chat_data[WAITING_DOC_UPLOAD] = True
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "➕ <b>Добавление файла</b>\n\n"
+                "Отправьте документ (как файл) следующим сообщением.\n"
+                "После этого выберем категорию.\n\n"
+                "Название можно указать в подписи к файлу (caption).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
             return
-        did = int(data.split(":")[-1])
-        ok = db_docs_delete_doc(did)
-        if ok:
-            await q.answer("Удалено ✅")
-            await q.edit_message_text("✅ Файл удалён.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
-        else:
-            await q.answer("Не найден", show_alert=True)
-        return
 
-    # после загрузки файла: выбор категории
-    if data.startswith("help:settings:add_doc:cat:"):
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data == "help:settings:del_doc":
+            clear_docs_flow(context)
+            await q.edit_message_text(
+                "➖ <b>Удаление файла</b>\n\nВыберите файл из последних добавленных:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_pick_doc_to_delete(),
+            )
             return
-        cid = int(data.split(":")[-1])
-        pending = context.chat_data.get(PENDING_DOC_INFO)
-        if not pending:
-            await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
-            return
-        title = pending["title"]
-        db_docs_add_doc(cid, title, pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
-        clear_docs_flow(context)
-        await q.edit_message_text("✅ Файл добавлен в документы.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
-        return
 
-    if data == "help:settings:add_doc:newcat":
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data.startswith("help:settings:del_doc:"):
+            did = int(data.split(":")[-1])
+            ok = db_docs_delete_doc(did)
+            if ok:
+                await q.answer("Удалено ✅")
+                await q.edit_message_text("✅ Файл удалён.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+            else:
+                await q.answer("Не найден", show_alert=True)
             return
-        pending = context.chat_data.get(PENDING_DOC_INFO)
-        if not pending:
-            await q.answer("Сначала отправьте файл.", show_alert=True)
-            return
-        context.chat_data[WAITING_NEW_CATEGORY_NAME] = True
-        context.chat_data[WAITING_USER_ID] = update.effective_user.id
-        context.chat_data[WAITING_SINCE_TS] = int(time.time())
-        await q.edit_message_text(
-            "➕ <b>Новая категория</b>\n\n"
-            "Отправьте название категории одним сообщением.\n"
-            "После этого файл будет сохранён в неё.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_cancel_wizard_settings(),
-        )
-        return
 
-    if data == "help:settings:add_profile":
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data.startswith("help:settings:add_doc:cat:"):
+            cid = int(data.split(":")[-1])
+            pending = context.chat_data.get(PENDING_DOC_INFO)
+            if not pending:
+                await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
+                return
+            db_docs_add_doc(cid, pending["title"], pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
+            clear_docs_flow(context)
+            await q.edit_message_text("✅ Файл добавлен в документы.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
             return
-        clear_profile_wiz(context)
-        context.chat_data[PROFILE_WIZ_ACTIVE] = True
-        context.chat_data[PROFILE_WIZ_STEP] = "full_name"
-        context.chat_data[PROFILE_WIZ_DATA] = {}
-        context.chat_data[WAITING_USER_ID] = update.effective_user.id
-        context.chat_data[WAITING_SINCE_TS] = int(time.time())
-        await q.edit_message_text(
-            "➕ <b>Добавление анкеты</b>\n\n"
-            "Шаг 1/6: отправьте <b>Имя и Фамилию</b>.\n"
-            "Пример: <code>Иван Петров</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_cancel_wizard_settings(),
-        )
-        return
 
-    if data == "help:settings:del_profile":
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data == "help:settings:add_doc:newcat":
+            pending = context.chat_data.get(PENDING_DOC_INFO)
+            if not pending:
+                await q.answer("Сначала отправьте файл.", show_alert=True)
+                return
+            context.chat_data[WAITING_NEW_CATEGORY_NAME] = True
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "➕ <b>Новая категория</b>\n\n"
+                "Отправьте название категории одним сообщением.\n"
+                "После этого файл будет сохранён в неё.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
             return
-        clear_profile_wiz(context)
-        await q.edit_message_text(
-            "➖ <b>Удаление анкеты</b>\n\n"
-            "Выберите человека:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_pick_profile_to_delete(),
-        )
-        return
 
-    if data.startswith("help:settings:del_profile:"):
-        if not is_adm:
-            await q.answer("Только администраторы.", show_alert=True)
+        if data == "help:settings:add_profile":
+            clear_profile_wiz(context)
+            context.chat_data[PROFILE_WIZ_ACTIVE] = True
+            context.chat_data[PROFILE_WIZ_STEP] = "full_name"
+            context.chat_data[PROFILE_WIZ_DATA] = {}
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "➕ <b>Добавление анкеты</b>\n\n"
+                "Шаг 1/6: отправьте <b>Имя и Фамилию</b>.\n"
+                "Пример: <code>Иван Петров</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
             return
-        pid = int(data.split(":")[-1])
-        ok = db_profiles_delete(pid)
-        if ok:
-            await q.answer("Удалено ✅")
-            await q.edit_message_text("✅ Анкета удалена.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
-        else:
-            await q.answer("Не найдено", show_alert=True)
-        return
 
-    # fallback
+        if data == "help:settings:del_profile":
+            clear_profile_wiz(context)
+            await q.edit_message_text(
+                "➖ <b>Удаление анкеты</b>\n\nВыберите человека:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_pick_profile_to_delete(),
+            )
+            return
+
+        if data.startswith("help:settings:del_profile:"):
+            pid = int(data.split(":")[-1])
+            ok = db_profiles_delete(pid)
+            if ok:
+                await q.answer("Удалено ✅")
+                await q.edit_message_text("✅ Анкета удалена.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+            else:
+                await q.answer("Не найдено", show_alert=True)
+            return
+
     await q.answer()
 
 # ---------------- HANDLERS: DOCUMENT UPLOAD ----------------
@@ -1347,7 +1307,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if waiting_user and user_id != waiting_user:
         return
 
-    # проверка админа
     if not await is_admin(update, context):
         clear_docs_flow(context)
         await update.message.reply_text("❌ Только администраторы могут добавлять документы.")
@@ -1357,7 +1316,6 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not doc:
         return
 
-    # заголовок: caption > file_name
     title = (update.message.caption or "").strip() or (doc.file_name or "Документ")
     pending = {
         "file_id": doc.file_id,
@@ -1369,8 +1327,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DOC_UPLOAD] = False
 
     await update.message.reply_text(
-        "✅ Файл получен.\n\n"
-        "Теперь выберите категорию для сохранения:",
+        "✅ Файл получен.\n\nТеперь выберите категорию для сохранения:",
         reply_markup=kb_pick_category_for_new_doc(),
     )
 
@@ -1383,13 +1340,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
     text = (update.message.text or "").strip()
 
-    # ограничение по пользователю, который начал визард
     waiting_user = context.chat_data.get(WAITING_USER_ID)
     if waiting_user and user_id != waiting_user:
-        # чужие сообщения не трогаем
         return
 
-    # таймаут 10 минут для визардов
     since_ts = context.chat_data.get(WAITING_SINCE_TS)
     if since_ts and int(time.time()) - int(since_ts) > 10 * 60:
         clear_waiting_date(context)
@@ -1398,7 +1352,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
         return
 
-    # 1) ручной ввод даты переноса (встречи)
+    # перенос даты вручную
     if context.chat_data.get(WAITING_DATE_FLAG):
         if not await is_admin(update, context):
             clear_waiting_date(context)
@@ -1427,12 +1381,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_waiting_date(context)
 
         title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
-        await update.message.reply_text(
-            f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом"
-        )
+        await update.message.reply_text(f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
         return
 
-    # 2) ввод названия категории (добавление категории или новая категория при сохранении файла)
+    # ввод названия категории
     if context.chat_data.get(WAITING_NEW_CATEGORY_NAME):
         if not await is_admin(update, context):
             clear_docs_flow(context)
@@ -1443,7 +1395,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Слишком коротко. Отправьте нормальное название категории.")
             return
 
-        # создаём категорию (если уже есть — покажем ошибку)
         try:
             cid = db_docs_add_category(text)
         except sqlite3.IntegrityError:
@@ -1454,18 +1405,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending = context.chat_data.get(PENDING_DOC_INFO)
         if pending:
-            # это режим "создать категорию и сохранить файл"
             db_docs_add_doc(cid, pending["title"], pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
             clear_docs_flow(context)
             await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
             return
 
-        # иначе — просто добавили категорию из настроек
         clear_docs_flow(context)
         await update.message.reply_text("✅ Категория добавлена.", reply_markup=kb_help_settings())
         return
 
-    # 3) анкета сотрудника — пошаговый ввод
+    # анкета — шаги
     if context.chat_data.get(PROFILE_WIZ_ACTIVE):
         if not await is_admin(update, context):
             clear_profile_wiz(context)
@@ -1482,10 +1431,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["full_name"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
             context.chat_data[PROFILE_WIZ_STEP] = "year_start"
-            await update.message.reply_text(
-                "Шаг 2/6: с какого года работает?\nПример: 2022",
-                reply_markup=kb_cancel_wizard_settings(),
-            )
+            await update.message.reply_text("Шаг 2/6: с какого года работает? Пример: 2022", reply_markup=kb_cancel_wizard_settings())
             return
 
         if step == "year_start":
@@ -1500,10 +1446,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["year_start"] = year
             context.chat_data[PROFILE_WIZ_DATA] = data
             context.chat_data[PROFILE_WIZ_STEP] = "city"
-            await update.message.reply_text(
-                "Шаг 3/6: город проживания\nПример: Москва",
-                reply_markup=kb_cancel_wizard_settings(),
-            )
+            await update.message.reply_text("Шаг 3/6: город проживания. Пример: Москва", reply_markup=kb_cancel_wizard_settings())
             return
 
         if step == "city":
@@ -1513,10 +1456,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["city"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
             context.chat_data[PROFILE_WIZ_STEP] = "about"
-            await update.message.reply_text(
-                "Шаг 4/6: кратко о себе (1–3 предложения)",
-                reply_markup=kb_cancel_wizard_settings(),
-            )
+            await update.message.reply_text("Шаг 4/6: кратко о себе (1–3 предложения)", reply_markup=kb_cancel_wizard_settings())
             return
 
         if step == "about":
@@ -1526,10 +1466,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["about"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
             context.chat_data[PROFILE_WIZ_STEP] = "topics"
-            await update.message.reply_text(
-                "Шаг 5/6: по каким вопросам обращаться?\nПример: CRM, отчеты, отраслевые презентации",
-                reply_markup=kb_cancel_wizard_settings(),
-            )
+            await update.message.reply_text("Шаг 5/6: по каким вопросам обращаться?", reply_markup=kb_cancel_wizard_settings())
             return
 
         if step == "topics":
@@ -1539,14 +1476,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["topics"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
             context.chat_data[PROFILE_WIZ_STEP] = "tg_link"
-            await update.message.reply_text(
-                "Шаг 6/6: ссылка на Telegram\nМожно: @username или https://t.me/username",
-                reply_markup=kb_cancel_wizard_settings(),
-            )
+            await update.message.reply_text("Шаг 6/6: Telegram (@username или https://t.me/username)", reply_markup=kb_cancel_wizard_settings())
             return
 
         if step == "tg_link":
-            # мягкая валидация
             tg = text.strip()
             ok = False
             if tg.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", tg):
@@ -1571,15 +1504,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             clear_profile_wiz(context)
-
-            await update.message.reply_text(
-                f"✅ Анкета добавлена (ID {pid}).\nПосмотреть можно через /help → О команде",
-                reply_markup=kb_help_settings(),
-            )
+            await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).\nСмотри /help → Команда", reply_markup=kb_help_settings())
             return
-
-    # иначе — игнорируем (не вмешиваемся в обычный чат)
-    return
 
 # ---------------- APP ----------------
 
@@ -1609,16 +1535,16 @@ def main():
     # callbacks: help
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
 
-    # document upload (для добавления файлов)
+    # document upload
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
 
-    # text input (даты / категории / анкеты)
+    # text input
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     # schedule checker
     app.job_queue.run_repeating(check_and_send_jobs, interval=60, first=10, name="meetings_checker")
 
-    logger.info("Bot started. Standup 09:15 MSK; Industry 11:30 MSK; /help enabled.")
+    logger.info("Bot started. Standup 09:15 MSK; Industry 11:30 MSK; /help DM-first enabled.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
