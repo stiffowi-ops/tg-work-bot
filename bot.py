@@ -767,14 +767,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
+# ✅ ИЗМЕНЕНО: /help — если ЛС открыта, в чат ничего не пишем. Если ЛС закрыта — пишем уведомление и удаляем через минуту.
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # гибрид: пробуем в ЛС, иначе — в чат (reply)
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main(bot_username)
 
     # если команда в личке — просто показываем там
     if update.effective_chat and update.effective_chat.type == "private":
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_main(), disable_web_page_preview=True)
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_main(),
+            disable_web_page_preview=True,
+        )
         return
 
     # если команда в группе — пытаемся в ЛС
@@ -788,20 +793,39 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_help_main(),
                 disable_web_page_preview=True,
             )
-            # короткий ответ в группе как reply (технически увидят все, но это минимально)
-            await update.message.reply_text(
-                "✅ Меню «Помогатор» отправил вам в ЛС.",
-                "<b>ВАЖНО!</b>\n"
-        "Я отправляю ответы на Ваши запросы в ЛС\n"
-        f"Чтобы я мог Вам написать, постучитесь ко мне(@{bot_username}) и отправьте /start"
-                reply_to_message_id=update.message.message_id,
-            )
+            # УСПЕХ: в общий чат НЕ пишем ничего
             return
+
         except Forbidden:
-            # нельзя писать пользователю
-            pass
+            # ЛС закрыта -> пишем уведомление в чат и удаляем через минуту
+            warn_text = (
+                "⚠️ Я не могу написать вам в ЛС.\n"
+                f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start, "
+                "после этого снова нажмите /help в чате."
+            )
+            msg = await update.message.reply_text(
+                warn_text,
+                reply_to_message_id=update.message.message_id,
+                disable_web_page_preview=True,
+            )
+
+            # удалить уведомление через 60 секунд
+            context.job_queue.run_once(
+                lambda ctx: ctx.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id),
+                when=60,
+            )
+
+            # (опционально) удалить сообщение пользователя с /help через 60 секунд — раскомментируйте при наличии прав
+            # context.job_queue.run_once(
+            #     lambda ctx: ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id),
+            #     when=60,
+            # )
+
+            return
+
         except Exception as e:
             logger.exception("Failed to DM /help: %s", e)
+            # На прочие ошибки — fallback ниже (в чат)
 
     # fallback: отправляем в чат (reply)
     await update.message.reply_text(
@@ -1123,7 +1147,6 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:settings":
-        # если не админ — показываем уведомление и не открываем меню
         if not is_adm:
             await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
             return
