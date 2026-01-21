@@ -609,13 +609,16 @@ def help_text_main(bot_username: str) -> str:
         "— 👥 Познакомиться с командой\n\n"
     )
 
-def kb_help_main():
-    return InlineKeyboardMarkup([
+# ✅ теперь можно скрывать "⚙️ Настройки" (например в ЛС)
+def kb_help_main(include_settings: bool = True):
+    rows = [
         [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
         [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links")],
         [InlineKeyboardButton("👥 Познакомиться с командой", callback_data="help:team")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")],
-    ])
+    ]
+    if include_settings:
+        rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")])
+    return InlineKeyboardMarkup(rows)
 
 def kb_help_docs_categories(is_admin_user: bool):
     cats = db_docs_list_categories()
@@ -757,7 +760,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Привет, {name}! 👋\n\n"
         "Я бот для уведомлений о встречах и меню /help.\n\n"
         "Команды:\n"
-        "• /help — меню «Помогатор»\n"
+        "• /help — меню «Помогатор» (в ЛС)\n"
+        "• /help_admin — меню «Помогатор» с настройками (админы, в группе)\n"
         "• /setchat — подключить чат к уведомлениям (админы)\n"
         "• /unsetchat — отключить уведомления (админы)\n"
         "• /force_standup — принудительно отправить планёрку (админы)\n"
@@ -767,17 +771,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
-# ✅ ИЗМЕНЕНО: /help — если ЛС открыта, в чат ничего не пишем. Если ЛС закрыта — пишем уведомление и удаляем через минуту.
+# ✅ /help: в группе пытаемся отправить в ЛС. Если получилось — молчим в чате.
+# Если ЛС закрыта — пишем уведомление в чат и удаляем через минуту.
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main(bot_username)
 
-    # если команда в личке — просто показываем там
+    # если команда в личке — показываем меню (без настроек)
     if update.effective_chat and update.effective_chat.type == "private":
         await update.message.reply_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_main(),
+            reply_markup=kb_help_main(include_settings=False),
             disable_web_page_preview=True,
         )
         return
@@ -790,14 +795,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb_help_main(),
+                reply_markup=kb_help_main(include_settings=False),
                 disable_web_page_preview=True,
             )
-            # УСПЕХ: в общий чат НЕ пишем ничего
-            return
-
+            return  # успех — ничего в чат
         except Forbidden:
-            # ЛС закрыта -> пишем уведомление в чат и удаляем через минуту
             warn_text = (
                 "⚠️ Я не могу написать вам в ЛС.\n"
                 f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start, "
@@ -808,30 +810,40 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_to_message_id=update.message.message_id,
                 disable_web_page_preview=True,
             )
-
-            # удалить уведомление через 60 секунд
             context.job_queue.run_once(
                 lambda ctx: ctx.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id),
                 when=60,
             )
-
-            # (опционально) удалить сообщение пользователя с /help через 60 секунд — раскомментируйте при наличии прав
-            # context.job_queue.run_once(
-            #     lambda ctx: ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id),
-            #     when=60,
-            # )
-
             return
-
         except Exception as e:
             logger.exception("Failed to DM /help: %s", e)
-            # На прочие ошибки — fallback ниже (в чат)
 
-    # fallback: отправляем в чат (reply)
+    # fallback: если не получилось — показываем меню в группе (без настроек, чтобы не ломать логику)
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_help_main(),
+        reply_markup=kb_help_main(include_settings=False),
+        disable_web_page_preview=True,
+        reply_to_message_id=update.message.message_id,
+    )
+
+# ✅ НОВОЕ: /help_admin — админское меню в группе (без ЛС)
+async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_username = (context.bot.username or "blablabird_bot")
+    text = help_text_main(bot_username)
+
+    if update.effective_chat and update.effective_chat.type == "private":
+        await update.message.reply_text("Эта команда работает в групповом чате для администраторов.")
+        return
+
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ Только администраторы могут использовать /help_admin.")
+        return
+
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_help_main(include_settings=True),
         disable_web_page_preview=True,
         reply_to_message_id=update.message.message_id,
     )
@@ -1070,14 +1082,16 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
-    is_adm = await is_admin(update, context)
+    is_private = bool(update.effective_chat and update.effective_chat.type == "private")
+    is_adm = (False if is_private else await is_admin(update, context))
+    include_settings = (not is_private) and is_adm
 
     if data == "help:main":
         bot_username = (context.bot.username or "blablabird_bot")
         await q.edit_message_text(
             help_text_main(bot_username),
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_main(),
+            reply_markup=kb_help_main(include_settings=include_settings),
             disable_web_page_preview=True,
         )
         return
@@ -1103,7 +1117,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_id = int(data.split(":")[-1])
         doc = db_docs_get(doc_id)
         if not doc:
-            await q.edit_message_text("Файл не найден (возможно удалён).", reply_markup=kb_help_main())
+            await q.edit_message_text("Файл не найден (возможно удалён).", reply_markup=kb_help_main(include_settings=include_settings))
             return
         try:
             await context.bot.send_document(
@@ -1147,9 +1161,15 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:settings":
+        # В ЛС настройки не открываем (работают через /help_admin в группе)
+        if is_private:
+            await q.answer("⚠️ Настройки доступны только в групповом чате через /help_admin.", show_alert=True)
+            return
+
         if not is_adm:
             await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
             return
+
         text = (
             "⚙️ <b>Настройки</b>\n\n"
             "Управление документами, категориями и анкетами."
@@ -1159,6 +1179,9 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # дальше — настройки (только админы)
     if data.startswith("help:settings:"):
+        if is_private:
+            await q.answer("⚠️ Настройки доступны только в групповом чате через /help_admin.", show_alert=True)
+            return
         if not is_adm:
             await q.answer("⚠️ Доступно администраторам чата.", show_alert=True)
             return
@@ -1372,7 +1395,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_waiting_date(context)
         clear_docs_flow(context)
         clear_profile_wiz(context)
-        await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
+        await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help_admin.")
         return
 
     # перенос даты вручную
@@ -1527,7 +1550,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             clear_profile_wiz(context)
-            await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).\nСмотри /help → Команда", reply_markup=kb_help_settings())
+            await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).\nСмотри /help_admin → Команда", reply_markup=kb_help_settings())
             return
 
 # ---------------- APP ----------------
@@ -1540,6 +1563,7 @@ def main():
     # commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("help_admin", cmd_help_admin))  # ✅ добавили
     app.add_handler(CommandHandler("setchat", cmd_setchat))
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
     app.add_handler(CommandHandler("force_standup", cmd_force_standup))
@@ -1567,7 +1591,7 @@ def main():
     # schedule checker
     app.job_queue.run_repeating(check_and_send_jobs, interval=60, first=10, name="meetings_checker")
 
-    logger.info("Bot started. Standup 09:15 MSK; Industry 11:30 MSK; /help DM-first enabled.")
+    logger.info("Bot started. Standup 09:15 MSK; Industry 11:30 MSK; /help DM-first enabled; /help_admin for admins.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
