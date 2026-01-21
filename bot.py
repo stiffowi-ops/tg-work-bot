@@ -54,6 +54,9 @@ MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 MEETING_STANDUP = "standup"
 MEETING_INDUSTRY = "industry"
 
+# где хранить контекст, из какого чата пользователь открыл /help
+HELP_SCOPE_CHAT_ID = "help_scope_chat_id"
+
 # ---------------- DB ----------------
 
 def db_init():
@@ -109,7 +112,7 @@ def db_init():
         )
     """)
 
-    # добавили description (для новых БД)
+    # docs + description
     cur.execute("""
         CREATE TABLE IF NOT EXISTS docs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,7 +127,7 @@ def db_init():
         )
     """)
 
-    # миграция для старых БД: добавить description, если поля нет
+    # миграция для старых БД
     try:
         cur.execute("ALTER TABLE docs ADD COLUMN description TEXT")
     except sqlite3.OperationalError:
@@ -493,28 +496,41 @@ def kb_manual_input_controls(meeting_type: str):
         [InlineKeyboardButton("Отмена ввода даты ❌", callback_data=f"reschedule:cancel_manual:{meeting_type}")]
     ])
 
-# ---------------- ADMIN CHECK ----------------
+# ---------------- ADMIN CHECK (с учетом scope) ----------------
 
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not update.effective_chat or not update.effective_user:
+async def is_admin_in_chat(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
         return False
-    member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    return member.status in ("administrator", "creator")
+
+def get_scope_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    # если в группе — scope это текущий чат
+    if update.effective_chat and update.effective_chat.type != "private":
+        return update.effective_chat.id
+    # если в ЛС — scope берём из user_data (последний чат, откуда открывали help)
+    return context.user_data.get(HELP_SCOPE_CHAT_ID)
+
+async def is_admin_scoped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not update.effective_user:
+        return False
+    scope_chat_id = get_scope_chat_id(update, context)
+    if not scope_chat_id:
+        return False
+    return await is_admin_in_chat(scope_chat_id, update.effective_user.id, context)
 
 # ---------------- STATES ----------------
-# meeting reschedule manual
 WAITING_DATE_FLAG = "waiting_reschedule_date"
 WAITING_USER_ID = "waiting_user_id"
 WAITING_SINCE_TS = "waiting_since_ts"
 WAITING_MEETING_TYPE = "waiting_meeting_type"
 
-# docs add flow (добавили WAITING_DOC_DESC)
 WAITING_DOC_UPLOAD = "waiting_doc_upload"
 WAITING_DOC_DESC = "waiting_doc_desc"
 PENDING_DOC_INFO = "pending_doc_info"
 WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
 
-# profiles add flow
 PROFILE_WIZ_ACTIVE = "profile_wiz_active"
 PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
@@ -617,7 +633,7 @@ async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- HELP MENUS ----------------
 
-def help_text_main(bot_username: str) -> str:
+def help_text_main() -> str:
     return (
         "🤖 <b>Меню «Помогатор Говорун»</b>\n"
         "Тут собраны актуальные материалы для команды:\n"
@@ -626,13 +642,13 @@ def help_text_main(bot_username: str) -> str:
         "— 👥 Познакомиться с командой\n\n"
     )
 
-def kb_help_main(include_settings: bool = True):
+def kb_help_main(is_admin_user: bool):
     rows = [
         [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
         [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links")],
         [InlineKeyboardButton("👥 Познакомиться с командой", callback_data="help:team")],
     ]
-    if include_settings:
+    if is_admin_user:
         rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")])
     return InlineKeyboardMarkup(rows)
 
@@ -662,12 +678,9 @@ def kb_help_docs_files(category_id: int):
 # -------- LINKS (меню + описания) --------
 
 def get_links_catalog() -> dict[str, dict]:
-    """
-    key -> {title, url, desc}
-    """
     catalog = {}
 
-    # добавленная ссылка "Чекко"
+    # Чекко
     catalog["checko"] = {
         "title": 'Сервис "Чекко" поиск контактов',
         "url": "https://checko.ru/",
@@ -709,17 +722,17 @@ def kb_help_links_menu():
     if not catalog:
         rows.append([InlineKeyboardButton("— ссылки не настроены —", callback_data="noop")])
     else:
-        # сортировка: сверху вниз по длине названия (убывание) — «пирамида»
+        # “пирамида”: сверху самые длинные названия
         items = sorted(catalog.items(), key=lambda kv: len(kv[1]["title"]), reverse=True)
         for key, item in items:
             rows.append([InlineKeyboardButton(item["title"], callback_data=f"help:links:item:{key}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
-def kb_help_link_card(url: str, back_to: str = "help:links"):
+def kb_help_link_card(url: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Открыть ссылку", url=url)],
-        [InlineKeyboardButton("⬅️ Назад", callback_data=back_to)],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:links")],
     ])
 
 def kb_help_team(is_admin_user: bool):
@@ -827,7 +840,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Я бот для уведомлений о встречах и меню /help.\n\n"
         "Команды:\n"
         "• /help — меню «Помогатор» (в ЛС)\n"
-        "• /help_admin — меню «Помогатор» с настройками (админы, в группе)\n"
         "• /setchat — подключить чат к уведомлениям (админы)\n"
         "• /unsetchat — отключить уведомления (админы)\n"
         "• /force_standup — принудительно отправить планёрку (админы)\n"
@@ -839,80 +851,64 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
-    text = help_text_main(bot_username)
+    text = help_text_main()
 
-    if update.effective_chat and update.effective_chat.type == "private":
-        await update.message.reply_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_main(include_settings=False),
-            disable_web_page_preview=True,
-        )
+    # если /help вызвали в группе — запоминаем scope и шлём в ЛС
+    if update.effective_chat and update.effective_chat.type != "private":
+        if update.effective_user:
+            context.user_data[HELP_SCOPE_CHAT_ID] = update.effective_chat.id
+
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id:
+            try:
+                # определяем админ ли он в этом чате (scope)
+                is_adm = await is_admin_scoped(update, context)
+
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_help_main(is_admin_user=is_adm),
+                    disable_web_page_preview=True,
+                )
+                # УСПЕХ — в чат ничего не пишем
+                return
+            except Forbidden:
+                warn_text = (
+                    "⚠️ Я не могу написать вам в ЛС.\n"
+                    f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start, "
+                    "после этого снова нажмите /help в чате."
+                )
+                msg = await update.message.reply_text(
+                    warn_text,
+                    reply_to_message_id=update.message.message_id,
+                    disable_web_page_preview=True,
+                )
+                context.job_queue.run_once(
+                    lambda ctx: ctx.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id),
+                    when=60,
+                )
+                return
+            except Exception as e:
+                logger.exception("Failed to DM /help: %s", e)
+
+        # fallback (редко): если user_id нет
         return
 
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id:
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_help_main(include_settings=False),
-                disable_web_page_preview=True,
-            )
-            return
-        except Forbidden:
-            warn_text = (
-                "⚠️ Я не могу написать вам в ЛС.\n"
-                f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start, "
-                "после этого снова нажмите /help в чате."
-            )
-            msg = await update.message.reply_text(
-                warn_text,
-                reply_to_message_id=update.message.message_id,
-                disable_web_page_preview=True,
-            )
-            context.job_queue.run_once(
-                lambda ctx: ctx.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id),
-                when=60,
-            )
-            return
-        except Exception as e:
-            logger.exception("Failed to DM /help: %s", e)
-
+    # если /help в ЛС — показываем меню, но настройки только если есть scope и он админ там
+    is_adm = await is_admin_scoped(update, context)
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_help_main(include_settings=False),
+        reply_markup=kb_help_main(is_admin_user=is_adm),
         disable_web_page_preview=True,
-        reply_to_message_id=update.message.message_id,
-    )
-
-async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot_username = (context.bot.username or "blablabird_bot")
-    text = help_text_main(bot_username)
-
-    if update.effective_chat and update.effective_chat.type == "private":
-        await update.message.reply_text("Эта команда работает в групповом чате для администраторов.")
-        return
-
-    if not await is_admin(update, context):
-        await update.message.reply_text("❌ Только администраторы могут использовать /help_admin.")
-        return
-
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_help_main(include_settings=True),
-        disable_web_page_preview=True,
-        reply_to_message_id=update.message.message_id,
     )
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
         await update.message.reply_text("Эта команда работает только в групповом чате.")
         return
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await update.message.reply_text("Только администраторы могут назначить чат для уведомлений.")
         return
     db_add_chat(update.effective_chat.id)
@@ -922,14 +918,14 @@ async def cmd_unsetchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
         await update.message.reply_text("Эта команда работает только в групповом чате.")
         return
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await update.message.reply_text("Только администраторы могут отключить уведомления.")
         return
     db_remove_chat(update.effective_chat.id)
     await update.message.reply_text("🧹 Этот чат убран из рассылки уведомлений.")
 
 async def cmd_force_standup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await update.message.reply_text("Недостаточно прав.")
         return
     if not db_list_chats():
@@ -939,7 +935,7 @@ async def cmd_force_standup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚀 Отправил принудительное уведомление планёрки.")
 
 async def cmd_test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await update.message.reply_text("Недостаточно прав.")
         return
     if not db_list_chats():
@@ -949,7 +945,7 @@ async def cmd_test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚀 Отправил тестовое уведомление отраслевой встречи.")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await update.message.reply_text("Только администраторы.")
         return
 
@@ -997,7 +993,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         return
     clear_waiting_date(context)
     clear_docs_flow(context)
@@ -1009,7 +1005,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await query.answer("Только администраторы могут отменять/переносить.", show_alert=True)
         return
     _, _, meeting_type = query.data.split(":")
@@ -1017,7 +1013,7 @@ async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_cancel_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await query.answer("Только администраторы.", show_alert=True)
         return
     await query.edit_message_reply_markup(reply_markup=None)
@@ -1025,7 +1021,7 @@ async def cb_cancel_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await query.answer("Только администраторы.", show_alert=True)
         return
 
@@ -1039,7 +1035,7 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_set_canceled(meeting_type, today_d, reason_text)
         await query.edit_message_reply_markup(reply_markup=None)
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
+        await context.bot.send_message(chat_id=get_scope_chat_id(update, context) or update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
         await query.answer("Отменено.")
         return
 
@@ -1048,7 +1044,7 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_set_canceled(meeting_type, today_d, reason_text)
         await query.edit_message_reply_markup(reply_markup=None)
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
+        await context.bot.send_message(chat_id=get_scope_chat_id(update, context) or update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
         await query.answer("Ок.")
         return
 
@@ -1059,7 +1055,7 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await query.answer("Только администраторы.", show_alert=True)
         return
 
@@ -1084,16 +1080,18 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await query.edit_message_reply_markup(reply_markup=None)
 
-    title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"{title}\nНовая дата: {picked} 📌\nСледите за расписанием или чатом"
-    )
+    scope_chat_id = get_scope_chat_id(update, context)
+    if scope_chat_id:
+        title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
+        await context.bot.send_message(
+            chat_id=scope_chat_id,
+            text=f"{title}\nНовая дата: {picked} 📌\nСледите за расписанием или чатом"
+        )
     await query.answer("Перенесено.")
 
 async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await query.answer("❌ Только администраторы.", show_alert=True)
         return
 
@@ -1112,7 +1110,7 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
             "📅 <b>Введите дату переноса</b>\n\n"
             "Формат: <b>ДД.ММ.ГГ</b>\n"
             "Пример: <code>22.01.26</code>\n\n"
-            "Просто отправьте дату сообщением в чат.\n"
+            "Просто отправьте дату сообщением.\n"
             "Если передумали — нажмите «Отмена ввода даты ❌»."
         ),
         parse_mode=ParseMode.HTML,
@@ -1121,7 +1119,7 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         await query.answer("❌ Только администраторы.", show_alert=True)
         return
     clear_waiting_date(context)
@@ -1142,16 +1140,13 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop":
         return
 
-    is_private = bool(update.effective_chat and update.effective_chat.type == "private")
-    is_adm = (False if is_private else await is_admin(update, context))
-    include_settings = (not is_private) and is_adm
+    is_adm = await is_admin_scoped(update, context)
 
     if data == "help:main":
-        bot_username = (context.bot.username or "blablabird_bot")
         await q.edit_message_text(
-            help_text_main(bot_username),
+            help_text_main(),
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_main(include_settings=include_settings),
+            reply_markup=kb_help_main(is_admin_user=is_adm),
             disable_web_page_preview=True,
         )
         return
@@ -1177,7 +1172,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_id = int(data.split(":")[-1])
         doc = db_docs_get(doc_id)
         if not doc:
-            await q.edit_message_text("Файл не найден (возможно удалён).", reply_markup=kb_help_main(include_settings=include_settings))
+            await q.edit_message_text("Файл не найден (возможно удалён).", reply_markup=kb_help_main(is_admin_user=is_adm))
             return
         try:
             caption = f"📄 <b>{doc['title']}</b>"
@@ -1209,12 +1204,9 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not item:
             await q.answer("Ссылка не найдена.", show_alert=True)
             return
-
-        # делаем кликабельную ссылку прямо в тексте, плюс кнопка
         url = item["url"]
         title = item["title"]
         desc = item["desc"]
-
         text = (
             f"<b>{title}</b>\n\n"
             f"{desc}\n\n"
@@ -1223,7 +1215,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_link_card(url, back_to="help:links"),
+            reply_markup=kb_help_link_card(url),
             disable_web_page_preview=True,
         )
         return
@@ -1251,26 +1243,21 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:settings":
-        if is_private:
-            await q.answer("⚠️ Настройки доступны только в групповом чате через /help_admin.", show_alert=True)
-            return
         if not is_adm:
-            await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
+            await q.answer("⚠️ Настройки доступны администраторам выбранного чата.", show_alert=True)
             return
         text = (
             "⚙️ <b>Настройки</b>\n\n"
-            "Управление документами, категориями и анкетами."
+            "Управление документами, категориями и анкетами.\n"
+            "Все действия делаются тут, в ЛС — в чате флудить не будем 🙂"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
         return
 
-    # дальше — настройки (только админы)
+    # настройки
     if data.startswith("help:settings:"):
-        if is_private:
-            await q.answer("⚠️ Настройки доступны только в групповом чате через /help_admin.", show_alert=True)
-            return
         if not is_adm:
-            await q.answer("⚠️ Доступно администраторам чата.", show_alert=True)
+            await q.answer("⚠️ Доступно администраторам.", show_alert=True)
             return
 
         if data == "help:settings:cancel":
@@ -1336,7 +1323,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(
                 "➕ <b>Добавление файла</b>\n\n"
                 "1) Отправьте документ (как файл) следующим сообщением.\n"
-                "   • Название можно указать в подписи к файлу (caption)\n"
+                "   • Название можно указать в подписи (caption)\n"
                 "2) Затем бот попросит краткое описание\n"
                 "3) Потом выберем категорию",
                 parse_mode=ParseMode.HTML,
@@ -1449,7 +1436,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if waiting_user and user_id != waiting_user:
         return
 
-    if not await is_admin(update, context):
+    if not await is_admin_scoped(update, context):
         clear_docs_flow(context)
         await update.message.reply_text("❌ Только администраторы могут добавлять документы.")
         return
@@ -1473,7 +1460,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "✍️ <b>Краткое описание</b>\n\n"
-        "Отправьте 1–2 предложения, чтобы коллегам было понятно, что внутри.\n"
+        "Отправьте 1–2 предложения.\n"
         "Если описания не нужно — отправьте <code>-</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=kb_cancel_wizard_settings(),
@@ -1497,11 +1484,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_waiting_date(context)
         clear_docs_flow(context)
         clear_profile_wiz(context)
-        await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help_admin.")
+        await update.message.reply_text("⏳ Время ожидания истекло. Откройте /help заново.")
         return
 
+    # описание документа
     if context.chat_data.get(WAITING_DOC_DESC):
-        if not await is_admin(update, context):
+        if not await is_admin_scoped(update, context):
             clear_docs_flow(context)
             await update.message.reply_text("❌ Только администраторы могут добавлять документы.")
             return
@@ -1509,14 +1497,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending = context.chat_data.get(PENDING_DOC_INFO)
         if not pending:
             clear_docs_flow(context)
-            await update.message.reply_text("❌ Не найден загруженный файл. Начните заново через /help_admin.")
+            await update.message.reply_text("❌ Не найден загруженный файл. Начните заново через /help.")
             return
 
         desc = None if text == "-" else text
         if desc is not None:
             desc = desc.strip()
             if len(desc) < 3:
-                await update.message.reply_text("❌ Описание слишком короткое. Напишите чуть подробнее или отправьте <code>-</code>.", parse_mode=ParseMode.HTML)
+                await update.message.reply_text("❌ Слишком коротко. Напишите чуть подробнее или отправьте <code>-</code>.", parse_mode=ParseMode.HTML)
                 return
             desc = desc[:600]
 
@@ -1525,16 +1513,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data[WAITING_DOC_DESC] = False
 
         await update.message.reply_text(
-            "✅ Описание сохранено.\n\nТеперь выберите категорию для сохранения:",
+            "✅ Описание сохранено.\n\nТеперь выберите категорию:",
             reply_markup=kb_pick_category_for_new_doc(),
         )
         return
 
-    # остальные ветки on_text — без изменений (переносы/категории/анкеты)
-    # ... (оставлены как в предыдущей версии, сокращать нельзя — тут полный код ниже)
-
+    # перенос даты вручную
     if context.chat_data.get(WAITING_DATE_FLAG):
-        if not await is_admin(update, context):
+        if not await is_admin_scoped(update, context):
             clear_waiting_date(context)
             await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
             return
@@ -1560,12 +1546,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_upsert_reschedule(meeting_type, today_d, new_d)
         clear_waiting_date(context)
 
-        title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
-        await update.message.reply_text(f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
+        scope_chat_id = context.user_data.get(HELP_SCOPE_CHAT_ID)
+        if scope_chat_id:
+            title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
+            await context.bot.send_message(chat_id=scope_chat_id, text=f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
+
+        await update.message.reply_text("✅ Готово. Перенос применён.")
         return
 
+    # ввод названия категории
     if context.chat_data.get(WAITING_NEW_CATEGORY_NAME):
-        if not await is_admin(update, context):
+        if not await is_admin_scoped(update, context):
             clear_docs_flow(context)
             await update.message.reply_text("❌ Только администраторы могут управлять категориями.")
             return
@@ -1600,8 +1591,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Категория добавлена.", reply_markup=kb_help_settings())
         return
 
+    # анкета — шаги
     if context.chat_data.get(PROFILE_WIZ_ACTIVE):
-        if not await is_admin(update, context):
+        if not await is_admin_scoped(update, context):
             clear_profile_wiz(context)
             await update.message.reply_text("❌ Только администраторы могут добавлять анкеты.")
             return
@@ -1689,7 +1681,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             clear_profile_wiz(context)
-            await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).\nСмотри /help_admin → Команда", reply_markup=kb_help_settings())
+            await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).", reply_markup=kb_help_settings())
             return
 
 # ---------------- APP ----------------
@@ -1702,7 +1694,6 @@ def main():
     # commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("help_admin", cmd_help_admin))
     app.add_handler(CommandHandler("setchat", cmd_setchat))
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
     app.add_handler(CommandHandler("force_standup", cmd_force_standup))
@@ -1730,7 +1721,7 @@ def main():
     # schedule checker
     app.job_queue.run_repeating(check_and_send_jobs, interval=60, first=10, name="meetings_checker")
 
-    logger.info("Bot started. Standup 09:15 MSK; Industry 11:30 MSK; /help DM-first enabled; /help_admin for admins.")
+    logger.info("Bot started. /help DM-first, admin settings shown only to admins of scope chat.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
