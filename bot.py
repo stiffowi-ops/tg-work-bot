@@ -15,7 +15,7 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.constants import ParseMode
-from telegram.error import Forbidden
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -60,7 +60,6 @@ def db_init():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
 
-    # рассылочные чаты
     cur.execute("""
         CREATE TABLE IF NOT EXISTS notify_chats (
             chat_id INTEGER PRIMARY KEY,
@@ -68,7 +67,6 @@ def db_init():
         )
     """)
 
-    # состояния встреч
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meeting_state (
             meeting_type TEXT NOT NULL,
@@ -80,7 +78,6 @@ def db_init():
         )
     """)
 
-    # переносы встреч
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meeting_reschedules (
             meeting_type TEXT NOT NULL,
@@ -92,7 +89,6 @@ def db_init():
         )
     """)
 
-    # мета
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
@@ -100,7 +96,6 @@ def db_init():
         )
     """)
 
-    # ------- HELP MENU: документы -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS doc_categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,7 +117,6 @@ def db_init():
         )
     """)
 
-    # ------- HELP MENU: анкеты -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -487,18 +481,16 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return member.status in ("administrator", "creator")
 
 # ---------------- STATES ----------------
-# meeting reschedule manual
+
 WAITING_DATE_FLAG = "waiting_reschedule_date"
 WAITING_USER_ID = "waiting_user_id"
 WAITING_SINCE_TS = "waiting_since_ts"
 WAITING_MEETING_TYPE = "waiting_meeting_type"
 
-# docs add flow
 WAITING_DOC_UPLOAD = "waiting_doc_upload"
 PENDING_DOC_INFO = "pending_doc_info"
 WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
 
-# profiles add flow
 PROFILE_WIZ_ACTIVE = "profile_wiz_active"
 PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
@@ -551,6 +543,7 @@ async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_
     due_orig_isos = db_get_due_reschedules(meeting_type, today_d)
     reschedule_due = len(due_orig_isos) > 0
 
+    # "железобетон" для отраслевой — переносы на обычный вторник не дублируем
     if meeting_type == MEETING_INDUSTRY and standard_due and reschedule_due:
         db_mark_reschedules_sent(meeting_type, due_orig_isos)
         due_orig_isos = []
@@ -600,18 +593,6 @@ async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- HELP MENUS ----------------
 
-def help_text_main(bot_username: str) -> str:
-    return (
-        "🤖 <b>Меню «Помогатор Говорун»</b>\n"
-        "Тут собраны актуальные материалы для команды:\n"
-        "— 📄 Документы\n"
-        "— 🔗 Полезные ссылки\n"
-        "— 👥 Познакомиться с командой\n\n"
-        "<b>ВАЖНО!</b>\n"
-        "Я отправляю ответы на Ваши запросы в ЛС\n"
-        f"Чтобы я мог Вам написать, постучитесь ко мне(@{bot_username}) и отправьте /start"
-    )
-
 def kb_help_main():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
@@ -620,7 +601,7 @@ def kb_help_main():
         [InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")],
     ])
 
-def kb_help_docs_categories(is_admin_user: bool):
+def kb_help_docs_categories():
     cats = db_docs_list_categories()
     rows = []
     if not cats:
@@ -656,7 +637,7 @@ def kb_help_links():
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
-def kb_help_team(is_admin_user: bool):
+def kb_help_team():
     people = db_profiles_list()
     rows = []
     if not people:
@@ -752,6 +733,26 @@ def kb_pick_profile_to_delete():
 def kb_cancel_wizard_settings():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="help:settings:cancel")]])
 
+def help_dm_menu_text() -> str:
+    return "🤖 <b>Меню «Помогатор Говорун»</b>"
+
+def help_chat_fallback_text(bot_username: str) -> str:
+    return (
+        "❗️<b>ВАЖНО</b> Я отправляю ответы на Ваши запросы в ЛС\n"
+        f"Чтобы я мог Вам написать, постучитесь ко мне(@{bot_username}) и отправьте /start"
+    )
+
+async def delete_later(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.data.get("chat_id")
+    message_id = job.data.get("message_id")
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except BadRequest as e:
+        logger.info("delete_message skipped: %s", e)
+    except Exception as e:
+        logger.exception("delete_message failed: %s", e)
+
 # ---------------- COMMANDS ----------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -771,45 +772,49 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # гибрид: пробуем в ЛС, иначе — в чат (reply)
     bot_username = (context.bot.username or "blablabird_bot")
-    text = help_text_main(bot_username)
 
     # если команда в личке — просто показываем там
     if update.effective_chat and update.effective_chat.type == "private":
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_main(), disable_web_page_preview=True)
+        await update.message.reply_text(
+            help_dm_menu_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_main(),
+            disable_web_page_preview=True,
+        )
         return
 
-    # если команда в группе — пытаемся в ЛС
     user_id = update.effective_user.id if update.effective_user else None
+
+    # 1) пробуем отправить в ЛС — если получилось, в чат НЕ пишем ничего
     if user_id:
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=text,
+                text=help_dm_menu_text(),
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_help_main(),
                 disable_web_page_preview=True,
             )
-            # короткий ответ в группе как reply (технически увидят все, но это минимально)
-            await update.message.reply_text(
-                "✅ Меню «Помогатор» отправил вам в ЛС.",
-                reply_to_message_id=update.message.message_id,
-            )
             return
         except Forbidden:
-            # нельзя писать пользователю
             pass
         except Exception as e:
             logger.exception("Failed to DM /help: %s", e)
 
-    # fallback: отправляем в чат (reply)
-    await update.message.reply_text(
-        text,
+    # 2) если ЛС недоступны — пишем в чат (reply) + автоудаление через минуту
+    msg = await update.message.reply_text(
+        help_chat_fallback_text(bot_username),
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_help_main(),
         disable_web_page_preview=True,
         reply_to_message_id=update.message.message_id,
+    )
+
+    context.job_queue.run_once(
+        delete_later,
+        when=60,
+        data={"chat_id": msg.chat_id, "message_id": msg.message_id},
+        name=f"del_help_notice:{msg.chat_id}:{msg.message_id}",
     )
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1049,9 +1054,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_adm = await is_admin(update, context)
 
     if data == "help:main":
-        bot_username = (context.bot.username or "blablabird_bot")
         await q.edit_message_text(
-            help_text_main(bot_username),
+            help_dm_menu_text(),
             parse_mode=ParseMode.HTML,
             reply_markup=kb_help_main(),
             disable_web_page_preview=True,
@@ -1064,7 +1068,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Выберите категорию — внутри будут файлы.\n"
             "Нажмите на файл, чтобы получить его в чат."
         )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_categories(is_adm))
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_categories())
         return
 
     if data.startswith("help:docs:cat:"):
@@ -1093,23 +1097,20 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:links":
-        text = (
-            "🔗 <b>Полезные ссылки</b>\n\n"
-            "Быстрый доступ к нужным ресурсам:"
-        )
+        text = "🔗 <b>Полезные ссылки</b>\n\nБыстрый доступ к нужным ресурсам:"
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_links(), disable_web_page_preview=True)
         return
 
     if data == "help:team":
         text = "👥 <b>Познакомиться с командой</b>\n\nВыберите человека:"
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_team(is_adm))
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_team())
         return
 
     if data.startswith("help:team:person:"):
         pid = int(data.split(":")[-1])
         p = db_profiles_get(pid)
         if not p:
-            await q.edit_message_text("Анкета не найдена (возможно удалена).", reply_markup=kb_help_team(is_adm))
+            await q.edit_message_text("Анкета не найдена (возможно удалена).", reply_markup=kb_help_team())
             return
         card = (
             f"👤 <b>{p['full_name']}</b>\n"
@@ -1123,18 +1124,14 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:settings":
-        # если не админ — показываем уведомление и не открываем меню
         if not is_adm:
             await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
             return
-        text = (
-            "⚙️ <b>Настройки</b>\n\n"
-            "Управление документами, категориями и анкетами."
-        )
+        text = "⚙️ <b>Настройки</b>\n\nУправление документами, категориями и анкетами."
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
         return
 
-    # дальше — настройки (только админы)
+    # ниже — настройки (только админы)
     if data.startswith("help:settings:"):
         if not is_adm:
             await q.answer("⚠️ Доступно администраторам чата.", show_alert=True)
@@ -1514,7 +1511,6 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("setchat", cmd_setchat))
@@ -1524,7 +1520,6 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reset", cmd_reset))
 
-    # callbacks: meetings
     app.add_handler(CallbackQueryHandler(cb_cancel_open, pattern=r"^cancel:open:(standup|industry)$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_close, pattern=r"^cancel:close:(standup|industry)$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_reason, pattern=r"^cancel:reason:(standup|industry):(no_topics|tech|move)$"))
@@ -1532,19 +1527,14 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_reschedule_manual, pattern=r"^reschedule:manual:(standup|industry)$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_manual_input, pattern=r"^reschedule:cancel_manual:(standup|industry)$"))
 
-    # callbacks: help
-    app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
+    app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)$"))
 
-    # document upload
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-
-    # text input
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # schedule checker
     app.job_queue.run_repeating(check_and_send_jobs, interval=60, first=10, name="meetings_checker")
 
-    logger.info("Bot started. Standup 09:15 MSK; Industry 11:30 MSK; /help DM-first enabled.")
+    logger.info("Bot started. Standup 09:15 MSK; Industry 11:30 MSK; /help DM-first (silent) + fallback auto-delete.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
