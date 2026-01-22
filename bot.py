@@ -190,12 +190,19 @@ def db_init():
             full_name TEXT NOT NULL,
             year_start INTEGER NOT NULL,
             city TEXT NOT NULL,
+            birthday TEXT,
             about TEXT NOT NULL,
             topics TEXT NOT NULL,
             tg_link TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
     """)
+
+    # миграция для старых БД: birthday
+    try:
+        cur.execute("ALTER TABLE profiles ADD COLUMN birthday TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     con.commit()
     con.close()
@@ -415,7 +422,7 @@ def db_profiles_get(pid: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT id, full_name, year_start, city, about, topics, tg_link
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link
         FROM profiles
         WHERE id=?
     """, (pid,))
@@ -428,18 +435,19 @@ def db_profiles_get(pid: int):
         "full_name": row[1],
         "year_start": row[2],
         "city": row[3],
-        "about": row[4],
-        "topics": row[5],
-        "tg_link": row[6],
+        "birthday": row[4],
+        "about": row[5],
+        "topics": row[6],
+        "tg_link": row[7],
     }
 
-def db_profiles_add(full_name: str, year_start: int, city: str, about: str, topics: str, tg_link: str) -> int:
+def db_profiles_add(full_name: str, year_start: int, city: str, birthday: str | None, about: str, topics: str, tg_link: str) -> int:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        INSERT INTO profiles(full_name, year_start, city, about, topics, tg_link, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (full_name.strip(), int(year_start), city.strip(), about.strip(), topics.strip(), tg_link.strip(), datetime.utcnow().isoformat()))
+        INSERT INTO profiles(full_name, year_start, city, birthday, about, topics, tg_link, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (full_name.strip(), int(year_start), city.strip(), (birthday or None), about.strip(), topics.strip(), tg_link.strip(), datetime.utcnow().isoformat()))
     con.commit()
     pid = cur.lastrowid
     con.close()
@@ -1276,10 +1284,14 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not p:
             await q.edit_message_text("Анкета не найдена (возможно удалена).", reply_markup=kb_help_team())
             return
+
+        bday = (p.get("birthday") or "").strip() or "—"
+
         card = (
             f"👤 <b>{p['full_name']}</b>\n"
             f"📅 Работает с: <b>{p['year_start']}</b>\n"
-            f"🏙️ Город: <b>{p['city']}</b>\n\n"
+            f"🏙️ Город: <b>{p['city']}</b>\n"
+            f"🎂 День рождения: <b>{bday}</b>\n\n"
             f"📝 <b>Кратко о себе</b>\n{p['about']}\n\n"
             f"❓ <b>По каким вопросам обращаться</b>\n{p['topics']}\n\n"
             f"🔗 TG: {p['tg_link']}"
@@ -1432,7 +1444,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.chat_data[WAITING_SINCE_TS] = int(time.time())
             await q.edit_message_text(
                 "➕ <b>Добавление анкеты</b>\n\n"
-                "Шаг 1/6: отправьте <b>Имя и Фамилию</b>.\n"
+                "Шаг 1/7: отправьте <b>Имя и Фамилию</b>.\n"
                 "Пример: <code>Иван Петров</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_cancel_wizard_settings(),
@@ -1634,7 +1646,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["full_name"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
             context.chat_data[PROFILE_WIZ_STEP] = "year_start"
-            await update.message.reply_text("Шаг 2/6: с какого года работает? Пример: 2022", reply_markup=kb_cancel_wizard_settings())
+            await update.message.reply_text("Шаг 2/7: с какого года работает? Пример: 2022", reply_markup=kb_cancel_wizard_settings())
             return
 
         if step == "year_start":
@@ -1649,7 +1661,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["year_start"] = year
             context.chat_data[PROFILE_WIZ_DATA] = data
             context.chat_data[PROFILE_WIZ_STEP] = "city"
-            await update.message.reply_text("Шаг 3/6: город проживания. Пример: Москва", reply_markup=kb_cancel_wizard_settings())
+            await update.message.reply_text("Шаг 3/7: город проживания. Пример: Москва", reply_markup=kb_cancel_wizard_settings())
             return
 
         if step == "city":
@@ -1658,8 +1670,39 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             data["city"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "birthday"
+            await update.message.reply_text(
+                "Шаг 4/7: день рождения (формат <b>ДД.ММ</b>)\n"
+                "Пример: <code>22.01</code>\n"
+                "Если не хотите указывать — отправьте <code>-</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings()
+            )
+            return
+
+        if step == "birthday":
+            b = text.strip()
+            if b == "-":
+                data["birthday"] = None
+            else:
+                if not re.fullmatch(r"\d{2}\.\d{2}", b):
+                    await update.message.reply_text("❌ Формат ДД.ММ (пример 22.01) или '-'")
+                    return
+                dd, mm = b.split(".")
+                try:
+                    dd_i = int(dd)
+                    mm_i = int(mm)
+                except Exception:
+                    await update.message.reply_text("❌ Формат ДД.ММ (пример 22.01) или '-'")
+                    return
+                if not (1 <= dd_i <= 31 and 1 <= mm_i <= 12):
+                    await update.message.reply_text("❌ Некорректная дата. Пример: 22.01")
+                    return
+                data["birthday"] = b
+
+            context.chat_data[PROFILE_WIZ_DATA] = data
             context.chat_data[PROFILE_WIZ_STEP] = "about"
-            await update.message.reply_text("Шаг 4/6: кратко о себе (1–3 предложения)", reply_markup=kb_cancel_wizard_settings())
+            await update.message.reply_text("Шаг 5/7: кратко о себе (1–3 предложения)", reply_markup=kb_cancel_wizard_settings())
             return
 
         if step == "about":
@@ -1669,7 +1712,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["about"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
             context.chat_data[PROFILE_WIZ_STEP] = "topics"
-            await update.message.reply_text("Шаг 5/6: по каким вопросам обращаться?", reply_markup=kb_cancel_wizard_settings())
+            await update.message.reply_text("Шаг 6/7: по каким вопросам обращаться?", reply_markup=kb_cancel_wizard_settings())
             return
 
         if step == "topics":
@@ -1679,7 +1722,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["topics"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
             context.chat_data[PROFILE_WIZ_STEP] = "tg_link"
-            await update.message.reply_text("Шаг 6/6: Telegram (@username или https://t.me/username)", reply_markup=kb_cancel_wizard_settings())
+            await update.message.reply_text("Шаг 7/7: Telegram (@username или https://t.me/username)", reply_markup=kb_cancel_wizard_settings())
             return
 
         if step == "tg_link":
@@ -1701,6 +1744,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 full_name=data["full_name"],
                 year_start=data["year_start"],
                 city=data["city"],
+                birthday=data.get("birthday"),
                 about=data["about"],
                 topics=data["topics"],
                 tg_link=data["tg_link"],
