@@ -1341,6 +1341,108 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _csv_bool(v: str | None) -> str:
     return "1" if str(v).strip().lower() in ("1", "true", "yes", "y") else "0"
 
+
+def export_backup_csv_bytes() -> bytes:
+    """
+    Собирает CSV-бэкап (категории/документы/анкеты) и возвращает как bytes (UTF-8).
+    Используется для кнопки «Скачать отчёт CSV» и команды /export_csv.
+    """
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[
+        "kind",
+        "category_title",
+        "doc_title",
+        "doc_description",
+        "doc_file_id",
+        "doc_file_unique_id",
+        "doc_mime_type",
+        "doc_local_path",
+        "profile_full_name",
+        "profile_year_start",
+        "profile_city",
+        "profile_birthday",
+        "profile_about",
+        "profile_topics",
+        "profile_tg_link",
+    ])
+    writer.writeheader()
+
+    # categories
+    cats = db_docs_list_categories()
+    for cid, title in cats:
+        writer.writerow({
+            "kind": "category",
+            "category_title": title,
+        })
+
+    # docs
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    # local_path колонка может отсутствовать в старых БД — попробуем мягко
+    try:
+        cur.execute("""
+            SELECT c.title, d.title, d.description, d.file_id, d.file_unique_id, d.mime_type, d.local_path
+            FROM docs d
+            JOIN doc_categories c ON c.id = d.category_id
+            ORDER BY d.id ASC
+        """)
+        rows = cur.fetchall()
+        has_local = True
+    except sqlite3.OperationalError:
+        cur.execute("""
+            SELECT c.title, d.title, d.description, d.file_id, d.file_unique_id, d.mime_type
+            FROM docs d
+            JOIN doc_categories c ON c.id = d.category_id
+            ORDER BY d.id ASC
+        """)
+        rows = cur.fetchall()
+        has_local = False
+    con.close()
+
+    for r in rows:
+        if has_local:
+            cat_title, doc_title, desc, file_id, file_unique_id, mime_type, local_path = r
+        else:
+            cat_title, doc_title, desc, file_id, file_unique_id, mime_type = r
+            local_path = ""
+        writer.writerow({
+            "kind": "doc",
+            "category_title": cat_title,
+            "doc_title": doc_title,
+            "doc_description": desc or "",
+            "doc_file_id": file_id or "",
+            "doc_file_unique_id": file_unique_id or "",
+            "doc_mime_type": mime_type or "",
+            "doc_local_path": local_path or "",
+        })
+
+    # profiles
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT full_name, year_start, city, birthday, about, topics, tg_link
+        FROM profiles
+        ORDER BY id ASC
+    """)
+    profs = cur.fetchall()
+    con.close()
+
+    for p in profs:
+        full_name, year_start, city, birthday, about, topics, tg_link = p
+        writer.writerow({
+            "kind": "profile",
+            "profile_full_name": full_name or "",
+            "profile_year_start": year_start or "",
+            "profile_city": city or "",
+            "profile_birthday": birthday or "",
+            "profile_about": about or "",
+            "profile_topics": topics or "",
+            "profile_tg_link": tg_link or "",
+        })
+
+    return buf.getvalue().encode("utf-8")
+
+
 async def cmd_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_scoped(update, context):
         await update.message.reply_text("Только администраторы.")
