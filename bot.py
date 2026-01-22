@@ -37,7 +37,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
 INDUSTRY_ZOOM_URL = os.getenv("INDUSTRY_ZOOM_URL")  # отраслевая
 
-# ✅ Поддержка DATABASE_PATH и DB_PATH
+# ✅ поддержка DATABASE_PATH и DB_PATH
 DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH", "bot.db")
 
 YA_CRM_URL = os.getenv("YA_CRM_URL", "")
@@ -56,8 +56,56 @@ MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 MEETING_STANDUP = "standup"
 MEETING_INDUSTRY = "industry"
 
-# контекст: из какого чата пользователь открывал /help
+# где хранить контекст, из какого чата пользователь открыл /help
 HELP_SCOPE_CHAT_ID = "help_scope_chat_id"
+
+# ---------------- DB PATH ENSURE ----------------
+
+def ensure_db_path(db_path: str):
+    """
+    Создаёт директорию под SQLite файл, если её нет.
+    Пишет понятный лог, где именно хранится БД и есть ли права на запись.
+    """
+    if not db_path:
+        raise RuntimeError("DATABASE_PATH/DB_PATH is empty")
+
+    if db_path == ":memory:":
+        return
+
+    abs_path = os.path.abspath(db_path) if not os.path.isabs(db_path) else db_path
+    db_dir = os.path.dirname(abs_path)
+
+    logger.info("SQLite DB path: %s", abs_path)
+    logger.info("SQLite DB dir : %s", db_dir or "(current dir)")
+
+    if db_dir and not os.path.exists(db_dir):
+        logger.info("DB dir does not exist -> creating: %s", db_dir)
+        os.makedirs(db_dir, exist_ok=True)
+
+    # тест прав на запись
+    try:
+        if db_dir:
+            test_file = os.path.join(db_dir, ".write_test")
+            with open(test_file, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(test_file)
+    except Exception as e:
+        logger.exception("No write access to DB directory: %s", e)
+        raise
+
+
+async def job_delete_message(context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет сообщение, параметры лежат в context.job.data"""
+    data = getattr(context.job, "data", None) or {}
+    chat_id = data.get("chat_id")
+    message_id = data.get("message_id")
+    if not chat_id or not message_id:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        # не критично (нет прав/сообщение уже удалено)
+        pass
 
 # ---------------- DB ----------------
 
@@ -114,6 +162,7 @@ def db_init():
         )
     """)
 
+    # docs + description
     cur.execute("""
         CREATE TABLE IF NOT EXISTS docs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,7 +177,7 @@ def db_init():
         )
     """)
 
-    # миграция для старых БД (если раньше не было description)
+    # миграция для старых БД
     try:
         cur.execute("ALTER TABLE docs ADD COLUMN description TEXT")
     except sqlite3.OperationalError:
@@ -329,14 +378,7 @@ def db_docs_get(doc_id: int):
     con.close()
     if not row:
         return None
-    return {
-        "id": row[0],
-        "category_id": row[1],
-        "title": row[2],
-        "description": row[3],
-        "file_id": row[4],
-        "mime": row[5],
-    }
+    return {"id": row[0], "category_id": row[1], "title": row[2], "description": row[3], "file_id": row[4], "mime": row[5]}
 
 def db_docs_add_doc(category_id: int, title: str, description: str | None, file_id: str, file_unique_id: str | None, mime_type: str | None) -> int:
     con = sqlite3.connect(DB_PATH)
@@ -497,7 +539,7 @@ def kb_manual_input_controls(meeting_type: str):
         [InlineKeyboardButton("Отмена ввода даты ❌", callback_data=f"reschedule:cancel_manual:{meeting_type}")]
     ])
 
-# ---------------- ADMIN CHECK (scope) ----------------
+# ---------------- ADMIN CHECK (scoped) ----------------
 
 async def is_admin_in_chat(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -520,17 +562,19 @@ async def is_admin_scoped(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return await is_admin_in_chat(scope_chat_id, update.effective_user.id, context)
 
 # ---------------- STATES ----------------
-
+# meeting reschedule manual
 WAITING_DATE_FLAG = "waiting_reschedule_date"
 WAITING_USER_ID = "waiting_user_id"
 WAITING_SINCE_TS = "waiting_since_ts"
 WAITING_MEETING_TYPE = "waiting_meeting_type"
 
+# docs add flow
 WAITING_DOC_UPLOAD = "waiting_doc_upload"
 WAITING_DOC_DESC = "waiting_doc_desc"
 PENDING_DOC_INFO = "pending_doc_info"
 WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
 
+# profiles add flow
 PROFILE_WIZ_ACTIVE = "profile_wiz_active"
 PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
@@ -633,7 +677,7 @@ async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- HELP MENUS ----------------
 
-def help_text_main() -> str:
+def help_text_main(bot_username: str) -> str:
     return (
         "🤖 <b>Меню «Помогатор Говорун»</b>\n"
         "Тут собраны актуальные материалы для команды:\n"
@@ -678,7 +722,7 @@ def kb_help_docs_files(category_id: int):
 # -------- LINKS (описание) --------
 
 def get_links_catalog() -> dict[str, dict]:
-    catalog = {}
+    catalog: dict[str, dict] = {}
 
     # Чекко
     catalog["checko"] = {
@@ -722,7 +766,6 @@ def kb_help_links_menu():
     if not catalog:
         rows.append([InlineKeyboardButton("— ссылки не настроены —", callback_data="noop")])
     else:
-        # “пирамида”: сверху длинные названия
         items = sorted(catalog.items(), key=lambda kv: len(kv[1]["title"]), reverse=True)
         for key, item in items:
             rows.append([InlineKeyboardButton(item["title"], callback_data=f"help:links:item:{key}")])
@@ -839,7 +882,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Привет, {name}! 👋\n\n"
         "Я бот для уведомлений о встречах и меню /help.\n\n"
         "Команды:\n"
-        "• /help — меню «Помогатор» (в ЛС)\n"
+        "• /help — меню «Помогатор»\n"
         "• /setchat — подключить чат к уведомлениям (админы)\n"
         "• /unsetchat — отключить уведомления (админы)\n"
         "• /force_standup — принудительно отправить планёрку (админы)\n"
@@ -851,58 +894,60 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
-    text = help_text_main()
+    text = help_text_main(bot_username)
 
-    # /help вызван в группе -> пытаемся в ЛС, в чат НЕ пишем при успехе
-    if update.effective_chat and update.effective_chat.type != "private":
-        if update.effective_user:
-            context.user_data[HELP_SCOPE_CHAT_ID] = update.effective_chat.id
-
-        user_id = update.effective_user.id if update.effective_user else None
-        if user_id:
-            try:
-                is_adm = await is_admin_scoped(update, context)
-
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_help_main(is_admin_user=is_adm),
-                    disable_web_page_preview=True,
-                )
-                return
-
-            except Forbidden:
-                warn_text = (
-                    "⚠️ Я не могу написать вам в ЛС.\n"
-                    f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
-                    "после этого снова нажмите /help в чате."
-                )
-                msg = await update.message.reply_text(
-                    warn_text,
-                    reply_to_message_id=update.message.message_id,
-                    disable_web_page_preview=True,
-                )
-
-                context.job_queue.run_once(
-                    lambda ctx: ctx.bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id),
-                    when=60,
-                )
-                return
-
-            except Exception as e:
-                logger.exception("Failed to DM /help: %s", e)
-                return
-
+    # если команда в личке — просто показываем там
+    if update.effective_chat and update.effective_chat.type == "private":
+        is_adm = await is_admin_scoped(update, context)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_main(is_admin_user=is_adm), disable_web_page_preview=True)
         return
 
-    # /help в ЛС — показываем меню, настройки только если админ в scope-чате
-    is_adm = await is_admin_scoped(update, context)
+    # если команда в группе — пытаемся в ЛС, в чат не пишем при успехе
+    if update.effective_user:
+        context.user_data[HELP_SCOPE_CHAT_ID] = update.effective_chat.id
+
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id:
+        try:
+            is_adm = await is_admin_scoped(update, context)
+
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_help_main(is_admin_user=is_adm),
+                disable_web_page_preview=True,
+            )
+            # успех -> в чат ничего не пишем
+            return
+        except Forbidden:
+            warn_text = (
+                "⚠️ Я не могу написать вам в ЛС.\n"
+                f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
+                "после этого снова нажмите /help в чате."
+            )
+            msg = await update.message.reply_text(
+                warn_text,
+                reply_to_message_id=update.message.message_id,
+                disable_web_page_preview=True,
+            )
+            context.job_queue.run_once(
+                job_delete_message,
+                when=60,
+                data={"chat_id": msg.chat_id, "message_id": msg.message_id},
+                name=f"del_help_warn_{msg.chat_id}_{msg.message_id}",
+            )
+            return
+        except Exception as e:
+            logger.exception("Failed to DM /help: %s", e)
+
+    # fallback: отправляем в чат (reply)
     await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_help_main(is_admin_user=is_adm),
+        reply_markup=kb_help_main(is_admin_user=await is_admin_scoped(update, context)),
         disable_web_page_preview=True,
+        reply_to_message_id=update.message.message_id,
     )
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1109,7 +1154,7 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
             "📅 <b>Введите дату переноса</b>\n\n"
             "Формат: <b>ДД.ММ.ГГ</b>\n"
             "Пример: <code>22.01.26</code>\n\n"
-            "Просто отправьте дату сообщением.\n"
+            "Просто отправьте дату сообщением в чат.\n"
             "Если передумали — нажмите «Отмена ввода даты ❌»."
         ),
         parse_mode=ParseMode.HTML,
@@ -1142,8 +1187,9 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_adm = await is_admin_scoped(update, context)
 
     if data == "help:main":
+        bot_username = (context.bot.username or "blablabird_bot")
         await q.edit_message_text(
-            help_text_main(),
+            help_text_main(bot_username),
             parse_mode=ParseMode.HTML,
             reply_markup=kb_help_main(is_admin_user=is_adm),
             disable_web_page_preview=True,
@@ -1243,7 +1289,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help:settings":
         if not is_adm:
-            await q.answer("⚠️ Настройки доступны администраторам.", show_alert=True)
+            await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
             return
         text = (
             "⚙️ <b>Настройки</b>\n\n"
@@ -1253,10 +1299,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
         return
 
-    # -------- настройки --------
+    # дальше — настройки (только админы)
     if data.startswith("help:settings:"):
         if not is_adm:
-            await q.answer("⚠️ Доступно администраторам.", show_alert=True)
+            await q.answer("⚠️ Доступно администраторам чата.", show_alert=True)
             return
 
         if data == "help:settings:cancel":
@@ -1355,14 +1401,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not pending:
                 await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
                 return
-            db_docs_add_doc(
-                cid,
-                pending["title"],
-                pending.get("description"),
-                pending["file_id"],
-                pending.get("file_unique_id"),
-                pending.get("mime"),
-            )
+            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
             clear_docs_flow(context)
             await q.edit_message_text("✅ Файл добавлен в документы.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
             return
@@ -1464,7 +1503,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb_cancel_wizard_settings(),
     )
 
-# ---------------- HANDLERS: TEXT INPUT ----------------
+# ---------------- HANDLERS: TEXT INPUT (dates / categories / profiles) ----------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
@@ -1482,7 +1521,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_waiting_date(context)
         clear_docs_flow(context)
         clear_profile_wiz(context)
-        await update.message.reply_text("⏳ Время ожидания истекло. Откройте /help заново.")
+        await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
         return
 
     # описание документа
@@ -1516,6 +1555,38 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # перенос даты вручную
+    if context.chat_data.get(WAITING_DATE_FLAG):
+        if not await is_admin_scoped(update, context):
+            clear_waiting_date(context)
+            await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
+            return
+
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", text):
+            await update.message.reply_text("❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
+            return
+
+        try:
+            dd, mm, yy = text.split(".")
+            new_d = date(int("20" + yy), int(mm), int(dd))
+        except Exception:
+            await update.message.reply_text("❌ Не удалось распознать дату. Проверьте корректность.")
+            return
+
+        today_d = datetime.now(MOSCOW_TZ).date()
+        if new_d <= today_d:
+            await update.message.reply_text("❌ Дата переноса должна быть в будущем.")
+            return
+
+        meeting_type = context.chat_data.get(WAITING_MEETING_TYPE, MEETING_STANDUP)
+        db_set_canceled(meeting_type, today_d, "Перенос на другой день", reschedule_date=text)
+        db_upsert_reschedule(meeting_type, today_d, new_d)
+        clear_waiting_date(context)
+
+        title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
+        await update.message.reply_text(f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
+        return
+
     # ввод названия категории
     if context.chat_data.get(WAITING_NEW_CATEGORY_NAME):
         if not await is_admin_scoped(update, context):
@@ -1537,14 +1608,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending = context.chat_data.get(PENDING_DOC_INFO)
         if pending:
-            db_docs_add_doc(
-                cid,
-                pending["title"],
-                pending.get("description"),
-                pending["file_id"],
-                pending.get("file_unique_id"),
-                pending.get("mime"),
-            )
+            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
             clear_docs_flow(context)
             await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
             return
@@ -1649,6 +1713,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- APP ----------------
 
 def main():
+    ensure_db_path(DB_PATH)
     db_init()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1674,7 +1739,7 @@ def main():
     # callbacks: help
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
 
-    # document upload (в ЛС тоже работает)
+    # document upload
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
 
     # text input
