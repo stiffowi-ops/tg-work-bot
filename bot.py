@@ -462,6 +462,31 @@ def db_profiles_delete(pid: int) -> bool:
     con.close()
     return ok
 
+def db_profiles_birthdays(ddmm: str) -> list[dict]:
+    """
+    Возвращает список профилей, у кого birthday == 'ДД.ММ'
+    """
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, full_name, tg_link, birthday
+        FROM profiles
+        WHERE birthday = ?
+        ORDER BY full_name COLLATE NOCASE ASC
+    """, (ddmm,))
+    rows = cur.fetchall()
+    con.close()
+
+    res = []
+    for r in rows:
+        res.append({
+            "id": r[0],
+            "full_name": r[1],
+            "tg_link": r[2] or "",
+            "birthday": r[3],
+        })
+    return res
+
 # ---------------- TEXT (meetings) ----------------
 
 DAY_RU_UPPER = {
@@ -612,6 +637,116 @@ def standup_due_on_weekday(d: date) -> bool:
 def industry_due_on_weekday(d: date) -> bool:
     return d.weekday() == 1
 
+# ---------------- BIRTHDAYS ----------------
+
+def normalize_tg_mention(tg_link: str) -> str | None:
+    """
+    Из tg_link (@username / username / https://t.me/username) делает '@username'
+    Возвращает None если не похоже на username.
+    """
+    tg = (tg_link or "").strip()
+    if not tg:
+        return None
+
+    # @username
+    if tg.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", tg):
+        return tg
+
+    # https://t.me/username или http://t.me/username
+    m = re.match(r"^https?://t\.me/([A-Za-z0-9_]{4,})/?$", tg)
+    if m:
+        return "@" + m.group(1)
+
+    # username
+    if re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
+        return "@" + tg
+
+    return None
+
+
+BDAY_TEMPLATE_1 = (
+    "🎉 Сегодня день рождения у {NAME}!\n"
+    "Поздравляем! 🥳 Желаем здоровья, сил, классных задач и кайфа от работы 💪✨"
+)
+
+BDAY_TEMPLATE_2 = (
+    "🎈 У нас +1 уровень прокачки у {NAME} 😄\n"
+    "С днём рождения! Пусть задачи решаются сами, лиды приходят без прогрева, а кофе всегда горячий ☕️🔥"
+)
+
+
+def pick_bday_text(template_no: int, full_name: str, mention: str | None) -> str:
+    """
+    template_no: 1 или 2
+    Если есть mention -> подставляем @username в {NAME}
+    Иначе:
+      - в шаблон 1: Имя Фамилия (full_name)
+      - в шаблон 2: только Имя (первое слово из full_name)
+    """
+    if mention:
+        name_for_text = mention
+    else:
+        if template_no == 1:
+            name_for_text = full_name
+        else:
+            name_for_text = (full_name.split()[0] if full_name.strip() else full_name)
+
+    if template_no == 1:
+        return BDAY_TEMPLATE_1.format(NAME=name_for_text)
+    return BDAY_TEMPLATE_2.format(NAME=name_for_text)
+
+
+async def send_birthday_congrats(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Шлёт поздравления в notify_chats всем, у кого birthday == сегодня (ДД.ММ).
+    Чередует шаблоны по кругу через meta.
+    """
+    now_msk = datetime.now(MOSCOW_TZ)
+    today_ddmm = now_msk.strftime("%d.%m")
+
+    chat_ids = db_list_chats()
+    if not chat_ids:
+        logger.warning("No chats for notifications. Add via /setchat.")
+        return False
+
+    people = db_profiles_birthdays(today_ddmm)
+
+    # какой шаблон следующий (1 или 2)
+    next_tpl = db_get_meta("bday_template_next")
+    try:
+        tpl_no = int(next_tpl) if next_tpl else 1
+    except Exception:
+        tpl_no = 1
+    if tpl_no not in (1, 2):
+        tpl_no = 1
+
+    sent_any = False
+
+    for p in people:
+        full_name = p["full_name"]
+        mention = normalize_tg_mention(p.get("tg_link", ""))
+
+        text = pick_bday_text(tpl_no, full_name, mention)
+
+        # переключаем 1->2->1->2...
+        tpl_no = 2 if tpl_no == 1 else 1
+
+        for chat_id in chat_ids:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    disable_web_page_preview=True,
+                )
+                sent_any = True
+            except Exception as e:
+                logger.exception("Cannot send birthday to %s: %s", chat_id, e)
+
+    # сохраняем “следующий шаблон” (какой будет использоваться в следующий раз)
+    db_set_meta("bday_template_next", str(tpl_no))
+
+    return sent_any
+
 # ---------------- CORE SENDERS ----------------
 
 async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> bool:
@@ -670,6 +805,13 @@ async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_
 async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
     now_msk = datetime.now(MOSCOW_TZ)
     today_iso = now_msk.date().isoformat()
+
+    # 🎂 Автопоздравления в 09:00 МСК
+    if now_msk.hour == 9 and now_msk.minute == 0:
+        key = "last_auto_sent_date:birthday"
+        if db_get_meta(key) != today_iso:
+            await send_birthday_congrats(context)
+            db_set_meta(key, today_iso)
 
     if now_msk.hour == 9 and now_msk.minute == 15:
         key = "last_auto_sent_date:standup"
@@ -1413,7 +1555,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not pending:
                 await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
                 return
-            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
+            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"))
             clear_docs_flow(context)
             await q.edit_message_text("✅ Файл добавлен в документы.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
             return
@@ -1620,7 +1762,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending = context.chat_data.get(PENDING_DOC_INFO)
         if pending:
-            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending.get("file_unique_id"), pending.get("mime"))
+            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"))
             clear_docs_flow(context)
             await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
             return
