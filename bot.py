@@ -512,6 +512,40 @@ STANDUP_GREETINGS = [
     "Врываемся в день мягко, но уверенно 😄☀️",
 ]
 
+
+# ---------------- WELCOME NEW MEMBERS ----------------
+
+WELCOME_TEXT = (
+    "👋 Привет, {name}! Добро пожаловать в команду!\n"
+    "Желаем успехов и как можно лидов, ну и естественно бабосиков!\n"
+    "Будем рады помочь! \n\n"
+    "Познакомиться с коллегами и посмотреть полезности можно по команде /help"
+)
+
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    new_members = update.message.new_chat_members or []
+    if not new_members:
+        return
+
+    # если добавили самого бота — не приветствуем
+    bot_id = context.bot.id
+    for m in new_members:
+        if m.id == bot_id:
+            return
+
+    names = []
+    for m in new_members:
+        name = (m.full_name or m.first_name or "коллега").strip()
+        names.append(name)
+
+    joined = ", ".join(names) if names else "коллега"
+    text = WELCOME_TEXT.format(name=joined)
+
+    await update.message.reply_text(text, disable_web_page_preview=True)
 def build_standup_text(today_d: date, zoom_url: str) -> str:
     greet = random.choice(STANDUP_GREETINGS)
     dow = DAY_RU_UPPER.get(today_d.weekday(), "СЕГОДНЯ")
@@ -1930,6 +1964,9 @@ def main():
 
     # text input
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    # welcome new members
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
 
     # schedule checker
     app.job_queue.run_repeating(check_and_send_jobs, interval=60, first=10, name="meetings_checker")
