@@ -1183,6 +1183,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main(bot_username)
 
+    orig_msg = update.message  # to optionally delete /help command in group
+
     # если команда в личке — просто показываем там
     if update.effective_chat and update.effective_chat.type == "private":
         is_adm = await is_admin_scoped(update, context)
@@ -1206,6 +1208,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
             )
             # успех -> в чат ничего не пишем
+            if orig_msg and update.effective_chat and update.effective_chat.type != "private":
+                try:
+                    await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
+                except Exception:
+                    pass
             return
         except Forbidden:
             warn_text = (
@@ -1213,6 +1220,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
                 "после этого снова нажмите /help в чате."
             )
+            # пробуем удалить исходное /help, чтобы не засорять чат
+            if orig_msg and update.effective_chat and update.effective_chat.type != "private":
+                try:
+                    await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
+                except Exception:
+                    pass
+
             msg = await update.message.reply_text(
                 warn_text,
                 reply_to_message_id=update.message.message_id,
@@ -1228,14 +1242,48 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.exception("Failed to DM /help: %s", e)
 
+    # удаляем исходное /help и сообщение бота через 60 секунд (если есть права)
+    if update.effective_chat and update.effective_chat.type != "private":
+        if orig_msg:
+            context.job_queue.run_once(
+                job_delete_message,
+                when=60,
+                data={"chat_id": orig_msg.chat_id, "message_id": orig_msg.message_id},
+                name=f"del_help_cmd_{orig_msg.chat_id}_{orig_msg.message_id}",
+            )
+        if msg:
+            context.job_queue.run_once(
+                job_delete_message,
+                when=60,
+                data={"chat_id": msg.chat_id, "message_id": msg.message_id},
+                name=f"del_help_fallback_{msg.chat_id}_{msg.message_id}",
+            )
+
     # fallback: отправляем в чат (reply)
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=kb_help_main(is_admin_user=await is_admin_scoped(update, context)),
         disable_web_page_preview=True,
         reply_to_message_id=update.message.message_id,
     )
+
+    # удаляем исходное /help и сообщение бота через 60 секунд (если есть права)
+    if update.effective_chat and update.effective_chat.type != "private":
+        if orig_msg:
+            context.job_queue.run_once(
+                job_delete_message,
+                when=60,
+                data={"chat_id": orig_msg.chat_id, "message_id": orig_msg.message_id},
+                name=f"del_help_cmd_{orig_msg.chat_id}_{orig_msg.message_id}",
+            )
+        if msg:
+            context.job_queue.run_once(
+                job_delete_message,
+                when=60,
+                data={"chat_id": msg.chat_id, "message_id": msg.message_id},
+                name=f"del_help_fallback_{msg.chat_id}_{msg.message_id}",
+            )
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
