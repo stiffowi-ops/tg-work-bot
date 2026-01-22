@@ -4,6 +4,9 @@ import random
 import sqlite3
 import logging
 import time
+import csv
+import io
+from pathlib import Path
 from datetime import datetime, date, timedelta
 
 import pytz
@@ -39,6 +42,8 @@ INDUSTRY_ZOOM_URL = os.getenv("INDUSTRY_ZOOM_URL")  # отраслевая
 
 # ✅ поддержка DATABASE_PATH и DB_PATH
 DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH", "bot.db")
+
+STORAGE_DIR = os.getenv("STORAGE_DIR", "storage")
 
 YA_CRM_URL = os.getenv("YA_CRM_URL", "")
 INDUSTRY_WIKI_URL = os.getenv("INDUSTRY_WIKI_URL", "")
@@ -92,6 +97,15 @@ def ensure_db_path(db_path: str):
     except Exception as e:
         logger.exception("No write access to DB directory: %s", e)
         raise
+
+
+def ensure_storage_dir(base_dir: str):
+    """Создаёт директорию для локального хранения файлов (бэкапы из Telegram)."""
+    if not base_dir:
+        raise RuntimeError("STORAGE_DIR is empty")
+    Path(base_dir).mkdir(parents=True, exist_ok=True)
+    Path(base_dir, "docs").mkdir(parents=True, exist_ok=True)
+
 
 
 async def job_delete_message(context: ContextTypes.DEFAULT_TYPE):
@@ -172,6 +186,7 @@ def db_init():
             file_id TEXT NOT NULL,
             file_unique_id TEXT,
             mime_type TEXT,
+            local_path TEXT,
             uploaded_at TEXT NOT NULL,
             FOREIGN KEY(category_id) REFERENCES doc_categories(id) ON DELETE CASCADE
         )
@@ -180,6 +195,12 @@ def db_init():
     # миграция для старых БД
     try:
         cur.execute("ALTER TABLE docs ADD COLUMN description TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # миграция для старых БД: local_path (локальный бэкап файла)
+    try:
+        cur.execute("ALTER TABLE docs ADD COLUMN local_path TEXT")
     except sqlite3.OperationalError:
         pass
 
@@ -378,22 +399,22 @@ def db_docs_get(doc_id: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
-        "SELECT id, category_id, title, description, file_id, mime_type FROM docs WHERE id=?",
+        "SELECT id, category_id, title, description, file_id, file_unique_id, mime_type, local_path FROM docs WHERE id=?",
         (doc_id,),
     )
     row = cur.fetchone()
     con.close()
     if not row:
         return None
-    return {"id": row[0], "category_id": row[1], "title": row[2], "description": row[3], "file_id": row[4], "mime": row[5]}
+    return {"id": row[0], "category_id": row[1], "title": row[2], "description": row[3], "file_id": row[4], "file_unique_id": row[5], "mime": row[6], "local_path": row[7]}
 
-def db_docs_add_doc(category_id: int, title: str, description: str | None, file_id: str, file_unique_id: str | None, mime_type: str | None) -> int:
+def db_docs_add_doc(category_id: int, title: str, description: str | None, file_id: str, file_unique_id: str | None, mime_type: str | None, local_path: str | None) -> int:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        INSERT INTO docs(category_id, title, description, file_id, file_unique_id, mime_type, uploaded_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (category_id, title.strip(), (description or "").strip() or None, file_id, file_unique_id, mime_type, datetime.utcnow().isoformat()))
+        INSERT INTO docs(category_id, title, description, file_id, file_unique_id, mime_type, local_path, uploaded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (category_id, title.strip(), (description or "").strip() or None, file_id, file_unique_id, mime_type, (local_path or None), datetime.utcnow().isoformat()))
     con.commit()
     did = cur.lastrowid
     con.close()
@@ -407,6 +428,101 @@ def db_docs_delete_doc(doc_id: int) -> bool:
     con.commit()
     con.close()
     return deleted
+
+
+
+def db_docs_get_category_id_by_title(title: str) -> int | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id FROM doc_categories WHERE title=?", (title.strip(),))
+    row = cur.fetchone()
+    con.close()
+    return int(row[0]) if row else None
+
+def db_docs_ensure_category(title: str) -> int:
+    cid = db_docs_get_category_id_by_title(title)
+    if cid:
+        return cid
+    return db_docs_add_category(title)
+
+def db_docs_get_by_file_unique_id(file_unique_id: str):
+    if not file_unique_id:
+        return None
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT id, category_id, title, description, file_id, file_unique_id, mime_type, local_path FROM docs WHERE file_unique_id=?",
+        (file_unique_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "category_id": row[1],
+        "title": row[2],
+        "description": row[3],
+        "file_id": row[4],
+        "file_unique_id": row[5],
+        "mime": row[6],
+        "local_path": row[7],
+    }
+
+def db_docs_upsert_by_unique(category_id: int, title: str, description: str | None, file_id: str, file_unique_id: str | None, mime_type: str | None, local_path: str | None) -> int:
+    """Upsert документа по file_unique_id (если есть), иначе добавляет новый."""
+    if file_unique_id:
+        existing = db_docs_get_by_file_unique_id(file_unique_id)
+        if existing:
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute(
+                """UPDATE docs
+                   SET category_id=?, title=?, description=?, file_id=?, mime_type=?, local_path=COALESCE(?, local_path)
+                   WHERE file_unique_id=?""",
+                (category_id, title.strip(), (description or None), file_id, mime_type, local_path, file_unique_id),
+            )
+            con.commit()
+            con.close()
+            return int(existing["id"])
+    # fallback insert
+    return db_docs_add_doc(category_id, title, description, file_id, file_unique_id, mime_type, local_path)
+
+def db_profiles_upsert(full_name: str, year_start: int, city: str, birthday: str | None, about: str, topics: str, tg_link: str) -> int:
+    """Upsert анкеты по tg_link (если есть) иначе по full_name."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    key = (tg_link or "").strip()
+    if key:
+        cur.execute("SELECT id FROM profiles WHERE tg_link=?", (key,))
+        row = cur.fetchone()
+    else:
+        cur.execute("SELECT id FROM profiles WHERE full_name=?", (full_name.strip(),))
+        row = cur.fetchone()
+
+    if row:
+        pid = int(row[0])
+        cur.execute(
+            """UPDATE profiles
+               SET full_name=?, year_start=?, city=?, birthday=?, about=?, topics=?, tg_link=?
+               WHERE id=?""",
+            (full_name.strip(), int(year_start), city.strip(), birthday, about.strip(), topics.strip(), (tg_link or "").strip(), pid),
+        )
+        con.commit()
+        con.close()
+        return pid
+
+    cur.execute(
+        """INSERT INTO profiles(full_name, year_start, city, birthday, about, topics, tg_link, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (full_name.strip(), int(year_start), city.strip(), birthday, about.strip(), topics.strip(), (tg_link or "").strip(), datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    pid = cur.lastrowid
+    con.close()
+    return int(pid)
+
 
 # ---------------- HELP DB: PROFILES ----------------
 
@@ -513,39 +629,19 @@ STANDUP_GREETINGS = [
 ]
 
 
-# ---------------- WELCOME NEW MEMBERS ----------------
-
 WELCOME_TEXT = (
-    "👋 Привет, {name}! Добро пожаловать в команду!\n"
-    "Желаем успехов и как можно лидов, ну и естественно бабосиков!\n"
-    "Будем рады помочь! \n\n"
-    "Познакомиться с коллегами и посмотреть полезности можно по команде /help"
+    "👋 Привет, {name}! Добро пожаловать в команду! 🎉
+"
+    "Очень рады, что ты с нами 😊
+"
+    "Желаем лёгкого старта, крутых задач, побольше лидов и, конечно, бабосиков 💸🚀
+
+"
+    "Если что — не стесняйся, всегда поможем 🙌
+"
+    "Познакомиться с коллегами и найти полезности можно через команду **/help** ✅"
 )
 
-
-async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    new_members = update.message.new_chat_members or []
-    if not new_members:
-        return
-
-    # если добавили самого бота — не приветствуем
-    bot_id = context.bot.id
-    for m in new_members:
-        if m.id == bot_id:
-            return
-
-    names = []
-    for m in new_members:
-        name = (m.full_name or m.first_name or "коллега").strip()
-        names.append(name)
-
-    joined = ", ".join(names) if names else "коллега"
-    text = WELCOME_TEXT.format(name=joined)
-
-    await update.message.reply_text(text, disable_web_page_preview=True)
 def build_standup_text(today_d: date, zoom_url: str) -> str:
     greet = random.choice(STANDUP_GREETINGS)
     dow = DAY_RU_UPPER.get(today_d.weekday(), "СЕГОДНЯ")
@@ -643,6 +739,9 @@ WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
 
 # profiles add flow
 PROFILE_WIZ_ACTIVE = "profile_wiz_active"
+
+# csv import flow
+WAITING_CSV_IMPORT = "waiting_csv_import"
 PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
 
@@ -657,6 +756,13 @@ def clear_docs_flow(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DOC_DESC] = False
     context.chat_data.pop(PENDING_DOC_INFO, None)
     context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
+
+
+
+def clear_csv_import(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[WAITING_CSV_IMPORT] = False
+    context.chat_data.pop(WAITING_USER_ID, None)
+    context.chat_data.pop(WAITING_SINCE_TS, None)
 
 def clear_profile_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[PROFILE_WIZ_ACTIVE] = False
@@ -999,8 +1105,11 @@ def kb_help_settings():
         [InlineKeyboardButton("🗂️ Редактировать категории", callback_data="help:settings:cats")],
         [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
         [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
+        [InlineKeyboardButton("📤 Скачать отчёт CSV", callback_data="help:settings:export_csv")],
+        [InlineKeyboardButton("📥 Загрузить отчёт CSV", callback_data="help:settings:import_csv")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
+
 
 def kb_settings_categories():
     cats = db_docs_list_categories()
@@ -1228,7 +1337,130 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_waiting_date(context)
     clear_docs_flow(context)
     clear_profile_wiz(context)
+    clear_csv_import(context)
     await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты).")
+
+
+
+# ---------------- CSV BACKUP/RESTORE ----------------
+
+def _csv_bool(v: str | None) -> str:
+    return "1" if str(v).strip().lower() in ("1", "true", "yes", "y") else "0"
+
+async def cmd_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_scoped(update, context):
+        await update.message.reply_text("Только администраторы.")
+        return
+
+    # выгружаем всё в один CSV (kind: category/doc/profile)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[
+        "kind",
+        "category_title",
+        "doc_title",
+        "doc_description",
+        "doc_file_id",
+        "doc_file_unique_id",
+        "doc_mime_type",
+        "doc_local_path",
+        "profile_full_name",
+        "profile_year_start",
+        "profile_city",
+        "profile_birthday",
+        "profile_about",
+        "profile_topics",
+        "profile_tg_link",
+    ])
+    writer.writeheader()
+
+    # categories
+    cats = db_docs_list_categories()
+    for cid, title in cats:
+        writer.writerow({
+            "kind": "category",
+            "category_title": title,
+        })
+
+    # docs
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT c.title, d.title, d.description, d.file_id, d.file_unique_id, d.mime_type, d.local_path
+        FROM docs d
+        JOIN doc_categories c ON c.id = d.category_id
+        ORDER BY c.title COLLATE NOCASE ASC, d.id ASC
+    """)
+    for row in cur.fetchall():
+        writer.writerow({
+            "kind": "doc",
+            "category_title": row[0],
+            "doc_title": row[1],
+            "doc_description": row[2] or "",
+            "doc_file_id": row[3] or "",
+            "doc_file_unique_id": row[4] or "",
+            "doc_mime_type": row[5] or "",
+            "doc_local_path": row[6] or "",
+        })
+    con.close()
+
+    # profiles
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT full_name, year_start, city, birthday, about, topics, tg_link
+        FROM profiles
+        ORDER BY full_name COLLATE NOCASE ASC
+    """)
+    for row in cur.fetchall():
+        writer.writerow({
+            "kind": "profile",
+            "profile_full_name": row[0],
+            "profile_year_start": row[1],
+            "profile_city": row[2],
+            "profile_birthday": row[3] or "",
+            "profile_about": row[4],
+            "profile_topics": row[5],
+            "profile_tg_link": row[6],
+        })
+    con.close()
+
+    data = buf.getvalue().encode("utf-8-sig")
+    bio = io.BytesIO(data)
+    bio.name = "bot_backup.csv"
+
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=bio,
+        caption="✅ Бэкап выгружен: bot_backup.csv",
+    )
+
+async def cmd_import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == "private":
+        # можно и в личке, и в чате — но импорт делает админ scoped
+        pass
+
+    if not await is_admin_scoped(update, context):
+        await update.message.reply_text("Только администраторы могут импортировать CSV.")
+        return
+
+    clear_docs_flow(context)
+    clear_profile_wiz(context)
+    clear_waiting_date(context)
+
+    context.chat_data[WAITING_CSV_IMPORT] = True
+    context.chat_data[WAITING_USER_ID] = update.effective_user.id if update.effective_user else None
+    context.chat_data[WAITING_SINCE_TS] = int(time.time())
+
+    await update.message.reply_text(
+        "📥 <b>Импорт из CSV</b>\n\n"
+        "Отправьте файлом CSV (например <code>bot_backup.csv</code>).\n"
+        "Бот восстановит категории/документы/анкеты.\n\n"
+        "Важно: если в CSV есть <code>doc_local_path</code> и файл сохранён на сервере, "
+        "бот сможет пере-залить документ в Telegram и обновить <code>file_id</code> при необходимости.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 
 # ---------------- CALLBACKS: meetings cancel/reschedule ----------------
 
@@ -1497,7 +1729,45 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_docs_flow(context)
             clear_profile_wiz(context)
             clear_waiting_date(context)
+            clear_csv_import(context)
+            clear_csv_import(context)
             await q.edit_message_text("✅ Действие отменено.", reply_markup=kb_help_settings(), parse_mode=ParseMode.HTML)
+            return
+
+        if data == "help:settings:export_csv":
+            # экспортируем CSV и отправляем в ЛС (тут мы и так в ЛС)
+            if update.effective_user:
+                try:
+                    csv_bytes = export_backup_csv_bytes()
+                    bio = io.BytesIO(csv_bytes)
+                    bio.name = "bot_backup.csv"
+                    await context.bot.send_document(
+                        chat_id=update.effective_user.id,
+                        document=bio,
+                        caption="📤 Отчёт CSV (бэкап) готов. Сохрани файл — он поможет восстановить документы и анкеты.",
+                    )
+                    await q.answer("Отправил CSV ✅")
+                except Exception as e:
+                    logger.exception("export_csv failed: %s", e)
+                    await q.answer("Не смог сформировать CSV 😕", show_alert=True)
+            return
+
+        if data == "help:settings:import_csv":
+            # включаем режим ожидания CSV файла
+            clear_docs_flow(context)
+            clear_profile_wiz(context)
+            clear_waiting_date(context)
+            context.chat_data[WAITING_CSV_IMPORT] = True
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id if update.effective_user else None
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "📥 <b>Импорт отчёта CSV</b>\n\n"
+                "Отправьте CSV-файл следующим сообщением.\n"
+                "После загрузки бот восстановит категории, документы и анкеты.\n\n"
+                "Если передумали — нажмите «Отмена».",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
             return
 
         if data == "help:settings:cats":
@@ -1589,7 +1859,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not pending:
                 await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
                 return
-            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"))
+            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
             clear_docs_flow(context)
             await q.edit_message_text("✅ Файл добавлен в документы.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
             return
@@ -1648,18 +1918,175 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.answer()
 
+
+
+# ---------------- HANDLERS: NEW MEMBERS ----------------
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    new_members = update.message.new_chat_members or []
+    if not new_members:
+        return
+
+    # если добавили самого бота — не приветствуем как человека
+    bot_id = context.bot.id
+    for m in new_members:
+        if m.id == bot_id:
+            await update.message.reply_text(
+                "Привет! Я в чате ✅\n"
+                "Чтобы включить уведомления, админ должен выполнить команду /setchat."
+            )
+            return
+
+    names = []
+    for m in new_members:
+        nm = (m.full_name or m.first_name or "коллега").strip()
+        if nm:
+            names.append(nm)
+
+    joined = ", ".join(names) if names else "коллега"
+    text = WELCOME_TEXT.format(name=joined)
+
+    await update.message.reply_text(text, disable_web_page_preview=True)
+
 # ---------------- HANDLERS: DOCUMENT UPLOAD ----------------
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
         return
 
-    if not context.chat_data.get(WAITING_DOC_UPLOAD):
-        return
-
     user_id = update.effective_user.id if update.effective_user else None
     waiting_user = context.chat_data.get(WAITING_USER_ID)
     if waiting_user and user_id != waiting_user:
+        return
+
+    # ---------------- CSV IMPORT FLOW ----------------
+    if context.chat_data.get(WAITING_CSV_IMPORT):
+        if not await is_admin_scoped(update, context):
+            clear_csv_import(context)
+            await update.message.reply_text("❌ Только администраторы могут импортировать CSV.")
+            return
+
+        doc = update.message.document
+        if not doc:
+            return
+
+        # скачиваем CSV во временный файл
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            tmp_path = Path(STORAGE_DIR) / "tmp_import.csv"
+            await tg_file.download_to_drive(custom_path=str(tmp_path))
+            raw = tmp_path.read_text(encoding="utf-8-sig")
+        except Exception as e:
+            clear_csv_import(context)
+            logger.exception("CSV import download/read failed: %s", e)
+            await update.message.reply_text("❌ Не смог скачать/прочитать CSV.")
+            return
+
+        ok_docs = ok_profiles = ok_cats = 0
+        skipped_docs = 0
+        reader = csv.DictReader(io.StringIO(raw))
+        for row in reader:
+            kind = (row.get("kind") or "").strip().lower()
+
+            if kind == "category":
+                title = (row.get("category_title") or "").strip()
+                if title:
+                    db_docs_ensure_category(title)
+                    ok_cats += 1
+                continue
+
+            if kind == "profile":
+                full_name = (row.get("profile_full_name") or "").strip()
+                if not full_name:
+                    continue
+                year_start = int((row.get("profile_year_start") or "0").strip() or 0)
+                city = (row.get("profile_city") or "").strip()
+                birthday = (row.get("profile_birthday") or "").strip() or None
+                about = (row.get("profile_about") or "").strip()
+                topics = (row.get("profile_topics") or "").strip()
+                tg_link = (row.get("profile_tg_link") or "").strip()
+                if not (year_start and city and about and topics and tg_link):
+                    # базовая валидация, чтобы не засорять базу
+                    continue
+                db_profiles_upsert(full_name, year_start, city, birthday, about, topics, tg_link)
+                ok_profiles += 1
+                continue
+
+            if kind == "doc":
+                cat_title = (row.get("category_title") or "").strip() or "Документы"
+                cid = db_docs_ensure_category(cat_title)
+
+                title = (row.get("doc_title") or "").strip() or "Документ"
+                description = (row.get("doc_description") or "").strip() or None
+                file_id = (row.get("doc_file_id") or "").strip() or None
+                file_unique_id = (row.get("doc_file_unique_id") or "").strip() or None
+                mime_type = (row.get("doc_mime_type") or "").strip() or None
+                local_path = (row.get("doc_local_path") or "").strip() or None
+
+                # Если file_id отсутствует, но есть локальный файл — пере-зальём в TG и обновим file_id
+                if (not file_id) and local_path and Path(local_path).exists():
+                    target_chat_id = update.effective_user.id if update.effective_user else update.effective_chat.id
+                    try:
+                        with open(local_path, "rb") as f:
+                            msg = await context.bot.send_document(
+                                chat_id=target_chat_id,
+                                document=f,
+                                caption=f"♻️ Восстановление: {title}",
+                                disable_notification=True,
+                            )
+                        if msg and msg.document:
+                            file_id = msg.document.file_id
+                            file_unique_id = msg.document.file_unique_id
+                            mime_type = msg.document.mime_type
+                    except Forbidden:
+                        # если бот не может в ЛС — отправим в текущий чат
+                        try:
+                            with open(local_path, "rb") as f:
+                                msg = await context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=f,
+                                    caption=f"♻️ Восстановление: {title}",
+                                    disable_notification=True,
+                                )
+                            if msg and msg.document:
+                                file_id = msg.document.file_id
+                                file_unique_id = msg.document.file_unique_id
+                                mime_type = msg.document.mime_type
+                        except Exception as e:
+                            logger.exception("Reupload local doc failed: %s", e)
+                    except Exception as e:
+                        logger.exception("Reupload local doc failed: %s", e)
+
+                if not file_id and not (local_path and Path(local_path).exists()):
+                    skipped_docs += 1
+                    continue
+
+                db_docs_upsert_by_unique(
+                    cid,
+                    title=title,
+                    description=description,
+                    file_id=file_id or "",
+                    file_unique_id=file_unique_id,
+                    mime_type=mime_type,
+                    local_path=local_path,
+                )
+                ok_docs += 1
+                continue
+
+        clear_csv_import(context)
+        await update.message.reply_text(
+            f"✅ Импорт завершён.\n"
+            f"Категории: {ok_cats}\n"
+            f"Документы: {ok_docs} (пропущено без файла: {skipped_docs})\n"
+            f"Анкеты: {ok_profiles}"
+        )
+        return
+
+    # ---------------- DOC ADD FLOW ----------------
+    if not context.chat_data.get(WAITING_DOC_UPLOAD):
         return
 
     if not await is_admin_scoped(update, context):
@@ -1672,12 +2099,25 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     title = (update.message.caption or "").strip() or (doc.file_name or "Документ")
+
+    # локально бэкапим документ (на случай краша/переезда)
+    local_path = None
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        safe_name = (doc.file_name or "document").replace("/", "_")
+        local_path = str(Path(STORAGE_DIR) / "docs" / f"{doc.file_unique_id}_{safe_name}")
+        await tg_file.download_to_drive(custom_path=local_path)
+    except Exception as e:
+        logger.exception("Failed to backup doc locally: %s", e)
+        local_path = None
+
     pending = {
         "file_id": doc.file_id,
         "file_unique_id": doc.file_unique_id,
         "mime": doc.mime_type,
         "title": title[:120],
         "description": None,
+        "local_path": local_path,
     }
     context.chat_data[PENDING_DOC_INFO] = pending
     context.chat_data[WAITING_DOC_UPLOAD] = False
@@ -1690,6 +2130,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
         reply_markup=kb_cancel_wizard_settings(),
     )
+
 
 # ---------------- HANDLERS: TEXT INPUT (dates / categories / profiles) ----------------
 
@@ -1709,6 +2150,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_waiting_date(context)
         clear_docs_flow(context)
         clear_profile_wiz(context)
+        clear_csv_import(context)
         await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
         return
 
@@ -1796,7 +2238,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending = context.chat_data.get(PENDING_DOC_INFO)
         if pending:
-            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"))
+            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
             clear_docs_flow(context)
             await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
             return
@@ -1934,6 +2376,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     ensure_db_path(DB_PATH)
+    ensure_storage_dir(STORAGE_DIR)
     db_init()
 
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1947,6 +2390,8 @@ def main():
     app.add_handler(CommandHandler("test_industry", cmd_test_industry))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("export_csv", cmd_export_csv))
+    app.add_handler(CommandHandler("import_csv", cmd_import_csv))
 
     # callbacks: meetings
     app.add_handler(CallbackQueryHandler(cb_cancel_open, pattern=r"^cancel:open:(standup|industry)$"))
@@ -1959,14 +2404,14 @@ def main():
     # callbacks: help
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
 
+    # new members welcome
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+
     # document upload
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
 
     # text input
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    # welcome new members
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
 
     # schedule checker
     app.job_queue.run_repeating(check_and_send_jobs, interval=60, first=10, name="meetings_checker")
