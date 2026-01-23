@@ -1647,13 +1647,19 @@ def export_backup_zip_bytes() -> bytes:
     """Формирует ZIP-бэкап с несколькими CSV (profiles/docs/categories/notify_chats/achievements_awards)."""
     files: dict[str, str] = {}
 
-    # categories.csv
+    # doc_categories.csv
     buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=["title"])
+    w = csv.DictWriter(buf, fieldnames=["title", "created_at"])
     w.writeheader()
-    for _, title in db_docs_list_categories():
-        w.writerow({"title": title})
-    files["categories.csv"] = buf.getvalue()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute("SELECT title, created_at FROM doc_categories ORDER BY title COLLATE NOCASE ASC")
+        for title, created_at in cur.fetchall():
+            w.writerow({"title": title or "", "created_at": created_at or ""})
+    finally:
+        con.close()
+    files["doc_categories.csv"] = buf.getvalue()
 
     # docs.csv
     buf = io.StringIO()
@@ -1850,9 +1856,15 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
             con.commit()
             con.close()
 
-        # 2) doc_categories.csv
+        # 2) doc_categories.csv (или legacy categories.csv)
+        cat_filename = None
         if "doc_categories.csv" in names:
-            raw = zf.read("doc_categories.csv").decode("utf-8", errors="replace")
+            cat_filename = "doc_categories.csv"
+        elif "categories.csv" in names:
+            cat_filename = "categories.csv"
+
+        if cat_filename:
+            raw = zf.read(cat_filename).decode("utf-8", errors="replace")
             rdr = csv.DictReader(io.StringIO(raw))
             con = sqlite3.connect(DB_PATH)
             cur = con.cursor()
