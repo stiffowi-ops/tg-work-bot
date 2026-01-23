@@ -51,6 +51,10 @@ DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH", "bot.db")
 STORAGE_DIR = os.getenv("STORAGE_DIR", "storage")
 
 INDUSTRY_WIKI_URL = os.getenv("INDUSTRY_WIKI_URL", "")
+STAFF_URL = os.getenv("STAFF_URL", "")
+SITE_URL = os.getenv("SITE_URL", "")
+LITE_FORM_URL = os.getenv("LITE_FORM_URL", "")
+LEAD_CRM_URL = os.getenv("LEAD_CRM_URL", "")
 HELPY_BOT_URL = os.getenv("HELPY_BOT_URL", "")
 
 if not BOT_TOKEN:
@@ -1082,31 +1086,44 @@ def kb_help_docs_files(category_id: int):
 def get_links_catalog() -> dict[str, dict]:
     catalog: dict[str, dict] = {}
 
-    # Чекко
-    catalog["checko"] = {
-        "title": 'Сервис "Чекко" поиск контактов',
-        "url": "https://checko.ru/",
-        "desc": (
-            "Готовишь карточку лида? Отлично! 🚀\n\n"
-            "Сервис «Чекко» поможет совершить первый шаг! 🔍\n\n"
-            "Поиск ведётся по:\n\n"
-            "• Названию компании 🏢\n"
-            "• ИНН или ОГРН 📑\n"
-            "• Фамилии ИП 👤\n\n"
-            "Нашёл контакты? Просто скопируй их и начинай прозвон! 📞✨"
-        ),
+    catalog["linkedin"] = {
+        "title": "LinkedIn 🔎",
+        "url": "https://www.linkedin.com/feed/",
+        "desc": "Ищем ЛПР/контакты и проверяем должности, компанию, активности",
     }
-    if INDUSTRY_WIKI_URL:
-        catalog["industry_wiki"] = {
-            "title": "📊 WIKI Отрасли (презы и спичи)",
-            "url": INDUSTRY_WIKI_URL,
-            "desc": "Материалы по отрасли: презентации, спичи и полезные справки.",
+
+    if STAFF_URL:
+        catalog["staff"] = {
+            "title": "Стафф 🧑‍🤝‍🧑",
+            "url": STAFF_URL,
+            "desc": "Находим коллег внутри компании: рабочие контакты",
         }
-    if HELPY_BOT_URL:
-        catalog["helpy_bot"] = {
-            "title": "🛠️ Бот Helpy",
-            "url": HELPY_BOT_URL,
-            "desc": "Бот поможет с техническими вопросами, связанными с работой.",
+
+    if SITE_URL:
+        catalog["site"] = {
+            "title": "Наш сайт 🌐",
+            "url": SITE_URL,
+            "desc": "Инфа о продукте: кейсы, клиенты, описание сервиса и ближайшие мероприятия — удобно кидать в диалог.",
+        }
+
+    catalog["yandex_maps"] = {
+        "title": "Яндекс Карты 🗺️",
+        "url": "https://yandex.ru/maps",
+        "desc": "Доп. поиск компании и контактов: филиалы, телефоны, сайт, отзывы, адреса.",
+    }
+
+    if LITE_FORM_URL:
+        catalog["lite_form"] = {
+            "title": "Форма Lite сервиса ✉️",
+            "url": LITE_FORM_URL,
+            "desc": "Отправляем клиенту описание Lite-версии и контакты техподдержки. Нужна почта клиента.",
+        }
+
+    if LEAD_CRM_URL:
+        catalog["lead_crm"] = {
+            "title": "Заведение лида в CRM 🧾",
+            "url": LEAD_CRM_URL,
+            "desc": "Создаём лида в CRM при проработке новой компании. <b>ВАЖНО!!! ПРОВЕРЬ ДУБЛИ</b>\nИли используем при задаче на реанимацию от руководителя.",
         }
 
     return catalog
@@ -1117,9 +1134,30 @@ def kb_help_links_menu():
     if not catalog:
         rows.append([InlineKeyboardButton("— ссылки не настроены —", callback_data="noop")])
     else:
-        items = sorted(catalog.items(), key=lambda kv: len(kv[1]["title"]), reverse=True)
+        # Сортируем по длине названия (короткие сверху)
+        items = sorted(catalog.items(), key=lambda kv: len(kv[1]["title"]))
+        pending_row = []
+
         for key, item in items:
-            rows.append([InlineKeyboardButton(item["title"], callback_data=f"help:links:item:{key}")])
+            btn = InlineKeyboardButton(item["title"], callback_data=f"help:links:item:{key}")
+
+            # длинные кнопки — отдельной строкой
+            if len(item["title"]) >= 22:
+                if pending_row:
+                    rows.append(pending_row)
+                    pending_row = []
+                rows.append([btn])
+                continue
+
+            # короткие — по две в ряд
+            pending_row.append(btn)
+            if len(pending_row) == 2:
+                rows.append(pending_row)
+                pending_row = []
+
+        if pending_row:
+            rows.append(pending_row)
+
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
