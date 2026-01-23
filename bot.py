@@ -2374,7 +2374,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_docs_flow(context)
         clear_profile_wiz(context)
         clear_csv_import(context)
-    clear_suggest_flow(context)
+        clear_suggest_flow(context)
         await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
         return
 
