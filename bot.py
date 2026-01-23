@@ -2594,7 +2594,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_profile_wiz(context)
             clear_waiting_date(context)
             clear_csv_import(context)
-            clear_csv_import(context)
+            clear_zip_import(context)
+            clear_suggest_flow(context)
+            clear_ach_wiz(context)
+            clear_bcast_flow(context)
             await q.edit_message_text("✅ Действие отменено.", reply_markup=kb_help_settings(), parse_mode=ParseMode.HTML)
             return
 
@@ -2725,6 +2728,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "help:settings:ach":
+            clear_bcast_flow(context)
+            clear_ach_wiz(context)
             await q.edit_message_text(
                 "🏆 <b>Ачивки</b>\n\n"
                 "Здесь можно выдать ачивку сотруднику из анкеты.\n"
@@ -2738,6 +2743,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "help:settings:ach:give":
+            clear_bcast_flow(context)
+            clear_ach_wiz(context)
             await q.edit_message_text(
                 "🎁 <b>Выдать ачивку</b>\n\nВыберите сотрудника:",
                 parse_mode=ParseMode.HTML,
@@ -2752,6 +2759,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Анкета не найдена.", show_alert=True)
                 return
             clear_ach_wiz(context)
+            clear_bcast_flow(context)
             context.chat_data[ACH_WIZ_ACTIVE] = True
             context.chat_data[ACH_WIZ_STEP] = "emoji"
             context.chat_data[ACH_WIZ_DATA] = {
