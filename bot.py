@@ -45,7 +45,6 @@ DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH", "bot.db")
 
 STORAGE_DIR = os.getenv("STORAGE_DIR", "storage")
 
-YA_CRM_URL = os.getenv("YA_CRM_URL", "")
 INDUSTRY_WIKI_URL = os.getenv("INDUSTRY_WIKI_URL", "")
 HELPY_BOT_URL = os.getenv("HELPY_BOT_URL", "")
 
@@ -1011,8 +1010,7 @@ def kb_help_main(is_admin_user: bool):
         [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
         [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links")],
         [InlineKeyboardButton("👥 Познакомиться с командой", callback_data="help:team")],
-    ],
-        [InlineKeyboardButton("💡 Предложка", callback_data="help:suggest")]
+        [InlineKeyboardButton("💡 Предложка", callback_data="help:suggest")],
     ]
     if is_admin_user:
         rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")])
@@ -1074,13 +1072,6 @@ def get_links_catalog() -> dict[str, dict]:
             "Нашёл контакты? Просто скопируй их и начинай прозвон! 📞✨"
         ),
     }
-
-    if YA_CRM_URL:
-        catalog["ya_crm"] = {
-            "title": "🌐 YA CRM",
-            "url": YA_CRM_URL,
-            "desc": "CRM-система для работы с заявками, задачами и клиентскими данными.",
-        }
     if INDUSTRY_WIKI_URL:
         catalog["industry_wiki"] = {
             "title": "📊 WIKI Отрасли (презы и спичи)",
