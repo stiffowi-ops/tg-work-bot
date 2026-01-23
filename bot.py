@@ -6,6 +6,7 @@ import logging
 import time
 import csv
 import io
+import zipfile
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
@@ -240,6 +241,21 @@ def db_init():
         cur.execute("ALTER TABLE profiles ADD COLUMN birthday TEXT")
     except sqlite3.OperationalError:
         pass
+
+
+    # ------- ACHIEVEMENTS: выдачи ачивок -------
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS achievement_awards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id INTEGER NOT NULL,
+        emoji TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        awarded_at TEXT NOT NULL,
+        awarded_by INTEGER,
+        FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+    )
+""")
 
     con.commit()
     con.close()
@@ -639,6 +655,76 @@ def db_profiles_birthdays(ddmm: str) -> list[dict]:
         })
     return res
 
+
+# ---------------- ACHIEVEMENTS (awards) ----------------
+
+def db_achievements_list(profile_id: int) -> list[dict]:
+    """Список ачивок для профиля (последние сверху)."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT emoji, title, description, awarded_at
+        FROM achievement_awards
+        WHERE profile_id=?
+        ORDER BY id DESC
+        """,
+        (int(profile_id),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {"emoji": r[0], "title": r[1], "description": r[2], "awarded_at": r[3]}
+        for r in rows
+    ]
+
+
+def db_achievement_award_add(profile_id: int, emoji: str, title: str, description: str, awarded_by: int | None = None) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO achievement_awards(profile_id, emoji, title, description, awarded_at, awarded_by)
+        VALUES(?, ?, ?, ?, ?, ?)
+        """,
+        (int(profile_id), emoji.strip(), title.strip(), description.strip(), datetime.utcnow().isoformat(), awarded_by),
+    )
+    con.commit()
+    aid = cur.lastrowid
+    con.close()
+    return aid
+
+
+def export_achievement_awards_rows() -> list[dict]:
+    """Для CSV/ZIP бэкапа: все выданные ачивки."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT a.id, p.id, p.full_name, p.tg_link, a.emoji, a.title, a.description, a.awarded_at, a.awarded_by
+        FROM achievement_awards a
+        JOIN profiles p ON p.id = a.profile_id
+        ORDER BY a.id ASC
+        """
+    )
+    rows = cur.fetchall()
+    con.close()
+    out = []
+    for r in rows:
+        out.append({
+            "award_id": r[0],
+            "profile_id": r[1],
+            "full_name": r[2] or "",
+            "tg_link": r[3] or "",
+            "emoji": r[4] or "",
+            "title": r[5] or "",
+            "description": r[6] or "",
+            "awarded_at": r[7] or "",
+            "awarded_by": r[8] or "",
+        })
+    return out
+
+
 # ---------------- TEXT (meetings) ----------------
 
 DAY_RU_UPPER = {
@@ -772,6 +858,12 @@ PROFILE_WIZ_ACTIVE = "profile_wiz_active"
 
 # csv import flow
 WAITING_CSV_IMPORT = "waiting_csv_import"
+WAITING_ZIP_IMPORT = "waiting_zip_import"
+
+# achievements award flow
+ACH_WIZ_ACTIVE = "ach_wiz_active"
+ACH_WIZ_STEP = "ach_wiz_step"
+ACH_WIZ_DATA = "ach_wiz_data"
 PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
 
@@ -808,6 +900,14 @@ def clear_profile_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop(PROFILE_WIZ_STEP, None)
     context.chat_data.pop(PROFILE_WIZ_DATA, None)
 
+def clear_zip_import(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[WAITING_ZIP_IMPORT] = False
+
+def clear_ach_wiz(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[ACH_WIZ_ACTIVE] = False
+    context.chat_data.pop(ACH_WIZ_STEP, None)
+    context.chat_data.pop(ACH_WIZ_DATA, None)
+
 def clear_suggest_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data[WAITING_SUGGESTION_TEXT] = False
     context.user_data.pop(SUGGESTION_MODE, None)
@@ -835,6 +935,16 @@ def normalize_tg_mention(tg_link: str) -> str | None:
     tg = (tg_link or "").strip()
     if not tg:
         return None
+
+
+def format_achievements_for_profile(profile_id: int) -> str:
+    items = db_achievements_list(profile_id)
+    if not items:
+        return "— Всё ещё впереди —"
+    parts = []
+    for it in items[:10]:
+        parts.append(f"{escape(it['emoji'])} <b>{escape(it['title'])}</b>\n{escape(it['description'])}")
+    return "\n\n".join(parts)
 
     # @username
     if tg.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", tg):
@@ -1228,9 +1338,10 @@ def kb_help_settings():
         [InlineKeyboardButton("🗂️ Редактировать категории", callback_data="help:settings:cats")],
         [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
         [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
-        [InlineKeyboardButton("📤 Скачать отчёт CSV", callback_data="help:settings:export_csv")],
-        [InlineKeyboardButton("📥 Загрузить отчёт CSV", callback_data="help:settings:import_csv")],        [InlineKeyboardButton("📣 Рассылка", callback_data="help:settings:bcast")],
-
+        [InlineKeyboardButton("🏆 Ачивки", callback_data="help:settings:ach")],
+        [InlineKeyboardButton("📦 Скачать бэкап ZIP", callback_data="help:settings:backup_zip")],
+        [InlineKeyboardButton("📥 Загрузить бэкап ZIP", callback_data="help:settings:restore_zip")],
+        [InlineKeyboardButton("📣 Рассылка", callback_data="help:settings:bcast")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
 
@@ -1275,6 +1386,23 @@ def kb_pick_doc_to_delete():
             rows.append([InlineKeyboardButton(f"{cat_title}: {doc_title}", callback_data=f"help:settings:del_doc:{did}")])
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_achievements_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Выдать ачивку", callback_data="help:settings:ach:give")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
+def kb_pick_profile_for_achievement():
+    people = db_profiles_list()
+    rows = []
+    if not people:
+        rows.append([InlineKeyboardButton("— анкет нет —", callback_data="noop")])
+    else:
+        for pid, name in people[:60]:
+            rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:ach:pick:{pid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:ach")])
     return InlineKeyboardMarkup(rows)
 
 def kb_pick_profile_to_delete():
@@ -1521,6 +1649,136 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _csv_bool(v: str | None) -> str:
     return "1" if str(v).strip().lower() in ("1", "true", "yes", "y") else "0"
 
+
+def export_backup_zip_bytes() -> bytes:
+    """Формирует ZIP-бэкап с несколькими CSV (profiles/docs/categories/notify_chats/achievements_awards)."""
+    files: dict[str, str] = {}
+
+    # categories.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["title"])
+    w.writeheader()
+    for _, title in db_docs_list_categories():
+        w.writerow({"title": title})
+    files["categories.csv"] = buf.getvalue()
+
+    # docs.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=[
+        "category_title",
+        "doc_title",
+        "doc_description",
+        "doc_file_id",
+        "doc_file_unique_id",
+        "doc_mime_type",
+        "doc_local_path",
+    ])
+    w.writeheader()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute("""
+            SELECT c.title, d.title, d.description, d.file_id, d.file_unique_id, d.mime_type, d.local_path
+            FROM docs d
+            JOIN doc_categories c ON c.id = d.category_id
+            ORDER BY d.id ASC
+        """)
+        rows = cur.fetchall()
+        has_local = True
+    except sqlite3.OperationalError:
+        cur.execute("""
+            SELECT c.title, d.title, d.description, d.file_id, d.file_unique_id, d.mime_type
+            FROM docs d
+            JOIN doc_categories c ON c.id = d.category_id
+            ORDER BY d.id ASC
+        """)
+        rows = cur.fetchall()
+        has_local = False
+    con.close()
+    for r in rows:
+        if has_local:
+            cat_title, doc_title, desc, file_id, file_unique_id, mime_type, local_path = r
+        else:
+            cat_title, doc_title, desc, file_id, file_unique_id, mime_type = r
+            local_path = ""
+        w.writerow({
+            "category_title": cat_title or "",
+            "doc_title": doc_title or "",
+            "doc_description": desc or "",
+            "doc_file_id": file_id or "",
+            "doc_file_unique_id": file_unique_id or "",
+            "doc_mime_type": mime_type or "",
+            "doc_local_path": local_path or "",
+        })
+    files["docs.csv"] = buf.getvalue()
+
+    # profiles.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=[
+        "full_name",
+        "year_start",
+        "city",
+        "birthday",
+        "about",
+        "topics",
+        "tg_link",
+    ])
+    w.writeheader()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT full_name, year_start, city, birthday, about, topics, tg_link
+        FROM profiles
+        ORDER BY id ASC
+    """)
+    for row in cur.fetchall():
+        w.writerow({
+            "full_name": row[0] or "",
+            "year_start": row[1] or "",
+            "city": row[2] or "",
+            "birthday": row[3] or "",
+            "about": row[4] or "",
+            "topics": row[5] or "",
+            "tg_link": row[6] or "",
+        })
+    con.close()
+    files["profiles.csv"] = buf.getvalue()
+
+    # notify_chats.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["chat_id", "added_at"])
+    w.writeheader()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT chat_id, added_at FROM notify_chats ORDER BY chat_id ASC")
+    for row in cur.fetchall():
+        w.writerow({"chat_id": row[0], "added_at": row[1]})
+    con.close()
+    files["notify_chats.csv"] = buf.getvalue()
+
+    # achievements_awards.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=[
+        "award_id",
+        "profile_id",
+        "full_name",
+        "tg_link",
+        "emoji",
+        "title",
+        "description",
+        "awarded_at",
+        "awarded_by",
+    ])
+    w.writeheader()
+    for r in export_achievement_awards_rows():
+        w.writerow(r)
+    files["achievements_awards.csv"] = buf.getvalue()
+
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, content in files.items():
+            zf.writestr(name, content.encode("utf-8-sig"))
+    return zbuf.getvalue()
 
 def export_backup_csv_bytes() -> bytes:
     """
@@ -2078,7 +2336,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎂 День рождения: <b>{bday}</b>\n\n"
             f"📝 <b>Кратко о себе</b>\n{p['about']}\n\n"
             f"❓ <b>По каким вопросам обращаться</b>\n{p['topics']}\n\n"
-            f"🔗 TG: {p['tg_link']}"
+            f"🔗 TG: {p['tg_link']}\n\n"
+            f"🏆 <b>Ачивки</b>\n{format_achievements_for_profile(p['id'])}"
         )
         await q.edit_message_text(card, parse_mode=ParseMode.HTML, reply_markup=kb_help_profile_card(p), disable_web_page_preview=True)
         return
@@ -2442,6 +2701,167 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if waiting_user and user_id != waiting_user:
         return
 
+    # ---------------- ZIP IMPORT FLOW ----------------
+    if context.chat_data.get(WAITING_ZIP_IMPORT):
+        if not await is_admin_scoped(update, context):
+            clear_zip_import(context)
+            await update.message.reply_text("❌ Только администраторы могут восстанавливать бэкап.")
+            return
+
+        doc = update.message.document
+        if not doc:
+            return
+
+        # скачиваем ZIP во временный файл
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            tmp_path = Path(STORAGE_DIR) / "tmp_backup.zip"
+            await tg_file.download_to_drive(custom_path=str(tmp_path))
+        except Exception as e:
+            clear_zip_import(context)
+            logger.exception("ZIP download failed: %s", e)
+            await update.message.reply_text("❌ Не смог скачать ZIP.")
+            return
+
+        def _read_csv_from_zip(zf: zipfile.ZipFile, name: str) -> str | None:
+            try:
+                data = zf.read(name)
+            except KeyError:
+                return None
+            try:
+                return data.decode("utf-8-sig")
+            except Exception:
+                return data.decode("utf-8", errors="ignore")
+
+        ok_cats = ok_docs = ok_profiles = ok_ach = 0
+        skipped_docs = 0
+
+        try:
+            with zipfile.ZipFile(tmp_path, "r") as zf:
+                # categories
+                raw = _read_csv_from_zip(zf, "categories.csv")
+                if raw:
+                    reader = csv.DictReader(io.StringIO(raw))
+                    for row in reader:
+                        title = (row.get("title") or "").strip()
+                        if title:
+                            db_docs_ensure_category(title)
+                            ok_cats += 1
+
+                # profiles
+                raw = _read_csv_from_zip(zf, "profiles.csv")
+                id_map: dict[str, int] = {}
+                if raw:
+                    reader = csv.DictReader(io.StringIO(raw))
+                    for row in reader:
+                        full_name = (row.get("full_name") or "").strip()
+                        if not full_name:
+                            continue
+                        year_start = int((row.get("year_start") or "0").strip() or 0)
+                        city = (row.get("city") or "").strip()
+                        birthday = (row.get("birthday") or "").strip() or None
+                        about = (row.get("about") or "").strip()
+                        topics = (row.get("topics") or "").strip()
+                        tg_link = (row.get("tg_link") or "").strip()
+                        if not (year_start and city and about and topics and tg_link):
+                            continue
+                        pid = db_profiles_upsert(full_name, year_start, city, birthday, about, topics, tg_link)
+                        ok_profiles += 1
+                        if tg_link:
+                            id_map[tg_link] = pid
+
+                # docs
+                raw = _read_csv_from_zip(zf, "docs.csv")
+                if raw:
+                    reader = csv.DictReader(io.StringIO(raw))
+                    for row in reader:
+                        cat_title = (row.get("category_title") or "").strip() or "Документы"
+                        cid = db_docs_ensure_category(cat_title)
+
+                        title = (row.get("doc_title") or "").strip() or "Документ"
+                        description = (row.get("doc_description") or "").strip() or None
+                        file_id = (row.get("doc_file_id") or "").strip() or None
+                        file_unique_id = (row.get("doc_file_unique_id") or "").strip() or None
+                        mime_type = (row.get("doc_mime_type") or "").strip() or None
+                        local_path = (row.get("doc_local_path") or "").strip() or None
+
+                        if (not file_id) and local_path and Path(local_path).exists():
+                            target_chat_id = update.effective_user.id if update.effective_user else update.effective_chat.id
+                            try:
+                                with open(local_path, "rb") as f:
+                                    msg = await context.bot.send_document(
+                                        chat_id=target_chat_id,
+                                        document=f,
+                                        caption=f"♻️ Восстановление: {title}",
+                                        disable_notification=True,
+                                    )
+                                if msg and msg.document:
+                                    file_id = msg.document.file_id
+                                    file_unique_id = msg.document.file_unique_id
+                                    mime_type = msg.document.mime_type
+                            except Exception as e:
+                                logger.exception("Reupload local doc failed: %s", e)
+
+                        if not file_id and not (local_path and Path(local_path).exists()):
+                            skipped_docs += 1
+                            continue
+
+                        db_docs_upsert_by_unique(
+                            cid,
+                            title=title,
+                            description=description,
+                            file_id=file_id or "",
+                            file_unique_id=file_unique_id,
+                            mime_type=mime_type,
+                            local_path=local_path,
+                        )
+                        ok_docs += 1
+
+                # achievements
+                raw = _read_csv_from_zip(zf, "achievements_awards.csv")
+                if raw:
+                    reader = csv.DictReader(io.StringIO(raw))
+                    for row in reader:
+                        tg_link = (row.get("tg_link") or "").strip()
+                        pid = id_map.get(tg_link) if tg_link else None
+                        if not pid and tg_link:
+                            # попробуем найти в БД
+                            con = sqlite3.connect(DB_PATH)
+                            cur = con.cursor()
+                            cur.execute("SELECT id FROM profiles WHERE tg_link=?", (tg_link,))
+                            r = cur.fetchone()
+                            con.close()
+                            pid = r[0] if r else None
+                        if not pid:
+                            continue
+                        emoji = (row.get("emoji") or "").strip() or "🏆"
+                        title = (row.get("title") or "").strip() or "Ачивка"
+                        description = (row.get("description") or "").strip() or ""
+                        # не тащим awarded_at/awarded_by в точности — создаём новую запись восстановления
+                        db_achievement_award_add(int(pid), emoji, title, description, None)
+                        ok_ach += 1
+
+        except zipfile.BadZipFile:
+            clear_zip_import(context)
+            await update.message.reply_text("❌ Это не ZIP или файл повреждён.")
+            return
+        except Exception as e:
+            clear_zip_import(context)
+            logger.exception("ZIP import failed: %s", e)
+            await update.message.reply_text("❌ Ошибка при восстановлении ZIP.")
+            return
+
+        clear_zip_import(context)
+        await update.message.reply_text(
+            "✅ Восстановление завершено.\n\n"
+            f"Категории: <b>{ok_cats}</b>\n"
+            f"Анкеты: <b>{ok_profiles}</b>\n"
+            f"Документы: <b>{ok_docs}</b> (пропущено без file_id: <b>{skipped_docs}</b>)\n"
+            f"Ачивки: <b>{ok_ach}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_settings(),
+        )
+        return
     # ---------------- CSV IMPORT FLOW ----------------
     if context.chat_data.get(WAITING_CSV_IMPORT):
         if not await is_admin_scoped(update, context):
@@ -2741,6 +3161,92 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # step == files -> ждём вложения или кнопку "Отправить"
         return
+
+    # ачивки — выдача
+    if context.chat_data.get(ACH_WIZ_ACTIVE):
+        if not await is_admin_scoped(update, context):
+            clear_ach_wiz(context)
+            await update.message.reply_text("❌ Только администраторы могут выдавать ачивки.")
+            return
+
+        step = context.chat_data.get(ACH_WIZ_STEP)
+        d = context.chat_data.get(ACH_WIZ_DATA) or {}
+
+        if step == "emoji":
+            emoji = text.strip()
+            if len(emoji) < 1 or len(emoji) > 16:
+                await update.message.reply_text("❌ Отправьте один эмодзи (или короткую связку). Пример: 🏅")
+                return
+            d["emoji"] = emoji
+            context.chat_data[ACH_WIZ_DATA] = d
+            context.chat_data[ACH_WIZ_STEP] = "title"
+            await update.message.reply_text(
+                "Шаг 3/4: отправьте <b>название ачивки</b> (будет жирным).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if step == "title":
+            title = text.strip()
+            if len(title) < 2:
+                await update.message.reply_text("❌ Слишком коротко. Напишите название ачивки.")
+                return
+            d["title"] = title[:80]
+            context.chat_data[ACH_WIZ_DATA] = d
+            context.chat_data[ACH_WIZ_STEP] = "description"
+            await update.message.reply_text(
+                "Шаг 4/4: напишите <b>описание</b> — за что выдаётся ачивка 🙂",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if step == "description":
+            desc = text.strip()
+            if len(desc) < 3:
+                await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
+                return
+            d["description"] = desc[:600]
+
+            pid = d.get("profile_id")
+            if not pid:
+                clear_ach_wiz(context)
+                await update.message.reply_text("❌ Не выбран сотрудник. Начните заново через /help → Настройки → Ачивки.")
+                return
+
+            admin_id = update.effective_user.id if update.effective_user else None
+            db_achievement_award_add(int(pid), d.get("emoji", "🏆"), d.get("title", "Ачивка"), d.get("description", ""), admin_id)
+
+            scope_chat_id = get_scope_chat_id(update, context)
+            mention = normalize_tg_mention(d.get("tg_link", "") or "")
+            who = mention if mention else f"<b>{escape(d.get('full_name', 'Сотрудник'))}</b>"
+            msg = (
+                f"🏆 {escape(d.get('emoji', '🏆'))} <b>{escape(d.get('title', 'Ачивка'))}</b>\n"
+                f"🎉 Поздравляем, {who}!\n"
+                f"{escape(d.get('description', ''))}"
+            )
+
+            sent = False
+            if scope_chat_id:
+                try:
+                    await context.bot.send_message(chat_id=scope_chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                    sent = True
+                except Exception as e:
+                    logger.exception("Cannot send achievement notify to scope chat: %s", e)
+
+            if not sent:
+                for chat_id in db_list_chats():
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                        sent = True
+                        break
+                    except Exception:
+                        pass
+
+            clear_ach_wiz(context)
+            await update.message.reply_text("✅ Ачивка выдана и опубликована в чате.", reply_markup=kb_help_settings())
+            return
 
     # описание документа
     if context.chat_data.get(WAITING_DOC_DESC):
