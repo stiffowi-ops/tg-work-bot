@@ -19,6 +19,7 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TimedOut, NetworkError
+from telegram.helpers import escape
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -772,6 +773,11 @@ PROFILE_WIZ_DATA = "profile_wiz_data"
 WAITING_SUGGESTION_TEXT = "waiting_suggestion_text"
 SUGGESTION_MODE = "suggestion_mode"  # anon|named
 
+# broadcast flow
+BCAST_ACTIVE = "bcast_active"
+BCAST_STEP = "bcast_step"  # topic|text|files
+BCAST_DATA = "bcast_data"
+
 def clear_waiting_date(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DATE_FLAG] = False
     context.chat_data.pop(WAITING_USER_ID, None)
@@ -799,6 +805,11 @@ def clear_profile_wiz(context: ContextTypes.DEFAULT_TYPE):
 def clear_suggest_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data[WAITING_SUGGESTION_TEXT] = False
     context.user_data.pop(SUGGESTION_MODE, None)
+
+def clear_bcast_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[BCAST_ACTIVE] = False
+    context.user_data.pop(BCAST_STEP, None)
+    context.user_data.pop(BCAST_DATA, None)
 
 # ---------------- DUE RULES ----------------
 
@@ -1032,6 +1043,15 @@ def kb_suggest_cancel():
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
 
+
+def kb_bcast_files_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Отправить", callback_data="help:settings:bcast:send")],
+        [InlineKeyboardButton("🗑️ Очистить файлы", callback_data="help:settings:bcast:clear_files")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
 def kb_help_docs_categories():
     cats = db_docs_list_categories()
     rows = []
@@ -1145,7 +1165,8 @@ def kb_help_settings():
         [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
         [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
         [InlineKeyboardButton("📤 Скачать отчёт CSV", callback_data="help:settings:export_csv")],
-        [InlineKeyboardButton("📥 Загрузить отчёт CSV", callback_data="help:settings:import_csv")],
+        [InlineKeyboardButton("📥 Загрузить отчёт CSV", callback_data="help:settings:import_csv")],        [InlineKeyboardButton("📣 Рассылка", callback_data="help:settings:bcast")],
+
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
 
@@ -1426,7 +1447,8 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_profile_wiz(context)
     clear_csv_import(context)
     clear_suggest_flow(context)
-    await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты/CSV/предложка).")
+    clear_bcast_flow(context)
+    await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты/CSV/предложка/рассылка).")
 
 
 
@@ -2030,6 +2052,57 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("✅ Действие отменено.", reply_markup=kb_help_settings(), parse_mode=ParseMode.HTML)
             return
 
+
+        if data == "help:settings:bcast":
+            clear_bcast_flow(context)
+            context.user_data[BCAST_ACTIVE] = True
+            context.user_data[BCAST_STEP] = "topic"
+            context.user_data[BCAST_DATA] = {"topic": None, "text": None, "files": []}
+            await q.edit_message_text(
+                "📣 <b>Рассылка</b>\n\n"
+                "Шаг 1/3: <b>Тема</b> (будет выделена жирным)\n"
+                "Отправьте тему одним сообщением.\n"
+                "Если тема не нужна — отправьте <code>-</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data == "help:settings:bcast:cancel":
+            clear_bcast_flow(context)
+            await q.edit_message_text("✅ Рассылка отменена.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+            return
+
+        if data == "help:settings:bcast:clear_files":
+            d = _bcast_get_data(context)
+            d["files"] = []
+            context.user_data[BCAST_DATA] = d
+            await q.answer("Файлы очищены ✅")
+            return
+
+        if data == "help:settings:bcast:send":
+            d = _bcast_get_data(context)
+            topic = d.get("topic")
+            body = d.get("text")
+            files = d.get("files") or []
+            message_html = _bcast_compose_message(topic, body)
+
+            if not message_html and not files:
+                await q.answer("Нечего отправлять: добавьте текст или файлы.", show_alert=True)
+                return
+
+            ok, fail = await broadcast_to_chats(context, message_html, files)
+            clear_bcast_flow(context)
+            await q.edit_message_text(
+                f"✅ Рассылка отправлена.\n\n"
+                f"Успешно: <b>{ok}</b>\n"
+                f"Ошибок: <b>{fail}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_help_settings(),
+            )
+            return
+
         if data == "help:settings:export_csv":
             # экспортируем CSV и отправляем в ЛС (тут мы и так в ЛС)
             if update.effective_user:
@@ -2289,6 +2362,17 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
         return
 
+    # рассылка  # bcast attachment: сохраняем документ как вложение (в ЛС админа)
+    if context.user_data.get(BCAST_ACTIVE) and context.user_data.get(BCAST_STEP) == "files":
+        doc = update.message.document
+        if doc:
+            d = _bcast_get_data(context)
+            d["files"].append({"kind": "document", "file_id": doc.file_id, "file_unique_id": doc.file_unique_id})
+            context.user_data[BCAST_DATA] = d
+            await update.message.reply_text("✅ Документ добавлен. Можешь добавить ещё или нажми «✅ Отправить».", reply_markup=kb_bcast_files_menu())
+        return
+
+
     user_id = update.effective_user.id if update.effective_user else None
     waiting_user = context.chat_data.get(WAITING_USER_ID)
     if waiting_user and user_id != waiting_user:
@@ -2464,6 +2548,31 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
+        return
+    if context.user_data.get(BCAST_ACTIVE) and context.user_data.get(BCAST_STEP) == "files":
+        photos = update.message.photo or []
+        if photos:
+            # берём самый большой
+            ph = photos[-1]
+            d = _bcast_get_data(context)
+            d["files"].append({"kind": "photo", "file_id": ph.file_id, "file_unique_id": ph.file_unique_id})
+            context.user_data[BCAST_DATA] = d
+            await update.message.reply_text("✅ Фото добавлено. Можешь добавить ещё или нажми «✅ Отправить».", reply_markup=kb_bcast_files_menu())
+
+async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
+        return
+    if context.user_data.get(BCAST_ACTIVE) and context.user_data.get(BCAST_STEP) == "files":
+        vid = update.message.video
+        if vid:
+            d = _bcast_get_data(context)
+            d["files"].append({"kind": "video", "file_id": vid.file_id, "file_unique_id": vid.file_unique_id})
+            context.user_data[BCAST_DATA] = d
+            await update.message.reply_text("✅ Видео добавлено. Можешь добавить ещё или нажми «✅ Отправить».", reply_markup=kb_bcast_files_menu())
+
+
 # ---------------- HANDLERS: TEXT INPUT (dates / categories / profiles) ----------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2484,6 +2593,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_profile_wiz(context)
         clear_csv_import(context)
         clear_suggest_flow(context)
+        clear_bcast_flow(context)
         await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
         return
 
@@ -2514,6 +2624,58 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         clear_suggest_flow(context)
         await update.message.reply_text("✅ Спасибо! Передал администраторам 🙌")
+        return
+
+    # рассылка  # bcast attachment (в ЛС админа): шаги тема/текст/файлы
+    if context.user_data.get(BCAST_ACTIVE):
+        step = context.user_data.get(BCAST_STEP)
+        d = _bcast_get_data(context)
+
+        if step == "topic":
+            if text != "-":
+                topic = text.strip()
+                if len(topic) < 2:
+                    await update.message.reply_text("❌ Тема слишком короткая. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
+                    return
+                d["topic"] = topic[:200]
+            else:
+                d["topic"] = None
+
+            context.user_data[BCAST_DATA] = d
+            context.user_data[BCAST_STEP] = "text"
+            await update.message.reply_text(
+                "Шаг 2/3: <b>Текст рассылки</b> 📝\n"
+                "Отправьте текст одним сообщением.\n"
+                "Если текст не нужен — отправьте <code>-</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if step == "text":
+            if text != "-":
+                body = text.strip()
+                if len(body) < 2:
+                    await update.message.reply_text("❌ Текст слишком короткий. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
+                    return
+                # лимит Telegram ~4096, оставим запас
+                d["text"] = body[:3500]
+            else:
+                d["text"] = None
+
+            context.user_data[BCAST_DATA] = d
+            context.user_data[BCAST_STEP] = "files"
+            await update.message.reply_text(
+                "Шаг 3/3: <b>Файлы</b> 📎\n\n"
+                "Можешь прикрепить <b>документы / фото / видео</b> (сколько нужно).\n"
+                "Когда закончишь — нажми <b>✅ Отправить</b>.\n"
+                "Можно без файлов 🙂",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_bcast_files_menu(),
+            )
+            return
+
+        # step == files -> ждём вложения или кнопку "Отправить"
         return
 
     # описание документа
@@ -2787,6 +2949,63 @@ async def send_suggestion_to_admins(scope_chat_id: int, update: Update, context:
 
     return (sent_ok, sent_fail)
 
+
+
+# ---------------- BROADCAST ----------------
+
+def _bcast_get_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    data = context.user_data.get(BCAST_DATA)
+    if not isinstance(data, dict):
+        data = {"topic": None, "text": None, "files": []}
+        context.user_data[BCAST_DATA] = data
+    if "files" not in data or not isinstance(data.get("files"), list):
+        data["files"] = []
+    return data
+
+def _bcast_compose_message(topic: str | None, body: str | None) -> str:
+    topic = (topic or "").strip()
+    body = (body or "").strip()
+    # Экрануем пользовательский ввод для HTML
+    topic_esc = escape(topic) if topic else ""
+    body_esc = escape(body) if body else ""
+    if topic_esc and body_esc:
+        return f"<b>{topic_esc}</b>\n\n{body_esc}"
+    if topic_esc:
+        return f"<b>{topic_esc}</b>"
+    return body_esc
+
+async def broadcast_to_chats(context: ContextTypes.DEFAULT_TYPE, message_html: str, files: list[dict]) -> tuple[int, int]:
+    """Рассылка в notify_chats. Возвращает (ok, fail)."""
+    ok = 0
+    fail = 0
+    chat_ids = db_list_chats()
+    for cid in chat_ids:
+        try:
+            if message_html:
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=message_html,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            # отправляем вложения (document/photo/video)
+            for f in files or []:
+                kind = f.get("kind")
+                file_id = f.get("file_id")
+                if not file_id:
+                    continue
+                if kind == "document":
+                    await context.bot.send_document(chat_id=cid, document=file_id)
+                elif kind == "photo":
+                    await context.bot.send_photo(chat_id=cid, photo=file_id)
+                elif kind == "video":
+                    await context.bot.send_video(chat_id=cid, video=file_id)
+            ok += 1
+        except Exception as e:
+            logger.exception("Broadcast failed to %s: %s", cid, e)
+            fail += 1
+    return ok, fail
+
 # ---------------- APP ----------------
 
 def main():
@@ -2826,6 +3045,10 @@ def main():
 
     # document upload
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+
+    # broadcast media (photo/video)
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.VIDEO, on_video))
 
     # text input
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
