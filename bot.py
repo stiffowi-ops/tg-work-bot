@@ -167,6 +167,14 @@ def db_init():
         )
     """)
 
+    # rate-limit предложки
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS suggest_rate (
+            user_id INTEGER PRIMARY KEY,
+            last_sent_ts INTEGER NOT NULL
+        )
+    """)
+
     # ------- HELP MENU: документы -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS doc_categories (
@@ -246,6 +254,26 @@ def db_set_meta(key: str, value: str):
         VALUES(?, ?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
     """, (key, value))
+    con.commit()
+    con.close()
+
+
+def db_get_suggest_last_ts(user_id: int) -> int | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT last_sent_ts FROM suggest_rate WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone()
+    con.close()
+    return int(row[0]) if row else None
+
+def db_set_suggest_last_ts(user_id: int, ts: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO suggest_rate(user_id, last_sent_ts)
+        VALUES(?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET last_sent_ts=excluded.last_sent_ts
+    """, (int(user_id), int(ts)))
     con.commit()
     con.close()
 
@@ -739,6 +767,10 @@ WAITING_CSV_IMPORT = "waiting_csv_import"
 PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
 
+# suggest box flow
+WAITING_SUGGESTION_TEXT = "waiting_suggestion_text"
+SUGGESTION_MODE = "suggestion_mode"  # anon|named
+
 def clear_waiting_date(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DATE_FLAG] = False
     context.chat_data.pop(WAITING_USER_ID, None)
@@ -762,6 +794,10 @@ def clear_profile_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[PROFILE_WIZ_ACTIVE] = False
     context.chat_data.pop(PROFILE_WIZ_STEP, None)
     context.chat_data.pop(PROFILE_WIZ_DATA, None)
+
+def clear_suggest_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[WAITING_SUGGESTION_TEXT] = False
+    context.user_data.pop(SUGGESTION_MODE, None)
 
 # ---------------- DUE RULES ----------------
 
@@ -975,10 +1011,26 @@ def kb_help_main(is_admin_user: bool):
         [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
         [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links")],
         [InlineKeyboardButton("👥 Познакомиться с командой", callback_data="help:team")],
+    ],
+        [InlineKeyboardButton("💡 Предложка", callback_data="help:suggest")]
     ]
     if is_admin_user:
         rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")])
     return InlineKeyboardMarkup(rows)
+
+
+def kb_suggest_modes():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🕵️ Анонимно", callback_data="help:suggest:mode:anon")],
+        [InlineKeyboardButton("🙋 Не анонимно", callback_data="help:suggest:mode:named")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+    ])
+
+def kb_suggest_cancel():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:suggest:cancel")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+    ])
 
 def kb_help_docs_categories():
     cats = db_docs_list_categories()
@@ -1380,7 +1432,8 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_docs_flow(context)
     clear_profile_wiz(context)
     clear_csv_import(context)
-    await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты).")
+    clear_suggest_flow(context)
+    await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты/CSV/предложка).")
 
 
 
@@ -1752,6 +1805,41 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             help_text_main(bot_username),
             parse_mode=ParseMode.HTML,
             reply_markup=kb_help_main(is_admin_user=is_adm),
+            disable_web_page_preview=True,
+        )
+        return
+
+
+    if data == "help:suggest":
+        text = (
+            "💡 <b>Предложка</b>\n\n"
+            "Тут ты можешь отправить свой вопрос/предложение/жалобу/просьбу и т.д. 🙂\n\n"
+            "Для этого воспользуйся одним из режимов ниже 👇"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_suggest_modes(), disable_web_page_preview=True)
+        return
+
+    if data == "help:suggest:cancel":
+        clear_suggest_flow(context)
+        await q.edit_message_text("✅ Отправка отменена.", parse_mode=ParseMode.HTML, reply_markup=kb_help_main(is_admin_user=is_adm))
+        return
+
+    if data.startswith("help:suggest:mode:"):
+        mode = data.split(":")[-1]  # anon|named
+        scope_chat_id = get_scope_chat_id(update, context)
+        if not scope_chat_id:
+            await q.answer("Открой /help из группового чата, чтобы привязать предложку к нему.", show_alert=True)
+            return
+
+        context.user_data[WAITING_SUGGESTION_TEXT] = True
+        context.user_data[SUGGESTION_MODE] = mode
+
+        await q.edit_message_text(
+            "✍️ <b>Напиши сообщение для администраторов</b>\n\n"
+            "Можно одним сообщением. Я передам его администраторам.\n"
+            "Чтобы отменить — нажми «Отмена».",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_suggest_cancel(),
             disable_web_page_preview=True,
         )
         return
@@ -2295,7 +2383,37 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_docs_flow(context)
         clear_profile_wiz(context)
         clear_csv_import(context)
+    clear_suggest_flow(context)
         await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
+        return
+
+
+    # предложка (в ЛС): ждём текст  # anti-spam
+    if context.user_data.get(WAITING_SUGGESTION_TEXT):
+        # анти-спам: 1 сообщение в 5 минут на человека
+        if user_id:
+            last_ts = db_get_suggest_last_ts(user_id) or 0
+            now_ts = int(time.time())
+            if now_ts - last_ts < 5 * 60:
+                left = 5 * 60 - (now_ts - last_ts)
+                mins = max(1, (left + 59) // 60)
+                await update.message.reply_text(f"⏳ Можно отправлять не чаще 1 раза в 5 минут. Попробуйте через ~{mins} мин.")
+                return
+
+        mode = context.user_data.get(SUGGESTION_MODE, "anon")
+        scope_chat_id = get_scope_chat_id(update, context)
+        if not scope_chat_id:
+            clear_suggest_flow(context)
+            await update.message.reply_text("⚠️ Не вижу, к какому чату привязать предложку. Открой /help в групповом чате ещё раз.")
+            return
+
+        await send_suggestion_to_admins(scope_chat_id, update, context, text, mode)
+
+        if user_id:
+            db_set_suggest_last_ts(user_id, int(time.time()))
+
+        clear_suggest_flow(context)
+        await update.message.reply_text("✅ Спасибо! Передал администраторам 🙌")
         return
 
     # описание документа
@@ -2515,6 +2633,59 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_profile_wiz(context)
             await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).", reply_markup=kb_help_settings())
             return
+
+
+
+# ---------------- SUGGEST BOX ----------------
+
+async def send_suggestion_to_admins(scope_chat_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str, mode: str) -> tuple[int, int]:
+    """Отправляет сообщение всем админам чата (кроме ботов). Возвращает (sent_ok, sent_fail)."""
+    sent_ok = 0
+    sent_fail = 0
+
+    user = update.effective_user
+    user_name = (user.full_name if user else "Неизвестный пользователь")
+    username = ("@" + user.username) if (user and user.username) else ""
+    user_id = user.id if user else 0
+
+    try:
+        chat = await context.bot.get_chat(scope_chat_id)
+        chat_title = chat.title or str(scope_chat_id)
+    except Exception:
+        chat_title = str(scope_chat_id)
+
+    mode_label = "🕵️ Анонимно" if mode == "anon" else "🙋 Не анонимно"
+
+    admin_text = (
+        f"💡 <b>Предложка</b> ({mode_label})\n"
+        f"Чат: <b>{chat_title}</b> (<code>{scope_chat_id}</code>)\n"
+        f"От: <b>{user_name}</b> {username} (<code>{user_id}</code>)\n\n"
+        f"Сообщение:\n{message_text}"
+    )
+
+    try:
+        admins = await context.bot.get_chat_administrators(scope_chat_id)
+    except Exception as e:
+        logger.exception("get_chat_administrators failed: %s", e)
+        return (0, 0)
+
+    for a in admins:
+        try:
+            if getattr(a.user, "is_bot", False):
+                continue
+            await context.bot.send_message(
+                chat_id=a.user.id,
+                text=admin_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            sent_ok += 1
+        except Forbidden:
+            sent_fail += 1
+        except Exception:
+            sent_fail += 1
+
+    return (sent_ok, sent_fail)
 
 # ---------------- APP ----------------
 
