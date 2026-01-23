@@ -2553,14 +2553,15 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bday = (p.get("birthday") or "").strip() or "—"
 
         card = (
-            f"👤 <b>{p['full_name']}</b>\n"
+            f"👤 <b>{p['full_name']}</b>\n\n"
             f"📅 Работает с: <b>{p['year_start']}</b>\n"
             f"🏙️ Город: <b>{p['city']}</b>\n"
             f"🎂 День рождения: <b>{bday}</b>\n\n"
             f"📝 <b>Кратко о себе</b>\n{p['about']}\n\n"
             f"❓ <b>По каким вопросам обращаться</b>\n{p['topics']}\n\n"
-            f"🔗 TG: {p['tg_link']}\n\n"
-            f"🏆 <b>Ачивки</b>\n{format_achievements_for_profile(p['id'])}"
+            f"🔗 <b>TG:</b> {p['tg_link']}\n\n"
+            f"━━━━━━━━━━━━━━\n\n"
+            f"🏆 <b>Ачивки</b>\n\n{format_achievements_for_profile(p['id'])}"
         )
         await q.edit_message_text(card, parse_mode=ParseMode.HTML, reply_markup=kb_help_profile_card(p), disable_web_page_preview=True)
         return
