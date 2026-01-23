@@ -1446,15 +1446,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main(bot_username)
 
-    orig_msg = update.message  # to optionally delete /help command in group
+    orig_msg = update.message  # чтобы (по возможности) удалить /help в группе
 
-    # если команда в личке — просто показываем там
+    # 1) если команда в личке — просто показываем меню тут
     if update.effective_chat and update.effective_chat.type == "private":
         is_adm = await is_admin_scoped(update, context)
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_main(is_admin_user=is_adm), disable_web_page_preview=True)
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_main(is_admin_user=is_adm),
+            disable_web_page_preview=True,
+        )
         return
 
-    # если команда в группе — пытаемся в ЛС, в чат не пишем при успехе
+    # 2) если команда в группе — пробуем прислать меню в ЛС пользователю
     if update.effective_user:
         context.user_data[HELP_SCOPE_CHAT_ID] = update.effective_chat.id
 
@@ -1462,7 +1467,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id:
         try:
             is_adm = await is_admin_scoped(update, context)
-
             await context.bot.send_message(
                 chat_id=user_id,
                 text=text,
@@ -1470,20 +1474,22 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_help_main(is_admin_user=is_adm),
                 disable_web_page_preview=True,
             )
-            # успех -> в чат ничего не пишем
+
+            # успех -> удаляем /help в чате (если есть права)
             if orig_msg and update.effective_chat and update.effective_chat.type != "private":
                 try:
                     await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
                 except Exception:
                     pass
             return
+
         except Forbidden:
             warn_text = (
                 "⚠️ Я не могу написать вам в ЛС.\n"
                 f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
                 "после этого снова нажмите /help в чате."
             )
-            # пробуем удалить исходное /help, чтобы не засорять чат
+
             if orig_msg and update.effective_chat and update.effective_chat.type != "private":
                 try:
                     await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
@@ -1502,27 +1508,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name=f"del_help_warn_{msg.chat_id}_{msg.message_id}",
             )
             return
+
         except Exception as e:
             logger.exception("Failed to DM /help: %s", e)
 
-    # удаляем исходное /help и сообщение бота через 60 секунд (если есть права)
-    if update.effective_chat and update.effective_chat.type != "private":
-        if orig_msg:
-            context.job_queue.run_once(
-                job_delete_message,
-                when=60,
-                data={"chat_id": orig_msg.chat_id, "message_id": orig_msg.message_id},
-                name=f"del_help_cmd_{orig_msg.chat_id}_{orig_msg.message_id}",
-            )
-        if msg:
-            context.job_queue.run_once(
-                job_delete_message,
-                when=60,
-                data={"chat_id": msg.chat_id, "message_id": msg.message_id},
-                name=f"del_help_fallback_{msg.chat_id}_{msg.message_id}",
-            )
-
-    # fallback: отправляем в чат (reply)
     msg = await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
@@ -1531,7 +1520,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_to_message_id=update.message.message_id,
     )
 
-    # удаляем исходное /help и сообщение бота через 60 секунд (если есть права)
     if update.effective_chat and update.effective_chat.type != "private":
         if orig_msg:
             context.job_queue.run_once(
@@ -3585,9 +3573,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mention = normalize_tg_mention(d.get("tg_link", "") or "")
             who = mention if mention else f"<b>{escape(d.get('full_name', 'Сотрудник'))}</b>"
             msg = (
-                f"🏆 {escape(d.get('emoji', '🏆'))} <b>{escape(d.get('title', 'Ачивка'))}</b>\n"
-                f"🎉 Поздравляем, {who}!\n"
-                f"{escape(d.get('description', ''))}"
+                f"🎉 <b>Поздравляем, {who}!</b>\n\n"
+                f"В твой профиль добавлена новая ачивка: <b>{escape(d.get('emoji', '🏆'))} {escape(d.get('title', 'Ачивка'))}</b>\n\n"
+                f"Достижение получено за: «{escape(d.get('description', ''))}»\n\n"
+                f"Так держать! 🚀🔥\n\n"
+                f"Посмотреть можно в /help"
             )
 
             sent = False
