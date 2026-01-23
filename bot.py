@@ -1733,7 +1733,7 @@ def export_backup_zip_bytes() -> bytes:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT full_name, year_start, city, birthday, about, topics, tg_link
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link
         FROM profiles
         ORDER BY id ASC
     """)
