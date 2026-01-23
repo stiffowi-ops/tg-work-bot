@@ -18,7 +18,7 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.constants import ParseMode
-from telegram.error import Forbidden
+from telegram.error import Forbidden, TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,6 +27,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -1654,9 +1656,18 @@ async def cmd_import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        try:
+            await query.answer()
+        except (TimedOut, NetworkError):
+            pass
+    except (TimedOut, NetworkError):
+        pass
     if not await is_admin_scoped(update, context):
-        await query.answer("Только администраторы могут отменять/переносить.", show_alert=True)
+        try:
+            await query.answer("Только администраторы могут отменять/переносить.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
     _, _, meeting_type = query.data.split(":")
     await query.edit_message_reply_markup(reply_markup=kb_cancel_options(meeting_type))
@@ -1664,15 +1675,24 @@ async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_cancel_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin_scoped(update, context):
-        await query.answer("Только администраторы.", show_alert=True)
+        try:
+            await query.answer("Только администраторы.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.answer("Ок, не отменяем ✅")
+    try:
+        await query.answer("Ок, не отменяем ✅")
+    except (TimedOut, NetworkError):
+        pass
 
 async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin_scoped(update, context):
-        await query.answer("Только администраторы.", show_alert=True)
+        try:
+            await query.answer("Только администраторы.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
 
     parts = query.data.split(":")
@@ -1686,7 +1706,10 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
-        await query.answer("Отменено.")
+        try:
+            await query.answer("Отменено.")
+        except (TimedOut, NetworkError):
+            pass
         return
 
     if reason_key == "tech":
@@ -1695,18 +1718,27 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
-        await query.answer("Ок.")
+        try:
+            await query.answer("Ок.")
+        except (TimedOut, NetworkError):
+            pass
         return
 
     if reason_key == "move":
         await query.edit_message_reply_markup(reply_markup=kb_reschedule_dates(meeting_type, today_d))
-        await query.answer("Выберите дату переноса 📆")
+        try:
+            await query.answer("Выберите дату переноса 📆")
+        except (TimedOut, NetworkError):
+            pass
         return
 
 async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin_scoped(update, context):
-        await query.answer("Только администраторы.", show_alert=True)
+        try:
+            await query.answer("Только администраторы.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
 
     parts = query.data.split(":")
@@ -1718,11 +1750,17 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         dd, mm, yy = picked.split(".")
         new_d = date(int("20" + yy), int(mm), int(dd))
     except Exception:
-        await query.answer("Не смог распознать дату.", show_alert=True)
+        try:
+            await query.answer("Не смог распознать дату.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
 
     if new_d <= today_d:
-        await query.answer("Дата переноса должна быть в будущем.", show_alert=True)
+        try:
+            await query.answer("Дата переноса должна быть в будущем.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
 
     db_set_canceled(meeting_type, today_d, "Перенос на другой день", reschedule_date=picked)
@@ -1735,12 +1773,18 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         chat_id=update.effective_chat.id,
         text=f"{title}\nНовая дата: {picked} 📌\nСледите за расписанием или чатом"
     )
-    await query.answer("Перенесено.")
+    try:
+        await query.answer("Перенесено.")
+    except (TimedOut, NetworkError):
+        pass
 
 async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin_scoped(update, context):
-        await query.answer("❌ Только администраторы.", show_alert=True)
+        try:
+            await query.answer("❌ Только администраторы.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
 
     parts = query.data.split(":")
@@ -1750,8 +1794,13 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
     context.chat_data[WAITING_USER_ID] = update.effective_user.id
     context.chat_data[WAITING_SINCE_TS] = int(time.time())
     context.chat_data[WAITING_MEETING_TYPE] = meeting_type
-
-    await query.answer()
+    try:
+        try:
+            await query.answer()
+        except (TimedOut, NetworkError):
+            pass
+    except (TimedOut, NetworkError):
+        pass
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=(
@@ -1768,10 +1817,16 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin_scoped(update, context):
-        await query.answer("❌ Только администраторы.", show_alert=True)
+        try:
+            await query.answer("❌ Только администраторы.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
     clear_waiting_date(context)
-    await query.answer("Ок, отменил ввод даты ✅")
+    try:
+        await query.answer("Ок, отменил ввод даты ✅")
+    except (TimedOut, NetworkError):
+        pass
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
@@ -1783,7 +1838,13 @@ async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_T
 async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data
-    await q.answer()
+    try:
+        try:
+            await q.answer()
+        except (TimedOut, NetworkError):
+            pass
+    except (TimedOut, NetworkError):
+        pass
 
     if data == "noop":
         return
@@ -1819,7 +1880,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = data.split(":")[-1]  # anon|named
         scope_chat_id = get_scope_chat_id(update, context)
         if not scope_chat_id:
-            await q.answer("Открой /help из группового чата, чтобы привязать предложку к нему.", show_alert=True)
+            try:
+                await q.answer("Открой /help из группового чата, чтобы привязать предложку к нему.", show_alert=True)
+            except (TimedOut, NetworkError):
+                pass
             return
 
         context.user_data[WAITING_SUGGESTION_TEXT] = True
@@ -1886,7 +1950,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         catalog = get_links_catalog()
         item = catalog.get(key)
         if not item:
-            await q.answer("Ссылка не найдена.", show_alert=True)
+            try:
+                await q.answer("Ссылка не найдена.", show_alert=True)
+            except (TimedOut, NetworkError):
+                pass
             return
         url = item["url"]
         title = item["title"]
@@ -1932,7 +1999,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help:settings":
         if not is_adm:
-            await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
+            try:
+                await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
+            except (TimedOut, NetworkError):
+                pass
             return
         text = (
             "⚙️ <b>Настройки</b>\n\n"
@@ -1945,7 +2015,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # дальше — настройки (только админы)
     if data.startswith("help:settings:"):
         if not is_adm:
-            await q.answer("⚠️ Доступно администраторам чата.", show_alert=True)
+            try:
+                await q.answer("⚠️ Доступно администраторам чата.", show_alert=True)
+            except (TimedOut, NetworkError):
+                pass
             return
 
         if data == "help:settings:cancel":
@@ -1969,10 +2042,16 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         document=bio,
                         caption="📤 Отчёт CSV (бэкап) готов. Сохрани файл — он поможет восстановить документы и анкеты.",
                     )
-                    await q.answer("Отправил CSV ✅")
+                    try:
+                        await q.answer("Отправил CSV ✅")
+                    except (TimedOut, NetworkError):
+                        pass
                 except Exception as e:
                     logger.exception("export_csv failed: %s", e)
-                    await q.answer("Не смог сформировать CSV 😕", show_alert=True)
+                    try:
+                        await q.answer("Не смог сформировать CSV 😕", show_alert=True)
+                    except (TimedOut, NetworkError):
+                        pass
             return
 
         if data == "help:settings:import_csv":
@@ -2034,10 +2113,16 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cid = int(data.split(":")[-1])
             ok = db_docs_delete_category_if_empty(cid)
             if ok:
-                await q.answer("Удалено ✅")
+                try:
+                    await q.answer("Удалено ✅")
+                except (TimedOut, NetworkError):
+                    pass
                 await q.edit_message_text("✅ Категория удалена.", reply_markup=kb_settings_categories(), parse_mode=ParseMode.HTML)
             else:
-                await q.answer("Нельзя: категория не пустая", show_alert=True)
+                try:
+                    await q.answer("Нельзя: категория не пустая", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
             return
 
         if data == "help:settings:add_doc":
@@ -2070,17 +2155,26 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             did = int(data.split(":")[-1])
             ok = db_docs_delete_doc(did)
             if ok:
-                await q.answer("Удалено ✅")
+                try:
+                    await q.answer("Удалено ✅")
+                except (TimedOut, NetworkError):
+                    pass
                 await q.edit_message_text("✅ Файл удалён.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
             else:
-                await q.answer("Не найден", show_alert=True)
+                try:
+                    await q.answer("Не найден", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
             return
 
         if data.startswith("help:settings:add_doc:cat:"):
             cid = int(data.split(":")[-1])
             pending = context.chat_data.get(PENDING_DOC_INFO)
             if not pending:
-                await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
+                try:
+                    await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
                 return
             db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
             clear_docs_flow(context)
@@ -2090,7 +2184,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "help:settings:add_doc:newcat":
             pending = context.chat_data.get(PENDING_DOC_INFO)
             if not pending:
-                await q.answer("Сначала отправьте файл.", show_alert=True)
+                try:
+                    await q.answer("Сначала отправьте файл.", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
                 return
             context.chat_data[WAITING_NEW_CATEGORY_NAME] = True
             context.chat_data[WAITING_USER_ID] = update.effective_user.id
@@ -2133,13 +2230,25 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pid = int(data.split(":")[-1])
             ok = db_profiles_delete(pid)
             if ok:
-                await q.answer("Удалено ✅")
+                try:
+                    await q.answer("Удалено ✅")
+                except (TimedOut, NetworkError):
+                    pass
                 await q.edit_message_text("✅ Анкета удалена.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
             else:
-                await q.answer("Не найдено", show_alert=True)
+                try:
+                    await q.answer("Не найдено", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
             return
 
-    await q.answer()
+    try:
+
+        await q.answer()
+
+    except (TimedOut, NetworkError):
+
+        pass
 
 
 
@@ -2685,7 +2794,9 @@ def main():
     ensure_storage_dir(STORAGE_DIR)
     db_init()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    request = HTTPXRequest(connect_timeout=15, read_timeout=30, write_timeout=30, pool_timeout=30)
+
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     # commands
     app.add_handler(CommandHandler("start", cmd_start))
