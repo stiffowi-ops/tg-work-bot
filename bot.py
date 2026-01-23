@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 
 from telegram import (
     Update,
+    InputMediaPhoto,
+    InputMediaVideo,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -2975,12 +2977,115 @@ def _bcast_compose_message(topic: str | None, body: str | None) -> str:
     return body_esc
 
 async def broadcast_to_chats(context: ContextTypes.DEFAULT_TYPE, message_html: str, files: list[dict]) -> tuple[int, int]:
-    """Рассылка в notify_chats. Возвращает (ok, fail)."""
+    """Рассылка в notify_chats. Возвращает (ok, fail).
+
+    Формат отправки:
+      A) нет файлов -> одно текстовое сообщение
+      B) ровно 1 файл (document/photo/video) -> одно сообщение с caption
+      C) несколько файлов и ВСЕ photo/video -> media_group, caption у первого
+      D) иначе -> текст отдельным + файлы по одному (fallback)
+    """
     ok = 0
     fail = 0
+
+    # caption лимиты у Telegram ~1024; оставим запас
+    def cap(text: str) -> str:
+        if not text:
+            return ""
+        return text[:900]
+
     chat_ids = db_list_chats()
+    files = files or []
+
     for cid in chat_ids:
         try:
+            # A) только текст
+            if not files:
+                if message_html:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text=message_html,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                ok += 1
+                continue
+
+            # B) один файл -> caption в это же сообщение
+            if len(files) == 1:
+                f0 = files[0]
+                kind = f0.get("kind")
+                file_id = f0.get("file_id")
+                caption = cap(message_html)
+
+                if kind == "document":
+                    await context.bot.send_document(
+                        chat_id=cid,
+                        document=file_id,
+                        caption=caption or None,
+                        parse_mode=ParseMode.HTML if caption else None,
+                    )
+                elif kind == "photo":
+                    await context.bot.send_photo(
+                        chat_id=cid,
+                        photo=file_id,
+                        caption=caption or None,
+                        parse_mode=ParseMode.HTML if caption else None,
+                    )
+                elif kind == "video":
+                    await context.bot.send_video(
+                        chat_id=cid,
+                        video=file_id,
+                        caption=caption or None,
+                        parse_mode=ParseMode.HTML if caption else None,
+                    )
+                else:
+                    # неизвестный тип -> fallback: текст + файл как документ
+                    if message_html:
+                        await context.bot.send_message(
+                            chat_id=cid,
+                            text=message_html,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                    if file_id:
+                        await context.bot.send_document(chat_id=cid, document=file_id)
+                ok += 1
+                continue
+
+            # C) несколько и все фото/видео -> media_group
+            all_media = all((x.get("kind") in ("photo", "video")) for x in files)
+            if all_media:
+                media = []
+                caption = cap(message_html)
+                for i, f0 in enumerate(files[:10]):  # лимит TG на альбом 10
+                    kind = f0.get("kind")
+                    file_id = f0.get("file_id")
+                    if not file_id:
+                        continue
+                    if kind == "photo":
+                        media.append(
+                            InputMediaPhoto(
+                                media=file_id,
+                                caption=(caption if i == 0 and caption else None),
+                                parse_mode=(ParseMode.HTML if i == 0 and caption else None),
+                            )
+                        )
+                    else:
+                        media.append(
+                            InputMediaVideo(
+                                media=file_id,
+                                caption=(caption if i == 0 and caption else None),
+                                parse_mode=(ParseMode.HTML if i == 0 and caption else None),
+                            )
+                        )
+
+                if media:
+                    await context.bot.send_media_group(chat_id=cid, media=media)
+                    ok += 1
+                    continue
+
+            # D) fallback: текст отдельно + файлы по одному
             if message_html:
                 await context.bot.send_message(
                     chat_id=cid,
@@ -2988,10 +3093,9 @@ async def broadcast_to_chats(context: ContextTypes.DEFAULT_TYPE, message_html: s
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
-            # отправляем вложения (document/photo/video)
-            for f in files or []:
-                kind = f.get("kind")
-                file_id = f.get("file_id")
+            for f0 in files:
+                kind = f0.get("kind")
+                file_id = f0.get("file_id")
                 if not file_id:
                     continue
                 if kind == "document":
@@ -3004,6 +3108,7 @@ async def broadcast_to_chats(context: ContextTypes.DEFAULT_TYPE, message_html: s
         except Exception as e:
             logger.exception("Broadcast failed to %s: %s", cid, e)
             fail += 1
+
     return ok, fail
 
 # ---------------- APP ----------------
