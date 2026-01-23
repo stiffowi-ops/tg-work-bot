@@ -853,6 +853,7 @@ WAITING_DOC_DESC = "waiting_doc_desc"
 PENDING_DOC_INFO = "pending_doc_info"
 WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
 
+WAITING_RESTORE_ZIP = "waiting_restore_zip"
 # profiles add flow
 PROFILE_WIZ_ACTIVE = "profile_wiz_active"
 
@@ -894,6 +895,10 @@ def clear_csv_import(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_CSV_IMPORT] = False
     context.chat_data.pop(WAITING_USER_ID, None)
     context.chat_data.pop(WAITING_SINCE_TS, None)
+
+def clear_restore_zip(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[WAITING_RESTORE_ZIP] = False
+
 
 def clear_profile_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[PROFILE_WIZ_ACTIVE] = False
@@ -1715,6 +1720,7 @@ def export_backup_zip_bytes() -> bytes:
     # profiles.csv
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=[
+        "profile_id",
         "full_name",
         "year_start",
         "city",
@@ -1733,13 +1739,14 @@ def export_backup_zip_bytes() -> bytes:
     """)
     for row in cur.fetchall():
         w.writerow({
-            "full_name": row[0] or "",
-            "year_start": row[1] or "",
-            "city": row[2] or "",
-            "birthday": row[3] or "",
-            "about": row[4] or "",
-            "topics": row[5] or "",
-            "tg_link": row[6] or "",
+            "profile_id": row[0],
+            "full_name": row[1] or "",
+            "year_start": row[2] or "",
+            "city": row[3] or "",
+            "birthday": row[4] or "",
+            "about": row[5] or "",
+            "topics": row[6] or "",
+            "tg_link": row[7] or "",
         })
     con.close()
     files["profiles.csv"] = buf.getvalue()
@@ -1779,6 +1786,234 @@ def export_backup_zip_bytes() -> bytes:
         for name, content in files.items():
             zf.writestr(name, content.encode("utf-8-sig"))
     return zbuf.getvalue()
+
+
+def restore_backup_zip_bytes(data: bytes) -> dict:
+    """Восстановление из ZIP бэкапа (CSV). Возвращает статистику по импортированным сущностям."""
+    stats = {"profiles": 0, "categories": 0, "docs": 0, "notify_chats": 0, "achievements_awards": 0}
+    zbuf = io.BytesIO(data)
+    with zipfile.ZipFile(zbuf, "r") as zf:
+        names = set(zf.namelist())
+
+        # 1) profiles.csv
+        profile_id_map: dict[str, int] = {}
+        if "profiles.csv" in names:
+            raw = zf.read("profiles.csv").decode("utf-8", errors="replace")
+            rdr = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in rdr:
+                if not row:
+                    continue
+                pid = (row.get("profile_id") or "").strip()
+                full_name = (row.get("full_name") or "").strip()
+                year_start = (row.get("year_start") or "").strip() or "2000"
+                city = (row.get("city") or "").strip()
+                birthday = (row.get("birthday") or "").strip() or None
+                about = (row.get("about") or "").strip()
+                topics = (row.get("topics") or "").strip()
+                tg_link = (row.get("tg_link") or "").strip()
+
+                created_at = datetime.utcnow().isoformat()
+
+                # upsert by id if present, else by (tg_link, full_name) heuristic
+                if pid.isdigit():
+                    cur.execute(
+                        """INSERT INTO profiles(id, full_name, year_start, city, birthday, about, topics, tg_link, created_at)
+                               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               ON CONFLICT(id) DO UPDATE SET
+                                 full_name=excluded.full_name,
+                                 year_start=excluded.year_start,
+                                 city=excluded.city,
+                                 birthday=excluded.birthday,
+                                 about=excluded.about,
+                                 topics=excluded.topics,
+                                 tg_link=excluded.tg_link
+                        """,
+                        (int(pid), full_name, int(year_start), city, birthday, about, topics, tg_link, created_at),
+                    )
+                    new_id = int(pid)
+                else:
+                    # try find existing by tg_link first
+                    new_id = None
+                    if tg_link:
+                        cur.execute("SELECT id FROM profiles WHERE tg_link=?", (tg_link,))
+                        r = cur.fetchone()
+                        if r:
+                            new_id = int(r[0])
+                    if new_id is None and full_name:
+                        cur.execute("SELECT id FROM profiles WHERE full_name=?", (full_name,))
+                        r = cur.fetchone()
+                        if r:
+                            new_id = int(r[0])
+                    if new_id is None:
+                        cur.execute(
+                            """INSERT INTO profiles(full_name, year_start, city, birthday, about, topics, tg_link, created_at)
+                                   VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (full_name, int(year_start), city, birthday, about, topics, tg_link, created_at),
+                        )
+                        new_id = int(cur.lastrowid)
+
+                if pid:
+                    profile_id_map[pid] = new_id
+                stats["profiles"] += 1
+
+            con.commit()
+            con.close()
+
+        # 2) doc_categories.csv
+        if "doc_categories.csv" in names:
+            raw = zf.read("doc_categories.csv").decode("utf-8", errors="replace")
+            rdr = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in rdr:
+                title = (row.get("title") or "").strip()
+                created_at = (row.get("created_at") or "").strip() or datetime.utcnow().isoformat()
+                if not title:
+                    continue
+                cur.execute(
+                    """INSERT INTO doc_categories(title, created_at)
+                           VALUES(?, ?)
+                           ON CONFLICT(title) DO UPDATE SET created_at=excluded.created_at
+                    """,
+                    (title, created_at),
+                )
+                stats["categories"] += 1
+            con.commit()
+            con.close()
+
+        # helper: get category_id by title (create if missing)
+        def _ensure_category(title: str) -> int:
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute("SELECT id FROM doc_categories WHERE title=?", (title,))
+            r = cur.fetchone()
+            if r:
+                con.close()
+                return int(r[0])
+            cur.execute("INSERT INTO doc_categories(title, created_at) VALUES(?, ?)", (title, datetime.utcnow().isoformat()))
+            con.commit()
+            cid = int(cur.lastrowid)
+            con.close()
+            return cid
+
+        # 3) docs.csv (by category_title)
+        if "docs.csv" in names:
+            raw = zf.read("docs.csv").decode("utf-8", errors="replace")
+            rdr = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in rdr:
+                cat_title = (row.get("category_title") or "").strip() or "Без категории"
+                doc_title = (row.get("doc_title") or "").strip() or "Документ"
+                doc_desc = (row.get("doc_description") or "").strip() or None
+                file_id = (row.get("doc_file_id") or "").strip()
+                file_unique_id = (row.get("doc_file_unique_id") or "").strip() or None
+                mime_type = (row.get("doc_mime_type") or "").strip() or None
+                if not file_id:
+                    continue
+                cid = _ensure_category(cat_title)
+                # вставляем как новый, но избегаем дублей по (category_id, title, file_id)
+                cur.execute(
+                    """SELECT id FROM docs WHERE category_id=? AND title=? AND file_id=?""",
+                    (cid, doc_title, file_id),
+                )
+                if cur.fetchone():
+                    continue
+                cur.execute(
+                    """INSERT INTO docs(category_id, title, description, file_id, file_unique_id, mime_type, uploaded_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (cid, doc_title, doc_desc, file_id, file_unique_id, mime_type, datetime.utcnow().isoformat()),
+                )
+                stats["docs"] += 1
+            con.commit()
+            con.close()
+
+        # 4) notify_chats.csv
+        if "notify_chats.csv" in names:
+            raw = zf.read("notify_chats.csv").decode("utf-8", errors="replace")
+            rdr = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in rdr:
+                chat_id = (row.get("chat_id") or "").strip()
+                added_at = (row.get("added_at") or "").strip() or datetime.utcnow().isoformat()
+                if not chat_id:
+                    continue
+                try:
+                    cid = int(chat_id)
+                except Exception:
+                    continue
+                cur.execute(
+                    """INSERT INTO notify_chats(chat_id, added_at)
+                           VALUES(?, ?)
+                           ON CONFLICT(chat_id) DO UPDATE SET added_at=excluded.added_at""",
+                    (cid, added_at),
+                )
+                stats["notify_chats"] += 1
+            con.commit()
+            con.close()
+
+        # 5) achievements_awards.csv
+        if "achievements_awards.csv" in names:
+            raw = zf.read("achievements_awards.csv").decode("utf-8", errors="replace")
+            rdr = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in rdr:
+                pid_old = (row.get("profile_id") or "").strip()
+                full_name = (row.get("full_name") or "").strip()
+                tg_link = (row.get("tg_link") or "").strip()
+                emoji = (row.get("emoji") or "🏆").strip()
+                title = (row.get("title") or "Ачивка").strip()
+                description = (row.get("description") or "").strip()
+                awarded_at = (row.get("awarded_at") or "").strip() or datetime.utcnow().isoformat()
+                awarded_by = (row.get("awarded_by") or "").strip()
+                awarded_by_val = int(awarded_by) if awarded_by.isdigit() else None
+
+                target_pid = None
+                if pid_old and pid_old in profile_id_map:
+                    target_pid = profile_id_map[pid_old]
+                elif pid_old.isdigit():
+                    target_pid = int(pid_old)
+                else:
+                    # fallback: by tg_link or full_name
+                    if tg_link:
+                        cur.execute("SELECT id FROM profiles WHERE tg_link=?", (tg_link,))
+                        r = cur.fetchone()
+                        if r:
+                            target_pid = int(r[0])
+                    if target_pid is None and full_name:
+                        cur.execute("SELECT id FROM profiles WHERE full_name=?", (full_name,))
+                        r = cur.fetchone()
+                        if r:
+                            target_pid = int(r[0])
+
+                if not target_pid:
+                    continue
+
+                # avoid duplicate exact same award
+                cur.execute(
+                    """SELECT id FROM achievement_awards
+                           WHERE profile_id=? AND emoji=? AND title=? AND description=?""",
+                    (int(target_pid), emoji, title, description),
+                )
+                if cur.fetchone():
+                    continue
+
+                cur.execute(
+                    """INSERT INTO achievement_awards(profile_id, emoji, title, description, awarded_at, awarded_by)
+                           VALUES(?, ?, ?, ?, ?, ?)""",
+                    (int(target_pid), emoji, title, description, awarded_at, awarded_by_val),
+                )
+                stats["achievements_awards"] += 1
+
+            con.commit()
+            con.close()
+
+    return stats
 
 def export_backup_csv_bytes() -> bytes:
     """
@@ -1941,7 +2176,7 @@ async def cmd_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT full_name, year_start, city, birthday, about, topics, tg_link
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link
         FROM profiles
         ORDER BY full_name COLLATE NOCASE ASC
     """)
@@ -2468,6 +2703,91 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if data == "help:settings:backup_zip":
+            # сформировать ZIP и отправить документом в текущий чат (обычно ЛС)
+            try:
+                b = export_backup_zip_bytes()
+                bio = io.BytesIO(b)
+                bio.name = f"backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=bio,
+                    caption="📦 Бэкап готов. Сохраните ZIP — его можно потом загрузить обратно для восстановления.",
+                )
+                await q.answer("Бэкап отправлен ✅")
+            except Exception as e:
+                logger.exception("backup_zip send failed: %s", e)
+                await q.answer("Не смог сформировать бэкап 😕", show_alert=True)
+            return
+
+        if data == "help:settings:restore_zip":
+            clear_restore_zip(context)
+            context.chat_data[WAITING_RESTORE_ZIP] = True
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "📥 <b>Восстановление из ZIP</b>\n\n"
+                "Пришлите ZIP-файл бэкапа следующим сообщением.\n"
+                "Я восстановлю карточки, документы/категории, подключённые чаты и ачивки.\n\n"
+                "Если передумали — нажмите «Отмена».",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            await q.answer()
+            return
+
+        if data == "help:settings:ach":
+            await q.edit_message_text(
+                "🏆 <b>Ачивки</b>\n\n"
+                "Здесь можно выдать ачивку сотруднику из анкеты.\n"
+                "Ачивки гибкие: эмодзи, название и описание задаются при выдаче.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎁 Выдать ачивку", callback_data="help:settings:ach:give")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+                ]),
+            )
+            return
+
+        if data == "help:settings:ach:give":
+            await q.edit_message_text(
+                "🎁 <b>Выдать ачивку</b>\n\nВыберите сотрудника:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_pick_profile_for_achievement(),
+            )
+            return
+
+        if data.startswith("help:settings:ach:pick:"):
+            pid = int(data.split(":")[-1])
+            p = db_profiles_get(pid)
+            if not p:
+                await q.answer("Анкета не найдена.", show_alert=True)
+                return
+            clear_ach_wiz(context)
+            context.chat_data[ACH_WIZ_ACTIVE] = True
+            context.chat_data[ACH_WIZ_STEP] = "emoji"
+            context.chat_data[ACH_WIZ_DATA] = {
+                "profile_id": pid,
+                "full_name": p.get("full_name", ""),
+                "tg_link": p.get("tg_link", ""),
+            }
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                f"🎁 Выдаём ачивку для: <b>{escape(p.get('full_name',''))}</b>\n\n"
+                "Шаг 2/4: отправьте <b>эмодзи</b> (пример: 🏅)",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if data == "help:settings:backup_zip":
+            # (obsolete alias if any)
+            return
+
+        if data == "help:settings:restore_zip":
+            return
+
         if data == "help:settings:cats":
             await q.edit_message_text(
                 "🗂️ <b>Категории документов</b>\n\n"
@@ -2684,6 +3004,49 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
         return
+
+    # restore ZIP backup
+    if context.chat_data.get(WAITING_RESTORE_ZIP):
+        user_id = update.effective_user.id if update.effective_user else None
+        waiting_user = context.chat_data.get(WAITING_USER_ID)
+        if waiting_user and user_id != waiting_user:
+            return
+
+        if not await is_admin_scoped(update, context):
+            clear_restore_zip(context)
+            await update.message.reply_text("❌ Только администраторы могут загружать бэкап.")
+            return
+
+        doc = update.message.document
+        if not doc:
+            return
+
+        # принимаем только .zip (по имени или mime)
+        fname = (doc.file_name or "").lower()
+        if not (fname.endswith(".zip") or (doc.mime_type or "").lower() in ("application/zip", "application/x-zip-compressed")):
+            await update.message.reply_text("❌ Нужен ZIP-файл (backup.zip). Пришлите корректный файл или нажмите «Отмена».")
+            return
+
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            b = await tg_file.download_as_bytearray()
+            stats = restore_backup_zip_bytes(bytes(b))
+            clear_restore_zip(context)
+            await update.message.reply_text(
+                "✅ Бэкап загружен и восстановлен.\n\n"
+                f"👥 Профили: <b>{stats.get('profiles', 0)}</b>\n"
+                f"🗂️ Категории: <b>{stats.get('categories', 0)}</b>\n"
+                f"📄 Документы: <b>{stats.get('docs', 0)}</b>\n"
+                f"💬 Чаты рассылки: <b>{stats.get('notify_chats', 0)}</b>\n"
+                f"🏆 Ачивки: <b>{stats.get('achievements_awards', 0)}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_help_settings(),
+            )
+        except Exception as e:
+            logger.exception("restore zip failed: %s", e)
+            await update.message.reply_text("❌ Не смог восстановить из ZIP. Проверьте файл и попробуйте ещё раз.")
+        return
+
 
     # рассылка  # bcast attachment: сохраняем документ как вложение (в ЛС админа)
     if context.user_data.get(BCAST_ACTIVE) and context.user_data.get(BCAST_STEP) == "files":
