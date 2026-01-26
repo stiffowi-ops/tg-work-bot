@@ -1843,14 +1843,17 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
 
     body_text, advice, focus = extract_horo_blocks(horo_text)
 
+    sep = "\n────────────\n\n"
+
     msg = (
-        f"<b>{escape(head)}</b>\n"
-        f"<i>Персональный прогноз на день</i>\n\n"
-        f"<b>Ваш гороскоп</b>\n"
-        f"{escape(body_text)}\n\n"
-        f"<b>Совет дня</b> 🧭\n"
-        f"{escape(advice)}\n\n"
-        f"<b>Фокус</b> 🎯\n"
+        f"<b>{escape(head)}</b>\n\n"
+        f"<b>Ваш гороскоп:</b>\n"
+        f"{escape(body_text)}"
+        f"{sep}"
+        f"<b>Совет дня 🧭:</b>\n"
+        f"{escape(advice)}"
+        f"{sep}"
+        f"<b>Фокус 🎯:</b>\n"
         f"{escape(focus)}"
     )
 
