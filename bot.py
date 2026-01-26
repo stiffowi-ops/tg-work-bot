@@ -4394,6 +4394,16 @@ async def broadcast_to_chats(context: ContextTypes.DEFAULT_TYPE, message_html: s
 
     return ok, fail
 
+
+# ---------------- ERROR HANDLER ----------------
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Логируем любые необработанные ошибки, чтобы бот не падал молча."""
+    try:
+        logger.exception("Unhandled exception while processing update: %s", context.error)
+    except Exception:
+        pass
+
 # ---------------- APP ----------------
 
 def main():
@@ -4404,6 +4414,9 @@ def main():
     request = HTTPXRequest(connect_timeout=15, read_timeout=30, write_timeout=30, pool_timeout=30)
 
     app = Application.builder().token(BOT_TOKEN).request(request).build()
+
+    # log errors
+    app.add_error_handler(error_handler)
 
     # commands
     app.add_handler(CommandHandler("start", cmd_start))
@@ -4447,7 +4460,11 @@ def main():
     app.job_queue.run_repeating(check_and_send_jobs, interval=60, first=10, name="meetings_checker")
 
     logger.info("Bot started. DB=%s", DB_PATH)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        logger.exception("run_polling crashed: %s", e)
+        raise
 
 if __name__ == "__main__":
     main()
