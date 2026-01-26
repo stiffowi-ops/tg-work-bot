@@ -629,10 +629,6 @@ def db_meme_add(file_id: str, source_chat_id: int) -> bool:
     con.commit()
     con.close()
     return inserted
-            except Exception:
-                pass
-    return None
-
 
 def db_add_chat(chat_id: int):
     con = sqlite3.connect(DB_PATH)
