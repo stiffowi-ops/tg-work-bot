@@ -9,7 +9,6 @@ import io
 import zipfile
 import html as html_lib
 import httpx
-from bs4 import BeautifulSoup
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
@@ -139,10 +138,65 @@ def zodiac_from_ddmm(ddmm: str) -> str | None:
     if (m == 2 and d >= 19) or (m == 3 and d <= 20): return "pisces"
     return None
 
+def split_sentences_ru(text: str) -> list[str]:
+    """
+    Very small RU sentence splitter suitable for horoscope paragraphs.
+    Keeps punctuation at the end of each sentence.
+    """
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return []
+    # Split on . ! ? … keeping delimiter
+    parts = re.split(r"(?<=[\.!\?…])\s+", t)
+    out: list[str] = []
+    for s in parts:
+        s = s.strip()
+        if not s:
+            continue
+        out.append(s)
+    return out
+
+
+def extract_horo_advice_focus(horo_text: str) -> tuple[str, str]:
+    """
+    Returns (advice_sentence, focus_sentence) picked strictly from the horoscope text (no new wording).
+    """
+    sents = split_sentences_ru(horo_text)
+    if not sents:
+        return horo_text.strip(), horo_text.strip()
+
+    # Prefer sentences that look like recommendations
+    keywords = [
+        "советует", "стоит", "нужно", "не ", "не\s", "следите", "контролируйте", "постарайтесь",
+        "не стоит", "важно", "лучше", "осторож", "держите", "помните",
+    ]
+
+    def score(sent: str) -> int:
+        sl = sent.lower()
+        sc = 0
+        for kw in keywords:
+            if re.search(kw, sl):
+                sc += 3
+        # shorter, “directive” sentences read better as blocks
+        if len(sent) <= 140:
+            sc += 1
+        return sc
+
+    ranked = sorted(sents, key=score, reverse=True)
+    advice = ranked[0]
+    # focus must be different; pick next best
+    focus = next((s for s in ranked[1:] if s != advice), None)
+    if not focus:
+        focus = sents[1] if len(sents) > 1 else advice
+
+    return advice.strip(), focus.strip()
 
 async def fetch_rambler_horo(sign_slug: str) -> tuple[str, str | None]:
-    """Парсит гороскоп на сегодня (RU) с horoscopes.rambler.ru.
-    Возвращает: (текст_гороскопа, дата_строкой_если_найдена)
+    """
+    Fetches Russian daily horoscope text from Rambler and returns:
+      (horo_text, date_str)
+
+    We intentionally return ONLY the horoscope body text (no menus/author/like/share).
     """
     url = f"https://horoscopes.rambler.ru/{sign_slug}/"
     headers = {
@@ -153,50 +207,44 @@ async def fetch_rambler_horo(sign_slug: str) -> tuple[str, str | None]:
     async with httpx.AsyncClient(timeout=10.0, headers=headers, follow_redirects=True) as client:
         r = await client.get(url)
         r.raise_for_status()
-        html = r.text
+        page_html = r.text
 
-    soup = BeautifulSoup(html, "html.parser")
+    # Strip scripts/styles to avoid noise
+    cleaned = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", page_html)
+    cleaned = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", cleaned)
 
-    # Дата (на странице обычно есть строка вида "26 января 2026")
-    page_text = soup.get_text(" ", strip=True)
-    date_m = re.search(r"\b\d{1,2}\s+[А-Яа-яЁё]+\s+\d{4}\b", page_text)
+    # Date (e.g. "26 января 2026") – try to find anywhere on the page
+    plain_for_date = re.sub(r"(?is)<[^>]+>", " ", cleaned)
+    plain_for_date = html_lib.unescape(plain_for_date)
+    plain_for_date = re.sub(r"\s+", " ", plain_for_date)
+    date_m = re.search(r"\b\d{1,2}\s+[А-Яа-яЁё]+\s+\d{4}\b", plain_for_date)
     date_str = date_m.group(0) if date_m else None
 
-    # Тело (стараемся взять абзацы из article/main)
-    container = soup.find("article") or soup.find("main") or soup
-    ps = [p.get_text(" ", strip=True) for p in container.find_all("p")]
+    # Extract paragraphs; Rambler keeps horoscope body in <p> tags
+    p_blocks = re.findall(r"(?is)<p\b[^>]*>(.*?)</p>", cleaned)
+    paras: list[str] = []
+    for p in p_blocks:
+        t = re.sub(r"(?is)<[^>]+>", " ", p)
+        t = html_lib.unescape(t)
+        t = re.sub(r"\s+", " ", t).strip()
+        if not t:
+            continue
+        # Filter obvious UI garbage if it leaks into <p>
+        bad = ("Нравится", "Поделиться", "Следующая неделя", "Неделя", "Месяц", "Январь", "Февраль")
+        if any(b in t for b in bad):
+            continue
+        # Keep only meaningful Cyrillic text
+        if len(re.findall(r"[А-Яа-яЁё]", t)) < 20:
+            continue
+        paras.append(t)
 
-    # Фильтруем мусорные/короткие
-    def looks_like_horo(s: str) -> bool:
-        if not s:
-            return False
-        if len(s) < 60:
-            return False
-        if not re.search(r"[А-Яа-яЁё]", s):
-            return False
-        bad = ("Нравится", "Поделиться", "Следующая неделя", "Неделя", "Месяц", "Январь", "Февраль",
-               "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
-        # если это чисто навигация
-        if any(s.strip() == b for b in bad):
-            return False
-        return True
+    if not paras:
+        raise RuntimeError("Не удалось извлечь текст гороскопа (Rambler)")
 
-    candidates = [p for p in ps if looks_like_horo(p)]
-
-    if not candidates:
-        # fallback: попробуем вытащить самый длинный "похожий на русский" кусок
-        candidates = [p for p in ps if re.search(r"[А-Яа-яЁё]", p)]
-        if not candidates:
-            raise RuntimeError("Не удалось извлечь текст гороскопа")
-
-    horo_text = max(candidates, key=len).strip()
-
-    # Финальная чистка на случай, если в абзац попали кнопки/ярлыки
-    horo_text = re.sub(r"\b(Нравится|Поделиться)\b.*$", "", horo_text).strip()
-    horo_text = re.sub(r"\s+", " ", horo_text).strip()
+    # Usually the horoscope is the longest paragraph block
+    horo_text = max(paras, key=len).strip()
 
     return horo_text, date_str
-
 
 def ensure_db_path(db_path: str):
     """
@@ -1754,10 +1802,17 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
     if date_str:
         head += f" • {date_str}"
 
+    advice, focus = extract_horo_advice_focus(horo_text)
+
     msg = (
-        f"<b>{escape(head)}</b>\n\n"
-        f"<b>Ваш гороскоп:</b>\n"
-        f"{escape(horo_text)}"
+        f"<b>{escape(head)}</b>\n"
+        f"<i>Персональный прогноз на день</i>\n\n"
+        f"<b>Ваш гороскоп</b>\n"
+        f"{escape(horo_text)}\n\n"
+        f"<b>Совет дня</b> 🧭\n"
+        f"{escape(advice)}\n\n"
+        f"<b>Фокус</b> 🎯\n"
+        f"{escape(focus)}"
     )
 
     await context.bot.send_message(
