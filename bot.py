@@ -189,6 +189,15 @@ def db_init():
         )
     """)
 
+
+    # rate-limit гороскопа (1 раз в день на пользователя)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS horo_rate (
+            user_id INTEGER PRIMARY KEY,
+            last_date TEXT NOT NULL
+        )
+    """)
+
     # ------- HELP MENU: документы -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS doc_categories (
@@ -303,6 +312,30 @@ def db_set_suggest_last_ts(user_id: int, ts: int):
         VALUES(?, ?)
         ON CONFLICT(user_id) DO UPDATE SET last_sent_ts=excluded.last_sent_ts
     """, (int(user_id), int(ts)))
+    con.commit()
+    con.close()
+
+
+def db_get_horo_last_date(user_id: int) -> str | None:
+    """Возвращает дату (YYYY-MM-DD) последнего запроса гороскопа пользователем."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT last_date FROM horo_rate WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def db_set_horo_last_date(user_id: int, iso_date: str):
+    """Записывает дату (YYYY-MM-DD) последнего запроса гороскопа пользователем."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """INSERT INTO horo_rate(user_id, last_date)
+               VALUES(?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET last_date=excluded.last_date""",
+        (int(user_id), iso_date),
+    )
     con.commit()
     con.close()
 
@@ -771,7 +804,6 @@ def build_standup_text(today_d: date, zoom_url: str) -> str:
         f"Сегодня <b>{dow}</b> 🗓️\n\n"
         f"Планёрка стартует через <b>15 минут</b> — в <b>09:30 (МСК)</b> ⏰\n\n"
         f'👉 <a href="{zoom_url}">Присоединиться к Zoom</a>\n\n'
-        ""
     )
 
 def build_industry_text(industry_zoom_url: str) -> str:
@@ -780,7 +812,6 @@ def build_industry_text(industry_zoom_url: str) -> str:
         "На горизонте <b>Отраслевая встреча</b> — стартуем через <b>30 минут</b> 🚀\n\n"
         "⏰ Встречаемся в <b>12:00 (МСК)</b>\n\n"
         f'👉 <a href="{industry_zoom_url}">Присоединиться к Zoom</a>\n\n'
-        ""
     )
 
 # ---------------- KEYBOARDS (meetings) ----------------
