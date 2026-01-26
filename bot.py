@@ -4,6 +4,10 @@ import random
 import sqlite3
 import logging
 import time
+import csv
+import io
+import zipfile
+from pathlib import Path
 from datetime import datetime, date, timedelta
 
 import pytz
@@ -11,11 +15,14 @@ from dotenv import load_dotenv
 
 from telegram import (
     Update,
+    InputMediaPhoto,
+    InputMediaVideo,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
 from telegram.constants import ParseMode
-from telegram.error import Forbidden
+from telegram.error import Forbidden, TimedOut, NetworkError
+from telegram.helpers import escape
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,6 +31,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+from telegram.request import HTTPXRequest
 
 load_dotenv()
 
@@ -40,12 +49,14 @@ INDUSTRY_ZOOM_URL = os.getenv("INDUSTRY_ZOOM_URL")  # отраслевая
 # ✅ поддержка DATABASE_PATH и DB_PATH
 DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH", "bot.db")
 
-YA_CRM_URL = os.getenv("YA_CRM_URL", "")
-INDUSTRY_WIKI_URL = os.getenv("INDUSTRY_WIKI_URL", "")
-HELPY_BOT_URL = os.getenv("HELPY_BOT_URL", "")
+STORAGE_DIR = os.getenv("STORAGE_DIR", "storage")
 
-IGNIO_COM_XML_URL = os.getenv("IGNIO_COM_XML_URL", "https://ignio.com/r/export/utf/xml/daily/com.xml")
-IGNIO_LOV_XML_URL = os.getenv("IGNIO_LOV_XML_URL", "https://ignio.com/r/export/utf/xml/daily/lov.xml")
+INDUSTRY_WIKI_URL = os.getenv("INDUSTRY_WIKI_URL", "")
+STAFF_URL = os.getenv("STAFF_URL", "")
+SITE_URL = os.getenv("SITE_URL", "")
+LITE_FORM_URL = os.getenv("LITE_FORM_URL", "")
+LEAD_CRM_URL = os.getenv("LEAD_CRM_URL", "")
+HELPY_BOT_URL = os.getenv("HELPY_BOT_URL", "")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -95,6 +106,15 @@ def ensure_db_path(db_path: str):
     except Exception as e:
         logger.exception("No write access to DB directory: %s", e)
         raise
+
+
+def ensure_storage_dir(base_dir: str):
+    """Создаёт директорию для локального хранения файлов (бэкапы из Telegram)."""
+    if not base_dir:
+        raise RuntimeError("STORAGE_DIR is empty")
+    Path(base_dir).mkdir(parents=True, exist_ok=True)
+    Path(base_dir, "docs").mkdir(parents=True, exist_ok=True)
+
 
 
 async def job_delete_message(context: ContextTypes.DEFAULT_TYPE):
@@ -156,6 +176,14 @@ def db_init():
         )
     """)
 
+    # rate-limit предложки
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS suggest_rate (
+            user_id INTEGER PRIMARY KEY,
+            last_sent_ts INTEGER NOT NULL
+        )
+    """)
+
     # ------- HELP MENU: документы -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS doc_categories (
@@ -175,6 +203,7 @@ def db_init():
             file_id TEXT NOT NULL,
             file_unique_id TEXT,
             mime_type TEXT,
+            local_path TEXT,
             uploaded_at TEXT NOT NULL,
             FOREIGN KEY(category_id) REFERENCES doc_categories(id) ON DELETE CASCADE
         )
@@ -183,6 +212,12 @@ def db_init():
     # миграция для старых БД
     try:
         cur.execute("ALTER TABLE docs ADD COLUMN description TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # миграция для старых БД: local_path (локальный бэкап файла)
+    try:
+        cur.execute("ALTER TABLE docs ADD COLUMN local_path TEXT")
     except sqlite3.OperationalError:
         pass
 
@@ -207,6 +242,21 @@ def db_init():
     except sqlite3.OperationalError:
         pass
 
+
+    # ------- ACHIEVEMENTS: выдачи ачивок -------
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS achievement_awards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id INTEGER NOT NULL,
+        emoji TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        awarded_at TEXT NOT NULL,
+        awarded_by INTEGER,
+        FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+    )
+""")
+
     con.commit()
     con.close()
 
@@ -228,6 +278,26 @@ def db_set_meta(key: str, value: str):
         VALUES(?, ?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
     """, (key, value))
+    con.commit()
+    con.close()
+
+
+def db_get_suggest_last_ts(user_id: int) -> int | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT last_sent_ts FROM suggest_rate WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone()
+    con.close()
+    return int(row[0]) if row else None
+
+def db_set_suggest_last_ts(user_id: int, ts: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO suggest_rate(user_id, last_sent_ts)
+        VALUES(?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET last_sent_ts=excluded.last_sent_ts
+    """, (int(user_id), int(ts)))
     con.commit()
     con.close()
 
@@ -381,22 +451,22 @@ def db_docs_get(doc_id: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
-        "SELECT id, category_id, title, description, file_id, mime_type FROM docs WHERE id=?",
+        "SELECT id, category_id, title, description, file_id, file_unique_id, mime_type, local_path FROM docs WHERE id=?",
         (doc_id,),
     )
     row = cur.fetchone()
     con.close()
     if not row:
         return None
-    return {"id": row[0], "category_id": row[1], "title": row[2], "description": row[3], "file_id": row[4], "mime": row[5]}
+    return {"id": row[0], "category_id": row[1], "title": row[2], "description": row[3], "file_id": row[4], "file_unique_id": row[5], "mime": row[6], "local_path": row[7]}
 
-def db_docs_add_doc(category_id: int, title: str, description: str | None, file_id: str, file_unique_id: str | None, mime_type: str | None) -> int:
+def db_docs_add_doc(category_id: int, title: str, description: str | None, file_id: str, file_unique_id: str | None, mime_type: str | None, local_path: str | None) -> int:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        INSERT INTO docs(category_id, title, description, file_id, file_unique_id, mime_type, uploaded_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (category_id, title.strip(), (description or "").strip() or None, file_id, file_unique_id, mime_type, datetime.utcnow().isoformat()))
+        INSERT INTO docs(category_id, title, description, file_id, file_unique_id, mime_type, local_path, uploaded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (category_id, title.strip(), (description or "").strip() or None, file_id, file_unique_id, mime_type, (local_path or None), datetime.utcnow().isoformat()))
     con.commit()
     did = cur.lastrowid
     con.close()
@@ -410,6 +480,101 @@ def db_docs_delete_doc(doc_id: int) -> bool:
     con.commit()
     con.close()
     return deleted
+
+
+
+def db_docs_get_category_id_by_title(title: str) -> int | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id FROM doc_categories WHERE title=?", (title.strip(),))
+    row = cur.fetchone()
+    con.close()
+    return int(row[0]) if row else None
+
+def db_docs_ensure_category(title: str) -> int:
+    cid = db_docs_get_category_id_by_title(title)
+    if cid:
+        return cid
+    return db_docs_add_category(title)
+
+def db_docs_get_by_file_unique_id(file_unique_id: str):
+    if not file_unique_id:
+        return None
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT id, category_id, title, description, file_id, file_unique_id, mime_type, local_path FROM docs WHERE file_unique_id=?",
+        (file_unique_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "category_id": row[1],
+        "title": row[2],
+        "description": row[3],
+        "file_id": row[4],
+        "file_unique_id": row[5],
+        "mime": row[6],
+        "local_path": row[7],
+    }
+
+def db_docs_upsert_by_unique(category_id: int, title: str, description: str | None, file_id: str, file_unique_id: str | None, mime_type: str | None, local_path: str | None) -> int:
+    """Upsert документа по file_unique_id (если есть), иначе добавляет новый."""
+    if file_unique_id:
+        existing = db_docs_get_by_file_unique_id(file_unique_id)
+        if existing:
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute(
+                """UPDATE docs
+                   SET category_id=?, title=?, description=?, file_id=?, mime_type=?, local_path=COALESCE(?, local_path)
+                   WHERE file_unique_id=?""",
+                (category_id, title.strip(), (description or None), file_id, mime_type, local_path, file_unique_id),
+            )
+            con.commit()
+            con.close()
+            return int(existing["id"])
+    # fallback insert
+    return db_docs_add_doc(category_id, title, description, file_id, file_unique_id, mime_type, local_path)
+
+def db_profiles_upsert(full_name: str, year_start: int, city: str, birthday: str | None, about: str, topics: str, tg_link: str) -> int:
+    """Upsert анкеты по tg_link (если есть) иначе по full_name."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    key = (tg_link or "").strip()
+    if key:
+        cur.execute("SELECT id FROM profiles WHERE tg_link=?", (key,))
+        row = cur.fetchone()
+    else:
+        cur.execute("SELECT id FROM profiles WHERE full_name=?", (full_name.strip(),))
+        row = cur.fetchone()
+
+    if row:
+        pid = int(row[0])
+        cur.execute(
+            """UPDATE profiles
+               SET full_name=?, year_start=?, city=?, birthday=?, about=?, topics=?, tg_link=?
+               WHERE id=?""",
+            (full_name.strip(), int(year_start), city.strip(), birthday, about.strip(), topics.strip(), (tg_link or "").strip(), pid),
+        )
+        con.commit()
+        con.close()
+        return pid
+
+    cur.execute(
+        """INSERT INTO profiles(full_name, year_start, city, birthday, about, topics, tg_link, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (full_name.strip(), int(year_start), city.strip(), birthday, about.strip(), topics.strip(), (tg_link or "").strip(), datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    pid = cur.lastrowid
+    con.close()
+    return int(pid)
+
 
 # ---------------- HELP DB: PROFILES ----------------
 
@@ -490,6 +655,76 @@ def db_profiles_birthdays(ddmm: str) -> list[dict]:
         })
     return res
 
+
+# ---------------- ACHIEVEMENTS (awards) ----------------
+
+def db_achievements_list(profile_id: int) -> list[dict]:
+    """Список ачивок для профиля (последние сверху)."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT emoji, title, description, awarded_at
+        FROM achievement_awards
+        WHERE profile_id=?
+        ORDER BY id DESC
+        """,
+        (int(profile_id),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {"emoji": r[0], "title": r[1], "description": r[2], "awarded_at": r[3]}
+        for r in rows
+    ]
+
+
+def db_achievement_award_add(profile_id: int, emoji: str, title: str, description: str, awarded_by: int | None = None) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO achievement_awards(profile_id, emoji, title, description, awarded_at, awarded_by)
+        VALUES(?, ?, ?, ?, ?, ?)
+        """,
+        (int(profile_id), emoji.strip(), title.strip(), description.strip(), datetime.utcnow().isoformat(), awarded_by),
+    )
+    con.commit()
+    aid = cur.lastrowid
+    con.close()
+    return aid
+
+
+def export_achievement_awards_rows() -> list[dict]:
+    """Для CSV/ZIP бэкапа: все выданные ачивки."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT a.id, p.id, p.full_name, p.tg_link, a.emoji, a.title, a.description, a.awarded_at, a.awarded_by
+        FROM achievement_awards a
+        JOIN profiles p ON p.id = a.profile_id
+        ORDER BY a.id ASC
+        """
+    )
+    rows = cur.fetchall()
+    con.close()
+    out = []
+    for r in rows:
+        out.append({
+            "award_id": r[0],
+            "profile_id": r[1],
+            "full_name": r[2] or "",
+            "tg_link": r[3] or "",
+            "emoji": r[4] or "",
+            "title": r[5] or "",
+            "description": r[6] or "",
+            "awarded_at": r[7] or "",
+            "awarded_by": r[8] or "",
+        })
+    return out
+
+
 # ---------------- TEXT (meetings) ----------------
 
 DAY_RU_UPPER = {
@@ -515,6 +750,14 @@ STANDUP_GREETINGS = [
     "Врываемся в день мягко, но уверенно 😄☀️",
 ]
 
+
+WELCOME_TEXT = """👋 Привет, {name}! Добро пожаловать в команду! 🎉
+Очень рады, что ты с нами 😊
+Желаем лёгкого старта, крутых задач, побольше лидов и, конечно, бабосиков 💸🚀
+
+Если что — не стесняйся, всегда поможем 🙌
+Познакомиться с коллегами и найти полезности можно через команду /help ✅"""
+
 def build_standup_text(today_d: date, zoom_url: str) -> str:
     greet = random.choice(STANDUP_GREETINGS)
     dow = DAY_RU_UPPER.get(today_d.weekday(), "СЕГОДНЯ")
@@ -523,7 +766,8 @@ def build_standup_text(today_d: date, zoom_url: str) -> str:
         f"Сегодня <b>{dow}</b> 🗓️\n\n"
         f"Планёрка стартует через <b>15 минут</b> — в <b>09:30 (МСК)</b> ⏰\n\n"
         f'👉 <a href="{zoom_url}">Присоединиться к Zoom</a>\n\n'
-            )
+        f"Если нужно — можно отменить/перенести ниже 👇"
+    )
 
 def build_industry_text(industry_zoom_url: str) -> str:
     return (
@@ -531,7 +775,8 @@ def build_industry_text(industry_zoom_url: str) -> str:
         "На горизонте <b>Отраслевая встреча</b> — стартуем через <b>30 минут</b> 🚀\n\n"
         "⏰ Встречаемся в <b>12:00 (МСК)</b>\n\n"
         f'👉 <a href="{industry_zoom_url}">Присоединиться к Zoom</a>\n\n'
-            )
+        "Если нужно — можно отменить/перенести ниже 👇"
+    )
 
 # ---------------- KEYBOARDS (meetings) ----------------
 
@@ -608,10 +853,29 @@ WAITING_DOC_DESC = "waiting_doc_desc"
 PENDING_DOC_INFO = "pending_doc_info"
 WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
 
+WAITING_RESTORE_ZIP = "waiting_restore_zip"
 # profiles add flow
 PROFILE_WIZ_ACTIVE = "profile_wiz_active"
+
+# csv import flow
+WAITING_CSV_IMPORT = "waiting_csv_import"
+WAITING_ZIP_IMPORT = "waiting_zip_import"
+
+# achievements award flow
+ACH_WIZ_ACTIVE = "ach_wiz_active"
+ACH_WIZ_STEP = "ach_wiz_step"
+ACH_WIZ_DATA = "ach_wiz_data"
 PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
+
+# suggest box flow
+WAITING_SUGGESTION_TEXT = "waiting_suggestion_text"
+SUGGESTION_MODE = "suggestion_mode"  # anon|named
+
+# broadcast flow
+BCAST_ACTIVE = "bcast_active"
+BCAST_STEP = "bcast_step"  # topic|text|files
+BCAST_DATA = "bcast_data"
 
 def clear_waiting_date(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DATE_FLAG] = False
@@ -625,10 +889,38 @@ def clear_docs_flow(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop(PENDING_DOC_INFO, None)
     context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
 
+
+
+def clear_csv_import(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[WAITING_CSV_IMPORT] = False
+    context.chat_data.pop(WAITING_USER_ID, None)
+    context.chat_data.pop(WAITING_SINCE_TS, None)
+
+def clear_restore_zip(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[WAITING_RESTORE_ZIP] = False
+
+
 def clear_profile_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[PROFILE_WIZ_ACTIVE] = False
     context.chat_data.pop(PROFILE_WIZ_STEP, None)
     context.chat_data.pop(PROFILE_WIZ_DATA, None)
+
+def clear_zip_import(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[WAITING_ZIP_IMPORT] = False
+
+def clear_ach_wiz(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[ACH_WIZ_ACTIVE] = False
+    context.chat_data.pop(ACH_WIZ_STEP, None)
+    context.chat_data.pop(ACH_WIZ_DATA, None)
+
+def clear_suggest_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[WAITING_SUGGESTION_TEXT] = False
+    context.user_data.pop(SUGGESTION_MODE, None)
+
+def clear_bcast_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[BCAST_ACTIVE] = False
+    context.user_data.pop(BCAST_STEP, None)
+    context.user_data.pop(BCAST_DATA, None)
 
 # ---------------- DUE RULES ----------------
 
@@ -648,6 +940,16 @@ def normalize_tg_mention(tg_link: str) -> str | None:
     tg = (tg_link or "").strip()
     if not tg:
         return None
+
+
+def format_achievements_for_profile(profile_id: int) -> str:
+    items = db_achievements_list(profile_id)
+    if not items:
+        return "— Всё ещё впереди —"
+    parts = []
+    for it in items[:10]:
+        parts.append(f"{escape(it['emoji'])} <b>{escape(it['title'])}</b>\n{escape(it['description'])}")
+    return "\n\n".join(parts)
 
     # @username
     if tg.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", tg):
@@ -842,10 +1144,34 @@ def kb_help_main(is_admin_user: bool):
         [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
         [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links")],
         [InlineKeyboardButton("👥 Познакомиться с командой", callback_data="help:team")],
+        [InlineKeyboardButton("💡 Предложка", callback_data="help:suggest")],
     ]
     if is_admin_user:
         rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")])
     return InlineKeyboardMarkup(rows)
+
+
+def kb_suggest_modes():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🕵️ Анонимно", callback_data="help:suggest:mode:anon")],
+        [InlineKeyboardButton("🙋 Не анонимно", callback_data="help:suggest:mode:named")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+    ])
+
+def kb_suggest_cancel():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:suggest:cancel")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+    ])
+
+
+def kb_bcast_files_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Отправить", callback_data="help:settings:bcast:send")],
+        [InlineKeyboardButton("🗑️ Очистить файлы", callback_data="help:settings:bcast:clear_files")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
 
 def kb_help_docs_categories():
     cats = db_docs_list_categories()
@@ -877,36 +1203,66 @@ def get_links_catalog() -> dict[str, dict]:
 
     # Чекко
     catalog["checko"] = {
-        "title": 'Сервис "Чекко" поиск контактов',
+        "title": 'Чекко 🔍',
         "url": "https://checko.ru/",
         "desc": (
-            "Готовишь карточку лида? Отлично! 🚀\n\n"
-            "Сервис «Чекко» поможет совершить первый шаг! 🔍\n\n"
-            "Поиск ведётся по:\n\n"
-            "• Названию компании 🏢\n"
-            "• ИНН или ОГРН 📑\n"
-            "• Фамилии ИП 👤\n\n"
-            "Нашёл контакты? Просто скопируй их и начинай прозвон! 📞✨"
+            "Поиск контактов и данных компании по названию/ИНН/ОГРН/ФИО ИП. "
+            "Удобно для быстрой подготовки перед прозвоном."
         ),
     }
 
-    if YA_CRM_URL:
-        catalog["ya_crm"] = {
-            "title": "🌐 YA CRM",
-            "url": YA_CRM_URL,
-            "desc": "CRM-система для работы с заявками, задачами и клиентскими данными.",
+    catalog["linkedin"] = {
+        "title": "LinkedIn 🔎",
+        "url": "https://www.linkedin.com/feed/",
+        "desc": "Ищем ЛПР/контакты и проверяем должности, компанию, активности",
+    }
+
+    catalog["yandex_maps"] = {
+        "title": "Яндекс Карты 🗺️",
+        "url": "https://yandex.ru/maps",
+        "desc": "Доп. поиск компании и контактов: филиалы, телефоны, сайт, отзывы, адреса.",
+    }
+
+    if STAFF_URL:
+        catalog["staff"] = {
+            "title": "Стафф 🧑‍🤝‍🧑",
+            "url": STAFF_URL,
+            "desc": "Находим коллег внутри компании: рабочие контакты",
         }
+
+    if SITE_URL:
+        catalog["site"] = {
+            "title": "Наш сайт 🌐",
+            "url": SITE_URL,
+            "desc": "Инфа о продукте: кейсы, клиенты, описание сервиса и ближайшие мероприятия — удобно кидать в диалог.",
+        }
+
     if INDUSTRY_WIKI_URL:
         catalog["industry_wiki"] = {
-            "title": "📊 WIKI Отрасли (презы и спичи)",
+            "title": "WIKI Отрасли 📊",
             "url": INDUSTRY_WIKI_URL,
             "desc": "Материалы по отрасли: презентации, спичи и полезные справки.",
         }
+
     if HELPY_BOT_URL:
         catalog["helpy_bot"] = {
-            "title": "🛠️ Бот Helpy",
+            "title": "Бот Helpy 🛠️",
             "url": HELPY_BOT_URL,
-            "desc": "Бот поможет с техническими вопросами, связанными с работой.",
+            "desc": "Помогает с техническими вопросами, связанными с работой.",
+        }
+
+    if LITE_FORM_URL:
+        catalog["lite_form"] = {
+            "title": "Форма Lite сервиса ✉️",
+            "url": LITE_FORM_URL,
+            "desc": "Отправляем клиенту описание Lite-версии и контакты техподдержки. Нужна почта клиента.",
+        }
+
+    if LEAD_CRM_URL:
+        catalog["lead_crm"] = {
+            "title": "Заведение лида в CRM 🧾",
+            "url": LEAD_CRM_URL,
+            "desc": "Создаём лида в CRM при проработке новой компании. <b>ВАЖНО!!! ПРОВЕРЬ ДУБЛИ</b>\nИли используем при задаче на реанимацию от руководителя.",
         }
 
     return catalog
@@ -917,9 +1273,30 @@ def kb_help_links_menu():
     if not catalog:
         rows.append([InlineKeyboardButton("— ссылки не настроены —", callback_data="noop")])
     else:
-        items = sorted(catalog.items(), key=lambda kv: len(kv[1]["title"]), reverse=True)
+        # Сортируем по длине названия (короткие сверху)
+        items = sorted(catalog.items(), key=lambda kv: len(kv[1]["title"]))
+        pending_row = []
+
         for key, item in items:
-            rows.append([InlineKeyboardButton(item["title"], callback_data=f"help:links:item:{key}")])
+            btn = InlineKeyboardButton(item["title"], callback_data=f"help:links:item:{key}")
+
+            # длинные кнопки — отдельной строкой
+            if len(item["title"]) >= 22:
+                if pending_row:
+                    rows.append(pending_row)
+                    pending_row = []
+                rows.append([btn])
+                continue
+
+            # короткие — по две в ряд
+            pending_row.append(btn)
+            if len(pending_row) == 2:
+                rows.append(pending_row)
+                pending_row = []
+
+        if pending_row:
+            rows.append(pending_row)
+
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -966,8 +1343,13 @@ def kb_help_settings():
         [InlineKeyboardButton("🗂️ Редактировать категории", callback_data="help:settings:cats")],
         [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
         [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
+        [InlineKeyboardButton("🏆 Ачивки", callback_data="help:settings:ach")],
+        [InlineKeyboardButton("📦 Скачать бэкап ZIP", callback_data="help:settings:backup_zip")],
+        [InlineKeyboardButton("📥 Загрузить бэкап ZIP", callback_data="help:settings:restore_zip")],
+        [InlineKeyboardButton("📣 Рассылка", callback_data="help:settings:bcast")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
+
 
 def kb_settings_categories():
     cats = db_docs_list_categories()
@@ -1011,6 +1393,23 @@ def kb_pick_doc_to_delete():
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
     return InlineKeyboardMarkup(rows)
 
+def kb_achievements_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Выдать ачивку", callback_data="help:settings:ach:give")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
+def kb_pick_profile_for_achievement():
+    people = db_profiles_list()
+    rows = []
+    if not people:
+        rows.append([InlineKeyboardButton("— анкет нет —", callback_data="noop")])
+    else:
+        for pid, name in people[:60]:
+            rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:ach:pick:{pid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:ach")])
+    return InlineKeyboardMarkup(rows)
+
 def kb_pick_profile_to_delete():
     people = db_profiles_list()
     rows = []
@@ -1047,13 +1446,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main(bot_username)
 
-    # если команда в личке — просто показываем там
+    orig_msg = update.message  # чтобы (по возможности) удалить /help в группе
+
+    # 1) если команда в личке — просто показываем меню тут
     if update.effective_chat and update.effective_chat.type == "private":
         is_adm = await is_admin_scoped(update, context)
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_main(is_admin_user=is_adm), disable_web_page_preview=True)
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_main(is_admin_user=is_adm),
+            disable_web_page_preview=True,
+        )
         return
 
-    # если команда в группе — пытаемся в ЛС, в чат не пишем при успехе
+    # 2) если команда в группе — пробуем прислать меню в ЛС пользователю
     if update.effective_user:
         context.user_data[HELP_SCOPE_CHAT_ID] = update.effective_chat.id
 
@@ -1061,7 +1467,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id:
         try:
             is_adm = await is_admin_scoped(update, context)
-
             await context.bot.send_message(
                 chat_id=user_id,
                 text=text,
@@ -1069,14 +1474,28 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_help_main(is_admin_user=is_adm),
                 disable_web_page_preview=True,
             )
-            # успех -> в чат ничего не пишем
+
+            # успех -> удаляем /help в чате (если есть права)
+            if orig_msg and update.effective_chat and update.effective_chat.type != "private":
+                try:
+                    await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
+                except Exception:
+                    pass
             return
+
         except Forbidden:
             warn_text = (
                 "⚠️ Я не могу написать вам в ЛС.\n"
                 f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
                 "после этого снова нажмите /help в чате."
             )
+
+            if orig_msg and update.effective_chat and update.effective_chat.type != "private":
+                try:
+                    await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
+                except Exception:
+                    pass
+
             msg = await update.message.reply_text(
                 warn_text,
                 reply_to_message_id=update.message.message_id,
@@ -1089,11 +1508,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name=f"del_help_warn_{msg.chat_id}_{msg.message_id}",
             )
             return
+
         except Exception as e:
             logger.exception("Failed to DM /help: %s", e)
 
-    # fallback: отправляем в чат (reply)
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=kb_help_main(is_admin_user=await is_admin_scoped(update, context)),
@@ -1101,176 +1520,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_to_message_id=update.message.message_id,
     )
 
-
-# ---------------- HOROSCOPE ----------------
-
-HORO_SIGNS = {
-    "овен": ("aries", "Овен"),
-    "телец": ("taurus", "Телец"),
-    "близнецы": ("gemini", "Близнецы"),
-    "рак": ("cancer", "Рак"),
-    "лев": ("leo", "Лев"),
-    "дева": ("virgo", "Дева"),
-    "весы": ("libra", "Весы"),
-    "скорпион": ("scorpio", "Скорпион"),
-    "стрелец": ("sagittarius", "Стрелец"),
-    "козерог": ("capricorn", "Козерог"),
-    "водолей": ("aquarius", "Водолей"),
-    "рыбы": ("pisces", "Рыбы"),
-}
-
-def _xml_find_sign_today_text(root: ET.Element, sign_tag: str) -> str | None:
-    """Достаём текст на сегодня из XML Ignio (мягкий парсер под разные структуры)."""
-    def _strip(tag: str) -> str:
-        return tag.split("}", 1)[-1] if "}" in tag else tag
-
-    # вариант 1: <aries> ... <today>TEXT
-    for el in root.iter():
-        if _strip(el.tag).lower() == sign_tag.lower():
-            for ch in list(el):
-                if _strip(ch.tag).lower() in ("today", "text"):
-                    t = (ch.text or "").strip()
-                    if t:
-                        return t
-            t = "".join(el.itertext()).strip()
-            if t:
-                return t
-
-    # вариант 2: <sign name="aries">TEXT
-    for el in root.iter():
-        if _strip(el.tag).lower() in ("sign", "zodiac"):
-            attrs = {k.lower(): (v or "").lower() for k, v in (el.attrib or {}).items()}
-            if attrs.get("name") == sign_tag.lower() or attrs.get("sign") == sign_tag.lower():
-                t = "".join(el.itertext()).strip()
-                if t:
-                    return t
-
-    return None
-
-
-async def _fetch_ignio_text(url: str, sign_tag: str) -> str | None:
-    """Скачиваем XML и достаём прогноз для знака. Парсим тело даже при не-200 статусе."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; MeetingsBot/1.0)",
-        "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
-            resp = await client.get(url)
-            content = resp.content
-    except Exception as e:
-        logger.exception("Ignio fetch failed: %s", e)
-        return None
-
-    if not content:
-        return None
-
-    try:
-        root = ET.fromstring(content)
-    except Exception:
-        try:
-            root = ET.fromstring(content.decode("utf-8", errors="ignore").encode("utf-8"))
-        except Exception as e:
-            logger.exception("Ignio XML parse failed: %s", e)
-            return None
-
-    return _xml_find_sign_today_text(root, sign_tag)
-
-
-def _make_horo_message(sign_ru: str, date_str: str, general: str, love: str) -> str:
-    # совет: первая фраза из общего прогноза
-    advice = ""
-    if general:
-        parts = re.split(r"(?<=[\.!\?])\s+|\n+", general.strip())
-        advice = (parts[0] if parts else general).strip()
-    if not advice:
-        advice = "Держи фокус на главном и не распыляйся 🙂"
-
-    general = (general or "").strip()[:1600]
-    love = (love or "").strip()[:1200]
-    advice = advice[:400]
-
-    return (
-        f"✨ <b>Гороскоп на {date_str}</b>\n"
-        f"Знак: <b>{escape(sign_ru)}</b>\n\n"
-        f"<b>🔮 Сегодня</b>\n{escape(general) if general else '—'}\n\n"
-        f"<b>❤️ Любовь</b>\n{escape(love) if love else '—'}\n\n"
-        f"<b>💡 Совет дня</b>\n{escape(advice)}"
-    )
-
-
-async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/horo <знак> — присылает гороскоп в ЛС. Лимит: 1 раз в день на сотрудника."""
-    bot_username = (context.bot.username or "blablabird_bot")
-    user = update.effective_user
-    if not user or not update.message:
-        return
-
-    args = (context.args or [])
-    sign_input = " ".join(args).strip().lower()
-    if not sign_input:
-        signs_list = ", ".join([v[1] for v in HORO_SIGNS.values()])
-        await update.message.reply_text(
-            "🔭 <b>Гороскоп</b>\n\n"
-            "Напиши команду так:\n"
-            "<code>/horo овен</code>\n\n"
-            f"Доступные знаки: {escape(signs_list)}",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    sign_key = sign_input.replace("ё", "е").strip()
-    # простая попытка убрать падежи (овна -> овен и т.п.)
-    sign_key = re.sub(r"(а|у|е|ом|ой|ы|и)$", "", sign_key).strip()
-
-    if sign_key not in HORO_SIGNS:
-        signs_list = ", ".join([v[1] for v in HORO_SIGNS.values()])
-        await update.message.reply_text(
-            "❌ Не понял знак зодиака.\n"
-            f"Доступные: {escape(signs_list)}\n\n"
-            "Пример: <code>/horo лев</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    sign_tag, sign_ru = HORO_SIGNS[sign_key]
-
-    now_msk = datetime.now(MOSCOW_TZ)
-    today_iso = now_msk.date().isoformat()
-
-    last = db_get_horo_last_date(user.id)
-    if last == today_iso:
-        await update.message.reply_text("🌟 Звёзды свою работу выполнили — приходи завтра 😉✨")
-        return
-
-    general = await _fetch_ignio_text(IGNIO_COM_XML_URL, sign_tag)
-    love = await _fetch_ignio_text(IGNIO_LOV_XML_URL, sign_tag)
-
-    if not general and not love:
-        await update.message.reply_text("😕 Не смог получить гороскоп сейчас. Попробуй позже.")
-        return
-
-    msg = _make_horo_message(sign_ru, now_msk.strftime("%d.%m.%Y"), general or "", love or "")
-
-    # если команда из группы — шлём в ЛС
     if update.effective_chat and update.effective_chat.type != "private":
-        try:
-            await context.bot.send_message(chat_id=user.id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            db_set_horo_last_date(user.id, today_iso)
-            await update.message.reply_text("✅ Отправил гороскоп в личку 🙂", disable_web_page_preview=True)
-        except Forbidden:
-            await update.message.reply_text(
-                "⚠️ Я не могу написать вам в ЛС.\n"
-                f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
-                "после этого повторите /horo.",
-                disable_web_page_preview=True,
+        if orig_msg:
+            context.job_queue.run_once(
+                job_delete_message,
+                when=60,
+                data={"chat_id": orig_msg.chat_id, "message_id": orig_msg.message_id},
+                name=f"del_help_cmd_{orig_msg.chat_id}_{orig_msg.message_id}",
             )
-        return
-
-    # личка
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    db_set_horo_last_date(user.id, today_iso)
-
+        if msg:
+            context.job_queue.run_once(
+                job_delete_message,
+                when=60,
+                data={"chat_id": msg.chat_id, "message_id": msg.message_id},
+                name=f"del_help_fallback_{msg.chat_id}_{msg.message_id}",
+            )
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
@@ -1366,15 +1630,623 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_waiting_date(context)
     clear_docs_flow(context)
     clear_profile_wiz(context)
-    await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты).")
+    clear_csv_import(context)
+    clear_suggest_flow(context)
+    clear_bcast_flow(context)
+    await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты/CSV/предложка/рассылка).")
+
+
+
+# ---------------- CSV BACKUP/RESTORE ----------------
+
+def _csv_bool(v: str | None) -> str:
+    return "1" if str(v).strip().lower() in ("1", "true", "yes", "y") else "0"
+
+
+def export_backup_zip_bytes() -> bytes:
+    """Формирует ZIP-бэкап с несколькими CSV (profiles/docs/categories/notify_chats/achievements_awards)."""
+    files: dict[str, str] = {}
+
+    # doc_categories.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["title", "created_at"])
+    w.writeheader()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute("SELECT title, created_at FROM doc_categories ORDER BY title COLLATE NOCASE ASC")
+        for title, created_at in cur.fetchall():
+            w.writerow({"title": title or "", "created_at": created_at or ""})
+    finally:
+        con.close()
+    files["doc_categories.csv"] = buf.getvalue()
+
+    # docs.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=[
+        "category_title",
+        "doc_title",
+        "doc_description",
+        "doc_file_id",
+        "doc_file_unique_id",
+        "doc_mime_type",
+        "doc_local_path",
+    ])
+    w.writeheader()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute("""
+            SELECT c.title, d.title, d.description, d.file_id, d.file_unique_id, d.mime_type, d.local_path
+            FROM docs d
+            JOIN doc_categories c ON c.id = d.category_id
+            ORDER BY d.id ASC
+        """)
+        rows = cur.fetchall()
+        has_local = True
+    except sqlite3.OperationalError:
+        cur.execute("""
+            SELECT c.title, d.title, d.description, d.file_id, d.file_unique_id, d.mime_type
+            FROM docs d
+            JOIN doc_categories c ON c.id = d.category_id
+            ORDER BY d.id ASC
+        """)
+        rows = cur.fetchall()
+        has_local = False
+    con.close()
+    for r in rows:
+        if has_local:
+            cat_title, doc_title, desc, file_id, file_unique_id, mime_type, local_path = r
+        else:
+            cat_title, doc_title, desc, file_id, file_unique_id, mime_type = r
+            local_path = ""
+        w.writerow({
+            "category_title": cat_title or "",
+            "doc_title": doc_title or "",
+            "doc_description": desc or "",
+            "doc_file_id": file_id or "",
+            "doc_file_unique_id": file_unique_id or "",
+            "doc_mime_type": mime_type or "",
+            "doc_local_path": local_path or "",
+        })
+    files["docs.csv"] = buf.getvalue()
+
+    # profiles.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=[
+        "profile_id",
+        "full_name",
+        "year_start",
+        "city",
+        "birthday",
+        "about",
+        "topics",
+        "tg_link",
+    ])
+    w.writeheader()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link
+        FROM profiles
+        ORDER BY id ASC
+    """)
+    for row in cur.fetchall():
+        w.writerow({
+            "profile_id": row[0],
+            "full_name": row[1] or "",
+            "year_start": row[2] or "",
+            "city": row[3] or "",
+            "birthday": row[4] or "",
+            "about": row[5] or "",
+            "topics": row[6] or "",
+            "tg_link": row[7] or "",
+        })
+    con.close()
+    files["profiles.csv"] = buf.getvalue()
+
+    # notify_chats.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["chat_id", "added_at"])
+    w.writeheader()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT chat_id, added_at FROM notify_chats ORDER BY chat_id ASC")
+    for row in cur.fetchall():
+        w.writerow({"chat_id": row[0], "added_at": row[1]})
+    con.close()
+    files["notify_chats.csv"] = buf.getvalue()
+
+    # achievements_awards.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=[
+        "award_id",
+        "profile_id",
+        "full_name",
+        "tg_link",
+        "emoji",
+        "title",
+        "description",
+        "awarded_at",
+        "awarded_by",
+    ])
+    w.writeheader()
+    for r in export_achievement_awards_rows():
+        w.writerow(r)
+    files["achievements_awards.csv"] = buf.getvalue()
+
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, content in files.items():
+            zf.writestr(name, content.encode("utf-8-sig"))
+    return zbuf.getvalue()
+
+
+def restore_backup_zip_bytes(data: bytes) -> dict:
+    """Восстановление из ZIP бэкапа (CSV). Возвращает статистику по импортированным сущностям."""
+    stats = {"profiles": 0, "categories": 0, "docs": 0, "notify_chats": 0, "achievements_awards": 0}
+    zbuf = io.BytesIO(data)
+    with zipfile.ZipFile(zbuf, "r") as zf:
+        names = set(zf.namelist())
+
+        # 1) profiles.csv
+        profile_id_map: dict[str, int] = {}
+        if "profiles.csv" in names:
+            raw = zf.read("profiles.csv").decode("utf-8", errors="replace")
+            rdr = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in rdr:
+                if not row:
+                    continue
+                pid = (row.get("profile_id") or "").strip()
+                full_name = (row.get("full_name") or "").strip()
+                year_start = (row.get("year_start") or "").strip() or "2000"
+                city = (row.get("city") or "").strip()
+                birthday = (row.get("birthday") or "").strip() or None
+                about = (row.get("about") or "").strip()
+                topics = (row.get("topics") or "").strip()
+                tg_link = (row.get("tg_link") or "").strip()
+
+                created_at = datetime.utcnow().isoformat()
+
+                # upsert by id if present, else by (tg_link, full_name) heuristic
+                if pid.isdigit():
+                    cur.execute(
+                        """INSERT INTO profiles(id, full_name, year_start, city, birthday, about, topics, tg_link, created_at)
+                               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               ON CONFLICT(id) DO UPDATE SET
+                                 full_name=excluded.full_name,
+                                 year_start=excluded.year_start,
+                                 city=excluded.city,
+                                 birthday=excluded.birthday,
+                                 about=excluded.about,
+                                 topics=excluded.topics,
+                                 tg_link=excluded.tg_link
+                        """,
+                        (int(pid), full_name, int(year_start), city, birthday, about, topics, tg_link, created_at),
+                    )
+                    new_id = int(pid)
+                else:
+                    # try find existing by tg_link first
+                    new_id = None
+                    if tg_link:
+                        cur.execute("SELECT id FROM profiles WHERE tg_link=?", (tg_link,))
+                        r = cur.fetchone()
+                        if r:
+                            new_id = int(r[0])
+                    if new_id is None and full_name:
+                        cur.execute("SELECT id FROM profiles WHERE full_name=?", (full_name,))
+                        r = cur.fetchone()
+                        if r:
+                            new_id = int(r[0])
+                    if new_id is None:
+                        cur.execute(
+                            """INSERT INTO profiles(full_name, year_start, city, birthday, about, topics, tg_link, created_at)
+                                   VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (full_name, int(year_start), city, birthday, about, topics, tg_link, created_at),
+                        )
+                        new_id = int(cur.lastrowid)
+
+                if pid:
+                    profile_id_map[pid] = new_id
+                stats["profiles"] += 1
+
+            con.commit()
+            con.close()
+
+        # 2) doc_categories.csv (или legacy categories.csv)
+        cat_filename = None
+        if "doc_categories.csv" in names:
+            cat_filename = "doc_categories.csv"
+        elif "categories.csv" in names:
+            cat_filename = "categories.csv"
+
+        if cat_filename:
+            raw = zf.read(cat_filename).decode("utf-8", errors="replace")
+            rdr = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in rdr:
+                title = (row.get("title") or "").strip()
+                created_at = (row.get("created_at") or "").strip() or datetime.utcnow().isoformat()
+                if not title:
+                    continue
+                cur.execute(
+                    """INSERT INTO doc_categories(title, created_at)
+                           VALUES(?, ?)
+                           ON CONFLICT(title) DO UPDATE SET created_at=excluded.created_at
+                    """,
+                    (title, created_at),
+                )
+                stats["categories"] += 1
+            con.commit()
+            con.close()
+
+        # helper: get category_id by title (create if missing)
+        def _ensure_category(title: str) -> int:
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute("SELECT id FROM doc_categories WHERE title=?", (title,))
+            r = cur.fetchone()
+            if r:
+                con.close()
+                return int(r[0])
+            cur.execute("INSERT INTO doc_categories(title, created_at) VALUES(?, ?)", (title, datetime.utcnow().isoformat()))
+            con.commit()
+            cid = int(cur.lastrowid)
+            con.close()
+            return cid
+
+        # 3) docs.csv (by category_title)
+        if "docs.csv" in names:
+            raw = zf.read("docs.csv").decode("utf-8", errors="replace")
+            rdr = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in rdr:
+                cat_title = (row.get("category_title") or "").strip() or "Без категории"
+                doc_title = (row.get("doc_title") or "").strip() or "Документ"
+                doc_desc = (row.get("doc_description") or "").strip() or None
+                file_id = (row.get("doc_file_id") or "").strip()
+                file_unique_id = (row.get("doc_file_unique_id") or "").strip() or None
+                mime_type = (row.get("doc_mime_type") or "").strip() or None
+                if not file_id:
+                    continue
+                cid = _ensure_category(cat_title)
+                # вставляем как новый, но избегаем дублей по (category_id, title, file_id)
+                cur.execute(
+                    """SELECT id FROM docs WHERE category_id=? AND title=? AND file_id=?""",
+                    (cid, doc_title, file_id),
+                )
+                if cur.fetchone():
+                    continue
+                cur.execute(
+                    """INSERT INTO docs(category_id, title, description, file_id, file_unique_id, mime_type, uploaded_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (cid, doc_title, doc_desc, file_id, file_unique_id, mime_type, datetime.utcnow().isoformat()),
+                )
+                stats["docs"] += 1
+            con.commit()
+            con.close()
+
+        # 4) notify_chats.csv
+        if "notify_chats.csv" in names:
+            raw = zf.read("notify_chats.csv").decode("utf-8", errors="replace")
+            rdr = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in rdr:
+                chat_id = (row.get("chat_id") or "").strip()
+                added_at = (row.get("added_at") or "").strip() or datetime.utcnow().isoformat()
+                if not chat_id:
+                    continue
+                try:
+                    cid = int(chat_id)
+                except Exception:
+                    continue
+                cur.execute(
+                    """INSERT INTO notify_chats(chat_id, added_at)
+                           VALUES(?, ?)
+                           ON CONFLICT(chat_id) DO UPDATE SET added_at=excluded.added_at""",
+                    (cid, added_at),
+                )
+                stats["notify_chats"] += 1
+            con.commit()
+            con.close()
+
+        # 5) achievements_awards.csv
+        if "achievements_awards.csv" in names:
+            raw = zf.read("achievements_awards.csv").decode("utf-8", errors="replace")
+            rdr = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in rdr:
+                pid_old = (row.get("profile_id") or "").strip()
+                full_name = (row.get("full_name") or "").strip()
+                tg_link = (row.get("tg_link") or "").strip()
+                emoji = (row.get("emoji") or "🏆").strip()
+                title = (row.get("title") or "Ачивка").strip()
+                description = (row.get("description") or "").strip()
+                awarded_at = (row.get("awarded_at") or "").strip() or datetime.utcnow().isoformat()
+                awarded_by = (row.get("awarded_by") or "").strip()
+                awarded_by_val = int(awarded_by) if awarded_by.isdigit() else None
+
+                target_pid = None
+                if pid_old and pid_old in profile_id_map:
+                    target_pid = profile_id_map[pid_old]
+                elif pid_old.isdigit():
+                    target_pid = int(pid_old)
+                else:
+                    # fallback: by tg_link or full_name
+                    if tg_link:
+                        cur.execute("SELECT id FROM profiles WHERE tg_link=?", (tg_link,))
+                        r = cur.fetchone()
+                        if r:
+                            target_pid = int(r[0])
+                    if target_pid is None and full_name:
+                        cur.execute("SELECT id FROM profiles WHERE full_name=?", (full_name,))
+                        r = cur.fetchone()
+                        if r:
+                            target_pid = int(r[0])
+
+                if not target_pid:
+                    continue
+
+                # avoid duplicate exact same award
+                cur.execute(
+                    """SELECT id FROM achievement_awards
+                           WHERE profile_id=? AND emoji=? AND title=? AND description=?""",
+                    (int(target_pid), emoji, title, description),
+                )
+                if cur.fetchone():
+                    continue
+
+                cur.execute(
+                    """INSERT INTO achievement_awards(profile_id, emoji, title, description, awarded_at, awarded_by)
+                           VALUES(?, ?, ?, ?, ?, ?)""",
+                    (int(target_pid), emoji, title, description, awarded_at, awarded_by_val),
+                )
+                stats["achievements_awards"] += 1
+
+            con.commit()
+            con.close()
+
+    return stats
+
+def export_backup_csv_bytes() -> bytes:
+    """
+    Собирает CSV-бэкап (категории/документы/анкеты) и возвращает как bytes (UTF-8).
+    Используется для кнопки «Скачать отчёт CSV» и команды /export_csv.
+    """
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[
+        "kind",
+        "category_title",
+        "doc_title",
+        "doc_description",
+        "doc_file_id",
+        "doc_file_unique_id",
+        "doc_mime_type",
+        "doc_local_path",
+        "profile_full_name",
+        "profile_year_start",
+        "profile_city",
+        "profile_birthday",
+        "profile_about",
+        "profile_topics",
+        "profile_tg_link",
+    ])
+    writer.writeheader()
+
+    # categories
+    cats = db_docs_list_categories()
+    for cid, title in cats:
+        writer.writerow({
+            "kind": "category",
+            "category_title": title,
+        })
+
+    # docs
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    # local_path колонка может отсутствовать в старых БД — попробуем мягко
+    try:
+        cur.execute("""
+            SELECT c.title, d.title, d.description, d.file_id, d.file_unique_id, d.mime_type, d.local_path
+            FROM docs d
+            JOIN doc_categories c ON c.id = d.category_id
+            ORDER BY d.id ASC
+        """)
+        rows = cur.fetchall()
+        has_local = True
+    except sqlite3.OperationalError:
+        cur.execute("""
+            SELECT c.title, d.title, d.description, d.file_id, d.file_unique_id, d.mime_type
+            FROM docs d
+            JOIN doc_categories c ON c.id = d.category_id
+            ORDER BY d.id ASC
+        """)
+        rows = cur.fetchall()
+        has_local = False
+    con.close()
+
+    for r in rows:
+        if has_local:
+            cat_title, doc_title, desc, file_id, file_unique_id, mime_type, local_path = r
+        else:
+            cat_title, doc_title, desc, file_id, file_unique_id, mime_type = r
+            local_path = ""
+        writer.writerow({
+            "kind": "doc",
+            "category_title": cat_title,
+            "doc_title": doc_title,
+            "doc_description": desc or "",
+            "doc_file_id": file_id or "",
+            "doc_file_unique_id": file_unique_id or "",
+            "doc_mime_type": mime_type or "",
+            "doc_local_path": local_path or "",
+        })
+
+    # profiles
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT full_name, year_start, city, birthday, about, topics, tg_link
+        FROM profiles
+        ORDER BY id ASC
+    """)
+    profs = cur.fetchall()
+    con.close()
+
+    for p in profs:
+        full_name, year_start, city, birthday, about, topics, tg_link = p
+        writer.writerow({
+            "kind": "profile",
+            "profile_full_name": full_name or "",
+            "profile_year_start": year_start or "",
+            "profile_city": city or "",
+            "profile_birthday": birthday or "",
+            "profile_about": about or "",
+            "profile_topics": topics or "",
+            "profile_tg_link": tg_link or "",
+        })
+
+    return buf.getvalue().encode("utf-8")
+
+
+async def cmd_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin_scoped(update, context):
+        await update.message.reply_text("Только администраторы.")
+        return
+
+    # выгружаем всё в один CSV (kind: category/doc/profile)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=[
+        "kind",
+        "category_title",
+        "doc_title",
+        "doc_description",
+        "doc_file_id",
+        "doc_file_unique_id",
+        "doc_mime_type",
+        "doc_local_path",
+        "profile_full_name",
+        "profile_year_start",
+        "profile_city",
+        "profile_birthday",
+        "profile_about",
+        "profile_topics",
+        "profile_tg_link",
+    ])
+    writer.writeheader()
+
+    # categories
+    cats = db_docs_list_categories()
+    for cid, title in cats:
+        writer.writerow({
+            "kind": "category",
+            "category_title": title,
+        })
+
+    # docs
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT c.title, d.title, d.description, d.file_id, d.file_unique_id, d.mime_type, d.local_path
+        FROM docs d
+        JOIN doc_categories c ON c.id = d.category_id
+        ORDER BY c.title COLLATE NOCASE ASC, d.id ASC
+    """)
+    for row in cur.fetchall():
+        writer.writerow({
+            "kind": "doc",
+            "category_title": row[0],
+            "doc_title": row[1],
+            "doc_description": row[2] or "",
+            "doc_file_id": row[3] or "",
+            "doc_file_unique_id": row[4] or "",
+            "doc_mime_type": row[5] or "",
+            "doc_local_path": row[6] or "",
+        })
+    con.close()
+
+    # profiles
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link
+        FROM profiles
+        ORDER BY full_name COLLATE NOCASE ASC
+    """)
+    for row in cur.fetchall():
+        writer.writerow({
+            "kind": "profile",
+            "profile_full_name": row[0],
+            "profile_year_start": row[1],
+            "profile_city": row[2],
+            "profile_birthday": row[3] or "",
+            "profile_about": row[4],
+            "profile_topics": row[5],
+            "profile_tg_link": row[6],
+        })
+    con.close()
+
+    data = buf.getvalue().encode("utf-8-sig")
+    bio = io.BytesIO(data)
+    bio.name = "bot_backup.csv"
+
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=bio,
+        caption="✅ Бэкап выгружен: bot_backup.csv",
+    )
+
+async def cmd_import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == "private":
+        # можно и в личке, и в чате — но импорт делает админ scoped
+        pass
+
+    if not await is_admin_scoped(update, context):
+        await update.message.reply_text("Только администраторы могут импортировать CSV.")
+        return
+
+    clear_docs_flow(context)
+    clear_profile_wiz(context)
+    clear_waiting_date(context)
+
+    context.chat_data[WAITING_CSV_IMPORT] = True
+    context.chat_data[WAITING_USER_ID] = update.effective_user.id if update.effective_user else None
+    context.chat_data[WAITING_SINCE_TS] = int(time.time())
+
+    await update.message.reply_text(
+        "📥 <b>Импорт из CSV</b>\n\n"
+        "Отправьте файлом CSV (например <code>bot_backup.csv</code>).\n"
+        "Бот восстановит категории/документы/анкеты.\n\n"
+        "Важно: если в CSV есть <code>doc_local_path</code> и файл сохранён на сервере, "
+        "бот сможет пере-залить документ в Telegram и обновить <code>file_id</code> при необходимости.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 
 # ---------------- CALLBACKS: meetings cancel/reschedule ----------------
 
 async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        try:
+            await query.answer()
+        except (TimedOut, NetworkError):
+            pass
+    except (TimedOut, NetworkError):
+        pass
     if not await is_admin_scoped(update, context):
-        await query.answer("Только администраторы могут отменять/переносить.", show_alert=True)
+        try:
+            await query.answer("Только администраторы могут отменять/переносить.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
     _, _, meeting_type = query.data.split(":")
     await query.edit_message_reply_markup(reply_markup=kb_cancel_options(meeting_type))
@@ -1382,15 +2254,24 @@ async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_cancel_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin_scoped(update, context):
-        await query.answer("Только администраторы.", show_alert=True)
+        try:
+            await query.answer("Только администраторы.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
     await query.edit_message_reply_markup(reply_markup=None)
-    await query.answer("Ок, не отменяем ✅")
+    try:
+        await query.answer("Ок, не отменяем ✅")
+    except (TimedOut, NetworkError):
+        pass
 
 async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin_scoped(update, context):
-        await query.answer("Только администраторы.", show_alert=True)
+        try:
+            await query.answer("Только администраторы.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
 
     parts = query.data.split(":")
@@ -1404,7 +2285,10 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
-        await query.answer("Отменено.")
+        try:
+            await query.answer("Отменено.")
+        except (TimedOut, NetworkError):
+            pass
         return
 
     if reason_key == "tech":
@@ -1413,18 +2297,27 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
-        await query.answer("Ок.")
+        try:
+            await query.answer("Ок.")
+        except (TimedOut, NetworkError):
+            pass
         return
 
     if reason_key == "move":
         await query.edit_message_reply_markup(reply_markup=kb_reschedule_dates(meeting_type, today_d))
-        await query.answer("Выберите дату переноса 📆")
+        try:
+            await query.answer("Выберите дату переноса 📆")
+        except (TimedOut, NetworkError):
+            pass
         return
 
 async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin_scoped(update, context):
-        await query.answer("Только администраторы.", show_alert=True)
+        try:
+            await query.answer("Только администраторы.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
 
     parts = query.data.split(":")
@@ -1436,11 +2329,17 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         dd, mm, yy = picked.split(".")
         new_d = date(int("20" + yy), int(mm), int(dd))
     except Exception:
-        await query.answer("Не смог распознать дату.", show_alert=True)
+        try:
+            await query.answer("Не смог распознать дату.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
 
     if new_d <= today_d:
-        await query.answer("Дата переноса должна быть в будущем.", show_alert=True)
+        try:
+            await query.answer("Дата переноса должна быть в будущем.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
 
     db_set_canceled(meeting_type, today_d, "Перенос на другой день", reschedule_date=picked)
@@ -1453,12 +2352,18 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         chat_id=update.effective_chat.id,
         text=f"{title}\nНовая дата: {picked} 📌\nСледите за расписанием или чатом"
     )
-    await query.answer("Перенесено.")
+    try:
+        await query.answer("Перенесено.")
+    except (TimedOut, NetworkError):
+        pass
 
 async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin_scoped(update, context):
-        await query.answer("❌ Только администраторы.", show_alert=True)
+        try:
+            await query.answer("❌ Только администраторы.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
 
     parts = query.data.split(":")
@@ -1468,8 +2373,13 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
     context.chat_data[WAITING_USER_ID] = update.effective_user.id
     context.chat_data[WAITING_SINCE_TS] = int(time.time())
     context.chat_data[WAITING_MEETING_TYPE] = meeting_type
-
-    await query.answer()
+    try:
+        try:
+            await query.answer()
+        except (TimedOut, NetworkError):
+            pass
+    except (TimedOut, NetworkError):
+        pass
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=(
@@ -1486,10 +2396,16 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
 async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await is_admin_scoped(update, context):
-        await query.answer("❌ Только администраторы.", show_alert=True)
+        try:
+            await query.answer("❌ Только администраторы.", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
         return
     clear_waiting_date(context)
-    await query.answer("Ок, отменил ввод даты ✅")
+    try:
+        await query.answer("Ок, отменил ввод даты ✅")
+    except (TimedOut, NetworkError):
+        pass
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
@@ -1501,7 +2417,13 @@ async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_T
 async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data
-    await q.answer()
+    try:
+        try:
+            await q.answer()
+        except (TimedOut, NetworkError):
+            pass
+    except (TimedOut, NetworkError):
+        pass
 
     if data == "noop":
         return
@@ -1514,6 +2436,44 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             help_text_main(bot_username),
             parse_mode=ParseMode.HTML,
             reply_markup=kb_help_main(is_admin_user=is_adm),
+            disable_web_page_preview=True,
+        )
+        return
+
+
+    if data == "help:suggest":
+        text = (
+            "💡 <b>Предложка</b>\n\n"
+            "Тут ты можешь отправить свой вопрос/предложение/жалобу/просьбу и т.д. 🙂\n\n"
+            "Для этого воспользуйся одним из режимов ниже 👇"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_suggest_modes(), disable_web_page_preview=True)
+        return
+
+    if data == "help:suggest:cancel":
+        clear_suggest_flow(context)
+        await q.edit_message_text("✅ Отправка отменена.", parse_mode=ParseMode.HTML, reply_markup=kb_help_main(is_admin_user=is_adm))
+        return
+
+    if data.startswith("help:suggest:mode:"):
+        mode = data.split(":")[-1]  # anon|named
+        scope_chat_id = get_scope_chat_id(update, context)
+        if not scope_chat_id:
+            try:
+                await q.answer("Открой /help из группового чата, чтобы привязать предложку к нему.", show_alert=True)
+            except (TimedOut, NetworkError):
+                pass
+            return
+
+        context.user_data[WAITING_SUGGESTION_TEXT] = True
+        context.user_data[SUGGESTION_MODE] = mode
+
+        await q.edit_message_text(
+            "✍️ <b>Напиши сообщение для администраторов</b>\n\n"
+            "Можно одним сообщением. Я передам его администраторам.\n"
+            "Чтобы отменить — нажми «Отмена».",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_suggest_cancel(),
             disable_web_page_preview=True,
         )
         return
@@ -1569,7 +2529,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         catalog = get_links_catalog()
         item = catalog.get(key)
         if not item:
-            await q.answer("Ссылка не найдена.", show_alert=True)
+            try:
+                await q.answer("Ссылка не найдена.", show_alert=True)
+            except (TimedOut, NetworkError):
+                pass
             return
         url = item["url"]
         title = item["title"]
@@ -1602,20 +2565,25 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bday = (p.get("birthday") or "").strip() or "—"
 
         card = (
-            f"👤 <b>{p['full_name']}</b>\n"
+            f"👤 <b>{p['full_name']}</b>\n\n"
             f"📅 Работает с: <b>{p['year_start']}</b>\n"
             f"🏙️ Город: <b>{p['city']}</b>\n"
             f"🎂 День рождения: <b>{bday}</b>\n\n"
             f"📝 <b>Кратко о себе</b>\n{p['about']}\n\n"
             f"❓ <b>По каким вопросам обращаться</b>\n{p['topics']}\n\n"
-            f"🔗 TG: {p['tg_link']}"
+            f"🔗 <b>TG:</b> {p['tg_link']}\n\n"
+            f"━━━━━━━━━━━━━━\n\n"
+            f"🏆 <b>Ачивки</b>\n\n{format_achievements_for_profile(p['id'])}"
         )
         await q.edit_message_text(card, parse_mode=ParseMode.HTML, reply_markup=kb_help_profile_card(p), disable_web_page_preview=True)
         return
 
     if data == "help:settings":
         if not is_adm:
-            await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
+            try:
+                await q.answer("⚠️ Кнопка доступна администраторам чата. Обратитесь к ним 🙂", show_alert=True)
+            except (TimedOut, NetworkError):
+                pass
             return
         text = (
             "⚙️ <b>Настройки</b>\n\n"
@@ -1628,14 +2596,205 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # дальше — настройки (только админы)
     if data.startswith("help:settings:"):
         if not is_adm:
-            await q.answer("⚠️ Доступно администраторам чата.", show_alert=True)
+            try:
+                await q.answer("⚠️ Доступно администраторам чата.", show_alert=True)
+            except (TimedOut, NetworkError):
+                pass
             return
 
         if data == "help:settings:cancel":
             clear_docs_flow(context)
             clear_profile_wiz(context)
             clear_waiting_date(context)
+            clear_csv_import(context)
+            clear_zip_import(context)
+            clear_suggest_flow(context)
+            clear_ach_wiz(context)
+            clear_bcast_flow(context)
             await q.edit_message_text("✅ Действие отменено.", reply_markup=kb_help_settings(), parse_mode=ParseMode.HTML)
+            return
+
+
+        if data == "help:settings:bcast":
+            clear_bcast_flow(context)
+            context.user_data[BCAST_ACTIVE] = True
+            context.user_data[BCAST_STEP] = "topic"
+            context.user_data[BCAST_DATA] = {"topic": None, "text": None, "files": []}
+            await q.edit_message_text(
+                "📣 <b>Рассылка</b>\n\n"
+                "Шаг 1/3: <b>Тема</b> (будет выделена жирным)\n"
+                "Отправьте тему одним сообщением.\n"
+                "Если тема не нужна — отправьте <code>-</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data == "help:settings:bcast:cancel":
+            clear_bcast_flow(context)
+            await q.edit_message_text("✅ Рассылка отменена.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+            return
+
+        if data == "help:settings:bcast:clear_files":
+            d = _bcast_get_data(context)
+            d["files"] = []
+            context.user_data[BCAST_DATA] = d
+            await q.answer("Файлы очищены ✅")
+            return
+
+        if data == "help:settings:bcast:send":
+            d = _bcast_get_data(context)
+            topic = d.get("topic")
+            body = d.get("text")
+            files = d.get("files") or []
+            message_html = _bcast_compose_message(topic, body)
+
+            if not message_html and not files:
+                await q.answer("Нечего отправлять: добавьте текст или файлы.", show_alert=True)
+                return
+
+            ok, fail = await broadcast_to_chats(context, message_html, files)
+            clear_bcast_flow(context)
+            await q.edit_message_text(
+                f"✅ Рассылка отправлена.\n\n"
+                f"Успешно: <b>{ok}</b>\n"
+                f"Ошибок: <b>{fail}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_help_settings(),
+            )
+            return
+
+        if data == "help:settings:export_csv":
+            # экспортируем CSV и отправляем в ЛС (тут мы и так в ЛС)
+            if update.effective_user:
+                try:
+                    csv_bytes = export_backup_csv_bytes()
+                    bio = io.BytesIO(csv_bytes)
+                    bio.name = "bot_backup.csv"
+                    await context.bot.send_document(
+                        chat_id=update.effective_user.id,
+                        document=bio,
+                        caption="📤 Отчёт CSV (бэкап) готов. Сохрани файл — он поможет восстановить документы и анкеты.",
+                    )
+                    try:
+                        await q.answer("Отправил CSV ✅")
+                    except (TimedOut, NetworkError):
+                        pass
+                except Exception as e:
+                    logger.exception("export_csv failed: %s", e)
+                    try:
+                        await q.answer("Не смог сформировать CSV 😕", show_alert=True)
+                    except (TimedOut, NetworkError):
+                        pass
+            return
+
+        if data == "help:settings:import_csv":
+            # включаем режим ожидания CSV файла
+            clear_docs_flow(context)
+            clear_profile_wiz(context)
+            clear_waiting_date(context)
+            context.chat_data[WAITING_CSV_IMPORT] = True
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id if update.effective_user else None
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "📥 <b>Импорт отчёта CSV</b>\n\n"
+                "Отправьте CSV-файл следующим сообщением.\n"
+                "После загрузки бот восстановит категории, документы и анкеты.\n\n"
+                "Если передумали — нажмите «Отмена».",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if data == "help:settings:backup_zip":
+            # сформировать ZIP и отправить документом в текущий чат (обычно ЛС)
+            try:
+                b = export_backup_zip_bytes()
+                bio = io.BytesIO(b)
+                bio.name = f"backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=bio,
+                    caption="📦 Бэкап готов. Сохраните ZIP — его можно потом загрузить обратно для восстановления.",
+                )
+                await q.answer("Бэкап отправлен ✅")
+            except Exception as e:
+                logger.exception("backup_zip send failed: %s", e)
+                await q.answer("Не смог сформировать бэкап 😕", show_alert=True)
+            return
+
+        if data == "help:settings:restore_zip":
+            clear_restore_zip(context)
+            context.chat_data[WAITING_RESTORE_ZIP] = True
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "📥 <b>Восстановление из ZIP</b>\n\n"
+                "Пришлите ZIP-файл бэкапа следующим сообщением.\n"
+                "Я восстановлю карточки, документы/категории, подключённые чаты и ачивки.\n\n"
+                "Если передумали — нажмите «Отмена».",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            await q.answer()
+            return
+
+        if data == "help:settings:ach":
+            clear_bcast_flow(context)
+            clear_ach_wiz(context)
+            await q.edit_message_text(
+                "🏆 <b>Ачивки</b>\n\n"
+                "Здесь можно выдать ачивку сотруднику из анкеты.\n"
+                "Ачивки гибкие: эмодзи, название и описание задаются при выдаче.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎁 Выдать ачивку", callback_data="help:settings:ach:give")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+                ]),
+            )
+            return
+
+        if data == "help:settings:ach:give":
+            clear_bcast_flow(context)
+            clear_ach_wiz(context)
+            await q.edit_message_text(
+                "🎁 <b>Выдать ачивку</b>\n\nВыберите сотрудника:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_pick_profile_for_achievement(),
+            )
+            return
+
+        if data.startswith("help:settings:ach:pick:"):
+            pid = int(data.split(":")[-1])
+            p = db_profiles_get(pid)
+            if not p:
+                await q.answer("Анкета не найдена.", show_alert=True)
+                return
+            clear_ach_wiz(context)
+            clear_bcast_flow(context)
+            context.chat_data[ACH_WIZ_ACTIVE] = True
+            context.chat_data[ACH_WIZ_STEP] = "emoji"
+            context.chat_data[ACH_WIZ_DATA] = {
+                "profile_id": pid,
+                "full_name": p.get("full_name", ""),
+                "tg_link": p.get("tg_link", ""),
+            }
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                f"🎁 Выдаём ачивку для: <b>{escape(p.get('full_name',''))}</b>\n\n"
+                "Шаг 2/4: отправьте <b>эмодзи</b> (пример: 🏅)",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if data == "help:settings:backup_zip":
+            # (obsolete alias if any)
+            return
+
+        if data == "help:settings:restore_zip":
             return
 
         if data == "help:settings:cats":
@@ -1679,10 +2838,16 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cid = int(data.split(":")[-1])
             ok = db_docs_delete_category_if_empty(cid)
             if ok:
-                await q.answer("Удалено ✅")
+                try:
+                    await q.answer("Удалено ✅")
+                except (TimedOut, NetworkError):
+                    pass
                 await q.edit_message_text("✅ Категория удалена.", reply_markup=kb_settings_categories(), parse_mode=ParseMode.HTML)
             else:
-                await q.answer("Нельзя: категория не пустая", show_alert=True)
+                try:
+                    await q.answer("Нельзя: категория не пустая", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
             return
 
         if data == "help:settings:add_doc":
@@ -1715,19 +2880,28 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             did = int(data.split(":")[-1])
             ok = db_docs_delete_doc(did)
             if ok:
-                await q.answer("Удалено ✅")
+                try:
+                    await q.answer("Удалено ✅")
+                except (TimedOut, NetworkError):
+                    pass
                 await q.edit_message_text("✅ Файл удалён.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
             else:
-                await q.answer("Не найден", show_alert=True)
+                try:
+                    await q.answer("Не найден", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
             return
 
         if data.startswith("help:settings:add_doc:cat:"):
             cid = int(data.split(":")[-1])
             pending = context.chat_data.get(PENDING_DOC_INFO)
             if not pending:
-                await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
+                try:
+                    await q.answer("Нет загруженного файла. Начните заново.", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
                 return
-            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"))
+            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
             clear_docs_flow(context)
             await q.edit_message_text("✅ Файл добавлен в документы.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
             return
@@ -1735,7 +2909,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "help:settings:add_doc:newcat":
             pending = context.chat_data.get(PENDING_DOC_INFO)
             if not pending:
-                await q.answer("Сначала отправьте файл.", show_alert=True)
+                try:
+                    await q.answer("Сначала отправьте файл.", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
                 return
             context.chat_data[WAITING_NEW_CATEGORY_NAME] = True
             context.chat_data[WAITING_USER_ID] = update.effective_user.id
@@ -1778,13 +2955,58 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pid = int(data.split(":")[-1])
             ok = db_profiles_delete(pid)
             if ok:
-                await q.answer("Удалено ✅")
+                try:
+                    await q.answer("Удалено ✅")
+                except (TimedOut, NetworkError):
+                    pass
                 await q.edit_message_text("✅ Анкета удалена.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
             else:
-                await q.answer("Не найдено", show_alert=True)
+                try:
+                    await q.answer("Не найдено", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
             return
 
-    await q.answer()
+    try:
+
+        await q.answer()
+
+    except (TimedOut, NetworkError):
+
+        pass
+
+
+
+# ---------------- HANDLERS: NEW MEMBERS ----------------
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    new_members = update.message.new_chat_members or []
+    if not new_members:
+        return
+
+    # если добавили самого бота — не приветствуем как человека
+    bot_id = context.bot.id
+    for m in new_members:
+        if m.id == bot_id:
+            await update.message.reply_text(
+                "Привет! Я в чате ✅\n"
+                "Чтобы включить уведомления, админ должен выполнить команду /setchat."
+            )
+            return
+
+    names = []
+    for m in new_members:
+        nm = (m.full_name or m.first_name or "коллега").strip()
+        if nm:
+            names.append(nm)
+
+    joined = ", ".join(names) if names else "коллега"
+    text = WELCOME_TEXT.format(name=joined)
+
+    await update.message.reply_text(text, disable_web_page_preview=True)
 
 # ---------------- HANDLERS: DOCUMENT UPLOAD ----------------
 
@@ -1792,12 +3014,351 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
         return
 
-    if not context.chat_data.get(WAITING_DOC_UPLOAD):
+    # restore ZIP backup
+    if context.chat_data.get(WAITING_RESTORE_ZIP):
+        user_id = update.effective_user.id if update.effective_user else None
+        waiting_user = context.chat_data.get(WAITING_USER_ID)
+        if waiting_user and user_id != waiting_user:
+            return
+
+        if not await is_admin_scoped(update, context):
+            clear_restore_zip(context)
+            await update.message.reply_text("❌ Только администраторы могут загружать бэкап.")
+            return
+
+        doc = update.message.document
+        if not doc:
+            return
+
+        # принимаем только .zip (по имени или mime)
+        fname = (doc.file_name or "").lower()
+        if not (fname.endswith(".zip") or (doc.mime_type or "").lower() in ("application/zip", "application/x-zip-compressed")):
+            await update.message.reply_text("❌ Нужен ZIP-файл (backup.zip). Пришлите корректный файл или нажмите «Отмена».")
+            return
+
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            b = await tg_file.download_as_bytearray()
+            stats = restore_backup_zip_bytes(bytes(b))
+            clear_restore_zip(context)
+            await update.message.reply_text(
+                "✅ Бэкап загружен и восстановлен.\n\n"
+                f"👥 Профили: <b>{stats.get('profiles', 0)}</b>\n"
+                f"🗂️ Категории: <b>{stats.get('categories', 0)}</b>\n"
+                f"📄 Документы: <b>{stats.get('docs', 0)}</b>\n"
+                f"💬 Чаты рассылки: <b>{stats.get('notify_chats', 0)}</b>\n"
+                f"🏆 Ачивки: <b>{stats.get('achievements_awards', 0)}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_help_settings(),
+            )
+        except Exception as e:
+            logger.exception("restore zip failed: %s", e)
+            await update.message.reply_text("❌ Не смог восстановить из ZIP. Проверьте файл и попробуйте ещё раз.")
         return
+
+
+    # рассылка  # bcast attachment: сохраняем документ как вложение (в ЛС админа)
+    if context.user_data.get(BCAST_ACTIVE) and context.user_data.get(BCAST_STEP) == "files":
+        doc = update.message.document
+        if doc:
+            d = _bcast_get_data(context)
+            d["files"].append({"kind": "document", "file_id": doc.file_id, "file_unique_id": doc.file_unique_id})
+            context.user_data[BCAST_DATA] = d
+            await update.message.reply_text("✅ Документ добавлен. Можешь добавить ещё или нажми «✅ Отправить».", reply_markup=kb_bcast_files_menu())
+        return
+
 
     user_id = update.effective_user.id if update.effective_user else None
     waiting_user = context.chat_data.get(WAITING_USER_ID)
     if waiting_user and user_id != waiting_user:
+        return
+
+    # ---------------- ZIP IMPORT FLOW ----------------
+    if context.chat_data.get(WAITING_ZIP_IMPORT):
+        if not await is_admin_scoped(update, context):
+            clear_zip_import(context)
+            await update.message.reply_text("❌ Только администраторы могут восстанавливать бэкап.")
+            return
+
+        doc = update.message.document
+        if not doc:
+            return
+
+        # скачиваем ZIP во временный файл
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            tmp_path = Path(STORAGE_DIR) / "tmp_backup.zip"
+            await tg_file.download_to_drive(custom_path=str(tmp_path))
+        except Exception as e:
+            clear_zip_import(context)
+            logger.exception("ZIP download failed: %s", e)
+            await update.message.reply_text("❌ Не смог скачать ZIP.")
+            return
+
+        def _read_csv_from_zip(zf: zipfile.ZipFile, name: str) -> str | None:
+            try:
+                data = zf.read(name)
+            except KeyError:
+                return None
+            try:
+                return data.decode("utf-8-sig")
+            except Exception:
+                return data.decode("utf-8", errors="ignore")
+
+        ok_cats = ok_docs = ok_profiles = ok_ach = 0
+        skipped_docs = 0
+
+        try:
+            with zipfile.ZipFile(tmp_path, "r") as zf:
+                # categories
+                raw = _read_csv_from_zip(zf, "categories.csv")
+                if raw:
+                    reader = csv.DictReader(io.StringIO(raw))
+                    for row in reader:
+                        title = (row.get("title") or "").strip()
+                        if title:
+                            db_docs_ensure_category(title)
+                            ok_cats += 1
+
+                # profiles
+                raw = _read_csv_from_zip(zf, "profiles.csv")
+                id_map: dict[str, int] = {}
+                if raw:
+                    reader = csv.DictReader(io.StringIO(raw))
+                    for row in reader:
+                        full_name = (row.get("full_name") or "").strip()
+                        if not full_name:
+                            continue
+                        year_start = int((row.get("year_start") or "0").strip() or 0)
+                        city = (row.get("city") or "").strip()
+                        birthday = (row.get("birthday") or "").strip() or None
+                        about = (row.get("about") or "").strip()
+                        topics = (row.get("topics") or "").strip()
+                        tg_link = (row.get("tg_link") or "").strip()
+                        if not (year_start and city and about and topics and tg_link):
+                            continue
+                        pid = db_profiles_upsert(full_name, year_start, city, birthday, about, topics, tg_link)
+                        ok_profiles += 1
+                        if tg_link:
+                            id_map[tg_link] = pid
+
+                # docs
+                raw = _read_csv_from_zip(zf, "docs.csv")
+                if raw:
+                    reader = csv.DictReader(io.StringIO(raw))
+                    for row in reader:
+                        cat_title = (row.get("category_title") or "").strip() or "Документы"
+                        cid = db_docs_ensure_category(cat_title)
+
+                        title = (row.get("doc_title") or "").strip() or "Документ"
+                        description = (row.get("doc_description") or "").strip() or None
+                        file_id = (row.get("doc_file_id") or "").strip() or None
+                        file_unique_id = (row.get("doc_file_unique_id") or "").strip() or None
+                        mime_type = (row.get("doc_mime_type") or "").strip() or None
+                        local_path = (row.get("doc_local_path") or "").strip() or None
+
+                        if (not file_id) and local_path and Path(local_path).exists():
+                            target_chat_id = update.effective_user.id if update.effective_user else update.effective_chat.id
+                            try:
+                                with open(local_path, "rb") as f:
+                                    msg = await context.bot.send_document(
+                                        chat_id=target_chat_id,
+                                        document=f,
+                                        caption=f"♻️ Восстановление: {title}",
+                                        disable_notification=True,
+                                    )
+                                if msg and msg.document:
+                                    file_id = msg.document.file_id
+                                    file_unique_id = msg.document.file_unique_id
+                                    mime_type = msg.document.mime_type
+                            except Exception as e:
+                                logger.exception("Reupload local doc failed: %s", e)
+
+                        if not file_id and not (local_path and Path(local_path).exists()):
+                            skipped_docs += 1
+                            continue
+
+                        db_docs_upsert_by_unique(
+                            cid,
+                            title=title,
+                            description=description,
+                            file_id=file_id or "",
+                            file_unique_id=file_unique_id,
+                            mime_type=mime_type,
+                            local_path=local_path,
+                        )
+                        ok_docs += 1
+
+                # achievements
+                raw = _read_csv_from_zip(zf, "achievements_awards.csv")
+                if raw:
+                    reader = csv.DictReader(io.StringIO(raw))
+                    for row in reader:
+                        tg_link = (row.get("tg_link") or "").strip()
+                        pid = id_map.get(tg_link) if tg_link else None
+                        if not pid and tg_link:
+                            # попробуем найти в БД
+                            con = sqlite3.connect(DB_PATH)
+                            cur = con.cursor()
+                            cur.execute("SELECT id FROM profiles WHERE tg_link=?", (tg_link,))
+                            r = cur.fetchone()
+                            con.close()
+                            pid = r[0] if r else None
+                        if not pid:
+                            continue
+                        emoji = (row.get("emoji") or "").strip() or "🏆"
+                        title = (row.get("title") or "").strip() or "Ачивка"
+                        description = (row.get("description") or "").strip() or ""
+                        # не тащим awarded_at/awarded_by в точности — создаём новую запись восстановления
+                        db_achievement_award_add(int(pid), emoji, title, description, None)
+                        ok_ach += 1
+
+        except zipfile.BadZipFile:
+            clear_zip_import(context)
+            await update.message.reply_text("❌ Это не ZIP или файл повреждён.")
+            return
+        except Exception as e:
+            clear_zip_import(context)
+            logger.exception("ZIP import failed: %s", e)
+            await update.message.reply_text("❌ Ошибка при восстановлении ZIP.")
+            return
+
+        clear_zip_import(context)
+        await update.message.reply_text(
+            "✅ Восстановление завершено.\n\n"
+            f"Категории: <b>{ok_cats}</b>\n"
+            f"Анкеты: <b>{ok_profiles}</b>\n"
+            f"Документы: <b>{ok_docs}</b> (пропущено без file_id: <b>{skipped_docs}</b>)\n"
+            f"Ачивки: <b>{ok_ach}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_settings(),
+        )
+        return
+    # ---------------- CSV IMPORT FLOW ----------------
+    if context.chat_data.get(WAITING_CSV_IMPORT):
+        if not await is_admin_scoped(update, context):
+            clear_csv_import(context)
+            await update.message.reply_text("❌ Только администраторы могут импортировать CSV.")
+            return
+
+        doc = update.message.document
+        if not doc:
+            return
+
+        # скачиваем CSV во временный файл
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            tmp_path = Path(STORAGE_DIR) / "tmp_import.csv"
+            await tg_file.download_to_drive(custom_path=str(tmp_path))
+            raw = tmp_path.read_text(encoding="utf-8-sig")
+        except Exception as e:
+            clear_csv_import(context)
+            logger.exception("CSV import download/read failed: %s", e)
+            await update.message.reply_text("❌ Не смог скачать/прочитать CSV.")
+            return
+
+        ok_docs = ok_profiles = ok_cats = 0
+        skipped_docs = 0
+        reader = csv.DictReader(io.StringIO(raw))
+        for row in reader:
+            kind = (row.get("kind") or "").strip().lower()
+
+            if kind == "category":
+                title = (row.get("category_title") or "").strip()
+                if title:
+                    db_docs_ensure_category(title)
+                    ok_cats += 1
+                continue
+
+            if kind == "profile":
+                full_name = (row.get("profile_full_name") or "").strip()
+                if not full_name:
+                    continue
+                year_start = int((row.get("profile_year_start") or "0").strip() or 0)
+                city = (row.get("profile_city") or "").strip()
+                birthday = (row.get("profile_birthday") or "").strip() or None
+                about = (row.get("profile_about") or "").strip()
+                topics = (row.get("profile_topics") or "").strip()
+                tg_link = (row.get("profile_tg_link") or "").strip()
+                if not (year_start and city and about and topics and tg_link):
+                    # базовая валидация, чтобы не засорять базу
+                    continue
+                db_profiles_upsert(full_name, year_start, city, birthday, about, topics, tg_link)
+                ok_profiles += 1
+                continue
+
+            if kind == "doc":
+                cat_title = (row.get("category_title") or "").strip() or "Документы"
+                cid = db_docs_ensure_category(cat_title)
+
+                title = (row.get("doc_title") or "").strip() or "Документ"
+                description = (row.get("doc_description") or "").strip() or None
+                file_id = (row.get("doc_file_id") or "").strip() or None
+                file_unique_id = (row.get("doc_file_unique_id") or "").strip() or None
+                mime_type = (row.get("doc_mime_type") or "").strip() or None
+                local_path = (row.get("doc_local_path") or "").strip() or None
+
+                # Если file_id отсутствует, но есть локальный файл — пере-зальём в TG и обновим file_id
+                if (not file_id) and local_path and Path(local_path).exists():
+                    target_chat_id = update.effective_user.id if update.effective_user else update.effective_chat.id
+                    try:
+                        with open(local_path, "rb") as f:
+                            msg = await context.bot.send_document(
+                                chat_id=target_chat_id,
+                                document=f,
+                                caption=f"♻️ Восстановление: {title}",
+                                disable_notification=True,
+                            )
+                        if msg and msg.document:
+                            file_id = msg.document.file_id
+                            file_unique_id = msg.document.file_unique_id
+                            mime_type = msg.document.mime_type
+                    except Forbidden:
+                        # если бот не может в ЛС — отправим в текущий чат
+                        try:
+                            with open(local_path, "rb") as f:
+                                msg = await context.bot.send_document(
+                                    chat_id=update.effective_chat.id,
+                                    document=f,
+                                    caption=f"♻️ Восстановление: {title}",
+                                    disable_notification=True,
+                                )
+                            if msg and msg.document:
+                                file_id = msg.document.file_id
+                                file_unique_id = msg.document.file_unique_id
+                                mime_type = msg.document.mime_type
+                        except Exception as e:
+                            logger.exception("Reupload local doc failed: %s", e)
+                    except Exception as e:
+                        logger.exception("Reupload local doc failed: %s", e)
+
+                if not file_id and not (local_path and Path(local_path).exists()):
+                    skipped_docs += 1
+                    continue
+
+                db_docs_upsert_by_unique(
+                    cid,
+                    title=title,
+                    description=description,
+                    file_id=file_id or "",
+                    file_unique_id=file_unique_id,
+                    mime_type=mime_type,
+                    local_path=local_path,
+                )
+                ok_docs += 1
+                continue
+
+        clear_csv_import(context)
+        await update.message.reply_text(
+            f"✅ Импорт завершён.\n"
+            f"Категории: {ok_cats}\n"
+            f"Документы: {ok_docs} (пропущено без файла: {skipped_docs})\n"
+            f"Анкеты: {ok_profiles}"
+        )
+        return
+
+    # ---------------- DOC ADD FLOW ----------------
+    if not context.chat_data.get(WAITING_DOC_UPLOAD):
         return
 
     if not await is_admin_scoped(update, context):
@@ -1810,12 +3371,25 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     title = (update.message.caption or "").strip() or (doc.file_name or "Документ")
+
+    # локально бэкапим документ (на случай краша/переезда)
+    local_path = None
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        safe_name = (doc.file_name or "document").replace("/", "_")
+        local_path = str(Path(STORAGE_DIR) / "docs" / f"{doc.file_unique_id}_{safe_name}")
+        await tg_file.download_to_drive(custom_path=local_path)
+    except Exception as e:
+        logger.exception("Failed to backup doc locally: %s", e)
+        local_path = None
+
     pending = {
         "file_id": doc.file_id,
         "file_unique_id": doc.file_unique_id,
         "mime": doc.mime_type,
         "title": title[:120],
         "description": None,
+        "local_path": local_path,
     }
     context.chat_data[PENDING_DOC_INFO] = pending
     context.chat_data[WAITING_DOC_UPLOAD] = False
@@ -1828,6 +3402,32 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
         reply_markup=kb_cancel_wizard_settings(),
     )
+
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
+        return
+    if context.user_data.get(BCAST_ACTIVE) and context.user_data.get(BCAST_STEP) == "files":
+        photos = update.message.photo or []
+        if photos:
+            # берём самый большой
+            ph = photos[-1]
+            d = _bcast_get_data(context)
+            d["files"].append({"kind": "photo", "file_id": ph.file_id, "file_unique_id": ph.file_unique_id})
+            context.user_data[BCAST_DATA] = d
+            await update.message.reply_text("✅ Фото добавлено. Можешь добавить ещё или нажми «✅ Отправить».", reply_markup=kb_bcast_files_menu())
+
+async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
+        return
+    if context.user_data.get(BCAST_ACTIVE) and context.user_data.get(BCAST_STEP) == "files":
+        vid = update.message.video
+        if vid:
+            d = _bcast_get_data(context)
+            d["files"].append({"kind": "video", "file_id": vid.file_id, "file_unique_id": vid.file_unique_id})
+            context.user_data[BCAST_DATA] = d
+            await update.message.reply_text("✅ Видео добавлено. Можешь добавить ещё или нажми «✅ Отправить».", reply_markup=kb_bcast_files_menu())
+
 
 # ---------------- HANDLERS: TEXT INPUT (dates / categories / profiles) ----------------
 
@@ -1847,8 +3447,180 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_waiting_date(context)
         clear_docs_flow(context)
         clear_profile_wiz(context)
+        clear_csv_import(context)
+        clear_suggest_flow(context)
+        clear_bcast_flow(context)
         await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
         return
+
+
+    # предложка (в ЛС): ждём текст  # anti-spam
+    if context.user_data.get(WAITING_SUGGESTION_TEXT):
+        # анти-спам: 1 сообщение в 5 минут на человека
+        if user_id:
+            last_ts = db_get_suggest_last_ts(user_id) or 0
+            now_ts = int(time.time())
+            if now_ts - last_ts < 5 * 60:
+                left = 5 * 60 - (now_ts - last_ts)
+                mins = max(1, (left + 59) // 60)
+                await update.message.reply_text(f"⏳ Можно отправлять не чаще 1 раза в 5 минут. Попробуйте через ~{mins} мин.")
+                return
+
+        mode = context.user_data.get(SUGGESTION_MODE, "anon")
+        scope_chat_id = get_scope_chat_id(update, context)
+        if not scope_chat_id:
+            clear_suggest_flow(context)
+            await update.message.reply_text("⚠️ Не вижу, к какому чату привязать предложку. Открой /help в групповом чате ещё раз.")
+            return
+
+        await send_suggestion_to_admins(scope_chat_id, update, context, text, mode)
+
+        if user_id:
+            db_set_suggest_last_ts(user_id, int(time.time()))
+
+        clear_suggest_flow(context)
+        await update.message.reply_text("✅ Спасибо! Передал администраторам 🙌")
+        return
+
+    # рассылка  # bcast attachment (в ЛС админа): шаги тема/текст/файлы
+    if context.user_data.get(BCAST_ACTIVE):
+        step = context.user_data.get(BCAST_STEP)
+        d = _bcast_get_data(context)
+
+        if step == "topic":
+            if text != "-":
+                topic = text.strip()
+                if len(topic) < 2:
+                    await update.message.reply_text("❌ Тема слишком короткая. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
+                    return
+                d["topic"] = topic[:200]
+            else:
+                d["topic"] = None
+
+            context.user_data[BCAST_DATA] = d
+            context.user_data[BCAST_STEP] = "text"
+            await update.message.reply_text(
+                "Шаг 2/3: <b>Текст рассылки</b> 📝\n"
+                "Отправьте текст одним сообщением.\n"
+                "Если текст не нужен — отправьте <code>-</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if step == "text":
+            if text != "-":
+                body = text.strip()
+                if len(body) < 2:
+                    await update.message.reply_text("❌ Текст слишком короткий. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
+                    return
+                # лимит Telegram ~4096, оставим запас
+                d["text"] = body[:3500]
+            else:
+                d["text"] = None
+
+            context.user_data[BCAST_DATA] = d
+            context.user_data[BCAST_STEP] = "files"
+            await update.message.reply_text(
+                "Шаг 3/3: <b>Файлы</b> 📎\n\n"
+                "Можешь прикрепить <b>документы / фото / видео</b> (сколько нужно).\n"
+                "Когда закончишь — нажми <b>✅ Отправить</b>.\n"
+                "Можно без файлов 🙂",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_bcast_files_menu(),
+            )
+            return
+
+        # step == files -> ждём вложения или кнопку "Отправить"
+        return
+
+    # ачивки — выдача
+    if context.chat_data.get(ACH_WIZ_ACTIVE):
+        if not await is_admin_scoped(update, context):
+            clear_ach_wiz(context)
+            await update.message.reply_text("❌ Только администраторы могут выдавать ачивки.")
+            return
+
+        step = context.chat_data.get(ACH_WIZ_STEP)
+        d = context.chat_data.get(ACH_WIZ_DATA) or {}
+
+        if step == "emoji":
+            emoji = text.strip()
+            if len(emoji) < 1 or len(emoji) > 16:
+                await update.message.reply_text("❌ Отправьте один эмодзи (или короткую связку). Пример: 🏅")
+                return
+            d["emoji"] = emoji
+            context.chat_data[ACH_WIZ_DATA] = d
+            context.chat_data[ACH_WIZ_STEP] = "title"
+            await update.message.reply_text(
+                "Шаг 3/4: отправьте <b>название ачивки</b> (будет жирным).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if step == "title":
+            title = text.strip()
+            if len(title) < 2:
+                await update.message.reply_text("❌ Слишком коротко. Напишите название ачивки.")
+                return
+            d["title"] = title[:80]
+            context.chat_data[ACH_WIZ_DATA] = d
+            context.chat_data[ACH_WIZ_STEP] = "description"
+            await update.message.reply_text(
+                "Шаг 4/4: напишите <b>описание</b> — за что выдаётся ачивка 🙂",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if step == "description":
+            desc = text.strip()
+            if len(desc) < 3:
+                await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
+                return
+            d["description"] = desc[:600]
+
+            pid = d.get("profile_id")
+            if not pid:
+                clear_ach_wiz(context)
+                await update.message.reply_text("❌ Не выбран сотрудник. Начните заново через /help → Настройки → Ачивки.")
+                return
+
+            admin_id = update.effective_user.id if update.effective_user else None
+            db_achievement_award_add(int(pid), d.get("emoji", "🏆"), d.get("title", "Ачивка"), d.get("description", ""), admin_id)
+
+            scope_chat_id = get_scope_chat_id(update, context)
+            mention = normalize_tg_mention(d.get("tg_link", "") or "")
+            who = mention if mention else f"<b>{escape(d.get('full_name', 'Сотрудник'))}</b>"
+            msg = (
+                f"🎉 <b>Поздравляем, {who}!</b>\n\n"
+                f"В твой профиль добавлена новая ачивка: <b>{escape(d.get('emoji', '🏆'))} {escape(d.get('title', 'Ачивка'))}</b>\n\n"
+                f"Достижение получено за: «{escape(d.get('description', ''))}»\n\n"
+                f"Так держать! 🚀🔥\n\n"
+                f"Посмотреть можно в /help"
+            )
+
+            sent = False
+            if scope_chat_id:
+                try:
+                    await context.bot.send_message(chat_id=scope_chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                    sent = True
+                except Exception as e:
+                    logger.exception("Cannot send achievement notify to scope chat: %s", e)
+
+            if not sent:
+                for chat_id in db_list_chats():
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                        sent = True
+                        break
+                    except Exception:
+                        pass
+
+            clear_ach_wiz(context)
+            await update.message.reply_text("✅ Ачивка выдана и опубликована в чате.", reply_markup=kb_help_settings())
+            return
 
     # описание документа
     if context.chat_data.get(WAITING_DOC_DESC):
@@ -1934,7 +3706,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending = context.chat_data.get(PENDING_DOC_INFO)
         if pending:
-            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"))
+            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
             clear_docs_flow(context)
             await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
             return
@@ -2068,24 +3840,241 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).", reply_markup=kb_help_settings())
             return
 
+
+
+# ---------------- SUGGEST BOX ----------------
+
+async def send_suggestion_to_admins(scope_chat_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str, mode: str) -> tuple[int, int]:
+    """Отправляет сообщение всем админам чата (кроме ботов). Возвращает (sent_ok, sent_fail)."""
+    sent_ok = 0
+    sent_fail = 0
+
+    user = update.effective_user
+    user_name = (user.full_name if user else "Неизвестный пользователь")
+    username = ("@" + user.username) if (user and user.username) else ""
+    user_id = user.id if user else 0
+
+    try:
+        chat = await context.bot.get_chat(scope_chat_id)
+        chat_title = chat.title or str(scope_chat_id)
+    except Exception:
+        chat_title = str(scope_chat_id)
+
+    mode_label = "🕵️ Анонимно" if mode == "anon" else "🙋 Не анонимно"
+
+    admin_text = (
+        f"💡 <b>Предложка</b> ({mode_label})\n"
+        f"Чат: <b>{chat_title}</b> (<code>{scope_chat_id}</code>)\n"
+        f"От: <b>{user_name}</b> {username} (<code>{user_id}</code>)\n\n"
+        f"Сообщение:\n{message_text}"
+    )
+
+    try:
+        admins = await context.bot.get_chat_administrators(scope_chat_id)
+    except Exception as e:
+        logger.exception("get_chat_administrators failed: %s", e)
+        return (0, 0)
+
+    for a in admins:
+        try:
+            if getattr(a.user, "is_bot", False):
+                continue
+            await context.bot.send_message(
+                chat_id=a.user.id,
+                text=admin_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            sent_ok += 1
+        except Forbidden:
+            sent_fail += 1
+        except Exception:
+            sent_fail += 1
+
+    return (sent_ok, sent_fail)
+
+
+
+# ---------------- BROADCAST ----------------
+
+def _bcast_get_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    data = context.user_data.get(BCAST_DATA)
+    if not isinstance(data, dict):
+        data = {"topic": None, "text": None, "files": []}
+        context.user_data[BCAST_DATA] = data
+    if "files" not in data or not isinstance(data.get("files"), list):
+        data["files"] = []
+    return data
+
+def _bcast_compose_message(topic: str | None, body: str | None) -> str:
+    topic = (topic or "").strip()
+    body = (body or "").strip()
+    # Экрануем пользовательский ввод для HTML
+    topic_esc = escape(topic) if topic else ""
+    body_esc = escape(body) if body else ""
+    if topic_esc and body_esc:
+        return f"<b>{topic_esc}</b>\n\n{body_esc}"
+    if topic_esc:
+        return f"<b>{topic_esc}</b>"
+    return body_esc
+
+async def broadcast_to_chats(context: ContextTypes.DEFAULT_TYPE, message_html: str, files: list[dict]) -> tuple[int, int]:
+    """Рассылка в notify_chats. Возвращает (ok, fail).
+
+    Формат отправки:
+      A) нет файлов -> одно текстовое сообщение
+      B) ровно 1 файл (document/photo/video) -> одно сообщение с caption
+      C) несколько файлов и ВСЕ photo/video -> media_group, caption у первого
+      D) иначе -> текст отдельным + файлы по одному (fallback)
+    """
+    ok = 0
+    fail = 0
+
+    # caption лимиты у Telegram ~1024; оставим запас
+    def cap(text: str) -> str:
+        if not text:
+            return ""
+        return text[:900]
+
+    chat_ids = db_list_chats()
+    files = files or []
+
+    for cid in chat_ids:
+        try:
+            # A) только текст
+            if not files:
+                if message_html:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text=message_html,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                ok += 1
+                continue
+
+            # B) один файл -> caption в это же сообщение
+            if len(files) == 1:
+                f0 = files[0]
+                kind = f0.get("kind")
+                file_id = f0.get("file_id")
+                caption = cap(message_html)
+
+                if kind == "document":
+                    await context.bot.send_document(
+                        chat_id=cid,
+                        document=file_id,
+                        caption=caption or None,
+                        parse_mode=ParseMode.HTML if caption else None,
+                    )
+                elif kind == "photo":
+                    await context.bot.send_photo(
+                        chat_id=cid,
+                        photo=file_id,
+                        caption=caption or None,
+                        parse_mode=ParseMode.HTML if caption else None,
+                    )
+                elif kind == "video":
+                    await context.bot.send_video(
+                        chat_id=cid,
+                        video=file_id,
+                        caption=caption or None,
+                        parse_mode=ParseMode.HTML if caption else None,
+                    )
+                else:
+                    # неизвестный тип -> fallback: текст + файл как документ
+                    if message_html:
+                        await context.bot.send_message(
+                            chat_id=cid,
+                            text=message_html,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                    if file_id:
+                        await context.bot.send_document(chat_id=cid, document=file_id)
+                ok += 1
+                continue
+
+            # C) несколько и все фото/видео -> media_group
+            all_media = all((x.get("kind") in ("photo", "video")) for x in files)
+            if all_media:
+                media = []
+                caption = cap(message_html)
+                for i, f0 in enumerate(files[:10]):  # лимит TG на альбом 10
+                    kind = f0.get("kind")
+                    file_id = f0.get("file_id")
+                    if not file_id:
+                        continue
+                    if kind == "photo":
+                        media.append(
+                            InputMediaPhoto(
+                                media=file_id,
+                                caption=(caption if i == 0 and caption else None),
+                                parse_mode=(ParseMode.HTML if i == 0 and caption else None),
+                            )
+                        )
+                    else:
+                        media.append(
+                            InputMediaVideo(
+                                media=file_id,
+                                caption=(caption if i == 0 and caption else None),
+                                parse_mode=(ParseMode.HTML if i == 0 and caption else None),
+                            )
+                        )
+
+                if media:
+                    await context.bot.send_media_group(chat_id=cid, media=media)
+                    ok += 1
+                    continue
+
+            # D) fallback: текст отдельно + файлы по одному
+            if message_html:
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=message_html,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            for f0 in files:
+                kind = f0.get("kind")
+                file_id = f0.get("file_id")
+                if not file_id:
+                    continue
+                if kind == "document":
+                    await context.bot.send_document(chat_id=cid, document=file_id)
+                elif kind == "photo":
+                    await context.bot.send_photo(chat_id=cid, photo=file_id)
+                elif kind == "video":
+                    await context.bot.send_video(chat_id=cid, video=file_id)
+            ok += 1
+        except Exception as e:
+            logger.exception("Broadcast failed to %s: %s", cid, e)
+            fail += 1
+
+    return ok, fail
+
 # ---------------- APP ----------------
 
 def main():
     ensure_db_path(DB_PATH)
+    ensure_storage_dir(STORAGE_DIR)
     db_init()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    request = HTTPXRequest(connect_timeout=15, read_timeout=30, write_timeout=30, pool_timeout=30)
+
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     # commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("horo", cmd_horo))
     app.add_handler(CommandHandler("setchat", cmd_setchat))
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
     app.add_handler(CommandHandler("force_standup", cmd_force_standup))
     app.add_handler(CommandHandler("test_industry", cmd_test_industry))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("export_csv", cmd_export_csv))
+    app.add_handler(CommandHandler("import_csv", cmd_import_csv))
 
     # callbacks: meetings
     app.add_handler(CallbackQueryHandler(cb_cancel_open, pattern=r"^cancel:open:(standup|industry)$"))
@@ -2098,8 +4087,15 @@ def main():
     # callbacks: help
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
 
+    # new members welcome
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+
     # document upload
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+
+    # broadcast media (photo/video)
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.VIDEO, on_video))
 
     # text input
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
