@@ -22,7 +22,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ParseMode
 from telegram.error import Forbidden, TimedOut, NetworkError
 from telegram.helpers import escape
 from telegram.ext import (
@@ -31,7 +31,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
-    TypeHandler,
     filters,
 )
 
@@ -94,15 +93,6 @@ ZODIAC = [
     ("pisces", "♓ Рыбы"),
 ]
 ZODIAC_NAME = {slug: title for slug, title in ZODIAC}
-
-# ------- MEMES: канал-источник -------
-MEME_CHANNEL_ID = -1003761916249
-
-
-def kb_horo_actions():
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton('Мой персональный мем 😂', callback_data='meme:get')]]
-    )
 
 
 def kb_horo_signs():
@@ -419,25 +409,6 @@ def db_init():
         )
     """)
 
-    # ------- MEMES: пул мемов из канала + rate-limit (1 раз в день) -------
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS memes_pool (
-            file_id TEXT PRIMARY KEY,
-            added_at TEXT NOT NULL,
-            source_chat_id INTEGER NOT NULL,
-            used INTEGER NOT NULL DEFAULT 0,
-            used_by INTEGER,
-            used_date TEXT
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS meme_rate (
-            user_id INTEGER PRIMARY KEY,
-            last_date TEXT NOT NULL
-        )
-    """)
-
     # ------- HELP MENU: документы -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS doc_categories (
@@ -596,39 +567,6 @@ def db_horo_set_user_sign(user_id: int, sign_slug: str):
     con.commit()
     con.close()
 
-
-# ---------------- MEMES DB ----------------
-def db_get_meme_last_date(user_id: int) -> str | None:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT last_date FROM meme_rate WHERE user_id=?", (int(user_id),))
-    row = cur.fetchone()
-    con.close()
-    return row[0] if row else None
-
-def db_set_meme_last_date(user_id: int, date_iso: str):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """INSERT INTO meme_rate(user_id, last_date) VALUES(?, ?)
-           ON CONFLICT(user_id) DO UPDATE SET last_date=excluded.last_date""",
-        (int(user_id), date_iso),
-    )
-    con.commit()
-    con.close()
-
-def db_meme_add(file_id: str, source_chat_id: int) -> bool:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """INSERT OR IGNORE INTO memes_pool(file_id, added_at, source_chat_id, used)
-           VALUES(?, ?, ?, 0)""",
-        (file_id, datetime.now(MOSCOW_TZ).isoformat(timespec='seconds'), int(source_chat_id)),
-    )
-    inserted = (cur.rowcount or 0) > 0
-    con.commit()
-    con.close()
-    return inserted
 
 def db_add_chat(chat_id: int):
     con = sqlite3.connect(DB_PATH)
@@ -1924,7 +1862,6 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
         text=msg,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
-        reply_markup=kb_horo_actions(),
     )
 
     db_set_horo_last_date(user_id, today_iso)
@@ -2016,62 +1953,14 @@ async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-
-async def _process_horo_sign_choice(user_id: int, sign_slug: str, context: ContextTypes.DEFAULT_TYPE,
-                                    msg_chat_id: int | None, msg_id: int | None):
-    """Runs in background: fetches & sends horoscope, then removes the sign-chooser message."""
-    try:
-        # Optional: show "typing" to make it feel responsive
-        try:
-            await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
-        except Exception:
-            pass
-
-        await _send_horo_dm(user_id, sign_slug, context)
-
-        # Remove the chooser message (in private chat) if we have it
-        if msg_chat_id is not None and msg_id is not None:
-            try:
-                await context.bot.delete_message(chat_id=msg_chat_id, message_id=msg_id)
-            except Exception:
-                # If can't delete, at least remove buttons
-                try:
-                    await context.bot.edit_message_reply_markup(chat_id=msg_chat_id, message_id=msg_id, reply_markup=None)
-                except Exception:
-                    pass
-
-    except Forbidden:
-        # User closed DMs (should be rare because buttons are in DM), but handle gracefully.
-        bot_username = (context.bot.username or "blablabird_bot")
-        warn = (
-            "⚠️ Я не могу написать вам в ЛС.\n"
-            f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
-            "после этого снова введите /horo."
-        )
-        try:
-            # If we have a message context, edit it with warning; otherwise ignore.
-            if msg_chat_id is not None and msg_id is not None:
-                await context.bot.edit_message_text(chat_id=msg_chat_id, message_id=msg_id, text=warn)
-        except Exception:
-            pass
-
-    except Exception as e:
-        logger.exception("Failed to send horoscope after sign choice: user_id=%s sign=%s", user_id, sign_slug)
-        try:
-            await context.bot.send_message(chat_id=user_id, text="Не удалось получить гороскоп 😕 Попробуйте чуть позже.")
-        except Exception:
-            pass
-
-
 async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.data:
         return
 
-    # Always answer quickly to avoid Telegram "loading" forever
     try:
-        await q.answer("Секунду…")
-    except Exception:
+        await q.answer()
+    except (TimedOut, NetworkError):
         pass
 
     parts = q.data.split(":")
@@ -2082,7 +1971,7 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sign_slug not in ZODIAC_NAME:
         try:
             await q.answer("Не понял знак 🤔", show_alert=True)
-        except Exception:
+        except (TimedOut, NetworkError):
             pass
         return
 
@@ -2091,18 +1980,31 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = user.id
 
-    # Save choice
     db_horo_set_user_sign(user_id, sign_slug)
 
-    # Run sending in background so callback returns instantly
-    msg_chat_id = q.message.chat_id if q.message else None
-    msg_id = q.message.message_id if q.message else None
-
     try:
-        context.application.create_task(_process_horo_sign_choice(user_id, sign_slug, context, msg_chat_id, msg_id))
-    except Exception:
-        # Fallback if create_task not available
-        await _process_horo_sign_choice(user_id, sign_slug, context, msg_chat_id, msg_id)
+        await _send_horo_dm(user_id, sign_slug, context)
+        # убираем клавиатуру/сообщение выбора — без лишних подтверждений
+        try:
+            if q.message:
+                await context.bot.delete_message(chat_id=q.message.chat_id, message_id=q.message.message_id)
+        except Exception:
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+    except Forbidden:
+        bot_username = (context.bot.username or "blablabird_bot")
+        warn = (
+            "⚠️ Я не могу написать вам в ЛС.\n"
+            f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
+            "после этого снова введите /horo."
+        )
+        try:
+            await q.edit_message_text(warn, disable_web_page_preview=True)
+        except Exception:
+            pass
 
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4634,52 +4536,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ---------------- APP ----------------
 
-
-
-async def on_meme_channel_post_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохраняем мемы (фото) из заданного канала в пул."""
-    post = update.channel_post
-    if not post or not post.chat:
-        return
-    if int(post.chat_id) != int(MEME_CHANNEL_ID):
-        return
-    if not post.photo:
-        return
-    file_id = post.photo[-1].file_id
-    logger.info(f"MEME CHANNEL: received photo post_id={post.message_id} file_id={file_id} media_group={post.media_group_id}")
-    inserted = db_meme_add(file_id=file_id, source_chat_id=post.chat_id)
-    logger.info(f"MEME CHANNEL: stored={inserted} file_id={file_id}")
-
-
-async def cb_meme(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or not q.data:
-        return
-    if q.data != 'meme:get':
-        return
-    try:
-        await q.answer()
-    except (TimedOut, NetworkError):
-        pass
-    user = update.effective_user
-    if not user:
-        return
-    user_id = user.id
-    today_iso = datetime.now(MOSCOW_TZ).date().isoformat()
-    if db_get_meme_last_date(user_id) == today_iso:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text='Звёзды любят работать, но поработай и ты. Давай завтра 😂',
-        )
-        return
-    file_id = db_meme_claim_random(user_id=user_id, date_iso=today_iso)
-    if not file_id:
-        await context.bot.send_message(chat_id=user_id, text='Мемы закончились — я уже всё раздал 😅')
-        return
-    await context.bot.send_photo(chat_id=user_id, photo=file_id)
-    db_set_meme_last_date(user_id, today_iso)
-
-
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
@@ -4696,13 +4552,6 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("horo", cmd_horo))
-
-    # callbacks: meme button under horoscope
-    app.add_handler(CallbackQueryHandler(cb_meme, pattern=r"^meme:get$"))
-
-    # channel memes intake
-    app.add_handler(TypeHandler(Update, on_meme_channel_post_update))
-
     app.add_handler(CommandHandler("setchat", cmd_setchat))
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
     app.add_handler(CommandHandler("force_standup", cmd_force_standup))
