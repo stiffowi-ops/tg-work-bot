@@ -9,13 +9,6 @@ import io
 import zipfile
 import html as html_lib
 import httpx
-from urllib.parse import quote_plus
-
-# optional: local meme rendering
-try:
-    from PIL import Image, ImageDraw, ImageFont
-except Exception:
-    Image = ImageDraw = ImageFont = None
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
@@ -38,6 +31,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
+    ChannelPostHandler,
     filters,
 )
 
@@ -101,117 +95,14 @@ ZODIAC = [
 ]
 ZODIAC_NAME = {slug: title for slug, title in ZODIAC}
 
+# ------- MEMES: канал-источник -------
+MEME_CHANNEL_ID = -1003761916249
 
-MEME_BUTTON_TEXT = "Мой персональный мем 😂"
 
-# Короткие "мемные" подписи по знакам (русский). Это текст, который попадёт на картинку.
-MEME_LINES = {
-    "aries": ("Овен сегодня:", "СДЕЛАТЬ. СЕЙЧАС."),
-    "taurus": ("Телец сегодня:", "ХОЧУ СЧАСТЬЕ.\n*НО ПРИДЁТСЯ РАБОТАТЬ*"),
-    "gemini": ("Близнецы сегодня:", "МЫСЛИ: 1000/сек.\nДЕЛА: ...потом"),
-    "cancer": ("Рак сегодня:", "ВСЕХ ОБНЯЛ.\nПЕРЕЖИВАЮ ДАЛЬШЕ"),
-    "leo": ("Лев сегодня:", "СИЯЮ.\nПОТОМ ЕЩЁ СИЯЮ."),
-    "virgo": ("Дева сегодня:", "ПЫТАЮСЬ РАССЛАБИТЬСЯ...\n*ОТКРЫВАЮ СПИСОК ДЕЛ*"),
-    "libra": ("Весы сегодня:", "ВЫБОР: ДА/НЕТ.\nРЕШЕНИЕ: ПОДУМАЮ ЕЩЁ"),
-    "scorpio": ("Скорпион сегодня:", "ВСЁ ПОД КОНТРОЛЕМ.\n*И ДА, ТЫ ТОЖЕ*"),
-    "sagittarius": ("Стрелец сегодня:", "ПЛАН:\nУЕХАТЬ В ПРИКЛЮЧЕНИЯ"),
-    "capricorn": ("Козерог сегодня:", "СПОКОЙНО.\nСИСТЕМНО.\nПО ПЛАНУ."),
-    "aquarius": ("Водолей сегодня:", "ИДЕЯ ЕСТЬ.\nОБЪЯСНЯТЬ НЕ БУДУ."),
-    "pisces": ("Рыбы сегодня:", "ЭМОЦИИ: ДА.\nРЕАЛЬНОСТЬ: ...тоже да"),
-}
-
-def kb_horo_meme(sign_slug: str) -> InlineKeyboardMarkup:
+def kb_horo_actions():
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(MEME_BUTTON_TEXT, callback_data=f"horo:meme:{sign_slug}")]]
+        [[InlineKeyboardButton('Мой персональный мем 😂', callback_data='meme:get')]]
     )
-
-def _pick_meme_text(sign_slug: str, user_name: str | None = None) -> str:
-    top, bottom = MEME_LINES.get(sign_slug, ("Сегодня:", "ну вы поняли"))
-    if user_name:
-        top = f"{user_name}, {top.lower()}"
-    return f"{top}\n{bottom}"
-
-async def send_personal_meme_dm(
-    user_id: int,
-    sign_slug: str,
-    user_name: str | None,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    """Отправляет картинку-мем в ЛС. Если Pillow недоступен — шлёт через cataas."""
-    meme_text = _pick_meme_text(sign_slug, user_name)
-
-    # 1) Пытаемся отрисовать локально (Pillow)
-    if Image is not None:
-        try:
-            W, H = 900, 600
-            img = Image.new("RGB", (W, H), color=(245, 245, 245))
-            draw = ImageDraw.Draw(img)
-
-            font_paths = [
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            ]
-            font = None
-            for fp in font_paths:
-                if os.path.exists(fp):
-                    try:
-                        font = ImageFont.truetype(fp, 44)
-                        break
-                    except Exception:
-                        pass
-            if font is None:
-                font = ImageFont.load_default()
-
-            def wrap_lines(text: str, max_chars: int = 22):
-                out = []
-                for part in text.split("\n"):
-                    part = part.strip()
-                    while len(part) > max_chars:
-                        out.append(part[:max_chars])
-                        part = part[max_chars:]
-                    if part:
-                        out.append(part)
-                return out
-
-            lines = wrap_lines(meme_text)
-            y = 70
-            for line in lines:
-                bbox = draw.textbbox((0, 0), line, font=font)
-                tw = bbox[2] - bbox[0]
-                x = (W - tw) // 2
-                for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
-                    draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0))
-                draw.text((x, y), line, font=font, fill=(20, 20, 20))
-                y += 70
-
-            small = (
-                ImageFont.truetype(font_paths[0], 24)
-                if os.path.exists(font_paths[0])
-                else ImageFont.load_default()
-            )
-            footer = "© meetings-bot"
-            bbox = draw.textbbox((0, 0), footer, font=small)
-            draw.text(
-                (W - (bbox[2] - bbox[0]) - 20, H - 40),
-                footer,
-                font=small,
-                fill=(120, 120, 120),
-            )
-
-            buf = io.BytesIO()
-            buf.name = "meme.jpg"
-            img.save(buf, format="JPEG", quality=92)
-            buf.seek(0)
-
-            await context.bot.send_photo(chat_id=user_id, photo=buf)
-            return
-        except Exception:
-            pass
-
-    # 2) fallback: внешний генератор
-    safe = quote_plus(meme_text)
-    url = f"https://cataas.com/cat/says/{safe}?fontSize=50&fontColor=white&fontBackground=black"
-    await context.bot.send_photo(chat_id=user_id, photo=url)
 
 
 def kb_horo_signs():
@@ -528,6 +419,25 @@ def db_init():
         )
     """)
 
+    # ------- MEMES: пул мемов из канала + rate-limit (1 раз в день) -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS memes_pool (
+            file_id TEXT PRIMARY KEY,
+            added_at TEXT NOT NULL,
+            source_chat_id INTEGER NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            used_by INTEGER,
+            used_date TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS meme_rate (
+            user_id INTEGER PRIMARY KEY,
+            last_date TEXT NOT NULL
+        )
+    """)
+
     # ------- HELP MENU: документы -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS doc_categories (
@@ -685,6 +595,73 @@ def db_horo_set_user_sign(user_id: int, sign_slug: str):
     )
     con.commit()
     con.close()
+
+
+# ---------------- MEMES DB ----------------
+def db_get_meme_last_date(user_id: int) -> str | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT last_date FROM meme_rate WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone()
+    con.close()
+    return row[0] if row else None
+
+def db_set_meme_last_date(user_id: int, date_iso: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """INSERT INTO meme_rate(user_id, last_date) VALUES(?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET last_date=excluded.last_date""",
+        (int(user_id), date_iso),
+    )
+    con.commit()
+    con.close()
+
+def db_meme_add(file_id: str, source_chat_id: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """INSERT OR IGNORE INTO memes_pool(file_id, added_at, source_chat_id, used)
+           VALUES(?, ?, ?, 0)""",
+        (file_id, datetime.now(MOSCOW_TZ).isoformat(timespec='seconds'), int(source_chat_id)),
+    )
+    con.commit()
+    con.close()
+
+def db_meme_claim_random(user_id: int, date_iso: str) -> str | None:
+    """Атомарно забирает один неиспользованный мем и помечает как использованный.
+    Требование: один мем нельзя отправить двум пользователям.
+    """
+    for _ in range(5):
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        try:
+            cur.execute('BEGIN IMMEDIATE')
+            cur.execute('SELECT file_id FROM memes_pool WHERE used=0 ORDER BY RANDOM() LIMIT 1')
+            row = cur.fetchone()
+            if not row:
+                con.commit(); con.close(); return None
+            file_id = row[0]
+            cur.execute(
+                """UPDATE memes_pool
+                   SET used=1, used_by=?, used_date=?
+                   WHERE file_id=? AND used=0""",
+                (int(user_id), date_iso, file_id),
+            )
+            if cur.rowcount == 1:
+                con.commit(); con.close(); return file_id
+            con.commit()
+        except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+    return None
 
 
 def db_add_chat(chat_id: int):
@@ -1981,7 +1958,7 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
         text=msg,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
-        reply_markup=kb_horo_meme(sign_slug),
+        reply_markup=kb_horo_actions(),
     )
 
     db_set_horo_last_date(user_id, today_iso)
@@ -2084,15 +2061,10 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     parts = q.data.split(":")
-    if len(parts) != 3 or parts[0] != "horo":
+    if len(parts) != 3 or parts[0] != "horo" or parts[1] != "sign":
         return
 
-    action = parts[1].strip()
     sign_slug = parts[2].strip()
-
-    if action not in ("sign", "meme"):
-        return
-
     if sign_slug not in ZODIAC_NAME:
         try:
             await q.answer("Не понял знак 🤔", show_alert=True)
@@ -2104,13 +2076,6 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
     user_id = user.id
-
-    if action == "meme":
-        try:
-            await send_personal_meme_dm(user_id, sign_slug, user.first_name, context)
-        except Forbidden:
-            pass
-        return
 
     db_horo_set_user_sign(user_id, sign_slug)
 
@@ -4668,6 +4633,50 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ---------------- APP ----------------
 
+
+
+async def on_meme_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняем мемы (фото) из заданного канала в пул."""
+    post = update.channel_post
+    if not post or not post.chat:
+        return
+    if int(post.chat_id) != int(MEME_CHANNEL_ID):
+        return
+    if not post.photo:
+        return
+    file_id = post.photo[-1].file_id
+    db_meme_add(file_id=file_id, source_chat_id=post.chat_id)
+
+
+async def cb_meme(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    if q.data != 'meme:get':
+        return
+    try:
+        await q.answer()
+    except (TimedOut, NetworkError):
+        pass
+    user = update.effective_user
+    if not user:
+        return
+    user_id = user.id
+    today_iso = datetime.now(MOSCOW_TZ).date().isoformat()
+    if db_get_meme_last_date(user_id) == today_iso:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text='Звёзды любят работать, но поработай и ты. Давай завтра 😂',
+        )
+        return
+    file_id = db_meme_claim_random(user_id=user_id, date_iso=today_iso)
+    if not file_id:
+        await context.bot.send_message(chat_id=user_id, text='Мемы закончились — я уже всё раздал 😅')
+        return
+    await context.bot.send_photo(chat_id=user_id, photo=file_id)
+    db_set_meme_last_date(user_id, today_iso)
+
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
@@ -4684,6 +4693,13 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("horo", cmd_horo))
+
+    # callbacks: meme button under horoscope
+    app.add_handler(CallbackQueryHandler(cb_meme, pattern=r"^meme:get$"))
+
+    # channel memes intake
+    app.add_handler(ChannelPostHandler(on_meme_channel_post, filters=filters.Chat(MEME_CHANNEL_ID) & filters.PHOTO))
+
     app.add_handler(CommandHandler("setchat", cmd_setchat))
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
     app.add_handler(CommandHandler("force_standup", cmd_force_standup))
