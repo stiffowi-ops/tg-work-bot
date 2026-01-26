@@ -31,6 +31,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -4634,7 +4635,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 
-async def on_meme_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_meme_channel_post_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняем мемы (фото) из заданного канала в пул."""
     post = update.channel_post
     if not post or not post.chat:
@@ -4697,7 +4698,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_meme, pattern=r"^meme:get$"))
 
     # channel memes intake
-    app.add_handler(MessageHandler(filters.Chat(MEME_CHANNEL_ID) & filters.PHOTO & filters.ChatType.CHANNEL, on_meme_channel_post))
+    app.add_handler(TypeHandler(Update, on_meme_channel_post_update))
 
     app.add_handler(CommandHandler("setchat", cmd_setchat))
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
