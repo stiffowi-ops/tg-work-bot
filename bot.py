@@ -9,6 +9,7 @@ import io
 import zipfile
 import html as html_lib
 import httpx
+from bs4 import BeautifulSoup
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
@@ -96,14 +97,21 @@ ZODIAC_NAME = {slug: title for slug, title in ZODIAC}
 
 
 def kb_horo_signs():
+    # Инвертированная "пирамида": сверху более длинные названия, ниже — короче
+    # (широкая верхушка -> узкое основание)
+    layout = [
+        ["sagittarius", "capricorn", "scorpio", "aquarius"],  # самые длинные
+        ["gemini", "taurus", "pisces"],                       # средние
+        ["virgo", "cancer", "libra"],                         # короче
+        ["aries", "leo"],                                     # самые короткие
+    ]
+
     rows = []
-    row = []
-    for slug, title in ZODIAC:
-        row.append(InlineKeyboardButton(title, callback_data=f"horo:sign:{slug}"))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
+    for slugs in layout:
+        row = [
+            InlineKeyboardButton(ZODIAC_NAME[slug], callback_data=f"horo:sign:{slug}")
+            for slug in slugs
+        ]
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
@@ -132,8 +140,10 @@ def zodiac_from_ddmm(ddmm: str) -> str | None:
     return None
 
 
-async def fetch_rambler_horo(sign_slug: str) -> tuple[str, str | None, str | None]:
-    """return: (horo_text, date_str, author_str)"""
+async def fetch_rambler_horo(sign_slug: str) -> tuple[str, str | None]:
+    """Парсит гороскоп на сегодня (RU) с horoscopes.rambler.ru.
+    Возвращает: (текст_гороскопа, дата_строкой_если_найдена)
+    """
     url = f"https://horoscopes.rambler.ru/{sign_slug}/"
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; meetings-bot/1.0)",
@@ -145,55 +155,48 @@ async def fetch_rambler_horo(sign_slug: str) -> tuple[str, str | None, str | Non
         r.raise_for_status()
         html = r.text
 
-    html = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
-    html = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", html)
+    soup = BeautifulSoup(html, "html.parser")
 
-    flat = re.sub(r"(?is)<[^>]+>", " ", html)
-    flat = html_lib.unescape(flat)
-    flat = re.sub(r"\s+", " ", flat).strip()
-
-    sign_title = ZODIAC_NAME.get(sign_slug, sign_slug)
-    sign_title_clean = re.sub(r"[^\wА-Яа-яЁё\- ]+", "", sign_title).strip()
-
-    anchor = f"Гороскоп на сегодня — {sign_title_clean}"
-    idx = flat.find(anchor)
-    if idx == -1:
-        m = re.search(rf"Гороскоп на сегодня\s*[—-]\s*{re.escape(sign_title_clean)}", flat)
-        idx = m.start() if m else -1
-    if idx == -1:
-        raise RuntimeError("Не смог найти якорь гороскопа на странице")
-
-    tail = flat[idx:]
-
-    date_m = re.search(r"\b\d{1,2}\s+[А-Яа-яЁё]+\s+\d{4}\b", tail)
+    # Дата (на странице обычно есть строка вида "26 января 2026")
+    page_text = soup.get_text(" ", strip=True)
+    date_m = re.search(r"\b\d{1,2}\s+[А-Яа-яЁё]+\s+\d{4}\b", page_text)
     date_str = date_m.group(0) if date_m else None
 
-    cut = tail
-    if date_m:
-        cut = tail[:date_m.start()].strip()
+    # Тело (стараемся взять абзацы из article/main)
+    container = soup.find("article") or soup.find("main") or soup
+    ps = [p.get_text(" ", strip=True) for p in container.find_all("p")]
 
-    cut = re.sub(r"\bВчера\b.*?\b(Сегодня|Завтра)\b", " ", cut)
-    cut = re.sub(r"\s+", " ", cut).strip()
+    # Фильтруем мусорные/короткие
+    def looks_like_horo(s: str) -> bool:
+        if not s:
+            return False
+        if len(s) < 60:
+            return False
+        if not re.search(r"[А-Яа-яЁё]", s):
+            return False
+        bad = ("Нравится", "Поделиться", "Следующая неделя", "Неделя", "Месяц", "Январь", "Февраль",
+               "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
+        # если это чисто навигация
+        if any(s.strip() == b for b in bad):
+            return False
+        return True
 
-    mhead = re.search(rf"^Гороскоп на сегодня\s*[—-]\s*{re.escape(sign_title_clean)}\s*", cut)
-    if mhead:
-        cut = cut[mhead.end():].strip()
+    candidates = [p for p in ps if looks_like_horo(p)]
 
-    author_str = None
-    if date_m:
-        after = tail[date_m.end():].strip()
-        m_auth = re.match(r"^([А-ЯЁ][А-Яа-яЁё]+(?:\s+[А-ЯЁ][А-Яа-яЁё]+){0,3})\b", after)
-        if m_auth:
-            author_str = m_auth.group(1)
+    if not candidates:
+        # fallback: попробуем вытащить самый длинный "похожий на русский" кусок
+        candidates = [p for p in ps if re.search(r"[А-Яа-яЁё]", p)]
+        if not candidates:
+            raise RuntimeError("Не удалось извлечь текст гороскопа")
 
-    horo_text = cut.strip()
-    if not horo_text:
-        raise RuntimeError("Пустой текст гороскопа после парсинга")
+    horo_text = max(candidates, key=len).strip()
 
-    return horo_text, date_str, author_str
+    # Финальная чистка на случай, если в абзац попали кнопки/ярлыки
+    horo_text = re.sub(r"\b(Нравится|Поделиться)\b.*$", "", horo_text).strip()
+    horo_text = re.sub(r"\s+", " ", horo_text).strip()
 
+    return horo_text, date_str
 
-# ---------------- DB PATH ENSURE ----------------
 
 def ensure_db_path(db_path: str):
     """
@@ -1704,7 +1707,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             context.job_queue.run_once(
                 job_delete_message,
-                when=60,
+                when=15,
                 data={"chat_id": msg.chat_id, "message_id": msg.message_id},
                 name=f"del_help_warn_{msg.chat_id}_{msg.message_id}",
             )
@@ -1725,33 +1728,37 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if orig_msg:
             context.job_queue.run_once(
                 job_delete_message,
-                when=60,
+                when=15,
                 data={"chat_id": orig_msg.chat_id, "message_id": orig_msg.message_id},
                 name=f"del_help_cmd_{orig_msg.chat_id}_{orig_msg.message_id}",
             )
         if msg:
             context.job_queue.run_once(
                 job_delete_message,
-                when=60,
+                when=15,
                 data={"chat_id": msg.chat_id, "message_id": msg.message_id},
                 name=f"del_help_fallback_{msg.chat_id}_{msg.message_id}",
             )
 async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFAULT_TYPE):
     today_iso = datetime.now(MOSCOW_TZ).date().isoformat()
+
+    # rate-limit: 1 раз в день — сообщение строго в ЛС
     if db_get_horo_last_date(user_id) == today_iso:
         await context.bot.send_message(chat_id=user_id, text="Звёзды свою работу выполнили, приходи завтра 🙂")
         return
 
-    horo_text, date_str, author_str = await fetch_rambler_horo(sign_slug)
+    horo_text, date_str = await fetch_rambler_horo(sign_slug)
 
     title = ZODIAC_NAME.get(sign_slug, sign_slug)
     head = title
     if date_str:
         head += f" • {date_str}"
 
-    msg = f"<b>{escape(head)}</b>\n\n{escape(horo_text)}"
-    if author_str:
-        msg += f"\n\n<i>{escape(author_str)}</i>"
+    msg = (
+        f"<b>{escape(head)}</b>\n\n"
+        f"<b>Ваш гороскоп:</b>\n"
+        f"{escape(horo_text)}"
+    )
 
     await context.bot.send_message(
         chat_id=user_id,
@@ -1759,6 +1766,7 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
     db_set_horo_last_date(user_id, today_iso)
 
 
@@ -1771,6 +1779,7 @@ async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = user.id
 
+    # 1) знак по карточке (birthday) если есть
     sign_slug = None
     username = (user.username or "").strip()
     if username:
@@ -1778,15 +1787,38 @@ async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if prof and prof.get("birthday"):
             sign_slug = zodiac_from_ddmm(prof["birthday"])
 
+    # 2) если карточки нет — пробуем сохранённый ранее знак
     if not sign_slug:
         sign_slug = db_horo_get_user_sign(user_id)
 
+    # 3) если знака нет — просим выбрать, но:
+    #    - в группе/канале клавиатуру шлём в ЛС
+    #    - в личке можно показать сразу тут
     if not sign_slug:
-        await orig_msg.reply_text(
-            "У тебя нет карточки сотрудника. Выбери свой знак — и я пришлю гороскоп в личку 👇",
-            reply_markup=kb_horo_signs(),
-            disable_web_page_preview=True,
-        )
+        text_pick = "У тебя нет карточки сотрудника. Выбери свой знак — и я пришлю гороскоп 👇"
+
+        if chat.type == "private":
+            await orig_msg.reply_text(text_pick, reply_markup=kb_horo_signs(), disable_web_page_preview=True)
+        else:
+            try:
+                await context.bot.send_message(chat_id=user_id, text=text_pick, reply_markup=kb_horo_signs(), disable_web_page_preview=True)
+            except Forbidden:
+                bot_username = (context.bot.username or "blablabird_bot")
+                warn = (
+                    "⚠️ Я не могу написать вам в ЛС.\n"
+                    f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
+                    "после этого снова введите /horo."
+                )
+                msg = await orig_msg.reply_text(warn, disable_web_page_preview=True)
+                # автоудаляем предупреждение в группе
+                context.job_queue.run_once(
+                    job_delete_message,
+                    when=15,
+                    data={"chat_id": msg.chat_id, "message_id": msg.message_id},
+                    name=f"del_horo_warn_{msg.chat_id}_{msg.message_id}",
+                )
+
+        # удаляем команду /horo в группе
         if chat.type != "private":
             try:
                 await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
@@ -1794,38 +1826,34 @@ async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
+    # 4) знак есть — шлём строго в ЛС, в чат ничего не пишем
     try:
-        # ВАЖНО: при повторном запросе в группе тоже ничего не пишем в чат — только ЛС
         await _send_horo_dm(user_id, sign_slug, context)
-
-        if chat.type != "private":
-            try:
-                await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
-            except Exception:
-                pass
-
     except Forbidden:
         bot_username = (context.bot.username or "blablabird_bot")
         warn = (
             "⚠️ Я не могу написать вам в ЛС.\n"
             f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
-            "после этого снова нажмите /horo."
+            "после этого снова введите /horo."
         )
-
-        if chat.type != "private":
-            try:
-                await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
-            except Exception:
-                pass
-
-        msg = await orig_msg.reply_text(warn, reply_to_message_id=orig_msg.message_id, disable_web_page_preview=True)
-        if chat.type != "private":
+        # предупреждаем только в том месте, где запросили (если это не ЛС)
+        if chat.type == "private":
+            await orig_msg.reply_text(warn, disable_web_page_preview=True)
+        else:
+            msg = await orig_msg.reply_text(warn, disable_web_page_preview=True)
             context.job_queue.run_once(
                 job_delete_message,
-                when=60,
+                when=15,
                 data={"chat_id": msg.chat_id, "message_id": msg.message_id},
                 name=f"del_horo_warn_{msg.chat_id}_{msg.message_id}",
             )
+
+    # удаляем команду /horo в группе
+    if chat.type != "private":
+        try:
+            await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
+        except Exception:
+            pass
 
 
 async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1859,22 +1887,27 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await _send_horo_dm(user_id, sign_slug, context)
+        # убираем клавиатуру/сообщение выбора — без лишних подтверждений
         try:
-            await q.edit_message_text("✅ Отправил гороскоп в личку.")
+            if q.message:
+                await context.bot.delete_message(chat_id=q.message.chat_id, message_id=q.message.message_id)
         except Exception:
-            pass
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
     except Forbidden:
         bot_username = (context.bot.username or "blablabird_bot")
+        warn = (
+            "⚠️ Я не могу написать вам в ЛС.\n"
+            f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
+            "после этого снова введите /horo."
+        )
         try:
-            await q.edit_message_text(
-                "⚠️ Не могу написать вам в ЛС.\n"
-                f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
-                "после этого снова нажмите /horo.",
-                disable_web_page_preview=True,
-            )
+            await q.edit_message_text(warn, disable_web_page_preview=True)
         except Exception:
             pass
-
 
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
