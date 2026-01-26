@@ -22,7 +22,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatAction
 from telegram.error import Forbidden, TimedOut, NetworkError
 from telegram.helpers import escape
 from telegram.ext import (
@@ -2016,14 +2016,62 @@ async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+
+async def _process_horo_sign_choice(user_id: int, sign_slug: str, context: ContextTypes.DEFAULT_TYPE,
+                                    msg_chat_id: int | None, msg_id: int | None):
+    """Runs in background: fetches & sends horoscope, then removes the sign-chooser message."""
+    try:
+        # Optional: show "typing" to make it feel responsive
+        try:
+            await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
+        except Exception:
+            pass
+
+        await _send_horo_dm(user_id, sign_slug, context)
+
+        # Remove the chooser message (in private chat) if we have it
+        if msg_chat_id is not None and msg_id is not None:
+            try:
+                await context.bot.delete_message(chat_id=msg_chat_id, message_id=msg_id)
+            except Exception:
+                # If can't delete, at least remove buttons
+                try:
+                    await context.bot.edit_message_reply_markup(chat_id=msg_chat_id, message_id=msg_id, reply_markup=None)
+                except Exception:
+                    pass
+
+    except Forbidden:
+        # User closed DMs (should be rare because buttons are in DM), but handle gracefully.
+        bot_username = (context.bot.username or "blablabird_bot")
+        warn = (
+            "⚠️ Я не могу написать вам в ЛС.\n"
+            f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
+            "после этого снова введите /horo."
+        )
+        try:
+            # If we have a message context, edit it with warning; otherwise ignore.
+            if msg_chat_id is not None and msg_id is not None:
+                await context.bot.edit_message_text(chat_id=msg_chat_id, message_id=msg_id, text=warn)
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.exception("Failed to send horoscope after sign choice: user_id=%s sign=%s", user_id, sign_slug)
+        try:
+            await context.bot.send_message(chat_id=user_id, text="Не удалось получить гороскоп 😕 Попробуйте чуть позже.")
+        except Exception:
+            pass
+
+
 async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.data:
         return
 
+    # Always answer quickly to avoid Telegram "loading" forever
     try:
-        await q.answer()
-    except (TimedOut, NetworkError):
+        await q.answer("Секунду…")
+    except Exception:
         pass
 
     parts = q.data.split(":")
@@ -2034,7 +2082,7 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sign_slug not in ZODIAC_NAME:
         try:
             await q.answer("Не понял знак 🤔", show_alert=True)
-        except (TimedOut, NetworkError):
+        except Exception:
             pass
         return
 
@@ -2043,31 +2091,18 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = user.id
 
+    # Save choice
     db_horo_set_user_sign(user_id, sign_slug)
 
-    try:
-        await _send_horo_dm(user_id, sign_slug, context)
-        # убираем клавиатуру/сообщение выбора — без лишних подтверждений
-        try:
-            if q.message:
-                await context.bot.delete_message(chat_id=q.message.chat_id, message_id=q.message.message_id)
-        except Exception:
-            try:
-                await q.edit_message_reply_markup(reply_markup=None)
-            except Exception:
-                pass
+    # Run sending in background so callback returns instantly
+    msg_chat_id = q.message.chat_id if q.message else None
+    msg_id = q.message.message_id if q.message else None
 
-    except Forbidden:
-        bot_username = (context.bot.username or "blablabird_bot")
-        warn = (
-            "⚠️ Я не могу написать вам в ЛС.\n"
-            f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
-            "после этого снова введите /horo."
-        )
-        try:
-            await q.edit_message_text(warn, disable_web_page_preview=True)
-        except Exception:
-            pass
+    try:
+        context.application.create_task(_process_horo_sign_choice(user_id, sign_slug, context, msg_chat_id, msg_id))
+    except Exception:
+        # Fallback if create_task not available
+        await _process_horo_sign_choice(user_id, sign_slug, context, msg_chat_id, msg_id)
 
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
