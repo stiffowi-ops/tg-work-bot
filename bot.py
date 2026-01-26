@@ -4611,9 +4611,9 @@ async def on_meme_channel_post_update(update: Update, context: ContextTypes.DEFA
     if not post.photo:
         return
     file_id = post.photo[-1].file_id
-    logger.info(f\"MEME CHANNEL: received photo post_id={post.message_id} file_id={file_id} media_group={post.media_group_id}\")
+    logger.info(f"MEME CHANNEL: received photo post_id={post.message_id} file_id={file_id} media_group={post.media_group_id}")
     inserted = db_meme_add(file_id=file_id, source_chat_id=post.chat_id)
-    logger.info(f\"MEME CHANNEL: stored={inserted} file_id={file_id}\")
+    logger.info(f"MEME CHANNEL: stored={inserted} file_id={file_id}")
 
 
 async def cb_meme(update: Update, context: ContextTypes.DEFAULT_TYPE):
