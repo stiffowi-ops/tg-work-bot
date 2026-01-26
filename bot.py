@@ -783,7 +783,9 @@ def db_profiles_get(pid: int):
         "about": row[5],
         "topics": row[6],
         "tg_link": row[7],
-    }def db_profiles_get_by_tg_link(tg_link: str):
+    }
+
+def db_profiles_get_by_tg_link(tg_link: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
