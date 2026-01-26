@@ -7,8 +7,8 @@ import time
 import csv
 import io
 import zipfile
+import html as html_lib
 import httpx
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
@@ -60,9 +60,6 @@ LITE_FORM_URL = os.getenv("LITE_FORM_URL", "")
 LEAD_CRM_URL = os.getenv("LEAD_CRM_URL", "")
 HELPY_BOT_URL = os.getenv("HELPY_BOT_URL", "")
 
-IGNIO_COM_XML_URL = os.getenv("IGNIO_COM_XML_URL", "https://ignio.com/r/export/utf/xml/daily/com.xml")
-IGNIO_LOV_XML_URL = os.getenv("IGNIO_LOV_XML_URL", "https://ignio.com/r/export/utf/xml/daily/lov.xml")
-
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 if not ZOOM_URL:
@@ -77,6 +74,124 @@ MEETING_INDUSTRY = "industry"
 
 # где хранить контекст, из какого чата пользователь открыл /help
 HELP_SCOPE_CHAT_ID = "help_scope_chat_id"
+
+
+# ---------------- HOROSCOPE ----------------
+
+ZODIAC = [
+    ("aries", "♈ Овен"),
+    ("taurus", "♉ Телец"),
+    ("gemini", "♊ Близнецы"),
+    ("cancer", "♋ Рак"),
+    ("leo", "♌ Лев"),
+    ("virgo", "♍ Дева"),
+    ("libra", "♎ Весы"),
+    ("scorpio", "♏ Скорпион"),
+    ("sagittarius", "♐ Стрелец"),
+    ("capricorn", "♑ Козерог"),
+    ("aquarius", "♒ Водолей"),
+    ("pisces", "♓ Рыбы"),
+]
+ZODIAC_NAME = {slug: title for slug, title in ZODIAC}
+
+
+def kb_horo_signs():
+    rows = []
+    row = []
+    for slug, title in ZODIAC:
+        row.append(InlineKeyboardButton(title, callback_data=f"horo:sign:{slug}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def zodiac_from_ddmm(ddmm: str) -> str | None:
+    # ddmm = "ДД.ММ"
+    try:
+        dd, mm = ddmm.split(".")
+        d = int(dd)
+        m = int(mm)
+    except Exception:
+        return None
+
+    if (m == 3 and d >= 21) or (m == 4 and d <= 19): return "aries"
+    if (m == 4 and d >= 20) or (m == 5 and d <= 20): return "taurus"
+    if (m == 5 and d >= 21) or (m == 6 and d <= 20): return "gemini"
+    if (m == 6 and d >= 21) or (m == 7 and d <= 22): return "cancer"
+    if (m == 7 and d >= 23) or (m == 8 and d <= 22): return "leo"
+    if (m == 8 and d >= 23) or (m == 9 and d <= 22): return "virgo"
+    if (m == 9 and d >= 23) or (m == 10 and d <= 22): return "libra"
+    if (m == 10 and d >= 23) or (m == 11 and d <= 21): return "scorpio"
+    if (m == 11 and d >= 22) or (m == 12 and d <= 21): return "sagittarius"
+    if (m == 12 and d >= 22) or (m == 1 and d <= 19): return "capricorn"
+    if (m == 1 and d >= 20) or (m == 2 and d <= 18): return "aquarius"
+    if (m == 2 and d >= 19) or (m == 3 and d <= 20): return "pisces"
+    return None
+
+
+async def fetch_rambler_horo(sign_slug: str) -> tuple[str, str | None, str | None]:
+    """return: (horo_text, date_str, author_str)"""
+    url = f"https://horoscopes.rambler.ru/{sign_slug}/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; meetings-bot/1.0)",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+    }
+
+    async with httpx.AsyncClient(timeout=10.0, headers=headers, follow_redirects=True) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        html = r.text
+
+    html = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
+    html = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", html)
+
+    flat = re.sub(r"(?is)<[^>]+>", " ", html)
+    flat = html_lib.unescape(flat)
+    flat = re.sub(r"\s+", " ", flat).strip()
+
+    sign_title = ZODIAC_NAME.get(sign_slug, sign_slug)
+    sign_title_clean = re.sub(r"[^\wА-Яа-яЁё\- ]+", "", sign_title).strip()
+
+    anchor = f"Гороскоп на сегодня — {sign_title_clean}"
+    idx = flat.find(anchor)
+    if idx == -1:
+        m = re.search(rf"Гороскоп на сегодня\s*[—-]\s*{re.escape(sign_title_clean)}", flat)
+        idx = m.start() if m else -1
+    if idx == -1:
+        raise RuntimeError("Не смог найти якорь гороскопа на странице")
+
+    tail = flat[idx:]
+
+    date_m = re.search(r"\b\d{1,2}\s+[А-Яа-яЁё]+\s+\d{4}\b", tail)
+    date_str = date_m.group(0) if date_m else None
+
+    cut = tail
+    if date_m:
+        cut = tail[:date_m.start()].strip()
+
+    cut = re.sub(r"\bВчера\b.*?\b(Сегодня|Завтра)\b", " ", cut)
+    cut = re.sub(r"\s+", " ", cut).strip()
+
+    mhead = re.search(rf"^Гороскоп на сегодня\s*[—-]\s*{re.escape(sign_title_clean)}\s*", cut)
+    if mhead:
+        cut = cut[mhead.end():].strip()
+
+    author_str = None
+    if date_m:
+        after = tail[date_m.end():].strip()
+        m_auth = re.match(r"^([А-ЯЁ][А-Яа-яЁё]+(?:\s+[А-ЯЁ][А-Яа-яЁё]+){0,3})\b", after)
+        if m_auth:
+            author_str = m_auth.group(1)
+
+    horo_text = cut.strip()
+    if not horo_text:
+        raise RuntimeError("Пустой текст гороскопа после парсинга")
+
+    return horo_text, date_str, author_str
+
 
 # ---------------- DB PATH ENSURE ----------------
 
@@ -186,15 +301,6 @@ def db_init():
         CREATE TABLE IF NOT EXISTS suggest_rate (
             user_id INTEGER PRIMARY KEY,
             last_sent_ts INTEGER NOT NULL
-        )
-    """)
-
-
-    # rate-limit гороскопа (1 раз в день на пользователя)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS horo_rate (
-            user_id INTEGER PRIMARY KEY,
-            last_date TEXT NOT NULL
         )
     """)
 
@@ -315,9 +421,7 @@ def db_set_suggest_last_ts(user_id: int, ts: int):
     con.commit()
     con.close()
 
-
 def db_get_horo_last_date(user_id: int) -> str | None:
-    """Возвращает дату (YYYY-MM-DD) последнего запроса гороскопа пользователем."""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("SELECT last_date FROM horo_rate WHERE user_id=?", (int(user_id),))
@@ -326,15 +430,34 @@ def db_get_horo_last_date(user_id: int) -> str | None:
     return row[0] if row else None
 
 
-def db_set_horo_last_date(user_id: int, iso_date: str):
-    """Записывает дату (YYYY-MM-DD) последнего запроса гороскопа пользователем."""
+def db_set_horo_last_date(user_id: int, date_iso: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
-        """INSERT INTO horo_rate(user_id, last_date)
-               VALUES(?, ?)
-               ON CONFLICT(user_id) DO UPDATE SET last_date=excluded.last_date""",
-        (int(user_id), iso_date),
+        """INSERT INTO horo_rate(user_id, last_date) VALUES(?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET last_date=excluded.last_date""",
+        (int(user_id), date_iso),
+    )
+    con.commit()
+    con.close()
+
+
+def db_horo_get_user_sign(user_id: int) -> str | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT sign_slug FROM horo_users WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def db_horo_set_user_sign(user_id: int, sign_slug: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """INSERT INTO horo_users(user_id, sign_slug) VALUES(?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET sign_slug=excluded.sign_slug""",
+        (int(user_id), sign_slug),
     )
     con.commit()
     con.close()
@@ -645,7 +768,30 @@ def db_profiles_get(pid: int):
         "about": row[5],
         "topics": row[6],
         "tg_link": row[7],
+    }def db_profiles_get_by_tg_link(tg_link: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link
+        FROM profiles
+        WHERE tg_link=?
+    """, (tg_link.strip(),))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "full_name": row[1],
+        "year_start": row[2],
+        "city": row[3],
+        "birthday": row[4],
+        "about": row[5],
+        "topics": row[6],
+        "tg_link": row[7],
     }
+
+
 
 def db_profiles_add(full_name: str, year_start: int, city: str, birthday: str | None, about: str, topics: str, tg_link: str) -> int:
     con = sqlite3.connect(DB_PATH)
@@ -804,6 +950,7 @@ def build_standup_text(today_d: date, zoom_url: str) -> str:
         f"Сегодня <b>{dow}</b> 🗓️\n\n"
         f"Планёрка стартует через <b>15 минут</b> — в <b>09:30 (МСК)</b> ⏰\n\n"
         f'👉 <a href="{zoom_url}">Присоединиться к Zoom</a>\n\n'
+        f""
     )
 
 def build_industry_text(industry_zoom_url: str) -> str:
@@ -812,6 +959,7 @@ def build_industry_text(industry_zoom_url: str) -> str:
         "На горизонте <b>Отраслевая встреча</b> — стартуем через <b>30 минут</b> 🚀\n\n"
         "⏰ Встречаемся в <b>12:00 (МСК)</b>\n\n"
         f'👉 <a href="{industry_zoom_url}">Присоединиться к Zoom</a>\n\n'
+        ""
     )
 
 # ---------------- KEYBOARDS (meetings) ----------------
@@ -1571,6 +1719,146 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data={"chat_id": msg.chat_id, "message_id": msg.message_id},
                 name=f"del_help_fallback_{msg.chat_id}_{msg.message_id}",
             )
+async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFAULT_TYPE):
+    today_iso = datetime.now(MOSCOW_TZ).date().isoformat()
+    if db_get_horo_last_date(user_id) == today_iso:
+        await context.bot.send_message(chat_id=user_id, text="Звёзды свою работу выполнили, приходи завтра 🙂")
+        return
+
+    horo_text, date_str, author_str = await fetch_rambler_horo(sign_slug)
+
+    title = ZODIAC_NAME.get(sign_slug, sign_slug)
+    head = title
+    if date_str:
+        head += f" • {date_str}"
+
+    msg = f"<b>{escape(head)}</b>\n\n{escape(horo_text)}"
+    if author_str:
+        msg += f"\n\n<i>{escape(author_str)}</i>"
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=msg,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    db_set_horo_last_date(user_id, today_iso)
+
+
+async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    orig_msg = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not orig_msg or not user or not chat:
+        return
+
+    user_id = user.id
+
+    sign_slug = None
+    username = (user.username or "").strip()
+    if username:
+        prof = db_profiles_get_by_tg_link("@" + username)
+        if prof and prof.get("birthday"):
+            sign_slug = zodiac_from_ddmm(prof["birthday"])
+
+    if not sign_slug:
+        sign_slug = db_horo_get_user_sign(user_id)
+
+    if not sign_slug:
+        await orig_msg.reply_text(
+            "У тебя нет карточки сотрудника. Выбери свой знак — и я пришлю гороскоп в личку 👇",
+            reply_markup=kb_horo_signs(),
+            disable_web_page_preview=True,
+        )
+        if chat.type != "private":
+            try:
+                await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
+            except Exception:
+                pass
+        return
+
+    try:
+        # ВАЖНО: при повторном запросе в группе тоже ничего не пишем в чат — только ЛС
+        await _send_horo_dm(user_id, sign_slug, context)
+
+        if chat.type != "private":
+            try:
+                await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
+            except Exception:
+                pass
+
+    except Forbidden:
+        bot_username = (context.bot.username or "blablabird_bot")
+        warn = (
+            "⚠️ Я не могу написать вам в ЛС.\n"
+            f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
+            "после этого снова нажмите /horo."
+        )
+
+        if chat.type != "private":
+            try:
+                await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
+            except Exception:
+                pass
+
+        msg = await orig_msg.reply_text(warn, reply_to_message_id=orig_msg.message_id, disable_web_page_preview=True)
+        if chat.type != "private":
+            context.job_queue.run_once(
+                job_delete_message,
+                when=60,
+                data={"chat_id": msg.chat_id, "message_id": msg.message_id},
+                name=f"del_horo_warn_{msg.chat_id}_{msg.message_id}",
+            )
+
+
+async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+
+    try:
+        await q.answer()
+    except (TimedOut, NetworkError):
+        pass
+
+    parts = q.data.split(":")
+    if len(parts) != 3 or parts[0] != "horo" or parts[1] != "sign":
+        return
+
+    sign_slug = parts[2].strip()
+    if sign_slug not in ZODIAC_NAME:
+        try:
+            await q.answer("Не понял знак 🤔", show_alert=True)
+        except (TimedOut, NetworkError):
+            pass
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+    user_id = user.id
+
+    db_horo_set_user_sign(user_id, sign_slug)
+
+    try:
+        await _send_horo_dm(user_id, sign_slug, context)
+        try:
+            await q.edit_message_text("✅ Отправил гороскоп в личку.")
+        except Exception:
+            pass
+    except Forbidden:
+        bot_username = (context.bot.username or "blablabird_bot")
+        try:
+            await q.edit_message_text(
+                "⚠️ Не могу написать вам в ЛС.\n"
+                f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
+                "после этого снова нажмите /horo.",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+
+
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
@@ -4089,274 +4377,6 @@ async def broadcast_to_chats(context: ContextTypes.DEFAULT_TYPE, message_html: s
 
     return ok, fail
 
-
-# ---------------- HOROSCOPE ----------------
-
-HORO_SIGNS = {
-    "овен": ("aries", "Овен"),
-    "телец": ("taurus", "Телец"),
-    "близнецы": ("gemini", "Близнецы"),
-    "рак": ("cancer", "Рак"),
-    "лев": ("leo", "Лев"),
-    "дева": ("virgo", "Дева"),
-    "весы": ("libra", "Весы"),
-    "скорпион": ("scorpio", "Скорпион"),
-    "стрелец": ("sagittarius", "Стрелец"),
-    "козерог": ("capricorn", "Козерог"),
-    "водолей": ("aquarius", "Водолей"),
-    "рыбы": ("pisces", "Рыбы"),
-}
-
-def _xml_find_sign_today_text(root: ET.Element, sign_tag: str) -> str | None:
-    """Достаём текст на сегодня из XML Ignio (мягкий парсер под разные структуры)."""
-    def _strip(tag: str) -> str:
-        return tag.split("}", 1)[-1] if "}" in tag else tag
-
-    # вариант 1: <aries> ... <today>TEXT
-    for el in root.iter():
-        if _strip(el.tag).lower() == sign_tag.lower():
-            for ch in list(el):
-                if _strip(ch.tag).lower() in ("today", "text"):
-                    t = (ch.text or "").strip()
-                    if t:
-                        return t
-            t = "".join(el.itertext()).strip()
-            if t:
-                return t
-
-    # вариант 2: <sign name="aries">TEXT
-    for el in root.iter():
-        if _strip(el.tag).lower() in ("sign", "zodiac"):
-            attrs = {k.lower(): (v or "").lower() for k, v in (el.attrib or {}).items()}
-            if attrs.get("name") == sign_tag.lower() or attrs.get("sign") == sign_tag.lower():
-                t = "".join(el.itertext()).strip()
-                if t:
-                    return t
-
-    return None
-
-
-async def _fetch_ignio_text(url: str, sign_tag: str) -> str | None:
-    """Скачиваем XML и достаём прогноз для знака. Парсим тело даже при не-200 статусе."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; MeetingsBot/1.0)",
-        "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
-            resp = await client.get(url)
-            content = resp.content
-    except Exception as e:
-        logger.exception("Ignio fetch failed: %s", e)
-        return None
-
-    if not content:
-        return None
-
-    try:
-        root = ET.fromstring(content)
-    except Exception:
-        try:
-            root = ET.fromstring(content.decode("utf-8", errors="ignore").encode("utf-8"))
-        except Exception as e:
-            logger.exception("Ignio XML parse failed: %s", e)
-            return None
-
-    return _xml_find_sign_today_text(root, sign_tag)
-
-
-def _make_horo_message(sign_ru: str, date_str: str, general: str, love: str) -> str:
-    # совет: первая фраза из общего прогноза
-    advice = ""
-    if general:
-        parts = re.split(r"(?<=[\.!\?])\s+|\n+", general.strip())
-        advice = (parts[0] if parts else general).strip()
-    if not advice:
-        advice = "Держи фокус на главном и не распыляйся 🙂"
-
-    general = (general or "").strip()[:1600]
-    love = (love or "").strip()[:1200]
-    advice = advice[:400]
-
-    return (
-        f"✨ <b>Гороскоп на {date_str}</b>\n"
-        f"Знак: <b>{escape(sign_ru)}</b>\n\n"
-        f"<b>🔮 Сегодня</b>\n{escape(general) if general else '—'}\n\n"
-        f"<b>❤️ Любовь</b>\n{escape(love) if love else '—'}\n\n"
-        f"<b>💡 Совет дня</b>\n{escape(advice)}"
-    )
-
-
-async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/horo <знак> — присылает гороскоп в ЛС. Лимит: 1 раз в день на сотрудника."""
-    bot_username = (context.bot.username or "blablabird_bot")
-    user = update.effective_user
-    if not user or not update.message:
-        return
-
-    args = (context.args or [])
-    sign_input = " ".join(args).strip().lower()
-    if not sign_input:
-        signs_list = ", ".join([v[1] for v in HORO_SIGNS.values()])
-        await update.message.reply_text(
-            "🔭 <b>Гороскоп</b>\n\n"
-            "Напиши команду так:\n"
-            "<code>/horo овен</code>\n\n"
-            f"Доступные знаки: {escape(signs_list)}",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    sign_key = sign_input.replace("ё", "е").strip()
-    # простая попытка убрать падежи (овна -> овен и т.п.)
-    sign_key = re.sub(r"(а|у|е|ом|ой|ы|и)$", "", sign_key).strip()
-
-    if sign_key not in HORO_SIGNS:
-        signs_list = ", ".join([v[1] for v in HORO_SIGNS.values()])
-        await update.message.reply_text(
-            "❌ Не понял знак зодиака.\n"
-            f"Доступные: {escape(signs_list)}\n\n"
-            "Пример: <code>/horo лев</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    sign_tag, sign_ru = HORO_SIGNS[sign_key]
-
-    now_msk = datetime.now(MOSCOW_TZ)
-    today_iso = now_msk.date().isoformat()
-
-    last = db_get_horo_last_date(user.id)
-    if last == today_iso:
-        await update.message.reply_text("🌟 Звёзды свою работу выполнили — приходи завтра 😉✨")
-        return
-
-    general = await _fetch_ignio_text(IGNIO_COM_XML_URL, sign_tag)
-    love = await _fetch_ignio_text(IGNIO_LOV_XML_URL, sign_tag)
-
-    if not general and not love:
-        await update.message.reply_text("😕 Не смог получить гороскоп сейчас. Попробуй позже.")
-        return
-
-    msg = _make_horo_message(sign_ru, now_msk.strftime("%d.%m.%Y"), general or "", love or "")
-
-    # если команда из группы — шлём в ЛС
-    if update.effective_chat and update.effective_chat.type != "private":
-        try:
-            await context.bot.send_message(chat_id=user.id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            db_set_horo_last_date(user.id, today_iso)
-            await update.message.reply_text("✅ Отправил гороскоп в личку 🙂", disable_web_page_preview=True)
-        except Forbidden:
-            await update.message.reply_text(
-                "⚠️ Я не могу написать вам в ЛС.\n"
-                f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
-                "после этого повторите /horo.",
-                disable_web_page_preview=True,
-            )
-        return
-
-    # личка
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    db_set_horo_last_date(user.id, today_iso)
-
-
-async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("Эта команда работает только в групповом чате.")
-        return
-    if not await is_admin_scoped(update, context):
-        await update.message.reply_text("Только администраторы могут назначить чат для уведомлений.")
-        return
-    db_add_chat(update.effective_chat.id)
-    await update.message.reply_text("✅ Готово! Этот чат добавлен в рассылку уведомлений.")
-
-async def cmd_unsetchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("Эта команда работает только в групповом чате.")
-        return
-    if not await is_admin_scoped(update, context):
-        await update.message.reply_text("Только администраторы могут отключить уведомления.")
-        return
-    db_remove_chat(update.effective_chat.id)
-    await update.message.reply_text("🧹 Этот чат убран из рассылки уведомлений.")
-
-async def cmd_force_standup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin_scoped(update, context):
-        await update.message.reply_text("Недостаточно прав.")
-        return
-    if not db_list_chats():
-        await update.message.reply_text("Сначала подключи чат командой /setchat.")
-        return
-    await send_meeting_message(MEETING_STANDUP, context, force=True)
-    await update.message.reply_text("🚀 Отправил принудительное уведомление планёрки.")
-
-async def cmd_test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin_scoped(update, context):
-        await update.message.reply_text("Недостаточно прав.")
-        return
-    if not db_list_chats():
-        await update.message.reply_text("Сначала подключи чат командой /setchat.")
-        return
-    await send_meeting_message(MEETING_INDUSTRY, context, force=True)
-    await update.message.reply_text("🚀 Отправил тестовое уведомление отраслевой встречи.")
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin_scoped(update, context):
-        await update.message.reply_text("Только администраторы.")
-        return
-
-    now_utc = datetime.utcnow().replace(tzinfo=pytz.UTC)
-    now_msk = datetime.now(MOSCOW_TZ)
-    today = now_msk.date()
-
-    chats = db_list_chats()
-    last_standup = db_get_meta("last_auto_sent_date:standup")
-    last_industry = db_get_meta("last_auto_sent_date:industry")
-
-    st_state = db_get_state(MEETING_STANDUP, today)
-    in_state = db_get_state(MEETING_INDUSTRY, today)
-
-    st_due_res = db_get_due_reschedules(MEETING_STANDUP, today)
-    in_due_res = db_get_due_reschedules(MEETING_INDUSTRY, today)
-
-    def fmt_state(title: str, state: dict, due_res: list[str]) -> str:
-        if state["canceled"] == 1:
-            reason = state["reason"] or "—"
-            rs = state["reschedule_date"]
-            if rs:
-                return f"• <b>{title}</b>: ❌ отменено/перенесено сегодня\n  Причина: {reason}\n  Новая дата: {rs}"
-            return f"• <b>{title}</b>: ❌ отменено сегодня\n  Причина: {reason}"
-        else:
-            extra = ""
-            if due_res:
-                extra = f"\n  Переносы на сегодня (sent=0): {', '.join(due_res)}"
-            return f"• <b>{title}</b>: ✅ активно{extra}"
-
-    text = (
-        "📊 <b>Статус бота</b>\n\n"
-        f"🕒 UTC: <code>{now_utc.strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-        f"🕒 МСК: <code>{now_msk.strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-        f"📅 Сегодня (МСК): <b>{DAY_RU_UPPER.get(today.weekday(), '—')}</b> <code>{today.strftime('%d.%m.%y')}</code>\n\n"
-        f"💬 Подключённых чатов: <b>{len(chats)}</b>\n\n"
-        f"📌 Последняя авто-отправка:\n"
-        f"• Планёрка: <code>{last_standup or '—'}</code>\n"
-        f"• Отраслевая: <code>{last_industry or '—'}</code>\n\n"
-        f"🗂️ Состояние на сегодня:\n"
-        f"{fmt_state('Планёрка', st_state, st_due_res)}\n"
-        f"{fmt_state('Отраслевая', in_state, in_due_res)}\n"
-    )
-
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin_scoped(update, context):
-        return
-    clear_waiting_date(context)
-    clear_docs_flow(context)
-    clear_profile_wiz(context)
-    await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты).")
-
-
 # ---------------- APP ----------------
 
 def main():
@@ -4383,6 +4403,7 @@ def main():
 
     # callbacks: meetings
     app.add_handler(CallbackQueryHandler(cb_cancel_open, pattern=r"^cancel:open:(standup|industry)$"))
+    app.add_handler(CallbackQueryHandler(cb_horo, pattern=r"^horo:"))
     app.add_handler(CallbackQueryHandler(cb_cancel_close, pattern=r"^cancel:close:(standup|industry)$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_reason, pattern=r"^cancel:reason:(standup|industry):(no_topics|tech|move)$"))
     app.add_handler(CallbackQueryHandler(cb_reschedule_pick, pattern=r"^reschedule:pick:(standup|industry):\d{2}\.\d{2}\.\d{2}$"))
