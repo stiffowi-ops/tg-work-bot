@@ -9,6 +9,13 @@ import io
 import zipfile
 import html as html_lib
 import httpx
+from urllib.parse import quote_plus
+
+# optional: local meme rendering
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    Image = ImageDraw = ImageFont = None
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
@@ -93,6 +100,118 @@ ZODIAC = [
     ("pisces", "♓ Рыбы"),
 ]
 ZODIAC_NAME = {slug: title for slug, title in ZODIAC}
+
+
+MEME_BUTTON_TEXT = "Мой персональный мем 😂"
+
+# Короткие "мемные" подписи по знакам (русский). Это текст, который попадёт на картинку.
+MEME_LINES = {
+    "aries": ("Овен сегодня:", "СДЕЛАТЬ. СЕЙЧАС."),
+    "taurus": ("Телец сегодня:", "ХОЧУ СЧАСТЬЕ.\n*НО ПРИДЁТСЯ РАБОТАТЬ*"),
+    "gemini": ("Близнецы сегодня:", "МЫСЛИ: 1000/сек.\nДЕЛА: ...потом"),
+    "cancer": ("Рак сегодня:", "ВСЕХ ОБНЯЛ.\nПЕРЕЖИВАЮ ДАЛЬШЕ"),
+    "leo": ("Лев сегодня:", "СИЯЮ.\nПОТОМ ЕЩЁ СИЯЮ."),
+    "virgo": ("Дева сегодня:", "ПЫТАЮСЬ РАССЛАБИТЬСЯ...\n*ОТКРЫВАЮ СПИСОК ДЕЛ*"),
+    "libra": ("Весы сегодня:", "ВЫБОР: ДА/НЕТ.\nРЕШЕНИЕ: ПОДУМАЮ ЕЩЁ"),
+    "scorpio": ("Скорпион сегодня:", "ВСЁ ПОД КОНТРОЛЕМ.\n*И ДА, ТЫ ТОЖЕ*"),
+    "sagittarius": ("Стрелец сегодня:", "ПЛАН:\nУЕХАТЬ В ПРИКЛЮЧЕНИЯ"),
+    "capricorn": ("Козерог сегодня:", "СПОКОЙНО.\nСИСТЕМНО.\nПО ПЛАНУ."),
+    "aquarius": ("Водолей сегодня:", "ИДЕЯ ЕСТЬ.\nОБЪЯСНЯТЬ НЕ БУДУ."),
+    "pisces": ("Рыбы сегодня:", "ЭМОЦИИ: ДА.\nРЕАЛЬНОСТЬ: ...тоже да"),
+}
+
+def kb_horo_meme(sign_slug: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(MEME_BUTTON_TEXT, callback_data=f"horo:meme:{sign_slug}")]]
+    )
+
+def _pick_meme_text(sign_slug: str, user_name: str | None = None) -> str:
+    top, bottom = MEME_LINES.get(sign_slug, ("Сегодня:", "ну вы поняли"))
+    if user_name:
+        top = f"{user_name}, {top.lower()}"
+    return f"{top}\n{bottom}"
+
+async def send_personal_meme_dm(
+    user_id: int,
+    sign_slug: str,
+    user_name: str | None,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Отправляет картинку-мем в ЛС. Если Pillow недоступен — шлёт через cataas."""
+    meme_text = _pick_meme_text(sign_slug, user_name)
+
+    # 1) Пытаемся отрисовать локально (Pillow)
+    if Image is not None:
+        try:
+            W, H = 900, 600
+            img = Image.new("RGB", (W, H), color=(245, 245, 245))
+            draw = ImageDraw.Draw(img)
+
+            font_paths = [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            ]
+            font = None
+            for fp in font_paths:
+                if os.path.exists(fp):
+                    try:
+                        font = ImageFont.truetype(fp, 44)
+                        break
+                    except Exception:
+                        pass
+            if font is None:
+                font = ImageFont.load_default()
+
+            def wrap_lines(text: str, max_chars: int = 22):
+                out = []
+                for part in text.split("\n"):
+                    part = part.strip()
+                    while len(part) > max_chars:
+                        out.append(part[:max_chars])
+                        part = part[max_chars:]
+                    if part:
+                        out.append(part)
+                return out
+
+            lines = wrap_lines(meme_text)
+            y = 70
+            for line in lines:
+                bbox = draw.textbbox((0, 0), line, font=font)
+                tw = bbox[2] - bbox[0]
+                x = (W - tw) // 2
+                for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
+                    draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0))
+                draw.text((x, y), line, font=font, fill=(20, 20, 20))
+                y += 70
+
+            small = (
+                ImageFont.truetype(font_paths[0], 24)
+                if os.path.exists(font_paths[0])
+                else ImageFont.load_default()
+            )
+            footer = "© meetings-bot"
+            bbox = draw.textbbox((0, 0), footer, font=small)
+            draw.text(
+                (W - (bbox[2] - bbox[0]) - 20, H - 40),
+                footer,
+                font=small,
+                fill=(120, 120, 120),
+            )
+
+            buf = io.BytesIO()
+            buf.name = "meme.jpg"
+            img.save(buf, format="JPEG", quality=92)
+            buf.seek(0)
+
+            await context.bot.send_photo(chat_id=user_id, photo=buf)
+            return
+        except Exception:
+            pass
+
+    # 2) fallback: внешний генератор
+    safe = quote_plus(meme_text)
+    url = f"https://cataas.com/cat/says/{safe}?fontSize=50&fontColor=white&fontBackground=black"
+    await context.bot.send_photo(chat_id=user_id, photo=url)
 
 
 def kb_horo_signs():
@@ -1862,6 +1981,7 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
         text=msg,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        reply_markup=kb_horo_meme(sign_slug),
     )
 
     db_set_horo_last_date(user_id, today_iso)
@@ -1964,10 +2084,15 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     parts = q.data.split(":")
-    if len(parts) != 3 or parts[0] != "horo" or parts[1] != "sign":
+    if len(parts) != 3 or parts[0] != "horo":
         return
 
+    action = parts[1].strip()
     sign_slug = parts[2].strip()
+
+    if action not in ("sign", "meme"):
+        return
+
     if sign_slug not in ZODIAC_NAME:
         try:
             await q.answer("Не понял знак 🤔", show_alert=True)
@@ -1979,6 +2104,13 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
     user_id = user.id
+
+    if action == "meme":
+        try:
+            await send_personal_meme_dm(user_id, sign_slug, user.first_name, context)
+        except Forbidden:
+            pass
+        return
 
     db_horo_set_user_sign(user_id, sign_slug)
 
