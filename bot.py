@@ -617,7 +617,7 @@ def db_set_meme_last_date(user_id: int, date_iso: str):
     con.commit()
     con.close()
 
-def db_meme_add(file_id: str, source_chat_id: int):
+def db_meme_add(file_id: str, source_chat_id: int) -> bool:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
@@ -625,40 +625,10 @@ def db_meme_add(file_id: str, source_chat_id: int):
            VALUES(?, ?, ?, 0)""",
         (file_id, datetime.now(MOSCOW_TZ).isoformat(timespec='seconds'), int(source_chat_id)),
     )
+    inserted = (cur.rowcount or 0) > 0
     con.commit()
     con.close()
-
-def db_meme_claim_random(user_id: int, date_iso: str) -> str | None:
-    """Атомарно забирает один неиспользованный мем и помечает как использованный.
-    Требование: один мем нельзя отправить двум пользователям.
-    """
-    for _ in range(5):
-        con = sqlite3.connect(DB_PATH)
-        cur = con.cursor()
-        try:
-            cur.execute('BEGIN IMMEDIATE')
-            cur.execute('SELECT file_id FROM memes_pool WHERE used=0 ORDER BY RANDOM() LIMIT 1')
-            row = cur.fetchone()
-            if not row:
-                con.commit(); con.close(); return None
-            file_id = row[0]
-            cur.execute(
-                """UPDATE memes_pool
-                   SET used=1, used_by=?, used_date=?
-                   WHERE file_id=? AND used=0""",
-                (int(user_id), date_iso, file_id),
-            )
-            if cur.rowcount == 1:
-                con.commit(); con.close(); return file_id
-            con.commit()
-        except Exception:
-            try:
-                con.rollback()
-            except Exception:
-                pass
-        finally:
-            try:
-                con.close()
+    return inserted
             except Exception:
                 pass
     return None
@@ -4645,7 +4615,9 @@ async def on_meme_channel_post_update(update: Update, context: ContextTypes.DEFA
     if not post.photo:
         return
     file_id = post.photo[-1].file_id
-    db_meme_add(file_id=file_id, source_chat_id=post.chat_id)
+    logger.info(f\"MEME CHANNEL: received photo post_id={post.message_id} file_id={file_id} media_group={post.media_group_id}\")
+    inserted = db_meme_add(file_id=file_id, source_chat_id=post.chat_id)
+    logger.info(f\"MEME CHANNEL: stored={inserted} file_id={file_id}\")
 
 
 async def cb_meme(update: Update, context: ContextTypes.DEFAULT_TYPE):
