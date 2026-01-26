@@ -157,39 +157,78 @@ def split_sentences_ru(text: str) -> list[str]:
     return out
 
 
-def extract_horo_advice_focus(horo_text: str) -> tuple[str, str]:
+def extract_horo_blocks(horo_text: str) -> tuple[str, str, str]:
     """
-    Returns (advice_sentence, focus_sentence) picked strictly from the horoscope text (no new wording).
+    Returns (body_text, advice_sentence, focus_sentence).
+
+    IMPORTANT:
+    - advice_sentence and focus_sentence are taken STRICTLY from the original horoscope text (no new wording).
+    - body_text is the original horoscope text with those two sentences removed (to avoid duplication).
     """
     sents = split_sentences_ru(horo_text)
+    src = re.sub(r"\s+", " ", (horo_text or "").strip())
     if not sents:
-        return horo_text.strip(), horo_text.strip()
+        t = src.strip()
+        return t, t, t
 
-    # Prefer sentences that look like recommendations
-    keywords = [
-        "советует", "стоит", "нужно", "не ", "не\s", "следите", "контролируйте", "постарайтесь",
+    # Scoring for "advice" (directive-like sentence)
+    advice_keywords = [
+        "советует", "стоит", "нужно", "не ", "следите", "контролируйте", "постарайтесь",
         "не стоит", "важно", "лучше", "осторож", "держите", "помните",
     ]
 
-    def score(sent: str) -> int:
+    def advice_score(sent: str) -> int:
         sl = sent.lower()
         sc = 0
-        for kw in keywords:
+        for kw in advice_keywords:
             if re.search(kw, sl):
                 sc += 3
-        # shorter, “directive” sentences read better as blocks
-        if len(sent) <= 140:
+        # avoid meta sentences like "Гороскоп на сегодня..."
+        if sl.startswith("гороскоп"):
+            sc -= 4
+        # shorter reads better as a separate block
+        if len(sent) <= 150:
             sc += 1
         return sc
 
-    ranked = sorted(sents, key=score, reverse=True)
-    advice = ranked[0]
-    # focus must be different; pick next best
-    focus = next((s for s in ranked[1:] if s != advice), None)
-    if not focus:
-        focus = sents[1] if len(sents) > 1 else advice
+    ranked_advice = sorted(sents, key=advice_score, reverse=True)
+    advice = ranked_advice[0].strip()
 
-    return advice.strip(), focus.strip()
+    remaining = [s for s in sents if s.strip() != advice]
+
+    # Scoring for "focus" (usually a short "keep an eye on ..." sentence)
+    focus_keywords = ["следите", "контрол", "держите", "помните", "осторож", "не спеш", "не тороп", "не кидай"]
+    def focus_score(sent: str) -> int:
+        sl = sent.lower()
+        sc = 0
+        for kw in focus_keywords:
+            if re.search(kw, sl):
+                sc += 4
+        # penalize the same "Гороскоп на сегодня..." meta phrasing
+        if "гороскоп на сегодня" in sl or sl.startswith("гороскоп"):
+            sc -= 6
+        # prefer concise focus
+        if len(sent) <= 120:
+            sc += 2
+        elif len(sent) <= 180:
+            sc += 1
+        return sc
+
+    focus = None
+    if remaining:
+        ranked_focus = sorted(remaining, key=focus_score, reverse=True)
+        focus = ranked_focus[0].strip()
+
+    if not focus:
+        focus = (remaining[0] if remaining else advice).strip()
+
+    # Build body without duplicates (remove first occurrences only)
+    body_sents = [s.strip() for s in sents if s.strip() not in (advice, focus)]
+    body = " ".join(body_sents).strip()
+    if not body:
+        body = src.strip()
+
+    return body, advice, focus
 
 async def fetch_rambler_horo(sign_slug: str) -> tuple[str, str | None]:
     """
@@ -1802,13 +1841,13 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
     if date_str:
         head += f" • {date_str}"
 
-    advice, focus = extract_horo_advice_focus(horo_text)
+    body_text, advice, focus = extract_horo_blocks(horo_text)
 
     msg = (
         f"<b>{escape(head)}</b>\n"
         f"<i>Персональный прогноз на день</i>\n\n"
         f"<b>Ваш гороскоп</b>\n"
-        f"{escape(horo_text)}\n\n"
+        f"{escape(body_text)}\n\n"
         f"<b>Совет дня</b> 🧭\n"
         f"{escape(advice)}\n\n"
         f"<b>Фокус</b> 🎯\n"
