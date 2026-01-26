@@ -2016,8 +2016,7 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not meme:
             await context.bot.send_message(
                 chat_id=update.effective_user.id,
-                text="Пока нет мемов в базе 😅
-Опубликуй пару мемов в канале — и я начну их раздавать.",
+                text="Пока нет мемов в базе 😅\nОпубликуй пару мемов в канале — и я начну их раздавать.",
             )
             return
 
