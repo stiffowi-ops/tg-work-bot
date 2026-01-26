@@ -502,6 +502,20 @@ def db_init():
     """)
 
 
+    # ------- MEME SENDS: выдача мемов без повторов в день -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS meme_sends (
+            day TEXT NOT NULL,            -- YYYY-MM-DD (по MOSCOW_TZ)
+            user_id INTEGER NOT NULL,
+            meme_id INTEGER NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (day, user_id),
+            UNIQUE (day, meme_id),
+            FOREIGN KEY(meme_id) REFERENCES memes(id) ON DELETE CASCADE
+        )
+    """)
+
+
     con.commit()
     con.close()
 
@@ -583,15 +597,57 @@ def db_meme_add(kind: str, file_id: str, unique_key: str):
     con.close()
 
 
-def db_meme_random() -> dict | None:
+def db_meme_user_has_today(user_id: int, day_iso: str) -> bool:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("SELECT kind, file_id FROM memes ORDER BY RANDOM() LIMIT 1")
+    cur.execute("SELECT 1 FROM meme_sends WHERE day=? AND user_id=? LIMIT 1", (day_iso, user_id))
+    row = cur.fetchone()
+    con.close()
+    return bool(row)
+
+
+def db_meme_pick_for_day(day_iso: str) -> dict | None:
+    """
+    Выбираем случайный мем, который ещё НЕ выдавался никому в этот день.
+    """
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT m.id, m.kind, m.file_id
+        FROM memes m
+        LEFT JOIN meme_sends s
+            ON s.meme_id = m.id AND s.day = ?
+        WHERE s.meme_id IS NULL
+        ORDER BY RANDOM()
+        LIMIT 1
+    """, (day_iso,))
     row = cur.fetchone()
     con.close()
     if not row:
         return None
-    return {"kind": row[0], "file_id": row[1]}
+    return {"id": row[0], "kind": row[1], "file_id": row[2]}
+
+
+def db_meme_mark_sent(day_iso: str, user_id: int, meme_id: int) -> bool:
+    """
+    Пишем факт выдачи. Возвращает True если успешно (без конфликтов),
+    False если уже есть выдача пользователю сегодня или мем уже занят сегодня.
+    """
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO meme_sends(day, user_id, meme_id, sent_at)
+            VALUES (?, ?, ?, ?)
+        """, (day_iso, user_id, meme_id, datetime.utcnow().isoformat()))
+        con.commit()
+        ok = True
+    except sqlite3.IntegrityError:
+        ok = False
+    finally:
+        con.close()
+    return ok
+
 
 def db_horo_get_user_sign(user_id: int) -> str | None:
     con = sqlite3.connect(DB_PATH)
@@ -2012,11 +2068,32 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # кнопка мема после гороскопа
     if q.data == "horo:meme":
-        meme = db_meme_random()
+        day_iso = datetime.now(MOSCOW_TZ).date().isoformat()
+        uid = update.effective_user.id
+
+        # 1 раз в день на пользователя
+        if db_meme_user_has_today(uid, day_iso):
+            await context.bot.send_message(
+                chat_id=uid,
+                text="Звёзды любят работать, но поработай и ты. Давай завтра 😂",
+            )
+            return
+
+        # без повторов: один и тот же мем нельзя выдать двум людям в этот день
+        meme = None
+        for _ in range(5):  # на всякий случай, если одновременно нажали несколько людей
+            candidate = db_meme_pick_for_day(day_iso)
+            if not candidate:
+                meme = None
+                break
+            if db_meme_mark_sent(day_iso, uid, candidate["id"]):
+                meme = candidate
+                break
+
         if not meme:
             await context.bot.send_message(
-                chat_id=update.effective_user.id,
-                text="Пока нет мемов в базе 😅\nОпубликуй пару мемов в канале — и я начну их раздавать.",
+                chat_id=uid,
+                text="Сегодня мемы уже разобрали 😅\nДавай завтра 😂",
             )
             return
 
@@ -2024,11 +2101,11 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = meme["file_id"]
 
         if kind == "photo":
-            await context.bot.send_photo(chat_id=update.effective_user.id, photo=file_id)
+            await context.bot.send_photo(chat_id=uid, photo=file_id)
         elif kind == "video":
-            await context.bot.send_video(chat_id=update.effective_user.id, video=file_id)
+            await context.bot.send_video(chat_id=uid, video=file_id)
         else:
-            await context.bot.send_document(chat_id=update.effective_user.id, document=file_id)
+            await context.bot.send_document(chat_id=uid, document=file_id)
         return
 
     parts = q.data.split(":")
