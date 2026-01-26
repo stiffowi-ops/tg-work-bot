@@ -304,6 +304,21 @@ def db_init():
         )
     """)
 
+    # ------- HORO: rate-limit (1 раз в день) + знак для пользователей без анкеты -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS horo_rate (
+            user_id INTEGER PRIMARY KEY,
+            last_date TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS horo_users (
+            user_id INTEGER PRIMARY KEY,
+            sign_slug TEXT NOT NULL
+        )
+    """)
+
     # ------- HELP MENU: документы -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS doc_categories (
@@ -768,10 +783,7 @@ def db_profiles_get(pid: int):
         "about": row[5],
         "topics": row[6],
         "tg_link": row[7],
-    }
-
-def db_profiles_get_by_tg_link(tg_link: str):
-
+    }def db_profiles_get_by_tg_link(tg_link: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
