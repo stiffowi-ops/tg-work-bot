@@ -53,6 +53,9 @@ DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH", "bot.db")
 
 STORAGE_DIR = os.getenv("STORAGE_DIR", "storage")
 
+# ------- MEMES (channel source) -------
+MEME_CHANNEL_ID = int(os.getenv("MEME_CHANNEL_ID", "-1003761916249"))
+
 INDUSTRY_WIKI_URL = os.getenv("INDUSTRY_WIKI_URL", "")
 STAFF_URL = os.getenv("STAFF_URL", "")
 SITE_URL = os.getenv("SITE_URL", "")
@@ -114,6 +117,12 @@ def kb_horo_signs():
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
+
+
+def kb_horo_after():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Твой персональный мем 😂", callback_data="horo:meme")]
+    ])
 
 def zodiac_from_ddmm(ddmm: str) -> str | None:
     # ddmm = "ДД.ММ"
@@ -481,6 +490,17 @@ def db_init():
         FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
     )
 """)
+    # ------- MEMES: пул мемов из канала -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS memes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,           -- photo|video|document
+            file_id TEXT NOT NULL,
+            unique_key TEXT UNIQUE,       -- чтобы не дублировать
+            created_at TEXT NOT NULL
+        )
+    """)
+
 
     con.commit()
     con.close()
@@ -546,6 +566,32 @@ def db_set_horo_last_date(user_id: int, date_iso: str):
     con.commit()
     con.close()
 
+
+
+# ---------------- MEMES DB ----------------
+
+def db_meme_add(kind: str, file_id: str, unique_key: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """INSERT INTO memes(kind, file_id, unique_key, created_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(unique_key) DO NOTHING""",
+        (kind, file_id, unique_key, datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    con.close()
+
+
+def db_meme_random() -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT kind, file_id FROM memes ORDER BY RANDOM() LIMIT 1")
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {"kind": row[0], "file_id": row[1]}
 
 def db_horo_get_user_sign(user_id: int) -> str | None:
     con = sqlite3.connect(DB_PATH)
@@ -1862,6 +1908,7 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
         text=msg,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        reply_markup=kb_horo_after(),
     )
 
     db_set_horo_last_date(user_id, today_iso)
@@ -1962,6 +2009,28 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
     except (TimedOut, NetworkError):
         pass
+
+    # кнопка мема после гороскопа
+    if q.data == "horo:meme":
+        meme = db_meme_random()
+        if not meme:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="Пока нет мемов в базе 😅
+Опубликуй пару мемов в канале — и я начну их раздавать.",
+            )
+            return
+
+        kind = meme["kind"]
+        file_id = meme["file_id"]
+
+        if kind == "photo":
+            await context.bot.send_photo(chat_id=update.effective_user.id, photo=file_id)
+        elif kind == "video":
+            await context.bot.send_video(chat_id=update.effective_user.id, video=file_id)
+        else:
+            await context.bot.send_document(chat_id=update.effective_user.id, document=file_id)
+        return
 
     parts = q.data.split(":")
     if len(parts) != 3 or parts[0] != "horo" or parts[1] != "sign":
@@ -3900,6 +3969,42 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Видео добавлено. Можешь добавить ещё или нажми «✅ Отправить».", reply_markup=kb_bcast_files_menu())
 
 
+
+# ---------------- HANDLERS: MEME CHANNEL (collect memes) ----------------
+
+async def on_meme_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not msg.chat:
+        return
+
+    # только нужный канал
+    if int(msg.chat_id) != int(MEME_CHANNEL_ID):
+        return
+
+    # PHOTO (берём самый большой размер)
+    if getattr(msg, "photo", None):
+        ph = msg.photo[-1]
+        unique_key = f"photo:{ph.file_unique_id}"
+        db_meme_add("photo", ph.file_id, unique_key)
+        return
+
+    # VIDEO
+    if getattr(msg, "video", None):
+        vd = msg.video
+        unique_key = f"video:{vd.file_unique_id}"
+        db_meme_add("video", vd.file_id, unique_key)
+        return
+
+    # DOCUMENT (например gif/видео/картинка документом)
+    if getattr(msg, "document", None):
+        doc = msg.document
+        unique_key = f"document:{doc.file_unique_id}"
+        db_meme_add("document", doc.file_id, unique_key)
+        return
+
+
+
+
 # ---------------- HANDLERS: TEXT INPUT (dates / categories / profiles) ----------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4575,6 +4680,12 @@ def main():
 
     # new members welcome
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+
+    # meme channel collector
+    app.add_handler(MessageHandler(
+        filters.Chat(MEME_CHANNEL_ID) & (filters.PHOTO | filters.VIDEO | filters.Document.ALL),
+        on_meme_channel_post
+    ))
 
     # document upload
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
