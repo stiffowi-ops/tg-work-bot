@@ -3239,11 +3239,34 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:faq":
+        clear_bonus_calc_flow(context)
         text = (
             "❓ <b>Часто задаваемые вопросы</b>\n\n"
             "Выберите вопрос из списка ниже 👇"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_faq_list(), disable_web_page_preview=True)
+        return
+
+
+    if data == "help:faq:bonus":
+        clear_bonus_calc_flow(context)
+        context.chat_data[WAITING_BONUS_CALC] = True
+        context.chat_data[BONUS_STEP] = 1
+        context.chat_data[BONUS_DATA] = {}
+
+        await q.message.reply_text(
+            "🧮 <b>Калькулятор премии</b>\n\n"
+            "Правила:\n"
+            "• Минимальный порог — <b>70%</b> плана\n"
+            "• Максимум считаем как <b>200%</b> (если введёте больше — возьмём 200)\n"
+            "• Если меньше 70% — премия всегда <b>0</b>\n\n"
+            "Формула: <b>оклад / 2 × (% / 100)</b>\n\n"
+            "Шаг 1/2: введите <b>оклад</b> (например: 40 000)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")]
+            ]),
+        )
         return
 
     if data.startswith("help:faq:item:"):
