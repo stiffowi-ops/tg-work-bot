@@ -455,7 +455,18 @@ def db_init():
     except sqlite3.OperationalError:
         pass
 
-    # ------- HELP MENU: анкеты -------
+    
+
+    # ------- HELP MENU: FAQ -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS faq_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+# ------- HELP MENU: анкеты -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -944,6 +955,81 @@ def db_profiles_upsert(full_name: str, year_start: int, city: str, birthday: str
     return int(pid)
 
 
+
+
+# ---------------- HELP DB: FAQ ----------------
+
+def db_faq_list() -> list[tuple[int, str]]:
+    """Список FAQ (id, question), последние сверху."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id, question FROM faq_items ORDER BY id DESC")
+    rows = cur.fetchall()
+    con.close()
+    return [(int(r[0]), r[1]) for r in rows]
+
+
+def db_faq_get(fid: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id, question, answer FROM faq_items WHERE id=?", (int(fid),))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {"id": int(row[0]), "question": row[1], "answer": row[2]}
+
+
+def db_faq_add(question: str, answer: str) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO faq_items(question, answer, created_at) VALUES(?, ?, ?)",
+        (question.strip(), answer.strip(), datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    fid = cur.lastrowid
+    con.close()
+    return int(fid)
+
+
+def db_faq_delete(fid: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM faq_items WHERE id=?", (int(fid),))
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+
+def db_faq_upsert(question: str, answer: str) -> int:
+    """Upsert по question: если вопрос уже есть — обновляем answer."""
+    q = (question or "").strip()
+    a = (answer or "").strip()
+    if not q or not a:
+        return 0
+
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id FROM faq_items WHERE question=?", (q,))
+    row = cur.fetchone()
+    if row:
+        fid = int(row[0])
+        cur.execute("UPDATE faq_items SET answer=? WHERE id=?", (a, fid))
+        con.commit()
+        con.close()
+        return fid
+
+    cur.execute(
+        "INSERT INTO faq_items(question, answer, created_at) VALUES(?, ?, ?)",
+        (q, a, datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    fid = int(cur.lastrowid)
+    con.close()
+    return fid
+
 # ---------------- HELP DB: PROFILES ----------------
 
 def db_profiles_list() -> list[tuple[int, str]]:
@@ -1246,6 +1332,12 @@ WAITING_DOC_DESC = "waiting_doc_desc"
 PENDING_DOC_INFO = "pending_doc_info"
 WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
 
+
+# faq add flow
+WAITING_FAQ_Q = "waiting_faq_q"
+WAITING_FAQ_A = "waiting_faq_a"
+PENDING_FAQ = "pending_faq"
+
 WAITING_RESTORE_ZIP = "waiting_restore_zip"
 # profiles add flow
 PROFILE_WIZ_ACTIVE = "profile_wiz_active"
@@ -1281,6 +1373,12 @@ def clear_docs_flow(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DOC_DESC] = False
     context.chat_data.pop(PENDING_DOC_INFO, None)
     context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
+
+
+def clear_faq_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[WAITING_FAQ_Q] = False
+    context.chat_data[WAITING_FAQ_A] = False
+    context.chat_data.pop(PENDING_FAQ, None)
 
 
 
@@ -1529,6 +1627,7 @@ def help_text_main(bot_username: str) -> str:
         "Тут собраны актуальные материалы для команды:\n\n"
         "📄 Документы  \n"
         "🔗 Полезные ссылки  \n"
+        "❓ FAQ  \n"
         "👥 Познакомиться с командой\n"
     )
 
@@ -1536,6 +1635,7 @@ def kb_help_main(is_admin_user: bool):
     rows = [
         [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
         [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links")],
+        [InlineKeyboardButton("❓ FAQ", callback_data="help:faq")],
         [InlineKeyboardButton("👥 Познакомиться с командой", callback_data="help:team")],
         [InlineKeyboardButton("💡 Предложка", callback_data="help:suggest")],
     ]
@@ -1576,6 +1676,26 @@ def kb_help_docs_categories():
             rows.append([InlineKeyboardButton(title, callback_data=f"help:docs:cat:{cid}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
+
+def kb_help_faq_list():
+    items = db_faq_list()
+    rows = []
+    if not items:
+        rows.append([InlineKeyboardButton("— пока пусто —", callback_data="noop")])
+    else:
+        for fid, q in items[:40]:
+            label = q if len(q) <= 60 else (q[:57] + "…")
+            rows.append([InlineKeyboardButton(label, callback_data=f"help:faq:item:{fid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_help_faq_item():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")],
+    ])
+
 
 def kb_help_docs_files(category_id: int):
     items = db_docs_list_by_category(category_id)
@@ -1737,11 +1857,33 @@ def kb_help_settings():
         [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
         [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
         [InlineKeyboardButton("🏆 Ачивки", callback_data="help:settings:ach")],
+        [InlineKeyboardButton("❓ FAQ", callback_data="help:settings:faq")],
         [InlineKeyboardButton("📦 Скачать бэкап ZIP", callback_data="help:settings:backup_zip")],
         [InlineKeyboardButton("📥 Загрузить бэкап ZIP", callback_data="help:settings:restore_zip")],
         [InlineKeyboardButton("📣 Рассылка", callback_data="help:settings:bcast")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
+
+
+def kb_settings_faq():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить вопрос", callback_data="help:settings:faq:add")],
+        [InlineKeyboardButton("➖ Удалить вопрос", callback_data="help:settings:faq:del")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
+
+def kb_pick_faq_to_delete():
+    items = db_faq_list()
+    rows = []
+    if not items:
+        rows.append([InlineKeyboardButton("— пусто —", callback_data="noop")])
+    else:
+        for fid, q in items[:40]:
+            label = q if len(q) <= 60 else (q[:57] + "…")
+            rows.append([InlineKeyboardButton(f"🗑️ {label}", callback_data=f"help:settings:faq:del:{fid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:faq")])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_settings_categories():
@@ -2389,6 +2531,21 @@ def export_backup_zip_bytes() -> bytes:
         w.writerow(r)
     files["achievements_awards.csv"] = buf.getvalue()
 
+
+    # faq.csv
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["question", "answer", "created_at"])
+    w.writeheader()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute("SELECT question, answer, created_at FROM faq_items ORDER BY id ASC")
+        for question, answer, created_at in cur.fetchall():
+            w.writerow({"question": question or "", "answer": answer or "", "created_at": created_at or ""})
+    finally:
+        con.close()
+    files["faq.csv"] = buf.getvalue()
+
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for name, content in files.items():
@@ -2398,7 +2555,7 @@ def export_backup_zip_bytes() -> bytes:
 
 def restore_backup_zip_bytes(data: bytes) -> dict:
     """Восстановление из ZIP бэкапа (CSV). Возвращает статистику по импортированным сущностям."""
-    stats = {"profiles": 0, "categories": 0, "docs": 0, "notify_chats": 0, "achievements_awards": 0}
+    stats = {"profiles": 0, "categories": 0, "docs": 0, "faq": 0, "notify_chats": 0, "achievements_awards": 0}
     zbuf = io.BytesIO(data)
     with zipfile.ZipFile(zbuf, "r") as zf:
         names = set(zf.namelist())
@@ -2545,7 +2702,19 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
             con.commit()
             con.close()
 
-        # 4) notify_chats.csv
+                # 4) faq.csv
+        if "faq.csv" in names:
+            raw = zf.read("faq.csv").decode("utf-8-sig", errors="ignore")
+            reader = csv.DictReader(io.StringIO(raw))
+            for row in reader:
+                q = (row.get("question") or "").strip()
+                a = (row.get("answer") or "").strip()
+                if not q or not a:
+                    continue
+                db_faq_upsert(q, a)
+                stats["faq"] += 1
+
+# 4) notify_chats.csv
         if "notify_chats.csv" in names:
             raw = zf.read("notify_chats.csv").decode("utf-8", errors="replace")
             rdr = csv.DictReader(io.StringIO(raw))
@@ -3054,6 +3223,27 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "help:faq":
+        text = (
+            "❓ <b>Часто задаваемые вопросы</b>\n\n"
+            "Выберите вопрос из списка ниже 👇"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_faq_list(), disable_web_page_preview=True)
+        return
+
+    if data.startswith("help:faq:item:"):
+        fid = int(data.split(":")[-1])
+        item = db_faq_get(fid)
+        if not item:
+            await q.edit_message_text("Вопрос не найден (возможно удалён).", reply_markup=kb_help_main(is_admin_user=is_adm))
+            return
+        text = (
+            f"❓ <b>{escape(item['question'])}</b>\n\n"
+            f"{escape(item['answer'])}"
+        )
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_faq_item(), disable_web_page_preview=True)
+        return
+
 
     if data == "help:suggest":
         text = (
@@ -3207,6 +3397,54 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
         return
 
+    if data == "help:settings:faq":
+        clear_faq_flow(context)
+        await q.edit_message_text(
+            "❓ <b>FAQ</b>\n\nУправление вопросами.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_settings_faq(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:settings:faq:add":
+        clear_faq_flow(context)
+        context.chat_data[WAITING_FAQ_Q] = True
+        context.chat_data[WAITING_USER_ID] = update.effective_user.id if update.effective_user else None
+        context.chat_data[WAITING_SINCE_TS] = int(time.time())
+        await q.edit_message_text(
+            "➕ <b>Добавление вопроса</b>\n\nОтправьте текст вопроса одним сообщением.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cancel_wizard_settings(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:settings:faq:del":
+        clear_faq_flow(context)
+        await q.edit_message_text(
+            "➖ <b>Удаление вопроса</b>\n\nВыберите, что удалить:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_pick_faq_to_delete(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:settings:faq:del:"):
+        fid = int(data.split(":")[-1])
+        ok = db_faq_delete(fid)
+        try:
+            await q.answer("Удалено ✅" if ok else "Не найдено", show_alert=not ok)
+        except (TimedOut, NetworkError):
+            pass
+        await q.edit_message_text(
+            "❓ <b>FAQ</b>\n\nУправление вопросами.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_settings_faq(),
+            disable_web_page_preview=True,
+        )
+        return
+
     # дальше — настройки (только админы)
     if data.startswith("help:settings:"):
         if not is_adm:
@@ -3218,6 +3456,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "help:settings:cancel":
             clear_docs_flow(context)
+            clear_faq_flow(context)
             clear_profile_wiz(context)
             clear_waiting_date(context)
             clear_csv_import(context)
@@ -3306,6 +3545,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "help:settings:import_csv":
             # включаем режим ожидания CSV файла
             clear_docs_flow(context)
+            clear_faq_flow(context)
             clear_profile_wiz(context)
             clear_waiting_date(context)
             context.chat_data[WAITING_CSV_IMPORT] = True
@@ -3719,7 +3959,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 return data.decode("utf-8", errors="ignore")
 
-        ok_cats = ok_docs = ok_profiles = ok_ach = 0
+        ok_cats = ok_docs = ok_profiles = ok_ach = ok_faq = 0
         skipped_docs = 0
 
         try:
@@ -3803,7 +4043,19 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                         ok_docs += 1
 
-                # achievements
+                                # faq
+                raw = _read_csv_from_zip(zf, "faq.csv")
+                if raw:
+                    reader = csv.DictReader(io.StringIO(raw))
+                    for row in reader:
+                        q_text = (row.get("question") or "").strip()
+                        a_text = (row.get("answer") or "").strip()
+                        if not q_text or not a_text:
+                            continue
+                        db_faq_upsert(q_text, a_text)
+                        ok_faq += 1
+
+# achievements
                 raw = _read_csv_from_zip(zf, "achievements_awards.csv")
                 if raw:
                     reader = csv.DictReader(io.StringIO(raw))
@@ -3843,6 +4095,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Категории: <b>{ok_cats}</b>\n"
             f"Анкеты: <b>{ok_profiles}</b>\n"
             f"Документы: <b>{ok_docs}</b> (пропущено без file_id: <b>{skipped_docs}</b>)\n"
+            f"FAQ: <b>{ok_faq}</b>\n"
             f"Ачивки: <b>{ok_ach}</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_help_settings(),
@@ -4304,7 +4557,37 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # перенос даты вручную
-    if context.chat_data.get(WAITING_DATE_FLAG):
+        # ---------------- FAQ ADD FLOW ----------------
+    if context.chat_data.get(WAITING_FAQ_Q):
+        context.chat_data[WAITING_FAQ_Q] = False
+        context.chat_data[WAITING_FAQ_A] = True
+        context.chat_data[PENDING_FAQ] = {"question": text}
+        await update.message.reply_text(
+            "✅ Вопрос сохранён.\n\nТеперь отправьте <b>ответ</b> одним сообщением.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cancel_wizard_settings(),
+        )
+        return
+
+    if context.chat_data.get(WAITING_FAQ_A):
+        pending = context.chat_data.get(PENDING_FAQ) or {}
+        q_text = (pending.get("question") or "").strip()
+        a_text = text.strip()
+        clear_faq_flow(context)
+
+        if not q_text or not a_text:
+            await update.message.reply_text("❌ Не удалось сохранить: пустой вопрос или ответ.")
+            return
+
+        db_faq_add(q_text, a_text)
+        await update.message.reply_text(
+            "✅ Вопрос добавлен в FAQ.",
+            reply_markup=kb_help_settings(),
+        )
+        return
+
+
+if context.chat_data.get(WAITING_DATE_FLAG):
         if not await is_admin_scoped(update, context):
             clear_waiting_date(context)
             await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
