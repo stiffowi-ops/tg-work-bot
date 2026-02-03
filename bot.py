@@ -4434,9 +4434,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Оклад: <b>{fmt_money(salary)}</b>\n"
             f"% выполнения (введено): <b>{percent_in:.2f}</b>\n"
             f"% выполнения (учтено): <b>{percent_used:.2f}</b>\n"
-            f"Премия: <b>{fmt_money(bonus)}</b>\n"
-            f"Итого (оклад + премия): <b>{fmt_money(total)}</b>"
-            f"{note}",
+            f"Премия: <b>{fmt_money(bonus)}</b>\n"            f"{note}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
