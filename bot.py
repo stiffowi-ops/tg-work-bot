@@ -1346,6 +1346,13 @@ PROFILE_WIZ_ACTIVE = "profile_wiz_active"
 WAITING_CSV_IMPORT = "waiting_csv_import"
 WAITING_ZIP_IMPORT = "waiting_zip_import"
 
+
+
+# bonus calculator (FAQ)
+WAITING_BONUS_CALC = "waiting_bonus_calc"
+BONUS_STEP = "bonus_step"
+BONUS_DATA = "bonus_data"
+
 # achievements award flow
 ACH_WIZ_ACTIVE = "ach_wiz_active"
 ACH_WIZ_STEP = "ach_wiz_step"
@@ -1412,6 +1419,13 @@ def clear_bcast_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data[BCAST_ACTIVE] = False
     context.user_data.pop(BCAST_STEP, None)
     context.user_data.pop(BCAST_DATA, None)
+
+
+def clear_bonus_calc_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data[WAITING_BONUS_CALC] = False
+    context.chat_data.pop(BONUS_STEP, None)
+    context.chat_data.pop(BONUS_DATA, None)
+
 
 # ---------------- DUE RULES ----------------
 
@@ -1680,6 +1694,7 @@ def kb_help_docs_categories():
 def kb_help_faq_list():
     items = db_faq_list()
     rows = []
+    rows.append([InlineKeyboardButton(\"🧮 Калькулятор премии\", callback_data=\"help:faq:bonus\")])
     if not items:
         rows.append([InlineKeyboardButton("— пока пусто —", callback_data="noop")])
     else:
@@ -4340,6 +4355,78 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id if update.effective_user else None
     text = (update.message.text or "").strip()
+
+    # ---------------- BONUS CALC (FAQ) ----------------
+    if context.chat_data.get(WAITING_BONUS_CALC):
+        step = int(context.chat_data.get(BONUS_STEP) or 1)
+        data = context.chat_data.get(BONUS_DATA) or {}
+
+        raw = (text or "")
+        raw = raw.replace("\u00A0", " ")  # nbsp
+        raw_num = raw.replace(" ", "").replace(",", ".").strip()
+        try:
+            val = float(raw_num)
+        except Exception:
+            await update.message.reply_text("Не понял число. Введите ещё раз:")
+            return
+
+        if step == 1:
+            if val <= 0:
+                await update.message.reply_text("Оклад должен быть больше 0. Введите ещё раз:")
+                return
+            data["salary"] = val
+            context.chat_data[BONUS_DATA] = data
+            context.chat_data[BONUS_STEP] = 2
+            await update.message.reply_text(
+                "✅ Оклад принят.\n\n"
+                "Шаг 2/2: введите <b>% выполнения плана</b> (например: 100)",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # step == 2
+        salary = float(data.get("salary") or 0)
+        percent_in = val
+
+        # clamp rules
+        if percent_in < 70:
+            bonus = 0.0
+        else:
+            percent_eff = min(percent_in, 200.0)
+            bonus = (salary / 2.0) * (percent_eff / 100.0)
+
+        total = salary + bonus
+
+        clear_bonus_calc_flow(context)
+
+        def fmt_money(x: float) -> str:
+            if abs(x - round(x)) < 1e-9:
+                return f"{x:,.0f}".replace(",", " ")
+            return f"{x:,.2f}".replace(",", " ")
+
+        note = ""
+        if percent_in >= 70 and percent_in > 200:
+            note = "\n\nℹ️ Ввели больше 200% — посчитано по 200%."
+        elif percent_in < 70:
+            note = "\n\nℹ️ Меньше 70% — премия 0."
+
+        percent_used = 0.0 if percent_in < 0 else min(percent_in, 200.0)
+
+        await update.message.reply_text(
+            "🧾 <b>Результат</b>\n\n"
+            f"Оклад: <b>{fmt_money(salary)}</b>\n"
+            f"% выполнения (введено): <b>{percent_in:.2f}</b>\n"
+            f"% выполнения (учтено): <b>{percent_used:.2f}</b>\n"
+            f"Премия: <b>{fmt_money(bonus)}</b>\n"
+            f"Итого (оклад + премия): <b>{fmt_money(total)}</b>"
+            f"{note}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
+            ]),
+        )
+        return
+
 
     waiting_user = context.chat_data.get(WAITING_USER_ID)
     if waiting_user and user_id != waiting_user:
