@@ -1649,13 +1649,16 @@ def kb_help_main(is_admin_user: bool):
     rows = [
         [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
         [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links")],
-        [InlineKeyboardButton("❓ FAQ", callback_data="help:faq")],
         [InlineKeyboardButton("👥 Познакомиться с командой", callback_data="help:team")],
-        [InlineKeyboardButton("💡 Предложка", callback_data="help:suggest")],
+        [
+            InlineKeyboardButton("❓ FAQ", callback_data="help:faq"),
+            InlineKeyboardButton("💡 Предложка", callback_data="help:suggest"),
+        ],
     ]
     if is_admin_user:
         rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")])
     return InlineKeyboardMarkup(rows)
+
 
 
 def kb_suggest_modes():
