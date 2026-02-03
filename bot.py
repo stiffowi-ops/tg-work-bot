@@ -1694,7 +1694,7 @@ def kb_help_docs_categories():
 def kb_help_faq_list():
     items = db_faq_list()
     rows = []
-    rows.append([InlineKeyboardButton(\"🧮 Калькулятор премии\", callback_data=\"help:faq:bonus\")])
+    rows.append([InlineKeyboardButton("🧮 Калькулятор премии", callback_data="help:faq:bonus")])
     if not items:
         rows.append([InlineKeyboardButton("— пока пусто —", callback_data="noop")])
     else:
@@ -4674,7 +4674,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-if context.chat_data.get(WAITING_DATE_FLAG):
+    if context.chat_data.get(WAITING_DATE_FLAG):
         if not await is_admin_scoped(update, context):
             clear_waiting_date(context)
             await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
