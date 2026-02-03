@@ -3256,12 +3256,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await q.message.reply_text(
             "🧮 <b>Калькулятор премии</b>\n\n"
-            "Правила:\n"
-            "• Минимальный порог — <b>70%</b> плана\n"
-            "• Максимум считаем как <b>200%</b> (если введёте больше — возьмём 200)\n"
-            "• Если меньше 70% — премия всегда <b>0</b>\n\n"
-            "Формула: <b>оклад / 2 × (% / 100)</b>\n\n"
-            "Шаг 1/2: введите <b>оклад</b> (например: 40 000)",
+            "Требования к премии:\n• Минимальный порог — <b>70%</b> плана\n• Максимальный порог — <b>200%</b> плана\n\nШаг 1/2: введите <b>оклад</b> (например: 40 000)",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")]
@@ -4416,9 +4411,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bonus = 0.0
         else:
             percent_eff = min(percent_in, 200.0)
-            bonus = (salary / 2.0) * (percent_eff / 100.0)
-
-        total = salary + bonus
+            bonus_gross = (salary / 2.0) * (percent_eff / 100.0)
+            bonus = bonus_gross * 0.87  # 13% tax
 
         clear_bonus_calc_flow(context)
 
