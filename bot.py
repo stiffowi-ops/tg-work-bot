@@ -1224,7 +1224,7 @@ STANDUP_GREETINGS = [
     "Доброе утро! Пусть день будет продуктивным 🚀",
     "Йо! Команда на связи? 😎",
     "Привет-привет! ☕️ Как настроение?",
-    "Доброе утро, супергерои задач! 🦸‍♀️🦸‍♂️",
+    "Доброе утро, супергерои задач! 🦸♀️🦸♂️",
     "Хорошего дня, коллеги! 🌿",
     "Врываемся в день мягко, но уверенно 😄☀️",
 ]
@@ -1446,16 +1446,6 @@ def normalize_tg_mention(tg_link: str) -> str | None:
     if not tg:
         return None
 
-
-def format_achievements_for_profile(profile_id: int) -> str:
-    items = db_achievements_list(profile_id)
-    if not items:
-        return "— Всё ещё впереди —"
-    parts = []
-    for it in items[:10]:
-        parts.append(f"{escape(it['emoji'])} <b>{escape(it['title'])}</b>\n{escape(it['description'])}")
-    return "\n\n".join(parts)
-
     # @username
     if tg.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", tg):
         return tg
@@ -1470,6 +1460,16 @@ def format_achievements_for_profile(profile_id: int) -> str:
         return "@" + tg
 
     return None
+
+
+def format_achievements_for_profile(profile_id: int) -> str:
+    items = db_achievements_list(profile_id)
+    if not items:
+        return "— Всё ещё впереди —"
+    parts = []
+    for it in items[:10]:
+        parts.append(f"{escape(it['emoji'])} <b>{escape(it['title'])}</b>\n{escape(it['description'])}")
+    return "\n\n".join(parts)
 
 
 BDAY_TEMPLATE_1 = (
@@ -1758,7 +1758,7 @@ def get_links_catalog() -> dict[str, dict]:
 
     if STAFF_URL:
         catalog["staff"] = {
-            "title": "Стафф 🧑‍🤝‍🧑",
+            "title": "Стафф 🧑🤝🧑",
             "url": STAFF_URL,
             "desc": "Находим коллег внутри компании: рабочие контакты",
         }
@@ -4427,26 +4427,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return f"{x:,.2f}".replace(",", " ")
 
         note = ""
-if percent_in > 200:
-    note = "\n\n<b>🔥 Вау, я поражён твоими результатами!</b>\nТак держать — видно, что ты умеешь выходить за рамки!"
-elif percent_in < 70:
-    note = "\n\n<b>🌱 Каждый результат — это шаг вперёд.</b>\nПродолжай — и всё обязательно получится"
+        if percent_in > 200:
+            note = "\n\n<b>🔥 Вау, я поражён твоими результатами!</b>\nТак держать — видно, что ты умеешь выходить за рамки!"
+        elif percent_in < 70:
+            note = "\n\n<b>🌱 Каждый результат — это шаг вперёд.</b>\nПродолжай — и всё обязательно получится"
 
         percent_used = 0.0 if percent_in < 0 else min(percent_in, 200.0)
 
-     await update.message.reply_text(
-    "🧾 <b>Результат</b>\n\n"
-    f"Оклад: <b>{fmt_money(salary)}</b>\n"
-    f"% выполнения (твой показатель): <b>{percent_in:.2f}</b>\n"
-    f"% выполнения (учитываем в расчётах): <b>{percent_used:.2f}</b>\n"
-    f"Премия: <b>{fmt_money(bonus)}</b>"
-    f"{note}",
-    parse_mode=ParseMode.HTML,
-    reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
-    ]),
-)
-        return
+        await update.message.reply_text(
+            "🧾 <b>Результат</b>\n\n"
+            f"Оклад: <b>{fmt_money(salary)}</b>\n"
+            f"% выполнения (твой показатель): <b>{percent_in:.2f}</b>\n"
+            f"% выполнения (учитываем в расчётах): <b>{percent_used:.2f}</b>\n"
+            f"Премия: <b>{fmt_money(bonus)}</b>"
+            f"{note}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
+            ]),
+        )
 
 
     waiting_user = context.chat_data.get(WAITING_USER_ID)
