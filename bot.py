@@ -56,6 +56,14 @@ STORAGE_DIR = os.getenv("STORAGE_DIR", "storage")
 # ------- MEMES (channel source) -------
 MEME_CHANNEL_ID = int(os.getenv("MEME_CHANNEL_ID", "-1003761916249"))
 
+# -------- ACCESS CONTROL --------
+ACCESS_CHAT_ID = -1003399576556
+
+NO_ACCESS_TEXT = (
+    "🕵️‍♂️ Еще никогда Штирлиц не был так близок к провалу!\n\n"
+    "🚫 Не нашёл Вас в чате — данные вам недоступны!"
+)
+
 INDUSTRY_WIKI_URL = os.getenv("INDUSTRY_WIKI_URL", "")
 STAFF_URL = os.getenv("STAFF_URL", "")
 SITE_URL = os.getenv("SITE_URL", "")
@@ -1306,6 +1314,54 @@ async def is_admin_in_chat(chat_id: int, user_id: int, context: ContextTypes.DEF
     except Exception:
         return False
 
+
+
+async def is_member_of_access_chat(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    True если пользователь состоит в ACCESS_CHAT_ID.
+    """
+    try:
+        member = await context.bot.get_chat_member(ACCESS_CHAT_ID, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Forbidden:
+        logger.warning(
+            "Forbidden while checking ACCESS_CHAT_ID. "
+            "Bot must be member of the chat and have rights."
+        )
+        return False
+    except Exception as e:
+        logger.exception("Error checking access chat membership: %s", e)
+        return False
+
+
+async def deny_no_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Если пользователь не в чате — шлём сообщение и запрещаем дальнейшую обработку.
+    """
+    user = update.effective_user
+    if not user:
+        return True
+
+    has_access = await is_member_of_access_chat(user.id, context)
+    if has_access:
+        return False
+
+    try:
+        if update.message:
+            await update.message.reply_text(NO_ACCESS_TEXT)
+        elif update.callback_query:
+            await update.callback_query.answer("Нет доступа", show_alert=True)
+            await update.callback_query.message.reply_text(NO_ACCESS_TEXT)
+        elif update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=NO_ACCESS_TEXT,
+            )
+    except Exception:
+        pass
+
+    return True
+
 def get_scope_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
     if update.effective_chat and update.effective_chat.type != "private":
         return update.effective_chat.id
@@ -1982,6 +2038,9 @@ def kb_cancel_wizard_settings():
 # ---------------- COMMANDS ----------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     name = update.effective_user.first_name if update.effective_user else "коллеги"
     text = (
         f"Привет, {name}! 👋\n\n"
@@ -1996,6 +2055,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     bot_username = (context.bot.username or "blablabird_bot")
     text = help_text_main(bot_username)
 
@@ -2131,6 +2193,9 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
 
 
 async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     orig_msg = update.message
     user = update.effective_user
     chat = update.effective_chat
@@ -2217,6 +2282,9 @@ async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     q = update.callback_query
     if not q or not q.data:
         return
@@ -2313,6 +2381,9 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     if update.effective_chat.type == "private":
         await update.message.reply_text("Эта команда работает только в групповом чате.")
         return
@@ -2323,6 +2394,9 @@ async def cmd_setchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Готово! Этот чат добавлен в рассылку уведомлений.")
 
 async def cmd_unsetchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     if update.effective_chat.type == "private":
         await update.message.reply_text("Эта команда работает только в групповом чате.")
         return
@@ -2333,6 +2407,9 @@ async def cmd_unsetchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 Этот чат убран из рассылки уведомлений.")
 
 async def cmd_force_standup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     if not await is_admin_scoped(update, context):
         await update.message.reply_text("Недостаточно прав.")
         return
@@ -2343,6 +2420,9 @@ async def cmd_force_standup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚀 Отправил принудительное уведомление планёрки.")
 
 async def cmd_test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     if not await is_admin_scoped(update, context):
         await update.message.reply_text("Недостаточно прав.")
         return
@@ -2353,6 +2433,9 @@ async def cmd_test_industry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚀 Отправил тестовое уведомление отраслевой встречи.")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     if not await is_admin_scoped(update, context):
         await update.message.reply_text("Только администраторы.")
         return
@@ -2401,6 +2484,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     if not await is_admin_scoped(update, context):
         return
     clear_waiting_date(context)
@@ -2920,6 +3006,9 @@ def export_backup_csv_bytes() -> bytes:
 
 
 async def cmd_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     if not await is_admin_scoped(update, context):
         await update.message.reply_text("Только администраторы.")
         return
@@ -3007,6 +3096,9 @@ async def cmd_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     if update.effective_chat.type == "private":
         # можно и в личке, и в чате — но импорт делает админ scoped
         pass
@@ -3037,6 +3129,9 @@ async def cmd_import_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- CALLBACKS: meetings cancel/reschedule ----------------
 
 async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     query = update.callback_query
     try:
         try:
@@ -3055,6 +3150,9 @@ async def cb_cancel_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_reply_markup(reply_markup=kb_cancel_options(meeting_type))
 
 async def cb_cancel_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     query = update.callback_query
     if not await is_admin_scoped(update, context):
         try:
@@ -3069,6 +3167,9 @@ async def cb_cancel_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     query = update.callback_query
     if not await is_admin_scoped(update, context):
         try:
@@ -3115,6 +3216,9 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     query = update.callback_query
     if not await is_admin_scoped(update, context):
         try:
@@ -3161,6 +3265,9 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pass
 
 async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     query = update.callback_query
     if not await is_admin_scoped(update, context):
         try:
@@ -3197,6 +3304,9 @@ async def cb_reschedule_manual(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     query = update.callback_query
     if not await is_admin_scoped(update, context):
         try:
@@ -3218,6 +3328,9 @@ async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_T
 # ---------------- CALLBACKS: HELP ----------------
 
 async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await deny_no_access(update, context):
+        return
+
     q = update.callback_query
     data = q.data
     try:
