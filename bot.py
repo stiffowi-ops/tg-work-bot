@@ -4434,17 +4434,18 @@ elif percent_in < 70:
 
         percent_used = 0.0 if percent_in < 0 else min(percent_in, 200.0)
 
-        await update.message.reply_text(
-            "🧾 <b>Результат</b>\n\n"
-            f"Оклад: <b>{fmt_money(salary)}</b>\n"
-            f"% выполнения (введено): <b>{percent_in:.2f}</b>\n"
-            f"% выполнения (учтено): <b>{percent_used:.2f}</b>\n"
-            f"Премия: <b>{fmt_money(bonus)}</b>\n"            f"{note}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
-            ]),
-        )
+     await update.message.reply_text(
+    "🧾 <b>Результат</b>\n\n"
+    f"Оклад: <b>{fmt_money(salary)}</b>\n"
+    f"% выполнения (твой показатель): <b>{percent_in:.2f}</b>\n"
+    f"% выполнения (учитываем в расчётах): <b>{percent_used:.2f}</b>\n"
+    f"Премия: <b>{fmt_money(bonus)}</b>"
+    f"{note}",
+    parse_mode=ParseMode.HTML,
+    reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
+    ]),
+)
         return
 
 
