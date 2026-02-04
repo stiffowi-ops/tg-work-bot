@@ -3311,8 +3311,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data[SUGGESTION_MODE] = mode
 
         await q.edit_message_text(
-            "✍️ <b>Напиши сообщение для администраторов</b>\n\n"
-            "Можно одним сообщением. Я передам его администраторам.\n"
+            "✍️ <b>Напиши сообщение для тимлида</b>\n\n"
+            "Можно одним сообщением. Я передам его тимлиду\n"
             "Чтобы отменить — нажми «Отмена».",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_suggest_cancel(),
