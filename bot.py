@@ -4489,7 +4489,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_set_suggest_last_ts(user_id, int(time.time()))
 
         clear_suggest_flow(context)
-        await update.message.reply_text("✅ Спасибо! Передал администраторам 🙌")
+        await update.message.reply_text("✅ Спасибо! Передал тимлиду 🙌")
         return
 
     # рассылка  # bcast attachment (в ЛС админа): шаги тема/текст/файлы
