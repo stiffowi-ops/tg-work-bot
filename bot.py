@@ -1837,6 +1837,12 @@ def clear_bcast_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(BCAST_STEP, None)
     context.user_data.pop(BCAST_DATA, None)
 
+
+def clear_active_test(context: ContextTypes.DEFAULT_TYPE):
+    """Сброс состояния прохождения теста у сотрудника."""
+    context.user_data.pop(ACTIVE_TEST_ASSIGNMENT_ID, None)
+    context.user_data.pop('active_test_multi_sel', None)
+
 def clear_test_wiz(context: ContextTypes.DEFAULT_TYPE):
     """Сброс визарда создания теста."""
     context.user_data.pop('TEST_WIZ_ACTIVE', None)
