@@ -708,6 +708,8 @@ def db_set_horo_last_date(user_id: int, date_iso: str):
     )
 
 # ---------------- TESTS: templates / assignments / answers ----------------
+con = sqlite3.connect(DB_PATH)
+cur = con.cursor()
 cur.execute("""
     CREATE TABLE IF NOT EXISTS test_templates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -778,6 +780,8 @@ except sqlite3.OperationalError:
 
 
 # ---------------- MEMES DB ----------------
+con.commit()
+con.close()
 
 def db_meme_add(kind: str, file_id: str, unique_key: str):
     con = sqlite3.connect(DB_PATH)
