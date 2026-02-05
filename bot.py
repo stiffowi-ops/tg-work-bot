@@ -706,6 +706,8 @@ def db_set_horo_last_date(user_id: int, date_iso: str):
            ON CONFLICT(user_id) DO UPDATE SET last_date=excluded.last_date""",
         (int(user_id), date_iso),
     )
+    con.commit()
+    con.close()
 
 # ---------------- TESTS: templates / assignments / answers ----------------
 con = sqlite3.connect(DB_PATH)
@@ -774,14 +776,13 @@ try:
     cur.execute("ALTER TABLE test_assignments ADD COLUMN deadline_at TEXT")
 except sqlite3.OperationalError:
     pass
-    con.commit()
-    con.close()
 
 
 
-# ---------------- MEMES DB ----------------
 con.commit()
 con.close()
+
+# ---------------- MEMES DB ----------------
 
 def db_meme_add(kind: str, file_id: str, unique_key: str):
     con = sqlite3.connect(DB_PATH)
