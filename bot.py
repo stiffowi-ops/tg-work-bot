@@ -1828,6 +1828,13 @@ def clear_bcast_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(BCAST_STEP, None)
     context.user_data.pop(BCAST_DATA, None)
 
+def clear_test_wiz(context: ContextTypes.DEFAULT_TYPE):
+    """Сброс визарда создания теста."""
+    context.user_data.pop('TEST_WIZ_ACTIVE', None)
+    context.user_data.pop('TEST_WIZ_STEP', None)
+    context.user_data.pop('TEST_WIZ_DATA', None)
+    # если админ был в промежуточном вводе
+    context.user_data.pop('TEST_WIZ_WAITING_INPUT', None)
 
 def clear_bonus_calc_flow(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_BONUS_CALC] = False
