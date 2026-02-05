@@ -1760,7 +1760,8 @@ def kb_help_faq_list():
         rows.append([InlineKeyboardButton("— пока пусто —", callback_data="noop")])
     else:
         for fid, q in items[:40]:
-            label = q if len(q) <= 60 else (q[:57] + "…")
+            plain = html_lib.unescape(re.sub(r"<[^>]+>", "", q or ""))
+            label = plain if len(plain) <= 60 else (plain[:57] + "…")
             rows.append([InlineKeyboardButton(label, callback_data=f"help:faq:item:{fid}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
@@ -1956,7 +1957,8 @@ def kb_pick_faq_to_delete():
         rows.append([InlineKeyboardButton("— пусто —", callback_data="noop")])
     else:
         for fid, q in items[:40]:
-            label = q if len(q) <= 60 else (q[:57] + "…")
+            plain = html_lib.unescape(re.sub(r"<[^>]+>", "", q or ""))
+            label = plain if len(plain) <= 60 else (plain[:57] + "…")
             rows.append([InlineKeyboardButton(f"🗑️ {label}", callback_data=f"help:settings:faq:del:{fid}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:faq")])
     return InlineKeyboardMarkup(rows)
@@ -3389,8 +3391,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Вопрос не найден (возможно удалён).", reply_markup=kb_help_main(is_admin_user=is_adm))
             return
         text = (
-            f"❓ <b>{escape(item['question'])}</b>\n\n"
-            f"{escape(item['answer'])}"
+            f"❓ {item['question']}\n\n"
+            f"{item['answer']}"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_faq_item(), disable_web_page_preview=True)
         return
@@ -4492,6 +4494,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
     text = (update.message.text or "").strip()
 
+    text_html = (update.message.text_html or update.message.text or "").strip()
+
     # ---------------- BONUS CALC (FAQ) ----------------
     if context.chat_data.get(WAITING_BONUS_CALC):
         step = int(context.chat_data.get(BONUS_STEP) or 1)
@@ -4781,7 +4785,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.chat_data.get(WAITING_FAQ_Q):
         context.chat_data[WAITING_FAQ_Q] = False
         context.chat_data[WAITING_FAQ_A] = True
-        context.chat_data[PENDING_FAQ] = {"question": text}
+
+        q_html = (text_html or text or "").strip()
+        q_plain = (text or "").strip()
+        context.chat_data[PENDING_FAQ] = {"question_html": q_html, "question_plain": q_plain}
+
         await update.message.reply_text(
             "✅ Вопрос сохранён.\n\nТеперь отправьте <b>ответ</b> одним сообщением.",
             parse_mode=ParseMode.HTML,
@@ -4791,14 +4799,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.chat_data.get(WAITING_FAQ_A):
         pending = context.chat_data.get(PENDING_FAQ) or {}
-        q_text = (pending.get("question") or "").strip()
-        a_text = text.strip()
+        q_html = (pending.get("question_html") or "").strip()
+        a_html = (text_html or text or "").strip()
         clear_faq_flow(context)
 
-        if not q_text or not a_text:
+        if not q_html or not a_html:
             await update.message.reply_text("❌ Не удалось сохранить: пустой вопрос или ответ.")
             return
 
+        db_faq_add(q_html, a_html)
+        await update.message.reply_text(
+            "✅ Вопрос добавлен в FAQ.",
+            reply_markup=kb_help_settings(),
+        )
+        return
         db_faq_add(q_text, a_text)
         await update.message.reply_text(
             "✅ Вопрос добавлен в FAQ.",
