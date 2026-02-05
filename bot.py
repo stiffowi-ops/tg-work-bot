@@ -5567,672 +5567,672 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------------- BONUS CALC (FAQ) ----------------
 
-# ---------------- ACTIVE TEST (employee) ----------------
-if context.user_data.get(ACTIVE_TEST):
-    at = context.user_data.get(ACTIVE_TEST) or {}
-    aid = int(at.get("assignment_id") or 0)
-    a = db_test_assignment_get(aid) if aid else None
-    if not a:
-        clear_active_test(context)
-    else:
-        # deadline check
-        if a.get("deadline_at"):
-            try:
-                dl = datetime.fromisoformat(a["deadline_at"])
-                if datetime.utcnow() > dl:
-                    db_test_assignment_set_status(aid, "expired", finished_at=datetime.utcnow().isoformat())
+    # ---------------- ACTIVE TEST (employee) ----------------
+    if context.user_data.get(ACTIVE_TEST):
+        at = context.user_data.get(ACTIVE_TEST) or {}
+        aid = int(at.get("assignment_id") or 0)
+        a = db_test_assignment_get(aid) if aid else None
+        if not a:
+            clear_active_test(context)
+        else:
+            # deadline check
+            if a.get("deadline_at"):
+                try:
+                    dl = datetime.fromisoformat(a["deadline_at"])
+                    if datetime.utcnow() > dl:
+                        db_test_assignment_set_status(aid, "expired", finished_at=datetime.utcnow().isoformat())
+                        clear_active_test(context)
+                        await update.message.reply_text("⏳ Время на тестирование истекло.")
+                        # notify admin
+                        if a.get("assigned_by"):
+                            try:
+                                await context.bot.send_message(chat_id=a["assigned_by"], text=f"⏳ Тест #{aid} истёк по времени.")
+                            except Exception:
+                                pass
+                        return
+                except Exception:
+                    pass
+
+            qs = db_test_template_get_questions(a["template_id"])
+            idx_cur = a.get("current_idx", 1)
+            # find current question record
+            qrec = next((x for x in qs if x["idx"] == idx_cur), None)
+            if not qrec:
+                # already finished
+                clear_active_test(context)
+            else:
+                if qrec["q_type"] != "open":
+                    await update.message.reply_text("Пожалуйста, отвечай кнопками 🙂")
+                    return
+
+                # save text answer
+                ans_text = (text or "").strip()
+                if not ans_text:
+                    await update.message.reply_text("Ответ пустой — напиши текстом 🙂")
+                    return
+                db_test_answer_upsert(aid, qrec["id"], {"text": ans_text}, None)
+
+                # next question / finish
+                next_idx = idx_cur + 1
+                if next_idx > len(qs):
+                    db_test_assignment_set_status(aid, "finished", finished_at=datetime.utcnow().isoformat(), current_idx=next_idx)
                     clear_active_test(context)
-                    await update.message.reply_text("⏳ Время на тестирование истекло.")
-                    # notify admin
+                    await update.message.reply_text("✅ Отлично. Тест пройден. Результаты сообщит твой руководитель.")
                     if a.get("assigned_by"):
                         try:
-                            await context.bot.send_message(chat_id=a["assigned_by"], text=f"⏳ Тест #{aid} истёк по времени.")
+                            await context.bot.send_message(chat_id=a["assigned_by"], text=f"✅ Тест #{aid} пройден сотрудником. Смотри результаты в /help → Настройки → Тестирование.")
                         except Exception:
                             pass
                     return
-            except Exception:
-                pass
-
-        qs = db_test_template_get_questions(a["template_id"])
-        idx_cur = a.get("current_idx", 1)
-        # find current question record
-        qrec = next((x for x in qs if x["idx"] == idx_cur), None)
-        if not qrec:
-            # already finished
-            clear_active_test(context)
-        else:
-            if qrec["q_type"] != "open":
-                await update.message.reply_text("Пожалуйста, отвечай кнопками 🙂")
+                db_test_assignment_set_status(aid, "in_progress", current_idx=next_idx)
+                await _send_test_question_to_user(update.effective_user.id, aid, context)
                 return
 
-            # save text answer
-            ans_text = (text or "").strip()
-            if not ans_text:
-                await update.message.reply_text("Ответ пустой — напиши текстом 🙂")
+    # ---------------- TEST WIZARD (admin) ----------------
+    if context.chat_data.get(TEST_WIZ_ACTIVE):
+        if not await is_admin_scoped(update, context):
+            clear_test_wiz(context)
+            return
+        step = context.chat_data.get(TEST_WIZ_STEP)
+        d = context.chat_data.get(TEST_WIZ_DATA) or {}
+
+        if step == "title":
+            title = (text or "").strip()
+            if len(title) < 2:
+                await update.message.reply_text("❌ Слишком коротко. Пришли нормальное название.")
                 return
-            db_test_answer_upsert(aid, qrec["id"], {"text": ans_text}, None)
-
-            # next question / finish
-            next_idx = idx_cur + 1
-            if next_idx > len(qs):
-                db_test_assignment_set_status(aid, "finished", finished_at=datetime.utcnow().isoformat(), current_idx=next_idx)
-                clear_active_test(context)
-                await update.message.reply_text("✅ Отлично. Тест пройден. Результаты сообщит твой руководитель.")
-                if a.get("assigned_by"):
-                    try:
-                        await context.bot.send_message(chat_id=a["assigned_by"], text=f"✅ Тест #{aid} пройден сотрудником. Смотри результаты в /help → Настройки → Тестирование.")
-                    except Exception:
-                        pass
-                return
-            db_test_assignment_set_status(aid, "in_progress", current_idx=next_idx)
-            await _send_test_question_to_user(update.effective_user.id, aid, context)
-            return
-
-# ---------------- TEST WIZARD (admin) ----------------
-if context.chat_data.get(TEST_WIZ_ACTIVE):
-    if not await is_admin_scoped(update, context):
-        clear_test_wiz(context)
-        return
-    step = context.chat_data.get(TEST_WIZ_STEP)
-    d = context.chat_data.get(TEST_WIZ_DATA) or {}
-
-    if step == "title":
-        title = (text or "").strip()
-        if len(title) < 2:
-            await update.message.reply_text("❌ Слишком коротко. Пришли нормальное название.")
-            return
-        d["title"] = title[:200]
-        context.chat_data[TEST_WIZ_DATA] = d
-        context.chat_data[TEST_WIZ_STEP] = "q_menu"
-        await update.message.reply_text(
-            f"✅ Название сохранено: <b>{escape(d['title'])}</b>\n\nТеперь добавим вопросы:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_test_wiz_question_menu(0),
-        )
-        return
-
-    if step == "q_text":
-        cq = d.get("current_q") or {}
-        qtxt = (text or "").strip()
-        if len(qtxt) < 2:
-            await update.message.reply_text("❌ Вопрос слишком короткий.")
-            return
-        cq["text"] = qtxt[:800]
-        d["current_q"] = cq
-        context.chat_data[TEST_WIZ_DATA] = d
-        if cq.get("q_type") == "open":
-            qs = d.get("questions") or []
-            qs.append({"q_type": "open", "text": cq["text"]})
-            d["questions"] = qs
-            d.pop("current_q", None)
+            d["title"] = title[:200]
             context.chat_data[TEST_WIZ_DATA] = d
             context.chat_data[TEST_WIZ_STEP] = "q_menu"
             await update.message.reply_text(
-                f"✅ Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
+                f"✅ Название сохранено: <b>{escape(d['title'])}</b>\n\nТеперь добавим вопросы:",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb_test_wiz_question_menu(len(qs)),
+                reply_markup=kb_test_wiz_question_menu(0),
             )
             return
 
-        # closed question -> collect options
-        context.chat_data[TEST_WIZ_STEP] = "opt_add"
-        await update.message.reply_text(
-            "Отправляй варианты ответа <b>по одному сообщению</b>.\n"
-            "Нужно минимум 2 варианта.\n"
-            "Когда закончишь — нажми «Готово с вариантами».",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_test_options_menu(0, can_finish=False),
-        )
-        return
-
-    if step == "opt_add":
-        cq = d.get("current_q") or {}
-        opt = (text or "").strip()
-        if len(opt) < 1:
-            await update.message.reply_text("Вариант пустой.")
-            return
-        opts = cq.get("options") or []
-        if len(opts) >= 8:
-            await update.message.reply_text("Достигнут лимит вариантов (8). Нажми «Готово с вариантами».")
-            return
-        opts.append(opt[:200])
-        cq["options"] = opts
-        d["current_q"] = cq
-        context.chat_data[TEST_WIZ_DATA] = d
-        await update.message.reply_text(
-            f"✅ Вариант добавлен. Сейчас вариантов: <b>{len(opts)}</b>.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_test_options_menu(len(opts), can_finish=(len(opts) >= 2)),
-        )
-        return
-
-    if step == "time_manual":
-        try:
-            mins = int(re.sub(r"\s+", "", text))
-        except Exception:
-            await update.message.reply_text("❌ Нужно число минут (например 12).")
-            return
-        if mins < 0 or mins > 240:
-            await update.message.reply_text("❌ Укажи от 0 до 240 минут.")
-            return
-        d["time_limit_min"] = mins
-        context.chat_data[TEST_WIZ_DATA] = d
-        context.chat_data[TEST_WIZ_STEP] = "pick_employee"
-        await update.message.reply_text(
-            "Выбери сотрудника:",
-            reply_markup=kb_pick_profile_for_test(),
-        )
-        return
-
-    if context.chat_data.get(WAITING_BONUS_CALC):
-        step = int(context.chat_data.get(BONUS_STEP) or 1)
-        data = context.chat_data.get(BONUS_DATA) or {}
-
-        raw = (text or "")
-        raw = raw.replace("\u00A0", " ")  # nbsp
-        raw_num = raw.replace(" ", "").replace(",", ".").strip()
-        try:
-            val = float(raw_num)
-        except Exception:
-            await update.message.reply_text("Не понял число. Введите ещё раз:")
-            return
-
-        if step == 1:
-            if val <= 0:
-                await update.message.reply_text("Оклад должен быть больше 0. Введите ещё раз:")
+        if step == "q_text":
+            cq = d.get("current_q") or {}
+            qtxt = (text or "").strip()
+            if len(qtxt) < 2:
+                await update.message.reply_text("❌ Вопрос слишком короткий.")
                 return
-            data["salary"] = val
-            context.chat_data[BONUS_DATA] = data
-            context.chat_data[BONUS_STEP] = 2
+            cq["text"] = qtxt[:800]
+            d["current_q"] = cq
+            context.chat_data[TEST_WIZ_DATA] = d
+            if cq.get("q_type") == "open":
+                qs = d.get("questions") or []
+                qs.append({"q_type": "open", "text": cq["text"]})
+                d["questions"] = qs
+                d.pop("current_q", None)
+                context.chat_data[TEST_WIZ_DATA] = d
+                context.chat_data[TEST_WIZ_STEP] = "q_menu"
+                await update.message.reply_text(
+                    f"✅ Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_test_wiz_question_menu(len(qs)),
+                )
+                return
+
+            # closed question -> collect options
+            context.chat_data[TEST_WIZ_STEP] = "opt_add"
             await update.message.reply_text(
-                "✅ Оклад принят.\n\n"
-                "Шаг 2/2: введите <b>% выполнения плана</b> (например: 100)",
+                "Отправляй варианты ответа <b>по одному сообщению</b>.\n"
+                "Нужно минимум 2 варианта.\n"
+                "Когда закончишь — нажми «Готово с вариантами».",
                 parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_options_menu(0, can_finish=False),
             )
             return
 
-        # step == 2
-        salary = float(data.get("salary") or 0)
-        percent_in = val
-
-        # clamp rules
-        if percent_in < 70:
-            bonus = 0.0
-        else:
-            percent_eff = min(percent_in, 200.0)
-            bonus_gross = (salary / 2.0) * (percent_eff / 100.0)
-            bonus = bonus_gross * 0.87  # 13% tax
-
-        clear_bonus_calc_flow(context)
-
-        def fmt_money(x: float) -> str:
-            if abs(x - round(x)) < 1e-9:
-                return f"{x:,.0f}".replace(",", " ")
-            return f"{x:,.2f}".replace(",", " ")
-
-        note = ""
-        if percent_in > 200:
-            note = "\n\n<b>🔥 Вау, я поражён твоими результатами!</b>\nТак держать — видно, что ты умеешь выходить за рамки!"
-        elif percent_in < 70:
-            note = "\n\n<b>🌱 Каждый результат — это шаг вперёд.</b>\nПродолжай — и всё обязательно получится"
-
-        percent_used = 0.0 if percent_in < 0 else min(percent_in, 200.0)
-
-        await update.message.reply_text(
-            "🧾 <b>Результат</b>\n\n"
-            f"Оклад: <b>{fmt_money(salary)}</b>\n"
-            f"% выполнения (твой показатель): <b>{percent_in:.2f}</b>\n"
-            f"% выполнения (учитываем в расчётах): <b>{percent_used:.2f}</b>\n"
-            f"Премия: <b>{fmt_money(bonus)}</b>"
-            f"{note}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
-            ]),
-        )
-
-
-    waiting_user = context.chat_data.get(WAITING_USER_ID)
-    if waiting_user and user_id != waiting_user:
-        return
-
-    since_ts = context.chat_data.get(WAITING_SINCE_TS)
-    if since_ts and int(time.time()) - int(since_ts) > 10 * 60:
-        clear_waiting_date(context)
-        clear_docs_flow(context)
-        clear_profile_wiz(context)
-        clear_csv_import(context)
-        clear_suggest_flow(context)
-        clear_bcast_flow(context)
-        await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
-        return
-
-
-    # предложка (в ЛС): ждём текст  # anti-spam
-    if context.user_data.get(WAITING_SUGGESTION_TEXT):
-        # анти-спам: 1 сообщение в 5 минут на человека
-        if user_id:
-            last_ts = db_get_suggest_last_ts(user_id) or 0
-            now_ts = int(time.time())
-            if now_ts - last_ts < 5 * 60:
-                left = 5 * 60 - (now_ts - last_ts)
-                mins = max(1, (left + 59) // 60)
-                await update.message.reply_text(f"⏳ Можно отправлять не чаще 1 раза в 5 минут. Попробуйте через ~{mins} мин.")
+        if step == "opt_add":
+            cq = d.get("current_q") or {}
+            opt = (text or "").strip()
+            if len(opt) < 1:
+                await update.message.reply_text("Вариант пустой.")
                 return
-
-        mode = context.user_data.get(SUGGESTION_MODE, "anon")
-        scope_chat_id = get_scope_chat_id(update, context)
-        if not scope_chat_id:
-            clear_suggest_flow(context)
-            await update.message.reply_text("⚠️ Не вижу, к какому чату привязать предложку. Открой /help в групповом чате ещё раз.")
+            opts = cq.get("options") or []
+            if len(opts) >= 8:
+                await update.message.reply_text("Достигнут лимит вариантов (8). Нажми «Готово с вариантами».")
+                return
+            opts.append(opt[:200])
+            cq["options"] = opts
+            d["current_q"] = cq
+            context.chat_data[TEST_WIZ_DATA] = d
+            await update.message.reply_text(
+                f"✅ Вариант добавлен. Сейчас вариантов: <b>{len(opts)}</b>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_options_menu(len(opts), can_finish=(len(opts) >= 2)),
+            )
             return
 
-        await send_suggestion_to_admins(scope_chat_id, update, context, text, mode)
+        if step == "time_manual":
+            try:
+                mins = int(re.sub(r"\s+", "", text))
+            except Exception:
+                await update.message.reply_text("❌ Нужно число минут (например 12).")
+                return
+            if mins < 0 or mins > 240:
+                await update.message.reply_text("❌ Укажи от 0 до 240 минут.")
+                return
+            d["time_limit_min"] = mins
+            context.chat_data[TEST_WIZ_DATA] = d
+            context.chat_data[TEST_WIZ_STEP] = "pick_employee"
+            await update.message.reply_text(
+                "Выбери сотрудника:",
+                reply_markup=kb_pick_profile_for_test(),
+            )
+            return
 
-        if user_id:
-            db_set_suggest_last_ts(user_id, int(time.time()))
+        if context.chat_data.get(WAITING_BONUS_CALC):
+            step = int(context.chat_data.get(BONUS_STEP) or 1)
+            data = context.chat_data.get(BONUS_DATA) or {}
 
-        clear_suggest_flow(context)
-        await update.message.reply_text("✅ Спасибо! Передал тимлиду 🙌")
-        return
+            raw = (text or "")
+            raw = raw.replace("\u00A0", " ")  # nbsp
+            raw_num = raw.replace(" ", "").replace(",", ".").strip()
+            try:
+                val = float(raw_num)
+            except Exception:
+                await update.message.reply_text("Не понял число. Введите ещё раз:")
+                return
 
-    # рассылка  # bcast attachment (в ЛС админа): шаги тема/текст/файлы
-    if context.user_data.get(BCAST_ACTIVE):
-        step = context.user_data.get(BCAST_STEP)
-        d = _bcast_get_data(context)
-
-        if step == "topic":
-            if text != "-":
-                topic = text.strip()
-                if len(topic) < 2:
-                    await update.message.reply_text("❌ Тема слишком короткая. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
+            if step == 1:
+                if val <= 0:
+                    await update.message.reply_text("Оклад должен быть больше 0. Введите ещё раз:")
                     return
-                d["topic"] = topic[:200]
+                data["salary"] = val
+                context.chat_data[BONUS_DATA] = data
+                context.chat_data[BONUS_STEP] = 2
+                await update.message.reply_text(
+                    "✅ Оклад принят.\n\n"
+                    "Шаг 2/2: введите <b>% выполнения плана</b> (например: 100)",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            # step == 2
+            salary = float(data.get("salary") or 0)
+            percent_in = val
+
+            # clamp rules
+            if percent_in < 70:
+                bonus = 0.0
             else:
-                d["topic"] = None
+                percent_eff = min(percent_in, 200.0)
+                bonus_gross = (salary / 2.0) * (percent_eff / 100.0)
+                bonus = bonus_gross * 0.87  # 13% tax
 
-            context.user_data[BCAST_DATA] = d
-            context.user_data[BCAST_STEP] = "text"
+            clear_bonus_calc_flow(context)
+
+            def fmt_money(x: float) -> str:
+                if abs(x - round(x)) < 1e-9:
+                    return f"{x:,.0f}".replace(",", " ")
+                return f"{x:,.2f}".replace(",", " ")
+
+            note = ""
+            if percent_in > 200:
+                note = "\n\n<b>🔥 Вау, я поражён твоими результатами!</b>\nТак держать — видно, что ты умеешь выходить за рамки!"
+            elif percent_in < 70:
+                note = "\n\n<b>🌱 Каждый результат — это шаг вперёд.</b>\nПродолжай — и всё обязательно получится"
+
+            percent_used = 0.0 if percent_in < 0 else min(percent_in, 200.0)
+
             await update.message.reply_text(
-                "Шаг 2/3: <b>Текст рассылки</b> 📝\n"
-                "Отправьте текст одним сообщением.\n"
-                "Если текст не нужен — отправьте <code>-</code>.",
+                "🧾 <b>Результат</b>\n\n"
+                f"Оклад: <b>{fmt_money(salary)}</b>\n"
+                f"% выполнения (твой показатель): <b>{percent_in:.2f}</b>\n"
+                f"% выполнения (учитываем в расчётах): <b>{percent_used:.2f}</b>\n"
+                f"Премия: <b>{fmt_money(bonus)}</b>"
+                f"{note}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb_cancel_wizard_settings(),
-            )
-            return
-
-        if step == "text":
-            if text != "-":
-                body = text.strip()
-                if len(body) < 2:
-                    await update.message.reply_text("❌ Текст слишком короткий. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
-                    return
-                # лимит Telegram ~4096, оставим запас
-                d["text"] = body[:3500]
-            else:
-                d["text"] = None
-
-            context.user_data[BCAST_DATA] = d
-            context.user_data[BCAST_STEP] = "files"
-            await update.message.reply_text(
-                "Шаг 3/3: <b>Файлы</b> 📎\n\n"
-                "Можешь прикрепить <b>документы / фото / видео</b> (сколько нужно).\n"
-                "Когда закончишь — нажми <b>✅ Отправить</b>.\n"
-                "Можно без файлов 🙂",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_bcast_files_menu(),
-            )
-            return
-
-        # step == files -> ждём вложения или кнопку "Отправить"
-        return
-
-    # ачивки — выдача
-    if context.chat_data.get(ACH_WIZ_ACTIVE):
-        if not await is_admin_scoped(update, context):
-            clear_ach_wiz(context)
-            await update.message.reply_text("❌ Только администраторы могут выдавать ачивки.")
-            return
-
-        step = context.chat_data.get(ACH_WIZ_STEP)
-        d = context.chat_data.get(ACH_WIZ_DATA) or {}
-
-        if step == "emoji":
-            emoji = text.strip()
-            if len(emoji) < 1 or len(emoji) > 16:
-                await update.message.reply_text("❌ Отправьте один эмодзи (или короткую связку). Пример: 🏅")
-                return
-            d["emoji"] = emoji
-            context.chat_data[ACH_WIZ_DATA] = d
-            context.chat_data[ACH_WIZ_STEP] = "title"
-            await update.message.reply_text(
-                "Шаг 3/4: отправьте <b>название ачивки</b> (будет жирным).",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_cancel_wizard_settings(),
-            )
-            return
-
-        if step == "title":
-            title = text.strip()
-            if len(title) < 2:
-                await update.message.reply_text("❌ Слишком коротко. Напишите название ачивки.")
-                return
-            d["title"] = title[:80]
-            context.chat_data[ACH_WIZ_DATA] = d
-            context.chat_data[ACH_WIZ_STEP] = "description"
-            await update.message.reply_text(
-                "Шаг 4/4: напишите <b>описание</b> — за что выдаётся ачивка 🙂",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_cancel_wizard_settings(),
-            )
-            return
-
-        if step == "description":
-            desc = text.strip()
-            if len(desc) < 3:
-                await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
-                return
-            d["description"] = desc[:600]
-
-            pid = d.get("profile_id")
-            if not pid:
-                clear_ach_wiz(context)
-                await update.message.reply_text("❌ Не выбран сотрудник. Начните заново через /help → Настройки → Ачивки.")
-                return
-
-            admin_id = update.effective_user.id if update.effective_user else None
-            db_achievement_award_add(int(pid), d.get("emoji", "🏆"), d.get("title", "Ачивка"), d.get("description", ""), admin_id)
-
-            scope_chat_id = get_scope_chat_id(update, context)
-            mention = normalize_tg_mention(d.get("tg_link", "") or "")
-            who = mention if mention else f"<b>{escape(d.get('full_name', 'Сотрудник'))}</b>"
-            msg = (
-                f"🎉 <b>Поздравляем, {who}!</b>\n\n"
-                f"В твой профиль добавлена новая ачивка: <b>{escape(d.get('emoji', '🏆'))} {escape(d.get('title', 'Ачивка'))}</b>\n\n"
-                f"Достижение получено за: «{escape(d.get('description', ''))}»\n\n"
-                f"Так держать! 🚀🔥\n\n"
-                f"Посмотреть можно в /help"
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
+                ]),
             )
 
-            sent = False
-            if scope_chat_id:
-                try:
-                    await context.bot.send_message(chat_id=scope_chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-                    sent = True
-                except Exception as e:
-                    logger.exception("Cannot send achievement notify to scope chat: %s", e)
 
-            if not sent:
-                for chat_id in db_list_chats():
-                    try:
-                        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-                        sent = True
-                        break
-                    except Exception:
-                        pass
-
-            clear_ach_wiz(context)
-            await update.message.reply_text("✅ Ачивка выдана и опубликована в чате.", reply_markup=kb_help_settings())
+        waiting_user = context.chat_data.get(WAITING_USER_ID)
+        if waiting_user and user_id != waiting_user:
             return
 
-    # описание документа
-    if context.chat_data.get(WAITING_DOC_DESC):
-        if not await is_admin_scoped(update, context):
-            clear_docs_flow(context)
-            await update.message.reply_text("❌ Только администраторы могут добавлять документы.")
-            return
-
-        pending = context.chat_data.get(PENDING_DOC_INFO)
-        if not pending:
-            clear_docs_flow(context)
-            await update.message.reply_text("❌ Не найден загруженный файл. Начните заново через /help.")
-            return
-
-        desc = None if text == "-" else text
-        if desc is not None:
-            desc = desc.strip()
-            if len(desc) < 3:
-                await update.message.reply_text("❌ Слишком коротко. Напишите чуть подробнее или отправьте <code>-</code>.", parse_mode=ParseMode.HTML)
-                return
-            desc = desc[:600]
-
-        pending["description"] = desc
-        context.chat_data[PENDING_DOC_INFO] = pending
-        context.chat_data[WAITING_DOC_DESC] = False
-
-        await update.message.reply_text(
-            "✅ Описание сохранено.\n\nТеперь выберите категорию:",
-            reply_markup=kb_pick_category_for_new_doc(),
-        )
-        return
-
-    # перенос даты вручную
-        # ---------------- FAQ ADD FLOW ----------------
-    if context.chat_data.get(WAITING_FAQ_Q):
-        context.chat_data[WAITING_FAQ_Q] = False
-        context.chat_data[WAITING_FAQ_A] = True
-
-        q_html = (text_html or text or "").strip()
-        q_plain = (text or "").strip()
-        context.chat_data[PENDING_FAQ] = {"question_html": q_html, "question_plain": q_plain}
-
-        await update.message.reply_text(
-            "✅ Вопрос сохранён.\n\nТеперь отправьте <b>ответ</b> одним сообщением.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_cancel_wizard_settings(),
-        )
-        return
-
-    if context.chat_data.get(WAITING_FAQ_A):
-        pending = context.chat_data.get(PENDING_FAQ) or {}
-        q_html = (pending.get("question_html") or "").strip()
-        a_html = (text_html or text or "").strip()
-        clear_faq_flow(context)
-
-        if not q_html or not a_html:
-            await update.message.reply_text("❌ Не удалось сохранить: пустой вопрос или ответ.")
-            return
-
-        db_faq_add(q_html, a_html)
-        await update.message.reply_text(
-            "✅ Вопрос добавлен в FAQ.",
-            reply_markup=kb_help_settings(),
-        )
-        return
-        db_faq_add(q_text, a_text)
-        await update.message.reply_text(
-            "✅ Вопрос добавлен в FAQ.",
-            reply_markup=kb_help_settings(),
-        )
-        return
-
-
-    if context.chat_data.get(WAITING_DATE_FLAG):
-        if not await is_admin_scoped(update, context):
+        since_ts = context.chat_data.get(WAITING_SINCE_TS)
+        if since_ts and int(time.time()) - int(since_ts) > 10 * 60:
             clear_waiting_date(context)
-            await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
-            return
-
-        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", text):
-            await update.message.reply_text("❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
-            return
-
-        try:
-            dd, mm, yy = text.split(".")
-            new_d = date(int("20" + yy), int(mm), int(dd))
-        except Exception:
-            await update.message.reply_text("❌ Не удалось распознать дату. Проверьте корректность.")
-            return
-
-        today_d = datetime.now(MOSCOW_TZ).date()
-        if new_d <= today_d:
-            await update.message.reply_text("❌ Дата переноса должна быть в будущем.")
-            return
-
-        meeting_type = context.chat_data.get(WAITING_MEETING_TYPE, MEETING_STANDUP)
-        db_set_canceled(meeting_type, today_d, "Перенос на другой день", reschedule_date=text)
-        db_upsert_reschedule(meeting_type, today_d, new_d)
-        clear_waiting_date(context)
-
-        title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
-        await update.message.reply_text(f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
-        return
-
-    # ввод названия категории
-    if context.chat_data.get(WAITING_NEW_CATEGORY_NAME):
-        if not await is_admin_scoped(update, context):
             clear_docs_flow(context)
-            await update.message.reply_text("❌ Только администраторы могут управлять категориями.")
-            return
-
-        if len(text) < 2:
-            await update.message.reply_text("❌ Слишком коротко. Отправьте нормальное название категории.")
-            return
-
-        try:
-            cid = db_docs_add_category(text)
-        except sqlite3.IntegrityError:
-            await update.message.reply_text("❌ Такая категория уже существует. Отправьте другое название.")
-            return
-
-        context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
-
-        pending = context.chat_data.get(PENDING_DOC_INFO)
-        if pending:
-            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
-            clear_docs_flow(context)
-            await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
-            return
-
-        clear_docs_flow(context)
-        await update.message.reply_text("✅ Категория добавлена.", reply_markup=kb_help_settings())
-        return
-
-    # анкета — шаги
-    if context.chat_data.get(PROFILE_WIZ_ACTIVE):
-        if not await is_admin_scoped(update, context):
             clear_profile_wiz(context)
-            await update.message.reply_text("❌ Только администраторы могут добавлять анкеты.")
+            clear_csv_import(context)
+            clear_suggest_flow(context)
+            clear_bcast_flow(context)
+            await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
             return
 
-        step = context.chat_data.get(PROFILE_WIZ_STEP)
-        data = context.chat_data.get(PROFILE_WIZ_DATA) or {}
 
-        if step == "full_name":
-            if len(text.split()) < 2:
-                await update.message.reply_text("❌ Нужно имя и фамилия. Пример: Иван Петров")
+        # предложка (в ЛС): ждём текст  # anti-spam
+        if context.user_data.get(WAITING_SUGGESTION_TEXT):
+            # анти-спам: 1 сообщение в 5 минут на человека
+            if user_id:
+                last_ts = db_get_suggest_last_ts(user_id) or 0
+                now_ts = int(time.time())
+                if now_ts - last_ts < 5 * 60:
+                    left = 5 * 60 - (now_ts - last_ts)
+                    mins = max(1, (left + 59) // 60)
+                    await update.message.reply_text(f"⏳ Можно отправлять не чаще 1 раза в 5 минут. Попробуйте через ~{mins} мин.")
+                    return
+
+            mode = context.user_data.get(SUGGESTION_MODE, "anon")
+            scope_chat_id = get_scope_chat_id(update, context)
+            if not scope_chat_id:
+                clear_suggest_flow(context)
+                await update.message.reply_text("⚠️ Не вижу, к какому чату привязать предложку. Открой /help в групповом чате ещё раз.")
                 return
-            data["full_name"] = text
-            context.chat_data[PROFILE_WIZ_DATA] = data
-            context.chat_data[PROFILE_WIZ_STEP] = "year_start"
-            await update.message.reply_text("Шаг 2/7: с какого года работает? Пример: 2022", reply_markup=kb_cancel_wizard_settings())
+
+            await send_suggestion_to_admins(scope_chat_id, update, context, text, mode)
+
+            if user_id:
+                db_set_suggest_last_ts(user_id, int(time.time()))
+
+            clear_suggest_flow(context)
+            await update.message.reply_text("✅ Спасибо! Передал тимлиду 🙌")
             return
 
-        if step == "year_start":
-            if not re.fullmatch(r"\d{4}", text):
-                await update.message.reply_text("❌ Введите год 4 цифрами. Пример: 2022")
+        # рассылка  # bcast attachment (в ЛС админа): шаги тема/текст/файлы
+        if context.user_data.get(BCAST_ACTIVE):
+            step = context.user_data.get(BCAST_STEP)
+            d = _bcast_get_data(context)
+
+            if step == "topic":
+                if text != "-":
+                    topic = text.strip()
+                    if len(topic) < 2:
+                        await update.message.reply_text("❌ Тема слишком короткая. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
+                        return
+                    d["topic"] = topic[:200]
+                else:
+                    d["topic"] = None
+
+                context.user_data[BCAST_DATA] = d
+                context.user_data[BCAST_STEP] = "text"
+                await update.message.reply_text(
+                    "Шаг 2/3: <b>Текст рассылки</b> 📝\n"
+                    "Отправьте текст одним сообщением.\n"
+                    "Если текст не нужен — отправьте <code>-</code>.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_cancel_wizard_settings(),
+                )
                 return
-            year = int(text)
-            cur_year = datetime.now(MOSCOW_TZ).year
-            if year < 1990 or year > cur_year:
-                await update.message.reply_text(f"❌ Год должен быть в диапазоне 1990–{cur_year}.")
+
+            if step == "text":
+                if text != "-":
+                    body = text.strip()
+                    if len(body) < 2:
+                        await update.message.reply_text("❌ Текст слишком короткий. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
+                        return
+                    # лимит Telegram ~4096, оставим запас
+                    d["text"] = body[:3500]
+                else:
+                    d["text"] = None
+
+                context.user_data[BCAST_DATA] = d
+                context.user_data[BCAST_STEP] = "files"
+                await update.message.reply_text(
+                    "Шаг 3/3: <b>Файлы</b> 📎\n\n"
+                    "Можешь прикрепить <b>документы / фото / видео</b> (сколько нужно).\n"
+                    "Когда закончишь — нажми <b>✅ Отправить</b>.\n"
+                    "Можно без файлов 🙂",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_bcast_files_menu(),
+                )
                 return
-            data["year_start"] = year
-            context.chat_data[PROFILE_WIZ_DATA] = data
-            context.chat_data[PROFILE_WIZ_STEP] = "city"
-            await update.message.reply_text("Шаг 3/7: город проживания. Пример: Москва", reply_markup=kb_cancel_wizard_settings())
+
+            # step == files -> ждём вложения или кнопку "Отправить"
             return
 
-        if step == "city":
-            if len(text) < 2:
-                await update.message.reply_text("❌ Укажите город.")
+        # ачивки — выдача
+        if context.chat_data.get(ACH_WIZ_ACTIVE):
+            if not await is_admin_scoped(update, context):
+                clear_ach_wiz(context)
+                await update.message.reply_text("❌ Только администраторы могут выдавать ачивки.")
                 return
-            data["city"] = text
-            context.chat_data[PROFILE_WIZ_DATA] = data
-            context.chat_data[PROFILE_WIZ_STEP] = "birthday"
+
+            step = context.chat_data.get(ACH_WIZ_STEP)
+            d = context.chat_data.get(ACH_WIZ_DATA) or {}
+
+            if step == "emoji":
+                emoji = text.strip()
+                if len(emoji) < 1 or len(emoji) > 16:
+                    await update.message.reply_text("❌ Отправьте один эмодзи (или короткую связку). Пример: 🏅")
+                    return
+                d["emoji"] = emoji
+                context.chat_data[ACH_WIZ_DATA] = d
+                context.chat_data[ACH_WIZ_STEP] = "title"
+                await update.message.reply_text(
+                    "Шаг 3/4: отправьте <b>название ачивки</b> (будет жирным).",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_cancel_wizard_settings(),
+                )
+                return
+
+            if step == "title":
+                title = text.strip()
+                if len(title) < 2:
+                    await update.message.reply_text("❌ Слишком коротко. Напишите название ачивки.")
+                    return
+                d["title"] = title[:80]
+                context.chat_data[ACH_WIZ_DATA] = d
+                context.chat_data[ACH_WIZ_STEP] = "description"
+                await update.message.reply_text(
+                    "Шаг 4/4: напишите <b>описание</b> — за что выдаётся ачивка 🙂",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_cancel_wizard_settings(),
+                )
+                return
+
+            if step == "description":
+                desc = text.strip()
+                if len(desc) < 3:
+                    await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
+                    return
+                d["description"] = desc[:600]
+
+                pid = d.get("profile_id")
+                if not pid:
+                    clear_ach_wiz(context)
+                    await update.message.reply_text("❌ Не выбран сотрудник. Начните заново через /help → Настройки → Ачивки.")
+                    return
+
+                admin_id = update.effective_user.id if update.effective_user else None
+                db_achievement_award_add(int(pid), d.get("emoji", "🏆"), d.get("title", "Ачивка"), d.get("description", ""), admin_id)
+
+                scope_chat_id = get_scope_chat_id(update, context)
+                mention = normalize_tg_mention(d.get("tg_link", "") or "")
+                who = mention if mention else f"<b>{escape(d.get('full_name', 'Сотрудник'))}</b>"
+                msg = (
+                    f"🎉 <b>Поздравляем, {who}!</b>\n\n"
+                    f"В твой профиль добавлена новая ачивка: <b>{escape(d.get('emoji', '🏆'))} {escape(d.get('title', 'Ачивка'))}</b>\n\n"
+                    f"Достижение получено за: «{escape(d.get('description', ''))}»\n\n"
+                    f"Так держать! 🚀🔥\n\n"
+                    f"Посмотреть можно в /help"
+                )
+
+                sent = False
+                if scope_chat_id:
+                    try:
+                        await context.bot.send_message(chat_id=scope_chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                        sent = True
+                    except Exception as e:
+                        logger.exception("Cannot send achievement notify to scope chat: %s", e)
+
+                if not sent:
+                    for chat_id in db_list_chats():
+                        try:
+                            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                            sent = True
+                            break
+                        except Exception:
+                            pass
+
+                clear_ach_wiz(context)
+                await update.message.reply_text("✅ Ачивка выдана и опубликована в чате.", reply_markup=kb_help_settings())
+                return
+
+        # описание документа
+        if context.chat_data.get(WAITING_DOC_DESC):
+            if not await is_admin_scoped(update, context):
+                clear_docs_flow(context)
+                await update.message.reply_text("❌ Только администраторы могут добавлять документы.")
+                return
+
+            pending = context.chat_data.get(PENDING_DOC_INFO)
+            if not pending:
+                clear_docs_flow(context)
+                await update.message.reply_text("❌ Не найден загруженный файл. Начните заново через /help.")
+                return
+
+            desc = None if text == "-" else text
+            if desc is not None:
+                desc = desc.strip()
+                if len(desc) < 3:
+                    await update.message.reply_text("❌ Слишком коротко. Напишите чуть подробнее или отправьте <code>-</code>.", parse_mode=ParseMode.HTML)
+                    return
+                desc = desc[:600]
+
+            pending["description"] = desc
+            context.chat_data[PENDING_DOC_INFO] = pending
+            context.chat_data[WAITING_DOC_DESC] = False
+
             await update.message.reply_text(
-                "Шаг 4/7: день рождения (формат <b>ДД.ММ</b>)\n"
-                "Пример: <code>22.01</code>\n"
-                "Если не хотите указывать — отправьте <code>-</code>",
+                "✅ Описание сохранено.\n\nТеперь выберите категорию:",
+                reply_markup=kb_pick_category_for_new_doc(),
+            )
+            return
+
+        # перенос даты вручную
+            # ---------------- FAQ ADD FLOW ----------------
+        if context.chat_data.get(WAITING_FAQ_Q):
+            context.chat_data[WAITING_FAQ_Q] = False
+            context.chat_data[WAITING_FAQ_A] = True
+
+            q_html = (text_html or text or "").strip()
+            q_plain = (text or "").strip()
+            context.chat_data[PENDING_FAQ] = {"question_html": q_html, "question_plain": q_plain}
+
+            await update.message.reply_text(
+                "✅ Вопрос сохранён.\n\nТеперь отправьте <b>ответ</b> одним сообщением.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb_cancel_wizard_settings()
+                reply_markup=kb_cancel_wizard_settings(),
             )
             return
 
-        if step == "birthday":
-            b = text.strip()
-            if b == "-":
-                data["birthday"] = None
-            else:
-                if not re.fullmatch(r"\d{2}\.\d{2}", b):
-                    await update.message.reply_text("❌ Формат ДД.ММ (пример 22.01) или '-'")
-                    return
-                dd, mm = b.split(".")
-                try:
-                    dd_i = int(dd)
-                    mm_i = int(mm)
-                except Exception:
-                    await update.message.reply_text("❌ Формат ДД.ММ (пример 22.01) или '-'")
-                    return
-                if not (1 <= dd_i <= 31 and 1 <= mm_i <= 12):
-                    await update.message.reply_text("❌ Некорректная дата. Пример: 22.01")
-                    return
-                data["birthday"] = b
+        if context.chat_data.get(WAITING_FAQ_A):
+            pending = context.chat_data.get(PENDING_FAQ) or {}
+            q_html = (pending.get("question_html") or "").strip()
+            a_html = (text_html or text or "").strip()
+            clear_faq_flow(context)
 
-            context.chat_data[PROFILE_WIZ_DATA] = data
-            context.chat_data[PROFILE_WIZ_STEP] = "about"
-            await update.message.reply_text("Шаг 5/7: кратко о себе (1–3 предложения)", reply_markup=kb_cancel_wizard_settings())
-            return
-
-        if step == "about":
-            if len(text) < 5:
-                await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
-                return
-            data["about"] = text
-            context.chat_data[PROFILE_WIZ_DATA] = data
-            context.chat_data[PROFILE_WIZ_STEP] = "topics"
-            await update.message.reply_text("Шаг 6/7: по каким вопросам обращаться?", reply_markup=kb_cancel_wizard_settings())
-            return
-
-        if step == "topics":
-            if len(text) < 3:
-                await update.message.reply_text("❌ Укажите темы/вопросы.")
-                return
-            data["topics"] = text
-            context.chat_data[PROFILE_WIZ_DATA] = data
-            context.chat_data[PROFILE_WIZ_STEP] = "tg_link"
-            await update.message.reply_text("Шаг 7/7: Telegram (@username или https://t.me/username)", reply_markup=kb_cancel_wizard_settings())
-            return
-
-        if step == "tg_link":
-            tg = text.strip()
-            ok = False
-            if tg.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", tg):
-                ok = True
-            if tg.startswith("https://t.me/") or tg.startswith("http://t.me/"):
-                ok = True
-            if re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
-                ok = True
-            if not ok:
-                await update.message.reply_text("❌ Не похоже на Telegram. Дайте @username или https://t.me/username")
+            if not q_html or not a_html:
+                await update.message.reply_text("❌ Не удалось сохранить: пустой вопрос или ответ.")
                 return
 
-            data["tg_link"] = tg
-
-            pid = db_profiles_add(
-                full_name=data["full_name"],
-                year_start=data["year_start"],
-                city=data["city"],
-                birthday=data.get("birthday"),
-                about=data["about"],
-                topics=data["topics"],
-                tg_link=data["tg_link"],
+            db_faq_add(q_html, a_html)
+            await update.message.reply_text(
+                "✅ Вопрос добавлен в FAQ.",
+                reply_markup=kb_help_settings(),
             )
-
-            clear_profile_wiz(context)
-            await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).", reply_markup=kb_help_settings())
             return
+            db_faq_add(q_text, a_text)
+            await update.message.reply_text(
+                "✅ Вопрос добавлен в FAQ.",
+                reply_markup=kb_help_settings(),
+            )
+            return
+
+
+        if context.chat_data.get(WAITING_DATE_FLAG):
+            if not await is_admin_scoped(update, context):
+                clear_waiting_date(context)
+                await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
+                return
+
+            if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", text):
+                await update.message.reply_text("❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
+                return
+
+            try:
+                dd, mm, yy = text.split(".")
+                new_d = date(int("20" + yy), int(mm), int(dd))
+            except Exception:
+                await update.message.reply_text("❌ Не удалось распознать дату. Проверьте корректность.")
+                return
+
+            today_d = datetime.now(MOSCOW_TZ).date()
+            if new_d <= today_d:
+                await update.message.reply_text("❌ Дата переноса должна быть в будущем.")
+                return
+
+            meeting_type = context.chat_data.get(WAITING_MEETING_TYPE, MEETING_STANDUP)
+            db_set_canceled(meeting_type, today_d, "Перенос на другой день", reschedule_date=text)
+            db_upsert_reschedule(meeting_type, today_d, new_d)
+            clear_waiting_date(context)
+
+            title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
+            await update.message.reply_text(f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
+            return
+
+        # ввод названия категории
+        if context.chat_data.get(WAITING_NEW_CATEGORY_NAME):
+            if not await is_admin_scoped(update, context):
+                clear_docs_flow(context)
+                await update.message.reply_text("❌ Только администраторы могут управлять категориями.")
+                return
+
+            if len(text) < 2:
+                await update.message.reply_text("❌ Слишком коротко. Отправьте нормальное название категории.")
+                return
+
+            try:
+                cid = db_docs_add_category(text)
+            except sqlite3.IntegrityError:
+                await update.message.reply_text("❌ Такая категория уже существует. Отправьте другое название.")
+                return
+
+            context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
+
+            pending = context.chat_data.get(PENDING_DOC_INFO)
+            if pending:
+                db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
+                clear_docs_flow(context)
+                await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
+                return
+
+            clear_docs_flow(context)
+            await update.message.reply_text("✅ Категория добавлена.", reply_markup=kb_help_settings())
+            return
+
+        # анкета — шаги
+        if context.chat_data.get(PROFILE_WIZ_ACTIVE):
+            if not await is_admin_scoped(update, context):
+                clear_profile_wiz(context)
+                await update.message.reply_text("❌ Только администраторы могут добавлять анкеты.")
+                return
+
+            step = context.chat_data.get(PROFILE_WIZ_STEP)
+            data = context.chat_data.get(PROFILE_WIZ_DATA) or {}
+
+            if step == "full_name":
+                if len(text.split()) < 2:
+                    await update.message.reply_text("❌ Нужно имя и фамилия. Пример: Иван Петров")
+                    return
+                data["full_name"] = text
+                context.chat_data[PROFILE_WIZ_DATA] = data
+                context.chat_data[PROFILE_WIZ_STEP] = "year_start"
+                await update.message.reply_text("Шаг 2/7: с какого года работает? Пример: 2022", reply_markup=kb_cancel_wizard_settings())
+                return
+
+            if step == "year_start":
+                if not re.fullmatch(r"\d{4}", text):
+                    await update.message.reply_text("❌ Введите год 4 цифрами. Пример: 2022")
+                    return
+                year = int(text)
+                cur_year = datetime.now(MOSCOW_TZ).year
+                if year < 1990 or year > cur_year:
+                    await update.message.reply_text(f"❌ Год должен быть в диапазоне 1990–{cur_year}.")
+                    return
+                data["year_start"] = year
+                context.chat_data[PROFILE_WIZ_DATA] = data
+                context.chat_data[PROFILE_WIZ_STEP] = "city"
+                await update.message.reply_text("Шаг 3/7: город проживания. Пример: Москва", reply_markup=kb_cancel_wizard_settings())
+                return
+
+            if step == "city":
+                if len(text) < 2:
+                    await update.message.reply_text("❌ Укажите город.")
+                    return
+                data["city"] = text
+                context.chat_data[PROFILE_WIZ_DATA] = data
+                context.chat_data[PROFILE_WIZ_STEP] = "birthday"
+                await update.message.reply_text(
+                    "Шаг 4/7: день рождения (формат <b>ДД.ММ</b>)\n"
+                    "Пример: <code>22.01</code>\n"
+                    "Если не хотите указывать — отправьте <code>-</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_cancel_wizard_settings()
+                )
+                return
+
+            if step == "birthday":
+                b = text.strip()
+                if b == "-":
+                    data["birthday"] = None
+                else:
+                    if not re.fullmatch(r"\d{2}\.\d{2}", b):
+                        await update.message.reply_text("❌ Формат ДД.ММ (пример 22.01) или '-'")
+                        return
+                    dd, mm = b.split(".")
+                    try:
+                        dd_i = int(dd)
+                        mm_i = int(mm)
+                    except Exception:
+                        await update.message.reply_text("❌ Формат ДД.ММ (пример 22.01) или '-'")
+                        return
+                    if not (1 <= dd_i <= 31 and 1 <= mm_i <= 12):
+                        await update.message.reply_text("❌ Некорректная дата. Пример: 22.01")
+                        return
+                    data["birthday"] = b
+
+                context.chat_data[PROFILE_WIZ_DATA] = data
+                context.chat_data[PROFILE_WIZ_STEP] = "about"
+                await update.message.reply_text("Шаг 5/7: кратко о себе (1–3 предложения)", reply_markup=kb_cancel_wizard_settings())
+                return
+
+            if step == "about":
+                if len(text) < 5:
+                    await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
+                    return
+                data["about"] = text
+                context.chat_data[PROFILE_WIZ_DATA] = data
+                context.chat_data[PROFILE_WIZ_STEP] = "topics"
+                await update.message.reply_text("Шаг 6/7: по каким вопросам обращаться?", reply_markup=kb_cancel_wizard_settings())
+                return
+
+            if step == "topics":
+                if len(text) < 3:
+                    await update.message.reply_text("❌ Укажите темы/вопросы.")
+                    return
+                data["topics"] = text
+                context.chat_data[PROFILE_WIZ_DATA] = data
+                context.chat_data[PROFILE_WIZ_STEP] = "tg_link"
+                await update.message.reply_text("Шаг 7/7: Telegram (@username или https://t.me/username)", reply_markup=kb_cancel_wizard_settings())
+                return
+
+            if step == "tg_link":
+                tg = text.strip()
+                ok = False
+                if tg.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", tg):
+                    ok = True
+                if tg.startswith("https://t.me/") or tg.startswith("http://t.me/"):
+                    ok = True
+                if re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
+                    ok = True
+                if not ok:
+                    await update.message.reply_text("❌ Не похоже на Telegram. Дайте @username или https://t.me/username")
+                    return
+
+                data["tg_link"] = tg
+
+                pid = db_profiles_add(
+                    full_name=data["full_name"],
+                    year_start=data["year_start"],
+                    city=data["city"],
+                    birthday=data.get("birthday"),
+                    about=data["about"],
+                    topics=data["topics"],
+                    tg_link=data["tg_link"],
+                )
+
+                clear_profile_wiz(context)
+                await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).", reply_markup=kb_help_settings())
+                return
 
 
 
