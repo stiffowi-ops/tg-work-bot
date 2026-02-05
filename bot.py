@@ -645,6 +645,72 @@ def db_init():
     """)
 
 
+    # ---------------- TESTS: templates / assignments / answers ----------------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER NOT NULL,
+            idx INTEGER NOT NULL,
+            q_type TEXT NOT NULL,              -- open|single|multi
+            question_text TEXT NOT NULL,
+            options_json TEXT,                 -- JSON list[str] for closed questions
+            correct_json TEXT,                 -- JSON list[int] (single => [i], multi => [i,...])
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(template_id) REFERENCES test_templates(id) ON DELETE CASCADE
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            assigned_by INTEGER,
+            assigned_at TEXT NOT NULL,
+            time_limit_sec INTEGER,
+            deadline_at TEXT,
+            status TEXT NOT NULL DEFAULT 'assigned',  -- assigned|in_progress|finished|expired|canceled|saved
+            started_at TEXT,
+            finished_at TEXT,
+            current_idx INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY(template_id) REFERENCES test_templates(id) ON DELETE CASCADE,
+            FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            assignment_id INTEGER NOT NULL,
+            question_id INTEGER NOT NULL,
+            answer_json TEXT,                  -- JSON: {"text": "..."} or {"selected":[0,2]}
+            is_correct INTEGER,                -- 1/0/NULL
+            answered_at TEXT NOT NULL,
+            FOREIGN KEY(assignment_id) REFERENCES test_assignments(id) ON DELETE CASCADE,
+            FOREIGN KEY(question_id) REFERENCES test_questions(id) ON DELETE CASCADE,
+            UNIQUE(assignment_id, question_id)
+        )
+    """)
+
+    # ---- migrations for older DBs (if any) ----
+    try:
+        cur.execute("ALTER TABLE test_assignments ADD COLUMN current_idx INTEGER NOT NULL DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE test_assignments ADD COLUMN deadline_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     con.commit()
     con.close()
 
@@ -708,79 +774,6 @@ def db_set_horo_last_date(user_id: int, date_iso: str):
     )
     con.commit()
     con.close()
-
-# ---------------- TESTS: templates / assignments / answers ----------------
-con = sqlite3.connect(DB_PATH)
-cur = con.cursor()
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS test_templates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        created_by INTEGER,
-        created_at TEXT NOT NULL
-    )
-""")
-
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS test_questions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        template_id INTEGER NOT NULL,
-        idx INTEGER NOT NULL,
-        q_type TEXT NOT NULL,              -- open|single|multi
-        question_text TEXT NOT NULL,
-        options_json TEXT,                 -- JSON list[str] for closed questions
-        correct_json TEXT,                 -- JSON list[int] (single => [i], multi => [i,...])
-        created_at TEXT NOT NULL,
-        FOREIGN KEY(template_id) REFERENCES test_templates(id) ON DELETE CASCADE
-    )
-""")
-
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS test_assignments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        template_id INTEGER NOT NULL,
-        profile_id INTEGER NOT NULL,
-        assigned_by INTEGER,
-        assigned_at TEXT NOT NULL,
-        time_limit_sec INTEGER,
-        deadline_at TEXT,
-        status TEXT NOT NULL DEFAULT 'assigned',  -- assigned|in_progress|finished|expired|canceled|saved
-        started_at TEXT,
-        finished_at TEXT,
-        current_idx INTEGER NOT NULL DEFAULT 1,
-        FOREIGN KEY(template_id) REFERENCES test_templates(id) ON DELETE CASCADE,
-        FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
-    )
-""")
-
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS test_answers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        assignment_id INTEGER NOT NULL,
-        question_id INTEGER NOT NULL,
-        answer_json TEXT,                  -- JSON: {"text": "..."} or {"selected":[0,2]}
-        is_correct INTEGER,                -- 1/0/NULL
-        answered_at TEXT NOT NULL,
-        FOREIGN KEY(assignment_id) REFERENCES test_assignments(id) ON DELETE CASCADE,
-        FOREIGN KEY(question_id) REFERENCES test_questions(id) ON DELETE CASCADE,
-        UNIQUE(assignment_id, question_id)
-    )
-""")
-
-# ---- migrations for older DBs (if any) ----
-try:
-    cur.execute("ALTER TABLE test_assignments ADD COLUMN current_idx INTEGER NOT NULL DEFAULT 1")
-except sqlite3.OperationalError:
-    pass
-try:
-    cur.execute("ALTER TABLE test_assignments ADD COLUMN deadline_at TEXT")
-except sqlite3.OperationalError:
-    pass
-
-
-
-con.commit()
-con.close()
 
 # ---------------- MEMES DB ----------------
 
