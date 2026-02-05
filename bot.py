@@ -36,6 +36,115 @@ from telegram.ext import (
 
 from telegram.request import HTTPXRequest
 
+
+# ---------------- TEXT -> HTML (entities incl. blockquote) ----------------
+def _utf16_to_py_index(s: str, u16_index: int) -> int:
+    """
+    Convert Telegram UTF-16 code unit offset to Python string index.
+    Telegram entities offsets/length are based on UTF-16 code units.
+    """
+    if u16_index <= 0:
+        return 0
+    count = 0
+    for i, ch in enumerate(s):
+        # characters outside BMP take 2 UTF-16 code units
+        count += 2 if ord(ch) > 0xFFFF else 1
+        if count >= u16_index:
+            return i + 1
+    return len(s)
+
+def _entity_open_close(entity) -> tuple[str, str]:
+    t = getattr(entity, "type", "")
+    if t == "bold":
+        return "<b>", "</b>"
+    if t == "italic":
+        return "<i>", "</i>"
+    if t == "underline":
+        return "<u>", "</u>"
+    if t == "strikethrough":
+        return "<s>", "</s>"
+    if t == "spoiler":
+        return '<span class="tg-spoiler">', "</span>"
+    if t == "code":
+        return "<code>", "</code>"
+    if t == "pre":
+        lang = getattr(entity, "language", None)
+        if lang:
+            # Telegram HTML supports <pre><code class="language-...">...</code></pre>
+            return f'<pre><code class="language-{html_lib.escape(lang)}">', "</code></pre>"
+        return "<pre>", "</pre>"
+    if t == "text_link":
+        url = getattr(entity, "url", "") or ""
+        return f'<a href="{html_lib.escape(url, quote=True)}">', "</a>"
+    if t == "blockquote":
+        return "<blockquote>", "</blockquote>"
+    if t == "expandable_blockquote":
+        return "<blockquote expandable>", "</blockquote>"
+    # Fallback: unsupported entity types are ignored
+    return "", ""
+
+def _text_with_entities_to_html(text: str, entities: list) -> str:
+    if not text:
+        return ""
+    entities = list(entities or [])
+    if not entities:
+        return html_lib.escape(text)
+
+    # Prepare start/end events
+    starts: dict[int, list[tuple[int, str]]] = {}
+    ends: dict[int, list[tuple[int, str]]] = {}
+
+    for e in entities:
+        try:
+            off = int(getattr(e, "offset", 0))
+            ln = int(getattr(e, "length", 0))
+        except Exception:
+            continue
+        if ln <= 0:
+            continue
+
+        start = _utf16_to_py_index(text, off)
+        end = _utf16_to_py_index(text, off + ln)
+        if end <= start:
+            continue
+
+        open_tag, close_tag = _entity_open_close(e)
+        if not open_tag:
+            continue
+
+        # For stable nesting:
+        # - open outer first => sort opens by longer span first (end desc)
+        # - close inner first => sort closes by shorter span first (start desc)
+        starts.setdefault(start, []).append((end, open_tag))
+        ends.setdefault(end, []).append((start, close_tag))
+
+    out: list[str] = []
+    for i in range(0, len(text) + 1):
+        if i in ends:
+            # close inner first => larger start (inner) first
+            for _start, tag in sorted(ends[i], key=lambda x: x[0], reverse=True):
+                out.append(tag)
+        if i in starts:
+            # open outer first => larger end first
+            for _end, tag in sorted(starts[i], key=lambda x: x[0], reverse=True):
+                out.append(tag)
+        if i < len(text):
+            out.append(html_lib.escape(text[i]))
+    return "".join(out)
+
+def message_to_html(message) -> str:
+    """
+    Returns HTML suitable for ParseMode.HTML from a Telegram Message,
+    preserving formatting entities (including blockquote).
+    """
+    if not message:
+        return ""
+    if getattr(message, "text", None):
+        return _text_with_entities_to_html(message.text, getattr(message, "entities", None) or [])
+    if getattr(message, "caption", None):
+        return _text_with_entities_to_html(message.caption, getattr(message, "caption_entities", None) or [])
+    return ""
+
 load_dotenv()
 
 logging.basicConfig(
@@ -4494,7 +4603,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
     text = (update.message.text or "").strip()
 
-    text_html = (update.message.text_html or update.message.text or "").strip()
+    text_html = (message_to_html(update.message) or "").strip()
 
     # ---------------- BONUS CALC (FAQ) ----------------
     if context.chat_data.get(WAITING_BONUS_CALC):
