@@ -1728,6 +1728,14 @@ async def is_admin_scoped(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return await is_admin_in_chat(scope_chat_id, update.effective_user.id, context)
 
 # ---------------- STATES ----------------
+
+# ------- TESTING (wizard + runtime) -------
+TEST_WIZ_ACTIVE = 'TEST_WIZ_ACTIVE'
+TEST_WIZ_STEP = 'TEST_WIZ_STEP'
+TEST_WIZ_DATA = 'TEST_WIZ_DATA'
+TEST_WIZ_WAITING_INPUT = 'TEST_WIZ_WAITING_INPUT'
+ACTIVE_TEST_ASSIGNMENT_ID = 'ACTIVE_TEST_ASSIGNMENT_ID'
+
 # meeting reschedule manual
 WAITING_DATE_FLAG = "waiting_reschedule_date"
 WAITING_USER_ID = "waiting_user_id"
@@ -4507,9 +4515,9 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "help:settings:test:create":
             clear_test_wiz(context)
-            context.chat_data[TEST_WIZ_ACTIVE] = True
-            context.chat_data[TEST_WIZ_STEP] = "title"
-            context.chat_data[TEST_WIZ_DATA] = {"title": None, "questions": [], "time_limit_min": None, "profile_id": None}
+            context.user_data[TEST_WIZ_ACTIVE] = True
+            context.user_data[TEST_WIZ_STEP] = "title"
+            context.user_data[TEST_WIZ_DATA] = {"title": None, "questions": [], "time_limit_min": None, "profile_id": None}
             context.chat_data[WAITING_USER_ID] = update.effective_user.id
             context.chat_data[WAITING_SINCE_TS] = int(time.time())
             await q.edit_message_text(
@@ -4521,10 +4529,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "help:settings:test:add_q":
-            if not context.chat_data.get(TEST_WIZ_ACTIVE):
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
                 await q.answer("Сначала запусти создание теста.", show_alert=True)
                 return
-            context.chat_data[TEST_WIZ_STEP] = "q_type"
+            context.user_data[TEST_WIZ_STEP] = "q_type"
             await q.edit_message_text(
                 "Шаг 2/5: выбери тип вопроса:",
                 parse_mode=ParseMode.HTML,
@@ -4533,14 +4541,14 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data.startswith("help:settings:test:qtype:"):
-            if not context.chat_data.get(TEST_WIZ_ACTIVE):
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
                 await q.answer("Сначала запусти создание теста.", show_alert=True)
                 return
             qtype = data.split(":")[-1]
-            d = context.chat_data.get(TEST_WIZ_DATA) or {}
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
             d["current_q"] = {"q_type": qtype, "text": None, "options": [], "correct": []}
-            context.chat_data[TEST_WIZ_DATA] = d
-            context.chat_data[TEST_WIZ_STEP] = "q_text"
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = "q_text"
             await q.edit_message_text(
                 "Отправь текст вопроса одним сообщением.",
                 parse_mode=ParseMode.HTML,
@@ -4549,7 +4557,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "help:settings:test:opt_done":
-            d = context.chat_data.get(TEST_WIZ_DATA) or {}
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
             cq = d.get("current_q") or {}
             opts = cq.get("options") or []
             qtype = cq.get("q_type")
@@ -4558,7 +4566,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             # move to correct picking
             if qtype == "single":
-                context.chat_data[TEST_WIZ_STEP] = "pick_correct_single"
+                context.user_data[TEST_WIZ_STEP] = "pick_correct_single"
                 await q.edit_message_text(
                     "Выбери <b>один</b> правильный вариант:",
                     parse_mode=ParseMode.HTML,
@@ -4567,8 +4575,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if qtype == "multi":
                 d["correct_sel"] = set()
-                context.chat_data[TEST_WIZ_DATA] = d
-                context.chat_data[TEST_WIZ_STEP] = "pick_correct_multi"
+                context.user_data[TEST_WIZ_DATA] = d
+                context.user_data[TEST_WIZ_STEP] = "pick_correct_multi"
                 await q.edit_message_text(
                     "Отметь <b>все</b> правильные варианты, затем нажми «Готово»:",
                     parse_mode=ParseMode.HTML,
@@ -4579,7 +4587,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data.startswith("help:settings:test:correct_single:"):
-            d = context.chat_data.get(TEST_WIZ_DATA) or {}
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
             cq = d.get("current_q") or {}
             opts = cq.get("options") or []
             i = int(data.split(":")[-1])
@@ -4593,8 +4601,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             qs.append({"q_type": cq["q_type"], "text": cq["text"], "options": opts, "correct": cq["correct"]})
             d["questions"] = qs
             d.pop("current_q", None)
-            context.chat_data[TEST_WIZ_DATA] = d
-            context.chat_data[TEST_WIZ_STEP] = "q_menu"
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = "q_menu"
             await q.edit_message_text(
                 f"✅ Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
                 parse_mode=ParseMode.HTML,
@@ -4603,7 +4611,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data.startswith("help:settings:test:correct_toggle:"):
-            d = context.chat_data.get(TEST_WIZ_DATA) or {}
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
             cq = d.get("current_q") or {}
             opts = cq.get("options") or []
             i = int(data.split(":")[-1])
@@ -4613,12 +4621,12 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 sel.add(i)
             d["correct_sel"] = sel
-            context.chat_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_DATA] = d
             await q.edit_message_reply_markup(reply_markup=kb_test_pick_correct_multi(opts, sel))
             return
 
         if data == "help:settings:test:correct_done":
-            d = context.chat_data.get(TEST_WIZ_DATA) or {}
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
             cq = d.get("current_q") or {}
             opts = cq.get("options") or []
             sel = sorted(list(d.get("correct_sel") or []))
@@ -4631,8 +4639,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d["questions"] = qs
             d.pop("current_q", None)
             d.pop("correct_sel", None)
-            context.chat_data[TEST_WIZ_DATA] = d
-            context.chat_data[TEST_WIZ_STEP] = "q_menu"
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = "q_menu"
             await q.edit_message_text(
                 f"✅ Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
                 parse_mode=ParseMode.HTML,
@@ -4641,12 +4649,12 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "help:settings:test:finish_qs":
-            d = context.chat_data.get(TEST_WIZ_DATA) or {}
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
             qs = d.get("questions") or []
             if not qs:
                 await q.answer("Добавь хотя бы 1 вопрос.", show_alert=True)
                 return
-            context.chat_data[TEST_WIZ_STEP] = "time_limit"
+            context.user_data[TEST_WIZ_STEP] = "time_limit"
             await q.edit_message_text(
                 "Шаг 3/5: выбери время на тестирование:",
                 parse_mode=ParseMode.HTML,
@@ -4656,9 +4664,9 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("help:settings:test:time:"):
             val = data.split(":")[-1]
-            d = context.chat_data.get(TEST_WIZ_DATA) or {}
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
             if val == "manual":
-                context.chat_data[TEST_WIZ_STEP] = "time_manual"
+                context.user_data[TEST_WIZ_STEP] = "time_manual"
                 await q.edit_message_text(
                     "Отправь число минут (например <code>12</code>).\n"
                     "0 = без лимита.",
@@ -4672,8 +4680,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Не понял время.", show_alert=True)
                 return
             d["time_limit_min"] = mins
-            context.chat_data[TEST_WIZ_DATA] = d
-            context.chat_data[TEST_WIZ_STEP] = "pick_employee"
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = "pick_employee"
             await q.edit_message_text(
                 "Шаг 4/5: выбери сотрудника:",
                 parse_mode=ParseMode.HTML,
@@ -4682,14 +4690,14 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data.startswith("help:settings:test:pick:"):
-            d = context.chat_data.get(TEST_WIZ_DATA) or {}
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
             pid = int(data.split(":")[-1])
             p = db_profiles_get(pid)
             if not p:
                 await q.answer("Анкета не найдена.", show_alert=True)
                 return
             d["profile_id"] = pid
-            context.chat_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_DATA] = d
             # confirm
             title = escape(d.get("title") or "")
             qn = len(d.get("questions") or [])
@@ -4712,7 +4720,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "help:settings:test:send":
-            d = context.chat_data.get(TEST_WIZ_DATA) or {}
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
             title = (d.get("title") or "").strip()
             qs = d.get("questions") or []
             pid = d.get("profile_id")
@@ -5634,12 +5642,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
     # ---------------- TEST WIZARD (admin) ----------------
-    if context.chat_data.get(TEST_WIZ_ACTIVE):
+    if context.user_data.get(TEST_WIZ_ACTIVE):
         if not await is_admin_scoped(update, context):
             clear_test_wiz(context)
             return
-        step = context.chat_data.get(TEST_WIZ_STEP)
-        d = context.chat_data.get(TEST_WIZ_DATA) or {}
+        step = context.user_data.get(TEST_WIZ_STEP)
+        d = context.user_data.get(TEST_WIZ_DATA) or {}
 
         if step == "title":
             title = (text or "").strip()
@@ -5647,8 +5655,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Слишком коротко. Пришли нормальное название.")
                 return
             d["title"] = title[:200]
-            context.chat_data[TEST_WIZ_DATA] = d
-            context.chat_data[TEST_WIZ_STEP] = "q_menu"
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = "q_menu"
             await update.message.reply_text(
                 f"✅ Название сохранено: <b>{escape(d['title'])}</b>\n\nТеперь добавим вопросы:",
                 parse_mode=ParseMode.HTML,
@@ -5664,14 +5672,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             cq["text"] = qtxt[:800]
             d["current_q"] = cq
-            context.chat_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_DATA] = d
             if cq.get("q_type") == "open":
                 qs = d.get("questions") or []
                 qs.append({"q_type": "open", "text": cq["text"]})
                 d["questions"] = qs
                 d.pop("current_q", None)
-                context.chat_data[TEST_WIZ_DATA] = d
-                context.chat_data[TEST_WIZ_STEP] = "q_menu"
+                context.user_data[TEST_WIZ_DATA] = d
+                context.user_data[TEST_WIZ_STEP] = "q_menu"
                 await update.message.reply_text(
                     f"✅ Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
                     parse_mode=ParseMode.HTML,
@@ -5680,7 +5688,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # closed question -> collect options
-            context.chat_data[TEST_WIZ_STEP] = "opt_add"
+            context.user_data[TEST_WIZ_STEP] = "opt_add"
             await update.message.reply_text(
                 "Отправляй варианты ответа <b>по одному сообщению</b>.\n"
                 "Нужно минимум 2 варианта.\n"
@@ -5703,7 +5711,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             opts.append(opt[:200])
             cq["options"] = opts
             d["current_q"] = cq
-            context.chat_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_DATA] = d
             await update.message.reply_text(
                 f"✅ Вариант добавлен. Сейчас вариантов: <b>{len(opts)}</b>.",
                 parse_mode=ParseMode.HTML,
@@ -5721,8 +5729,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Укажи от 0 до 240 минут.")
                 return
             d["time_limit_min"] = mins
-            context.chat_data[TEST_WIZ_DATA] = d
-            context.chat_data[TEST_WIZ_STEP] = "pick_employee"
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = "pick_employee"
             await update.message.reply_text(
                 "Выбери сотрудника:",
                 reply_markup=kb_pick_profile_for_test(),
