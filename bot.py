@@ -1735,6 +1735,7 @@ TEST_WIZ_STEP = 'TEST_WIZ_STEP'
 TEST_WIZ_DATA = 'TEST_WIZ_DATA'
 TEST_WIZ_WAITING_INPUT = 'TEST_WIZ_WAITING_INPUT'
 ACTIVE_TEST_ASSIGNMENT_ID = 'ACTIVE_TEST_ASSIGNMENT_ID'
+ACTIVE_TEST = ACTIVE_TEST_ASSIGNMENT_ID  # backward-compatible alias
 
 # meeting reschedule manual
 WAITING_DATE_FLAG = "waiting_reschedule_date"
@@ -2103,7 +2104,7 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             deadline_at = (now + timedelta(seconds=int(a["time_limit_sec"]))).isoformat()
 
         db_test_assignment_set_status(aid, "in_progress", started_at=started_at, deadline_at=deadline_at, current_idx=1)
-        context.user_data[ACTIVE_TEST] = {"assignment_id": aid}
+        context.user_data[ACTIVE_TEST_ASSIGNMENT_ID] = {"assignment_id": aid}
 
         try:
             await q.edit_message_text("✅ Тест начат. Отвечай на вопросы по порядку.")
@@ -5581,8 +5582,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---------------- BONUS CALC (FAQ) ----------------
 
     # ---------------- ACTIVE TEST (employee) ----------------
-    if context.user_data.get(ACTIVE_TEST):
-        at = context.user_data.get(ACTIVE_TEST) or {}
+    if context.user_data.get(ACTIVE_TEST_ASSIGNMENT_ID):
+        at = context.user_data.get(ACTIVE_TEST_ASSIGNMENT_ID) or {}
         aid = int(at.get("assignment_id") or 0)
         a = db_test_assignment_get(aid) if aid else None
         if not a:
