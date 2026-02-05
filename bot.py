@@ -6,7 +6,6 @@ import logging
 import time
 import csv
 import io
-import json
 import zipfile
 import html as html_lib
 import httpx
@@ -645,72 +644,6 @@ def db_init():
     """)
 
 
-    # ---------------- TESTS: templates / assignments / answers ----------------
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS test_templates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            created_by INTEGER,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS test_questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            template_id INTEGER NOT NULL,
-            idx INTEGER NOT NULL,
-            q_type TEXT NOT NULL,              -- open|single|multi
-            question_text TEXT NOT NULL,
-            options_json TEXT,                 -- JSON list[str] for closed questions
-            correct_json TEXT,                 -- JSON list[int] (single => [i], multi => [i,...])
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(template_id) REFERENCES test_templates(id) ON DELETE CASCADE
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS test_assignments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            template_id INTEGER NOT NULL,
-            profile_id INTEGER NOT NULL,
-            assigned_by INTEGER,
-            assigned_at TEXT NOT NULL,
-            time_limit_sec INTEGER,
-            deadline_at TEXT,
-            status TEXT NOT NULL DEFAULT 'assigned',  -- assigned|in_progress|finished|expired|canceled|saved
-            started_at TEXT,
-            finished_at TEXT,
-            current_idx INTEGER NOT NULL DEFAULT 1,
-            FOREIGN KEY(template_id) REFERENCES test_templates(id) ON DELETE CASCADE,
-            FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS test_answers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            assignment_id INTEGER NOT NULL,
-            question_id INTEGER NOT NULL,
-            answer_json TEXT,                  -- JSON: {"text": "..."} or {"selected":[0,2]}
-            is_correct INTEGER,                -- 1/0/NULL
-            answered_at TEXT NOT NULL,
-            FOREIGN KEY(assignment_id) REFERENCES test_assignments(id) ON DELETE CASCADE,
-            FOREIGN KEY(question_id) REFERENCES test_questions(id) ON DELETE CASCADE,
-            UNIQUE(assignment_id, question_id)
-        )
-    """)
-
-    # ---- migrations for older DBs (if any) ----
-    try:
-        cur.execute("ALTER TABLE test_assignments ADD COLUMN current_idx INTEGER NOT NULL DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cur.execute("ALTER TABLE test_assignments ADD COLUMN deadline_at TEXT")
-    except sqlite3.OperationalError:
-        pass
-
     con.commit()
     con.close()
 
@@ -774,6 +707,8 @@ def db_set_horo_last_date(user_id: int, date_iso: str):
     )
     con.commit()
     con.close()
+
+
 
 # ---------------- MEMES DB ----------------
 
@@ -1487,184 +1422,6 @@ async def is_admin_in_chat(chat_id: int, user_id: int, context: ContextTypes.DEF
         return member.status in ("administrator", "creator")
     except Exception:
         return False
-# ---------------- TESTS DB ----------------
-
-def db_test_template_create(title: str, created_by: int | None) -> int:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO test_templates(title, created_by, created_at) VALUES(?, ?, ?)",
-        ((title or "").strip()[:200], int(created_by) if created_by else None, datetime.utcnow().isoformat()),
-    )
-    con.commit()
-    tid = int(cur.lastrowid)
-    con.close()
-    return tid
-
-def db_test_question_add(template_id: int, idx: int, q_type: str, question_text: str,
-                         options: list[str] | None = None, correct: list[int] | None = None) -> int:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """INSERT INTO test_questions(template_id, idx, q_type, question_text, options_json, correct_json, created_at)
-           VALUES(?, ?, ?, ?, ?, ?, ?)""",
-        (
-            int(template_id),
-            int(idx),
-            (q_type or "open"),
-            (question_text or "").strip(),
-            json.dumps(options or [], ensure_ascii=False) if options is not None else None,
-            json.dumps(correct or [], ensure_ascii=False) if correct is not None else None,
-            datetime.utcnow().isoformat(),
-        ),
-    )
-    con.commit()
-    qid = int(cur.lastrowid)
-    con.close()
-    return qid
-
-def db_test_template_get_questions(template_id: int) -> list[dict]:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "SELECT id, idx, q_type, question_text, options_json, correct_json FROM test_questions WHERE template_id=? ORDER BY idx ASC",
-        (int(template_id),),
-    )
-    rows = cur.fetchall()
-    con.close()
-    out = []
-    for r in rows:
-        out.append({
-            "id": int(r[0]),
-            "idx": int(r[1]),
-            "q_type": r[2],
-            "text": r[3],
-            "options": json.loads(r[4]) if r[4] else [],
-            "correct": json.loads(r[5]) if r[5] else [],
-        })
-    return out
-
-def db_test_assignment_create(template_id: int, profile_id: int, assigned_by: int | None, time_limit_sec: int | None) -> int:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """INSERT INTO test_assignments(template_id, profile_id, assigned_by, assigned_at, time_limit_sec, status, current_idx)
-           VALUES(?, ?, ?, ?, ?, 'assigned', 1)""",
-        (int(template_id), int(profile_id), int(assigned_by) if assigned_by else None, datetime.utcnow().isoformat(), int(time_limit_sec) if time_limit_sec else None),
-    )
-    con.commit()
-    aid = int(cur.lastrowid)
-    con.close()
-    return aid
-
-def db_test_assignment_get(aid: int) -> dict | None:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "SELECT id, template_id, profile_id, assigned_by, assigned_at, time_limit_sec, deadline_at, status, started_at, finished_at, current_idx "
-        "FROM test_assignments WHERE id=?",
-        (int(aid),),
-    )
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
-    return {
-        "id": int(row[0]),
-        "template_id": int(row[1]),
-        "profile_id": int(row[2]),
-        "assigned_by": int(row[3]) if row[3] is not None else None,
-        "assigned_at": row[4],
-        "time_limit_sec": int(row[5]) if row[5] is not None else None,
-        "deadline_at": row[6],
-        "status": row[7],
-        "started_at": row[8],
-        "finished_at": row[9],
-        "current_idx": int(row[10]) if row[10] is not None else 1,
-    }
-
-def db_test_assignment_set_status(aid: int, status: str, started_at: str | None = None, finished_at: str | None = None, deadline_at: str | None = None, current_idx: int | None = None):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    # build dynamic update
-    fields = ["status=?"]
-    vals = [status]
-    if started_at is not None:
-        fields.append("started_at=?")
-        vals.append(started_at)
-    if finished_at is not None:
-        fields.append("finished_at=?")
-        vals.append(finished_at)
-    if deadline_at is not None:
-        fields.append("deadline_at=?")
-        vals.append(deadline_at)
-    if current_idx is not None:
-        fields.append("current_idx=?")
-        vals.append(int(current_idx))
-    vals.append(int(aid))
-    cur.execute(f"UPDATE test_assignments SET {', '.join(fields)} WHERE id=?", tuple(vals))
-    con.commit()
-    con.close()
-
-def db_test_answer_upsert(aid: int, qid: int, answer_json: dict, is_correct: int | None):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """INSERT INTO test_answers(assignment_id, question_id, answer_json, is_correct, answered_at)
-           VALUES(?, ?, ?, ?, ?)
-           ON CONFLICT(assignment_id, question_id) DO UPDATE SET
-             answer_json=excluded.answer_json,
-             is_correct=excluded.is_correct,
-             answered_at=excluded.answered_at
-        """,
-        (int(aid), int(qid), json.dumps(answer_json, ensure_ascii=False), is_correct, datetime.utcnow().isoformat()),
-    )
-    con.commit()
-    con.close()
-
-def db_test_get_answers(aid: int) -> list[dict]:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "SELECT question_id, answer_json, is_correct, answered_at FROM test_answers WHERE assignment_id=? ORDER BY id ASC",
-        (int(aid),),
-    )
-    rows = cur.fetchall()
-    con.close()
-    out = []
-    for r in rows:
-        out.append({
-            "question_id": int(r[0]),
-            "answer": json.loads(r[1]) if r[1] else {},
-            "is_correct": (None if r[2] is None else int(r[2])),
-            "answered_at": r[3],
-        })
-    return out
-
-def db_test_list_recent(limit: int = 20) -> list[dict]:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """SELECT a.id, t.title, p.full_name, a.status, a.assigned_at, a.finished_at
-           FROM test_assignments a
-           JOIN test_templates t ON t.id=a.template_id
-           JOIN profiles p ON p.id=a.profile_id
-           ORDER BY a.id DESC
-           LIMIT ?""",
-        (int(limit),),
-    )
-    rows = cur.fetchall()
-    con.close()
-    return [{"id": int(r[0]), "title": r[1], "name": r[2], "status": r[3], "assigned_at": r[4], "finished_at": r[5]} for r in rows]
-
-def db_test_delete_attempt(aid: int):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("DELETE FROM test_answers WHERE assignment_id=?", (int(aid),))
-    cur.execute("UPDATE test_assignments SET status='canceled', finished_at=? WHERE id=?", (datetime.utcnow().isoformat(), int(aid)))
-    con.commit()
-    con.close()
-
 
 
 
@@ -1728,15 +1485,6 @@ async def is_admin_scoped(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return await is_admin_in_chat(scope_chat_id, update.effective_user.id, context)
 
 # ---------------- STATES ----------------
-
-# ------- TESTING (wizard + runtime) -------
-TEST_WIZ_ACTIVE = 'TEST_WIZ_ACTIVE'
-TEST_WIZ_STEP = 'TEST_WIZ_STEP'
-TEST_WIZ_DATA = 'TEST_WIZ_DATA'
-TEST_WIZ_WAITING_INPUT = 'TEST_WIZ_WAITING_INPUT'
-ACTIVE_TEST_ASSIGNMENT_ID = 'ACTIVE_TEST_ASSIGNMENT_ID'
-ACTIVE_TEST = ACTIVE_TEST_ASSIGNMENT_ID  # backward-compatible alias
-
 # meeting reschedule manual
 WAITING_DATE_FLAG = "waiting_reschedule_date"
 WAITING_USER_ID = "waiting_user_id"
@@ -1837,19 +1585,6 @@ def clear_bcast_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(BCAST_STEP, None)
     context.user_data.pop(BCAST_DATA, None)
 
-
-def clear_active_test(context: ContextTypes.DEFAULT_TYPE):
-    """Сброс состояния прохождения теста у сотрудника."""
-    context.user_data.pop(ACTIVE_TEST_ASSIGNMENT_ID, None)
-    context.user_data.pop('active_test_multi_sel', None)
-
-def clear_test_wiz(context: ContextTypes.DEFAULT_TYPE):
-    """Сброс визарда создания теста."""
-    context.user_data.pop('TEST_WIZ_ACTIVE', None)
-    context.user_data.pop('TEST_WIZ_STEP', None)
-    context.user_data.pop('TEST_WIZ_DATA', None)
-    # если админ был в промежуточном вводе
-    context.user_data.pop('TEST_WIZ_WAITING_INPUT', None)
 
 def clear_bonus_calc_flow(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_BONUS_CALC] = False
@@ -2015,221 +1750,6 @@ async def send_birthday_congrats(context: ContextTypes.DEFAULT_TYPE) -> bool:
     db_set_meta("bday_template_next", str(tpl_idx))
 
     return sent_any
-
-
-# ---------------- TESTS: sending questions / callbacks ----------------
-
-async def _send_test_question_to_user(user_id: int, assignment_id: int, context: ContextTypes.DEFAULT_TYPE):
-    a = db_test_assignment_get(int(assignment_id))
-    if not a:
-        return
-    qs = db_test_template_get_questions(a["template_id"])
-    idx_cur = a.get("current_idx", 1)
-    qrec = next((x for x in qs if x["idx"] == idx_cur), None)
-    if not qrec:
-        return
-
-    # deadline guard
-    if a.get("deadline_at"):
-        try:
-            dl = datetime.fromisoformat(a["deadline_at"])
-            if datetime.utcnow() > dl:
-                db_test_assignment_set_status(assignment_id, "expired", finished_at=datetime.utcnow().isoformat())
-                clear_active_test(context)
-                await context.bot.send_message(chat_id=user_id, text="⏳ Время на тестирование истекло.")
-                return
-        except Exception:
-            pass
-
-    head = f"📝 <b>Вопрос {qrec['idx']}/{len(qs)}</b>\n\n{escape(qrec['text'])}"
-    qtype = qrec["q_type"]
-
-    if qtype == "open":
-        await context.bot.send_message(chat_id=user_id, text=head + "\n\nНапиши ответ текстом.", parse_mode=ParseMode.HTML)
-        return
-
-    options = qrec.get("options") or []
-    if qtype == "single":
-        rows = []
-        for i, opt in enumerate(options):
-            label = opt if len(opt) <= 40 else (opt[:37] + "…")
-            rows.append([InlineKeyboardButton(label, callback_data=f"test:single:{assignment_id}:{qrec['id']}:{i}")])
-        await context.bot.send_message(chat_id=user_id, text=head + "\n\nВыбери один вариант:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if qtype == "multi":
-        # init selection
-        context.user_data["active_test_multi_sel"] = []
-        rows = []
-        for i, opt in enumerate(options):
-            label = f"⬜ {opt if len(opt)<=35 else (opt[:32]+'…')}"
-            rows.append([InlineKeyboardButton(label, callback_data=f"test:toggle:{assignment_id}:{qrec['id']}:{i}")])
-        rows.append([InlineKeyboardButton("✅ Ответить", callback_data=f"test:multi_submit:{assignment_id}:{qrec['id']}")])
-        await context.bot.send_message(chat_id=user_id, text=head + "\n\nОтметь нужные варианты и нажми «Ответить».", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-
-async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await deny_no_access(update, context):
-        return
-
-    q = update.callback_query
-    if not q or not q.data:
-        return
-
-    try:
-        await q.answer()
-    except (TimedOut, NetworkError):
-        pass
-
-    parts = q.data.split(":")
-    if len(parts) < 2:
-        return
-
-    if parts[1] == "start":
-        # test:start:<aid>
-        try:
-            aid = int(parts[2])
-        except Exception:
-            return
-        a = db_test_assignment_get(aid)
-        if not a:
-            await q.answer("Тест не найден.", show_alert=True)
-            return
-
-        # allow only assigned employee (best effort): compare by username if present
-        # If already finished/expired
-        if a["status"] in ("finished", "expired", "canceled", "saved"):
-            await q.edit_message_text("Этот тест уже завершён.")
-            return
-
-        now = datetime.utcnow()
-        started_at = now.isoformat()
-        deadline_at = None
-        if a.get("time_limit_sec"):
-            deadline_at = (now + timedelta(seconds=int(a["time_limit_sec"]))).isoformat()
-
-        db_test_assignment_set_status(aid, "in_progress", started_at=started_at, deadline_at=deadline_at, current_idx=1)
-        context.user_data[ACTIVE_TEST_ASSIGNMENT_ID] = {"assignment_id": aid}
-
-        try:
-            await q.edit_message_text("✅ Тест начат. Отвечай на вопросы по порядку.")
-        except Exception:
-            pass
-
-        await _send_test_question_to_user(update.effective_user.id, aid, context)
-        return
-
-    if parts[1] == "single" and len(parts) == 5:
-        # test:single:<aid>:<qid>:<opt>
-        aid = int(parts[2]); qid = int(parts[3]); opt = int(parts[4])
-        a = db_test_assignment_get(aid)
-        if not a:
-            return
-        qs = db_test_template_get_questions(a["template_id"])
-        qrec = next((x for x in qs if x["id"] == qid), None)
-        if not qrec:
-            return
-        correct = qrec.get("correct") or []
-        is_correct = (1 if correct and opt == int(correct[0]) else 0)
-        db_test_answer_upsert(aid, qid, {"selected": [opt]}, is_correct)
-
-        next_idx = a.get("current_idx", 1) + 1
-        if next_idx > len(qs):
-            db_test_assignment_set_status(aid, "finished", finished_at=datetime.utcnow().isoformat(), current_idx=next_idx)
-            clear_active_test(context)
-            try:
-                await q.edit_message_text("✅ Ответ сохранён.")
-            except Exception:
-                pass
-            await context.bot.send_message(chat_id=update.effective_user.id, text="✅ Отлично. Тест пройден. Результаты сообщит твой руководитель.")
-            if a.get("assigned_by"):
-                try:
-                    await context.bot.send_message(chat_id=a["assigned_by"], text=f"✅ Тест #{aid} пройден сотрудником. Смотри результаты в /help → Настройки → Тестирование.")
-                except Exception:
-                    pass
-            return
-
-        db_test_assignment_set_status(aid, "in_progress", current_idx=next_idx)
-        try:
-            await q.edit_message_text("✅ Ответ принят.")
-        except Exception:
-            pass
-        await _send_test_question_to_user(update.effective_user.id, aid, context)
-        return
-
-    if parts[1] == "toggle" and len(parts) == 5:
-        # test:toggle:<aid>:<qid>:<opt>
-        aid = int(parts[2]); qid = int(parts[3]); opt = int(parts[4])
-        sel = set(context.user_data.get("active_test_multi_sel") or [])
-        if opt in sel:
-            sel.remove(opt)
-        else:
-            sel.add(opt)
-        context.user_data["active_test_multi_sel"] = sorted(list(sel))
-
-        a = db_test_assignment_get(aid)
-        if not a:
-            return
-        qs = db_test_template_get_questions(a["template_id"])
-        qrec = next((x for x in qs if x["id"] == qid), None)
-        if not qrec:
-            return
-        options = qrec.get("options") or []
-
-        rows = []
-        for i, opt_text in enumerate(options):
-            mark = "☑️" if i in sel else "⬜"
-            label = f"{mark} {opt_text if len(opt_text)<=35 else (opt_text[:32]+'…')}"
-            rows.append([InlineKeyboardButton(label, callback_data=f"test:toggle:{aid}:{qid}:{i}")])
-        rows.append([InlineKeyboardButton("✅ Ответить", callback_data=f"test:multi_submit:{aid}:{qid}")])
-        try:
-            await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
-        except Exception:
-            pass
-        return
-
-    if parts[1] == "multi_submit" and len(parts) == 4:
-        aid = int(parts[2]); qid = int(parts[3])
-        a = db_test_assignment_get(aid)
-        if not a:
-            return
-        sel = sorted(list(set(context.user_data.get("active_test_multi_sel") or [])))
-        if not sel:
-            await q.answer("Выбери хотя бы 1 вариант.", show_alert=True)
-            return
-        qs = db_test_template_get_questions(a["template_id"])
-        qrec = next((x for x in qs if x["id"] == qid), None)
-        if not qrec:
-            return
-        correct = sorted([int(x) for x in (qrec.get("correct") or [])])
-        is_correct = (1 if sel == correct else 0)
-        db_test_answer_upsert(aid, qid, {"selected": sel}, is_correct)
-        context.user_data.pop("active_test_multi_sel", None)
-
-        next_idx = a.get("current_idx", 1) + 1
-        if next_idx > len(qs):
-            db_test_assignment_set_status(aid, "finished", finished_at=datetime.utcnow().isoformat(), current_idx=next_idx)
-            clear_active_test(context)
-            try:
-                await q.edit_message_text("✅ Ответ принят.")
-            except Exception:
-                pass
-            await context.bot.send_message(chat_id=update.effective_user.id, text="✅ Отлично. Тест пройден. Результаты сообщит твой руководитель.")
-            if a.get("assigned_by"):
-                try:
-                    await context.bot.send_message(chat_id=a["assigned_by"], text=f"✅ Тест #{aid} пройден сотрудником. Смотри результаты в /help → Настройки → Тестирование.")
-                except Exception:
-                    pass
-            return
-
-        db_test_assignment_set_status(aid, "in_progress", current_idx=next_idx)
-        try:
-            await q.edit_message_text("✅ Ответ принят.")
-        except Exception:
-            pass
-        await _send_test_question_to_user(update.effective_user.id, aid, context)
-        return
 
 # ---------------- CORE SENDERS ----------------
 
@@ -2554,7 +2074,6 @@ def kb_help_settings():
         [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
         [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
         [InlineKeyboardButton("🏆 Ачивки", callback_data="help:settings:ach")],
-        [InlineKeyboardButton("📝 Тестирование", callback_data="help:settings:test")],
         [InlineKeyboardButton("❓ FAQ", callback_data="help:settings:faq")],
         [InlineKeyboardButton("📦 Скачать бэкап ZIP", callback_data="help:settings:backup_zip")],
         [InlineKeyboardButton("📥 Загрузить бэкап ZIP", callback_data="help:settings:restore_zip")],
@@ -2633,76 +2152,6 @@ def kb_achievements_menu():
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
     ])
 
-
-def kb_pick_profile_for_test():
-    people = db_profiles_list()
-    rows = []
-    if not people:
-        rows.append([InlineKeyboardButton("— анкет нет —", callback_data="noop")])
-    else:
-        for pid, name in people[:60]:
-            rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:test:pick:{pid}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")])
-    return InlineKeyboardMarkup(rows)
-
-def kb_test_wiz_question_menu(q_count: int):
-    rows = [
-        [InlineKeyboardButton("➕ Добавить вопрос", callback_data="help:settings:test:add_q")],
-    ]
-    if q_count > 0:
-        rows.append([InlineKeyboardButton(f"✅ Завершить вопросы (сейчас: {q_count})", callback_data="help:settings:test:finish_qs")])
-    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")])
-    return InlineKeyboardMarkup(rows)
-
-def kb_test_pick_qtype():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✍️ Открытый", callback_data="help:settings:test:qtype:open")],
-        [InlineKeyboardButton("🔘 Закрытый (1 вариант)", callback_data="help:settings:test:qtype:single")],
-        [InlineKeyboardButton("☑️ Закрытый (несколько)", callback_data="help:settings:test:qtype:multi")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")],
-    ])
-
-def kb_test_time_limit():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("5 мин", callback_data="help:settings:test:time:5"),
-            InlineKeyboardButton("10 мин", callback_data="help:settings:test:time:10"),
-            InlineKeyboardButton("15 мин", callback_data="help:settings:test:time:15"),
-        ],
-        [
-            InlineKeyboardButton("20 мин", callback_data="help:settings:test:time:20"),
-            InlineKeyboardButton("30 мин", callback_data="help:settings:test:time:30"),
-            InlineKeyboardButton("Без лимита", callback_data="help:settings:test:time:0"),
-        ],
-        [InlineKeyboardButton("Ввести вручную (мин)", callback_data="help:settings:test:time:manual")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")],
-    ])
-
-def kb_test_options_menu(opt_count: int, can_finish: bool):
-    rows = []
-    rows.append([InlineKeyboardButton("✅ Готово с вариантами", callback_data="help:settings:test:opt_done")])
-    if not can_finish:
-        rows[0][0] = InlineKeyboardButton(f"✅ Готово с вариантами (нужно ≥2, сейчас {opt_count})", callback_data="noop")
-    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")])
-    return InlineKeyboardMarkup(rows)
-
-def kb_test_pick_correct_single(options: list[str]):
-    rows = []
-    for i, opt in enumerate(options):
-        label = opt if len(opt) <= 40 else (opt[:37] + "…")
-        rows.append([InlineKeyboardButton(label, callback_data=f"help:settings:test:correct_single:{i}")])
-    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")])
-    return InlineKeyboardMarkup(rows)
-
-def kb_test_pick_correct_multi(options: list[str], selected: set[int]):
-    rows = []
-    for i, opt in enumerate(options):
-        mark = "☑️" if i in selected else "⬜"
-        label = f"{mark} {opt if len(opt)<=35 else (opt[:32]+'…')}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"help:settings:test:correct_toggle:{i}")])
-    rows.append([InlineKeyboardButton("✅ Готово", callback_data="help:settings:test:correct_done")])
-    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")])
-    return InlineKeyboardMarkup(rows)
 def kb_pick_profile_for_achievement():
     people = db_profiles_list()
     rows = []
@@ -4495,404 +3944,6 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "help:settings:restore_zip":
             return
 
-        if data == "help:settings:test":
-            clear_test_wiz(context)
-            clear_bcast_flow(context)
-            await q.edit_message_text(
-                "📝 <b>Тестирование</b>\n\n"
-                "Здесь можно создать тест (до 10 вопросов) и отправить сотруднику.\n"
-                "Результаты сотруднику <b>не показываются</b> — их сообщает руководитель.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➕ Создать и отправить тест", callback_data="help:settings:test:create")],
-                    [InlineKeyboardButton("📋 Результаты (последние)", callback_data="help:settings:test:results")],
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
-                ]),
-            )
-            return
-
-        if data == "help:settings:test:cancel":
-            clear_test_wiz(context)
-            try:
-                await q.answer("Отменено ✅")
-            except (TimedOut, NetworkError):
-                pass
-            await q.edit_message_text("✅ Действие отменено.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
-            return
-
-        if data == "help:settings:test:create":
-            clear_test_wiz(context)
-            context.user_data[TEST_WIZ_ACTIVE] = True
-            context.user_data[TEST_WIZ_STEP] = "title"
-            context.user_data[TEST_WIZ_DATA] = {"title": None, "questions": [], "time_limit_min": None, "profile_id": None}
-            context.chat_data[WAITING_USER_ID] = update.effective_user.id
-            context.chat_data[WAITING_SINCE_TS] = int(time.time())
-            await q.edit_message_text(
-                "📝 <b>Создание теста</b>\n\n"
-                "Шаг 1/5: отправьте <b>название теста</b> одним сообщением.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_cancel_wizard_settings(),
-            )
-            return
-
-        if data == "help:settings:test:add_q":
-            if not context.user_data.get(TEST_WIZ_ACTIVE):
-                await q.answer("Сначала запусти создание теста.", show_alert=True)
-                return
-            context.user_data[TEST_WIZ_STEP] = "q_type"
-            await q.edit_message_text(
-                "Шаг 2/5: выбери тип вопроса:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_test_pick_qtype(),
-            )
-            return
-
-        if data.startswith("help:settings:test:qtype:"):
-            if not context.user_data.get(TEST_WIZ_ACTIVE):
-                await q.answer("Сначала запусти создание теста.", show_alert=True)
-                return
-            qtype = data.split(":")[-1]
-            d = context.user_data.get(TEST_WIZ_DATA) or {}
-            d["current_q"] = {"q_type": qtype, "text": None, "options": [], "correct": []}
-            context.user_data[TEST_WIZ_DATA] = d
-            context.user_data[TEST_WIZ_STEP] = "q_text"
-            await q.edit_message_text(
-                "Отправь текст вопроса одним сообщением.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_cancel_wizard_settings(),
-            )
-            return
-
-        if data == "help:settings:test:opt_done":
-            d = context.user_data.get(TEST_WIZ_DATA) or {}
-            cq = d.get("current_q") or {}
-            opts = cq.get("options") or []
-            qtype = cq.get("q_type")
-            if len(opts) < 2:
-                await q.answer("Нужно минимум 2 варианта.", show_alert=True)
-                return
-            # move to correct picking
-            if qtype == "single":
-                context.user_data[TEST_WIZ_STEP] = "pick_correct_single"
-                await q.edit_message_text(
-                    "Выбери <b>один</b> правильный вариант:",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_test_pick_correct_single(opts),
-                )
-                return
-            if qtype == "multi":
-                d["correct_sel"] = set()
-                context.user_data[TEST_WIZ_DATA] = d
-                context.user_data[TEST_WIZ_STEP] = "pick_correct_multi"
-                await q.edit_message_text(
-                    "Отметь <b>все</b> правильные варианты, затем нажми «Готово»:",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_test_pick_correct_multi(opts, set()),
-                )
-                return
-            await q.answer("Неожиданный тип.", show_alert=True)
-            return
-
-        if data.startswith("help:settings:test:correct_single:"):
-            d = context.user_data.get(TEST_WIZ_DATA) or {}
-            cq = d.get("current_q") or {}
-            opts = cq.get("options") or []
-            i = int(data.split(":")[-1])
-            if i < 0 or i >= len(opts):
-                await q.answer("Не найдено.", show_alert=True)
-                return
-            cq["correct"] = [i]
-            d["current_q"] = cq
-            # commit question
-            qs = d.get("questions") or []
-            qs.append({"q_type": cq["q_type"], "text": cq["text"], "options": opts, "correct": cq["correct"]})
-            d["questions"] = qs
-            d.pop("current_q", None)
-            context.user_data[TEST_WIZ_DATA] = d
-            context.user_data[TEST_WIZ_STEP] = "q_menu"
-            await q.edit_message_text(
-                f"✅ Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_test_wiz_question_menu(len(qs)),
-            )
-            return
-
-        if data.startswith("help:settings:test:correct_toggle:"):
-            d = context.user_data.get(TEST_WIZ_DATA) or {}
-            cq = d.get("current_q") or {}
-            opts = cq.get("options") or []
-            i = int(data.split(":")[-1])
-            sel = set(d.get("correct_sel") or set())
-            if i in sel:
-                sel.remove(i)
-            else:
-                sel.add(i)
-            d["correct_sel"] = sel
-            context.user_data[TEST_WIZ_DATA] = d
-            await q.edit_message_reply_markup(reply_markup=kb_test_pick_correct_multi(opts, sel))
-            return
-
-        if data == "help:settings:test:correct_done":
-            d = context.user_data.get(TEST_WIZ_DATA) or {}
-            cq = d.get("current_q") or {}
-            opts = cq.get("options") or []
-            sel = sorted(list(d.get("correct_sel") or []))
-            if not sel:
-                await q.answer("Нужно выбрать хотя бы 1 правильный вариант.", show_alert=True)
-                return
-            cq["correct"] = sel
-            qs = d.get("questions") or []
-            qs.append({"q_type": cq["q_type"], "text": cq["text"], "options": opts, "correct": cq["correct"]})
-            d["questions"] = qs
-            d.pop("current_q", None)
-            d.pop("correct_sel", None)
-            context.user_data[TEST_WIZ_DATA] = d
-            context.user_data[TEST_WIZ_STEP] = "q_menu"
-            await q.edit_message_text(
-                f"✅ Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_test_wiz_question_menu(len(qs)),
-            )
-            return
-
-        if data == "help:settings:test:finish_qs":
-            d = context.user_data.get(TEST_WIZ_DATA) or {}
-            qs = d.get("questions") or []
-            if not qs:
-                await q.answer("Добавь хотя бы 1 вопрос.", show_alert=True)
-                return
-            context.user_data[TEST_WIZ_STEP] = "time_limit"
-            await q.edit_message_text(
-                "Шаг 3/5: выбери время на тестирование:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_test_time_limit(),
-            )
-            return
-
-        if data.startswith("help:settings:test:time:"):
-            val = data.split(":")[-1]
-            d = context.user_data.get(TEST_WIZ_DATA) or {}
-            if val == "manual":
-                context.user_data[TEST_WIZ_STEP] = "time_manual"
-                await q.edit_message_text(
-                    "Отправь число минут (например <code>12</code>).\n"
-                    "0 = без лимита.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_cancel_wizard_settings(),
-                )
-                return
-            try:
-                mins = int(val)
-            except Exception:
-                await q.answer("Не понял время.", show_alert=True)
-                return
-            d["time_limit_min"] = mins
-            context.user_data[TEST_WIZ_DATA] = d
-            context.user_data[TEST_WIZ_STEP] = "pick_employee"
-            await q.edit_message_text(
-                "Шаг 4/5: выбери сотрудника:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_pick_profile_for_test(),
-            )
-            return
-
-        if data.startswith("help:settings:test:pick:"):
-            d = context.user_data.get(TEST_WIZ_DATA) or {}
-            pid = int(data.split(":")[-1])
-            p = db_profiles_get(pid)
-            if not p:
-                await q.answer("Анкета не найдена.", show_alert=True)
-                return
-            d["profile_id"] = pid
-            context.user_data[TEST_WIZ_DATA] = d
-            # confirm
-            title = escape(d.get("title") or "")
-            qn = len(d.get("questions") or [])
-            mins = d.get("time_limit_min")
-            mins_txt = ("без лимита" if mins in (None, 0) else f"{mins} мин")
-            await q.edit_message_text(
-                "Шаг 5/5: подтвердите отправку\n\n"
-                f"Тест: <b>{title}</b>\n"
-                f"Вопросов: <b>{qn}</b>\n"
-                f"Время: <b>{mins_txt}</b>\n"
-                f"Сотрудник: <b>{escape(p.get('full_name',''))}</b>\n\n"
-                "После прохождения сотруднику не показываем результат.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Отправить", callback_data="help:settings:test:send")],
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")],
-                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")],
-                ]),
-            )
-            return
-
-        if data == "help:settings:test:send":
-            d = context.user_data.get(TEST_WIZ_DATA) or {}
-            title = (d.get("title") or "").strip()
-            qs = d.get("questions") or []
-            pid = d.get("profile_id")
-            mins = d.get("time_limit_min")
-            if not title or not qs or not pid:
-                await q.answer("Не хватает данных (название/вопросы/сотрудник).", show_alert=True)
-                return
-            # create template + questions
-            tid = db_test_template_create(title, update.effective_user.id if update.effective_user else None)
-            for i, qq in enumerate(qs, start=1):
-                db_test_question_add(
-                    tid, i, qq.get("q_type") or "open", qq.get("text") or "",
-                    qq.get("options") if qq.get("q_type") in ("single","multi") else None,
-                    qq.get("correct") if qq.get("q_type") in ("single","multi") else None,
-                )
-            aid = db_test_assignment_create(tid, int(pid), update.effective_user.id if update.effective_user else None, (int(mins) * 60 if mins and mins > 0 else None))
-            clear_test_wiz(context)
-
-            # Try to DM employee
-            p = db_profiles_get(int(pid)) or {}
-            mention = normalize_tg_mention(p.get("tg_link", "")) or ""
-            chat_id_to_send = None
-            if mention:
-                try:
-                    ch = await context.bot.get_chat(mention)
-                    chat_id_to_send = ch.id
-                except Exception:
-                    chat_id_to_send = None
-
-            if not chat_id_to_send:
-                await q.edit_message_text(
-                    "⚠️ Тест создан, но я не смог отправить его сотруднику в ЛС.\n\n"
-                    "Причины обычно такие: сотрудник не запускал бота в личке или нет username в анкете.\n\n"
-                    "Что сделать:\n"
-                    "1) Пусть сотрудник откроет бота и отправит /start\n"
-                    "2) Проверь, что в анкете есть @username\n\n"
-                    f"ID теста: <code>{aid}</code>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_help_settings(),
-                )
-                return
-
-            btn = InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ Начать тест", callback_data=f"test:start:{aid}")]
-            ])
-            mins_txt = ("без лимита" if mins in (None, 0) else f"{mins} мин")
-            await context.bot.send_message(
-                chat_id=chat_id_to_send,
-                text=(
-                    "📝 <b>Тебе назначен тест</b>\n\n"
-                    f"Название: <b>{escape(title)}</b>\n"
-                    f"Вопросов: <b>{len(qs)}</b>\n"
-                    f"Время: <b>{mins_txt}</b>\n\n"
-                    "Нажми «Начать тест», когда будешь готов."
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=btn,
-                disable_web_page_preview=True,
-            )
-
-            await q.edit_message_text(
-                "✅ Тест создан и отправлен сотруднику в ЛС.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_help_settings(),
-            )
-            return
-
-        if data == "help:settings:test:results":
-            items = db_test_list_recent(25)
-            if not items:
-                await q.edit_message_text("Пока нет тестов.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
-                return
-            rows = []
-            for it in items[:25]:
-                st = it["status"]
-                label = f"{it['name']} • {it['title']} • {st}"
-                if len(label) > 60:
-                    label = label[:57] + "…"
-                rows.append([InlineKeyboardButton(label, callback_data=f"help:settings:test:res:{it['id']}")])
-            rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")])
-            await q.edit_message_text(
-                "📋 <b>Последние тесты</b>\n\nВыбери запись:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(rows),
-            )
-            return
-
-        if data.startswith("help:settings:test:res:"):
-            aid = int(data.split(":")[-1])
-            a = db_test_assignment_get(aid)
-            if not a:
-                await q.answer("Не найдено.", show_alert=True)
-                return
-            p = db_profiles_get(a["profile_id"]) or {}
-            qs = db_test_template_get_questions(a["template_id"])
-            ans = db_test_get_answers(aid)
-            ans_by_qid = {x["question_id"]: x for x in ans}
-            # Build report
-            lines = [
-                f"📝 <b>Результаты теста</b>",
-                f"Сотрудник: <b>{escape(p.get('full_name',''))}</b>",
-                f"Статус: <b>{escape(a['status'])}</b>",
-                "",
-            ]
-            correct_cnt = 0
-            closed_cnt = 0
-            for qrec in qs:
-                qid = qrec["id"]
-                qtype = qrec["q_type"]
-                lines.append(f"<b>{qrec['idx']}. {escape(qrec['text'])}</b>")
-                ar = ans_by_qid.get(qid)
-                if not ar:
-                    lines.append("— нет ответа —")
-                    lines.append("")
-                    continue
-                if qtype == "open":
-                    lines.append(f"Ответ: {escape((ar['answer'].get('text') or '').strip())}")
-                else:
-                    sel = ar["answer"].get("selected") or []
-                    opts = qrec.get("options") or []
-                    chosen = ", ".join([opts[i] for i in sel if 0 <= i < len(opts)]) if opts else str(sel)
-                    lines.append(f"Выбрано: {escape(chosen)}")
-                    closed_cnt += 1
-                    if ar["is_correct"] == 1:
-                        correct_cnt += 1
-                        lines.append("✅ Верно")
-                    elif ar["is_correct"] == 0:
-                        lines.append("❌ Неверно")
-                lines.append("")
-            if closed_cnt > 0:
-                lines.insert(4, f"Итог по закрытым: <b>{correct_cnt}/{closed_cnt}</b>")
-                lines.insert(5, "")
-            text = "\n".join(lines).strip()
-            await q.edit_message_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💾 Сохранить (зафиксировать)", callback_data=f"help:settings:test:save:{aid}")],
-                    [InlineKeyboardButton("🗑️ Удалить ответы", callback_data=f"help:settings:test:delete:{aid}")],
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test:results")],
-                ]),
-                disable_web_page_preview=True,
-            )
-            return
-
-        if data.startswith("help:settings:test:save:"):
-            aid = int(data.split(":")[-1])
-            a = db_test_assignment_get(aid)
-            if not a:
-                await q.answer("Не найдено.", show_alert=True)
-                return
-            db_test_assignment_set_status(aid, "saved")
-            await q.answer("Сохранено ✅")
-            return
-
-        if data.startswith("help:settings:test:delete:"):
-            aid = int(data.split(":")[-1])
-            db_test_delete_attempt(aid)
-            await q.edit_message_text(
-                "🗑️ Ответы удалены, тест помечен как canceled.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_help_settings(),
-            )
-            return
-
         if data == "help:settings:cats":
             await q.edit_message_text(
                 "🗂️ <b>Категории документов</b>\n\n"
@@ -5586,673 +4637,515 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_html = (message_to_html(update.message) or "").strip()
 
     # ---------------- BONUS CALC (FAQ) ----------------
+    if context.chat_data.get(WAITING_BONUS_CALC):
+        step = int(context.chat_data.get(BONUS_STEP) or 1)
+        data = context.chat_data.get(BONUS_DATA) or {}
 
-    # ---------------- ACTIVE TEST (employee) ----------------
-    if context.user_data.get(ACTIVE_TEST_ASSIGNMENT_ID):
-        at = context.user_data.get(ACTIVE_TEST_ASSIGNMENT_ID) or {}
-        aid = int(at.get("assignment_id") or 0)
-        a = db_test_assignment_get(aid) if aid else None
-        if not a:
-            clear_active_test(context)
+        raw = (text or "")
+        raw = raw.replace("\u00A0", " ")  # nbsp
+        raw_num = raw.replace(" ", "").replace(",", ".").strip()
+        try:
+            val = float(raw_num)
+        except Exception:
+            await update.message.reply_text("Не понял число. Введите ещё раз:")
+            return
+
+        if step == 1:
+            if val <= 0:
+                await update.message.reply_text("Оклад должен быть больше 0. Введите ещё раз:")
+                return
+            data["salary"] = val
+            context.chat_data[BONUS_DATA] = data
+            context.chat_data[BONUS_STEP] = 2
+            await update.message.reply_text(
+                "✅ Оклад принят.\n\n"
+                "Шаг 2/2: введите <b>% выполнения плана</b> (например: 100)",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # step == 2
+        salary = float(data.get("salary") or 0)
+        percent_in = val
+
+        # clamp rules
+        if percent_in < 70:
+            bonus = 0.0
         else:
-            # deadline check
-            if a.get("deadline_at"):
-                try:
-                    dl = datetime.fromisoformat(a["deadline_at"])
-                    if datetime.utcnow() > dl:
-                        db_test_assignment_set_status(aid, "expired", finished_at=datetime.utcnow().isoformat())
-                        clear_active_test(context)
-                        await update.message.reply_text("⏳ Время на тестирование истекло.")
-                        # notify admin
-                        if a.get("assigned_by"):
-                            try:
-                                await context.bot.send_message(chat_id=a["assigned_by"], text=f"⏳ Тест #{aid} истёк по времени.")
-                            except Exception:
-                                pass
-                        return
-                except Exception:
-                    pass
+            percent_eff = min(percent_in, 200.0)
+            bonus_gross = (salary / 2.0) * (percent_eff / 100.0)
+            bonus = bonus_gross * 0.87  # 13% tax
 
-            qs = db_test_template_get_questions(a["template_id"])
-            idx_cur = a.get("current_idx", 1)
-            # find current question record
-            qrec = next((x for x in qs if x["idx"] == idx_cur), None)
-            if not qrec:
-                # already finished
-                clear_active_test(context)
-            else:
-                if qrec["q_type"] != "open":
-                    await update.message.reply_text("Пожалуйста, отвечай кнопками 🙂")
-                    return
+        clear_bonus_calc_flow(context)
 
-                # save text answer
-                ans_text = (text or "").strip()
-                if not ans_text:
-                    await update.message.reply_text("Ответ пустой — напиши текстом 🙂")
-                    return
-                db_test_answer_upsert(aid, qrec["id"], {"text": ans_text}, None)
+        def fmt_money(x: float) -> str:
+            if abs(x - round(x)) < 1e-9:
+                return f"{x:,.0f}".replace(",", " ")
+            return f"{x:,.2f}".replace(",", " ")
 
-                # next question / finish
-                next_idx = idx_cur + 1
-                if next_idx > len(qs):
-                    db_test_assignment_set_status(aid, "finished", finished_at=datetime.utcnow().isoformat(), current_idx=next_idx)
-                    clear_active_test(context)
-                    await update.message.reply_text("✅ Отлично. Тест пройден. Результаты сообщит твой руководитель.")
-                    if a.get("assigned_by"):
-                        try:
-                            await context.bot.send_message(chat_id=a["assigned_by"], text=f"✅ Тест #{aid} пройден сотрудником. Смотри результаты в /help → Настройки → Тестирование.")
-                        except Exception:
-                            pass
-                    return
-                db_test_assignment_set_status(aid, "in_progress", current_idx=next_idx)
-                await _send_test_question_to_user(update.effective_user.id, aid, context)
+        note = ""
+        if percent_in > 200:
+            note = "\n\n<b>🔥 Вау, я поражён твоими результатами!</b>\nТак держать — видно, что ты умеешь выходить за рамки!"
+        elif percent_in < 70:
+            note = "\n\n<b>🌱 Каждый результат — это шаг вперёд.</b>\nПродолжай — и всё обязательно получится"
+
+        percent_used = 0.0 if percent_in < 0 else min(percent_in, 200.0)
+
+        await update.message.reply_text(
+            "🧾 <b>Результат</b>\n\n"
+            f"Оклад: <b>{fmt_money(salary)}</b>\n"
+            f"% выполнения (твой показатель): <b>{percent_in:.2f}</b>\n"
+            f"% выполнения (учитываем в расчётах): <b>{percent_used:.2f}</b>\n"
+            f"Премия: <b>{fmt_money(bonus)}</b>"
+            f"{note}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
+            ]),
+        )
+
+
+    waiting_user = context.chat_data.get(WAITING_USER_ID)
+    if waiting_user and user_id != waiting_user:
+        return
+
+    since_ts = context.chat_data.get(WAITING_SINCE_TS)
+    if since_ts and int(time.time()) - int(since_ts) > 10 * 60:
+        clear_waiting_date(context)
+        clear_docs_flow(context)
+        clear_profile_wiz(context)
+        clear_csv_import(context)
+        clear_suggest_flow(context)
+        clear_bcast_flow(context)
+        await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
+        return
+
+
+    # предложка (в ЛС): ждём текст  # anti-spam
+    if context.user_data.get(WAITING_SUGGESTION_TEXT):
+        # анти-спам: 1 сообщение в 5 минут на человека
+        if user_id:
+            last_ts = db_get_suggest_last_ts(user_id) or 0
+            now_ts = int(time.time())
+            if now_ts - last_ts < 5 * 60:
+                left = 5 * 60 - (now_ts - last_ts)
+                mins = max(1, (left + 59) // 60)
+                await update.message.reply_text(f"⏳ Можно отправлять не чаще 1 раза в 5 минут. Попробуйте через ~{mins} мин.")
                 return
 
-    # ---------------- TEST WIZARD (admin) ----------------
-    if context.user_data.get(TEST_WIZ_ACTIVE):
-        if not await is_admin_scoped(update, context):
-            clear_test_wiz(context)
-            return
-        step = context.user_data.get(TEST_WIZ_STEP)
-        d = context.user_data.get(TEST_WIZ_DATA) or {}
-
-        if step == "title":
-            title = (text or "").strip()
-            if len(title) < 2:
-                await update.message.reply_text("❌ Слишком коротко. Пришли нормальное название.")
-                return
-            d["title"] = title[:200]
-            context.user_data[TEST_WIZ_DATA] = d
-            context.user_data[TEST_WIZ_STEP] = "q_menu"
-            await update.message.reply_text(
-                f"✅ Название сохранено: <b>{escape(d['title'])}</b>\n\nТеперь добавим вопросы:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_test_wiz_question_menu(0),
-            )
-            return
-
-        if step == "q_text":
-            cq = d.get("current_q") or {}
-            qtxt = (text or "").strip()
-            if len(qtxt) < 2:
-                await update.message.reply_text("❌ Вопрос слишком короткий.")
-                return
-            cq["text"] = qtxt[:800]
-            d["current_q"] = cq
-            context.user_data[TEST_WIZ_DATA] = d
-            if cq.get("q_type") == "open":
-                qs = d.get("questions") or []
-                qs.append({"q_type": "open", "text": cq["text"]})
-                d["questions"] = qs
-                d.pop("current_q", None)
-                context.user_data[TEST_WIZ_DATA] = d
-                context.user_data[TEST_WIZ_STEP] = "q_menu"
-                await update.message.reply_text(
-                    f"✅ Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_test_wiz_question_menu(len(qs)),
-                )
-                return
-
-            # closed question -> collect options
-            context.user_data[TEST_WIZ_STEP] = "opt_add"
-            await update.message.reply_text(
-                "Отправляй варианты ответа <b>по одному сообщению</b>.\n"
-                "Нужно минимум 2 варианта.\n"
-                "Когда закончишь — нажми «Готово с вариантами».",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_test_options_menu(0, can_finish=False),
-            )
-            return
-
-        if step == "opt_add":
-            cq = d.get("current_q") or {}
-            opt = (text or "").strip()
-            if len(opt) < 1:
-                await update.message.reply_text("Вариант пустой.")
-                return
-            opts = cq.get("options") or []
-            if len(opts) >= 8:
-                await update.message.reply_text("Достигнут лимит вариантов (8). Нажми «Готово с вариантами».")
-                return
-            opts.append(opt[:200])
-            cq["options"] = opts
-            d["current_q"] = cq
-            context.user_data[TEST_WIZ_DATA] = d
-            await update.message.reply_text(
-                f"✅ Вариант добавлен. Сейчас вариантов: <b>{len(opts)}</b>.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_test_options_menu(len(opts), can_finish=(len(opts) >= 2)),
-            )
-            return
-
-        if step == "time_manual":
-            try:
-                mins = int(re.sub(r"\s+", "", text))
-            except Exception:
-                await update.message.reply_text("❌ Нужно число минут (например 12).")
-                return
-            if mins < 0 or mins > 240:
-                await update.message.reply_text("❌ Укажи от 0 до 240 минут.")
-                return
-            d["time_limit_min"] = mins
-            context.user_data[TEST_WIZ_DATA] = d
-            context.user_data[TEST_WIZ_STEP] = "pick_employee"
-            await update.message.reply_text(
-                "Выбери сотрудника:",
-                reply_markup=kb_pick_profile_for_test(),
-            )
-            return
-
-        if context.chat_data.get(WAITING_BONUS_CALC):
-            step = int(context.chat_data.get(BONUS_STEP) or 1)
-            data = context.chat_data.get(BONUS_DATA) or {}
-
-            raw = (text or "")
-            raw = raw.replace("\u00A0", " ")  # nbsp
-            raw_num = raw.replace(" ", "").replace(",", ".").strip()
-            try:
-                val = float(raw_num)
-            except Exception:
-                await update.message.reply_text("Не понял число. Введите ещё раз:")
-                return
-
-            if step == 1:
-                if val <= 0:
-                    await update.message.reply_text("Оклад должен быть больше 0. Введите ещё раз:")
-                    return
-                data["salary"] = val
-                context.chat_data[BONUS_DATA] = data
-                context.chat_data[BONUS_STEP] = 2
-                await update.message.reply_text(
-                    "✅ Оклад принят.\n\n"
-                    "Шаг 2/2: введите <b>% выполнения плана</b> (например: 100)",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-
-            # step == 2
-            salary = float(data.get("salary") or 0)
-            percent_in = val
-
-            # clamp rules
-            if percent_in < 70:
-                bonus = 0.0
-            else:
-                percent_eff = min(percent_in, 200.0)
-                bonus_gross = (salary / 2.0) * (percent_eff / 100.0)
-                bonus = bonus_gross * 0.87  # 13% tax
-
-            clear_bonus_calc_flow(context)
-
-            def fmt_money(x: float) -> str:
-                if abs(x - round(x)) < 1e-9:
-                    return f"{x:,.0f}".replace(",", " ")
-                return f"{x:,.2f}".replace(",", " ")
-
-            note = ""
-            if percent_in > 200:
-                note = "\n\n<b>🔥 Вау, я поражён твоими результатами!</b>\nТак держать — видно, что ты умеешь выходить за рамки!"
-            elif percent_in < 70:
-                note = "\n\n<b>🌱 Каждый результат — это шаг вперёд.</b>\nПродолжай — и всё обязательно получится"
-
-            percent_used = 0.0 if percent_in < 0 else min(percent_in, 200.0)
-
-            await update.message.reply_text(
-                "🧾 <b>Результат</b>\n\n"
-                f"Оклад: <b>{fmt_money(salary)}</b>\n"
-                f"% выполнения (твой показатель): <b>{percent_in:.2f}</b>\n"
-                f"% выполнения (учитываем в расчётах): <b>{percent_used:.2f}</b>\n"
-                f"Премия: <b>{fmt_money(bonus)}</b>"
-                f"{note}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
-                ]),
-            )
-
-
-        waiting_user = context.chat_data.get(WAITING_USER_ID)
-        if waiting_user and user_id != waiting_user:
-            return
-
-        since_ts = context.chat_data.get(WAITING_SINCE_TS)
-        if since_ts and int(time.time()) - int(since_ts) > 10 * 60:
-            clear_waiting_date(context)
-            clear_docs_flow(context)
-            clear_profile_wiz(context)
-            clear_csv_import(context)
+        mode = context.user_data.get(SUGGESTION_MODE, "anon")
+        scope_chat_id = get_scope_chat_id(update, context)
+        if not scope_chat_id:
             clear_suggest_flow(context)
-            clear_bcast_flow(context)
-            await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
+            await update.message.reply_text("⚠️ Не вижу, к какому чату привязать предложку. Открой /help в групповом чате ещё раз.")
             return
 
+        await send_suggestion_to_admins(scope_chat_id, update, context, text, mode)
 
-        # предложка (в ЛС): ждём текст  # anti-spam
-        if context.user_data.get(WAITING_SUGGESTION_TEXT):
-            # анти-спам: 1 сообщение в 5 минут на человека
-            if user_id:
-                last_ts = db_get_suggest_last_ts(user_id) or 0
-                now_ts = int(time.time())
-                if now_ts - last_ts < 5 * 60:
-                    left = 5 * 60 - (now_ts - last_ts)
-                    mins = max(1, (left + 59) // 60)
-                    await update.message.reply_text(f"⏳ Можно отправлять не чаще 1 раза в 5 минут. Попробуйте через ~{mins} мин.")
+        if user_id:
+            db_set_suggest_last_ts(user_id, int(time.time()))
+
+        clear_suggest_flow(context)
+        await update.message.reply_text("✅ Спасибо! Передал тимлиду 🙌")
+        return
+
+    # рассылка  # bcast attachment (в ЛС админа): шаги тема/текст/файлы
+    if context.user_data.get(BCAST_ACTIVE):
+        step = context.user_data.get(BCAST_STEP)
+        d = _bcast_get_data(context)
+
+        if step == "topic":
+            if text != "-":
+                topic = text.strip()
+                if len(topic) < 2:
+                    await update.message.reply_text("❌ Тема слишком короткая. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
                     return
+                d["topic"] = topic[:200]
+            else:
+                d["topic"] = None
 
-            mode = context.user_data.get(SUGGESTION_MODE, "anon")
-            scope_chat_id = get_scope_chat_id(update, context)
-            if not scope_chat_id:
-                clear_suggest_flow(context)
-                await update.message.reply_text("⚠️ Не вижу, к какому чату привязать предложку. Открой /help в групповом чате ещё раз.")
-                return
-
-            await send_suggestion_to_admins(scope_chat_id, update, context, text, mode)
-
-            if user_id:
-                db_set_suggest_last_ts(user_id, int(time.time()))
-
-            clear_suggest_flow(context)
-            await update.message.reply_text("✅ Спасибо! Передал тимлиду 🙌")
-            return
-
-        # рассылка  # bcast attachment (в ЛС админа): шаги тема/текст/файлы
-        if context.user_data.get(BCAST_ACTIVE):
-            step = context.user_data.get(BCAST_STEP)
-            d = _bcast_get_data(context)
-
-            if step == "topic":
-                if text != "-":
-                    topic = text.strip()
-                    if len(topic) < 2:
-                        await update.message.reply_text("❌ Тема слишком короткая. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
-                        return
-                    d["topic"] = topic[:200]
-                else:
-                    d["topic"] = None
-
-                context.user_data[BCAST_DATA] = d
-                context.user_data[BCAST_STEP] = "text"
-                await update.message.reply_text(
-                    "Шаг 2/3: <b>Текст рассылки</b> 📝\n"
-                    "Отправьте текст одним сообщением.\n"
-                    "Если текст не нужен — отправьте <code>-</code>.",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_cancel_wizard_settings(),
-                )
-                return
-
-            if step == "text":
-                if text != "-":
-                    body = text.strip()
-                    if len(body) < 2:
-                        await update.message.reply_text("❌ Текст слишком короткий. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
-                        return
-                    # лимит Telegram ~4096, оставим запас
-                    d["text"] = body[:3500]
-                else:
-                    d["text"] = None
-
-                context.user_data[BCAST_DATA] = d
-                context.user_data[BCAST_STEP] = "files"
-                await update.message.reply_text(
-                    "Шаг 3/3: <b>Файлы</b> 📎\n\n"
-                    "Можешь прикрепить <b>документы / фото / видео</b> (сколько нужно).\n"
-                    "Когда закончишь — нажми <b>✅ Отправить</b>.\n"
-                    "Можно без файлов 🙂",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_bcast_files_menu(),
-                )
-                return
-
-            # step == files -> ждём вложения или кнопку "Отправить"
-            return
-
-        # ачивки — выдача
-        if context.chat_data.get(ACH_WIZ_ACTIVE):
-            if not await is_admin_scoped(update, context):
-                clear_ach_wiz(context)
-                await update.message.reply_text("❌ Только администраторы могут выдавать ачивки.")
-                return
-
-            step = context.chat_data.get(ACH_WIZ_STEP)
-            d = context.chat_data.get(ACH_WIZ_DATA) or {}
-
-            if step == "emoji":
-                emoji = text.strip()
-                if len(emoji) < 1 or len(emoji) > 16:
-                    await update.message.reply_text("❌ Отправьте один эмодзи (или короткую связку). Пример: 🏅")
-                    return
-                d["emoji"] = emoji
-                context.chat_data[ACH_WIZ_DATA] = d
-                context.chat_data[ACH_WIZ_STEP] = "title"
-                await update.message.reply_text(
-                    "Шаг 3/4: отправьте <b>название ачивки</b> (будет жирным).",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_cancel_wizard_settings(),
-                )
-                return
-
-            if step == "title":
-                title = text.strip()
-                if len(title) < 2:
-                    await update.message.reply_text("❌ Слишком коротко. Напишите название ачивки.")
-                    return
-                d["title"] = title[:80]
-                context.chat_data[ACH_WIZ_DATA] = d
-                context.chat_data[ACH_WIZ_STEP] = "description"
-                await update.message.reply_text(
-                    "Шаг 4/4: напишите <b>описание</b> — за что выдаётся ачивка 🙂",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_cancel_wizard_settings(),
-                )
-                return
-
-            if step == "description":
-                desc = text.strip()
-                if len(desc) < 3:
-                    await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
-                    return
-                d["description"] = desc[:600]
-
-                pid = d.get("profile_id")
-                if not pid:
-                    clear_ach_wiz(context)
-                    await update.message.reply_text("❌ Не выбран сотрудник. Начните заново через /help → Настройки → Ачивки.")
-                    return
-
-                admin_id = update.effective_user.id if update.effective_user else None
-                db_achievement_award_add(int(pid), d.get("emoji", "🏆"), d.get("title", "Ачивка"), d.get("description", ""), admin_id)
-
-                scope_chat_id = get_scope_chat_id(update, context)
-                mention = normalize_tg_mention(d.get("tg_link", "") or "")
-                who = mention if mention else f"<b>{escape(d.get('full_name', 'Сотрудник'))}</b>"
-                msg = (
-                    f"🎉 <b>Поздравляем, {who}!</b>\n\n"
-                    f"В твой профиль добавлена новая ачивка: <b>{escape(d.get('emoji', '🏆'))} {escape(d.get('title', 'Ачивка'))}</b>\n\n"
-                    f"Достижение получено за: «{escape(d.get('description', ''))}»\n\n"
-                    f"Так держать! 🚀🔥\n\n"
-                    f"Посмотреть можно в /help"
-                )
-
-                sent = False
-                if scope_chat_id:
-                    try:
-                        await context.bot.send_message(chat_id=scope_chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-                        sent = True
-                    except Exception as e:
-                        logger.exception("Cannot send achievement notify to scope chat: %s", e)
-
-                if not sent:
-                    for chat_id in db_list_chats():
-                        try:
-                            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-                            sent = True
-                            break
-                        except Exception:
-                            pass
-
-                clear_ach_wiz(context)
-                await update.message.reply_text("✅ Ачивка выдана и опубликована в чате.", reply_markup=kb_help_settings())
-                return
-
-        # описание документа
-        if context.chat_data.get(WAITING_DOC_DESC):
-            if not await is_admin_scoped(update, context):
-                clear_docs_flow(context)
-                await update.message.reply_text("❌ Только администраторы могут добавлять документы.")
-                return
-
-            pending = context.chat_data.get(PENDING_DOC_INFO)
-            if not pending:
-                clear_docs_flow(context)
-                await update.message.reply_text("❌ Не найден загруженный файл. Начните заново через /help.")
-                return
-
-            desc = None if text == "-" else text
-            if desc is not None:
-                desc = desc.strip()
-                if len(desc) < 3:
-                    await update.message.reply_text("❌ Слишком коротко. Напишите чуть подробнее или отправьте <code>-</code>.", parse_mode=ParseMode.HTML)
-                    return
-                desc = desc[:600]
-
-            pending["description"] = desc
-            context.chat_data[PENDING_DOC_INFO] = pending
-            context.chat_data[WAITING_DOC_DESC] = False
-
+            context.user_data[BCAST_DATA] = d
+            context.user_data[BCAST_STEP] = "text"
             await update.message.reply_text(
-                "✅ Описание сохранено.\n\nТеперь выберите категорию:",
-                reply_markup=kb_pick_category_for_new_doc(),
-            )
-            return
-
-        # перенос даты вручную
-            # ---------------- FAQ ADD FLOW ----------------
-        if context.chat_data.get(WAITING_FAQ_Q):
-            context.chat_data[WAITING_FAQ_Q] = False
-            context.chat_data[WAITING_FAQ_A] = True
-
-            q_html = (text_html or text or "").strip()
-            q_plain = (text or "").strip()
-            context.chat_data[PENDING_FAQ] = {"question_html": q_html, "question_plain": q_plain}
-
-            await update.message.reply_text(
-                "✅ Вопрос сохранён.\n\nТеперь отправьте <b>ответ</b> одним сообщением.",
+                "Шаг 2/3: <b>Текст рассылки</b> 📝\n"
+                "Отправьте текст одним сообщением.\n"
+                "Если текст не нужен — отправьте <code>-</code>.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_cancel_wizard_settings(),
             )
             return
 
-        if context.chat_data.get(WAITING_FAQ_A):
-            pending = context.chat_data.get(PENDING_FAQ) or {}
-            q_html = (pending.get("question_html") or "").strip()
-            a_html = (text_html or text or "").strip()
-            clear_faq_flow(context)
+        if step == "text":
+            if text != "-":
+                body = text.strip()
+                if len(body) < 2:
+                    await update.message.reply_text("❌ Текст слишком короткий. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
+                    return
+                # лимит Telegram ~4096, оставим запас
+                d["text"] = body[:3500]
+            else:
+                d["text"] = None
 
-            if not q_html or not a_html:
-                await update.message.reply_text("❌ Не удалось сохранить: пустой вопрос или ответ.")
-                return
-
-            db_faq_add(q_html, a_html)
+            context.user_data[BCAST_DATA] = d
+            context.user_data[BCAST_STEP] = "files"
             await update.message.reply_text(
-                "✅ Вопрос добавлен в FAQ.",
-                reply_markup=kb_help_settings(),
+                "Шаг 3/3: <b>Файлы</b> 📎\n\n"
+                "Можешь прикрепить <b>документы / фото / видео</b> (сколько нужно).\n"
+                "Когда закончишь — нажми <b>✅ Отправить</b>.\n"
+                "Можно без файлов 🙂",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_bcast_files_menu(),
             )
             return
-            db_faq_add(q_text, a_text)
+
+        # step == files -> ждём вложения или кнопку "Отправить"
+        return
+
+    # ачивки — выдача
+    if context.chat_data.get(ACH_WIZ_ACTIVE):
+        if not await is_admin_scoped(update, context):
+            clear_ach_wiz(context)
+            await update.message.reply_text("❌ Только администраторы могут выдавать ачивки.")
+            return
+
+        step = context.chat_data.get(ACH_WIZ_STEP)
+        d = context.chat_data.get(ACH_WIZ_DATA) or {}
+
+        if step == "emoji":
+            emoji = text.strip()
+            if len(emoji) < 1 or len(emoji) > 16:
+                await update.message.reply_text("❌ Отправьте один эмодзи (или короткую связку). Пример: 🏅")
+                return
+            d["emoji"] = emoji
+            context.chat_data[ACH_WIZ_DATA] = d
+            context.chat_data[ACH_WIZ_STEP] = "title"
             await update.message.reply_text(
-                "✅ Вопрос добавлен в FAQ.",
-                reply_markup=kb_help_settings(),
+                "Шаг 3/4: отправьте <b>название ачивки</b> (будет жирным).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
             )
             return
 
-
-        if context.chat_data.get(WAITING_DATE_FLAG):
-            if not await is_admin_scoped(update, context):
-                clear_waiting_date(context)
-                await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
+        if step == "title":
+            title = text.strip()
+            if len(title) < 2:
+                await update.message.reply_text("❌ Слишком коротко. Напишите название ачивки.")
                 return
-
-            if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", text):
-                await update.message.reply_text("❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
-                return
-
-            try:
-                dd, mm, yy = text.split(".")
-                new_d = date(int("20" + yy), int(mm), int(dd))
-            except Exception:
-                await update.message.reply_text("❌ Не удалось распознать дату. Проверьте корректность.")
-                return
-
-            today_d = datetime.now(MOSCOW_TZ).date()
-            if new_d <= today_d:
-                await update.message.reply_text("❌ Дата переноса должна быть в будущем.")
-                return
-
-            meeting_type = context.chat_data.get(WAITING_MEETING_TYPE, MEETING_STANDUP)
-            db_set_canceled(meeting_type, today_d, "Перенос на другой день", reschedule_date=text)
-            db_upsert_reschedule(meeting_type, today_d, new_d)
-            clear_waiting_date(context)
-
-            title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
-            await update.message.reply_text(f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
+            d["title"] = title[:80]
+            context.chat_data[ACH_WIZ_DATA] = d
+            context.chat_data[ACH_WIZ_STEP] = "description"
+            await update.message.reply_text(
+                "Шаг 4/4: напишите <b>описание</b> — за что выдаётся ачивка 🙂",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
             return
 
-        # ввод названия категории
-        if context.chat_data.get(WAITING_NEW_CATEGORY_NAME):
-            if not await is_admin_scoped(update, context):
-                clear_docs_flow(context)
-                await update.message.reply_text("❌ Только администраторы могут управлять категориями.")
+        if step == "description":
+            desc = text.strip()
+            if len(desc) < 3:
+                await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
+                return
+            d["description"] = desc[:600]
+
+            pid = d.get("profile_id")
+            if not pid:
+                clear_ach_wiz(context)
+                await update.message.reply_text("❌ Не выбран сотрудник. Начните заново через /help → Настройки → Ачивки.")
                 return
 
-            if len(text) < 2:
-                await update.message.reply_text("❌ Слишком коротко. Отправьте нормальное название категории.")
-                return
+            admin_id = update.effective_user.id if update.effective_user else None
+            db_achievement_award_add(int(pid), d.get("emoji", "🏆"), d.get("title", "Ачивка"), d.get("description", ""), admin_id)
 
-            try:
-                cid = db_docs_add_category(text)
-            except sqlite3.IntegrityError:
-                await update.message.reply_text("❌ Такая категория уже существует. Отправьте другое название.")
-                return
+            scope_chat_id = get_scope_chat_id(update, context)
+            mention = normalize_tg_mention(d.get("tg_link", "") or "")
+            who = mention if mention else f"<b>{escape(d.get('full_name', 'Сотрудник'))}</b>"
+            msg = (
+                f"🎉 <b>Поздравляем, {who}!</b>\n\n"
+                f"В твой профиль добавлена новая ачивка: <b>{escape(d.get('emoji', '🏆'))} {escape(d.get('title', 'Ачивка'))}</b>\n\n"
+                f"Достижение получено за: «{escape(d.get('description', ''))}»\n\n"
+                f"Так держать! 🚀🔥\n\n"
+                f"Посмотреть можно в /help"
+            )
 
-            context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
+            sent = False
+            if scope_chat_id:
+                try:
+                    await context.bot.send_message(chat_id=scope_chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                    sent = True
+                except Exception as e:
+                    logger.exception("Cannot send achievement notify to scope chat: %s", e)
 
-            pending = context.chat_data.get(PENDING_DOC_INFO)
-            if pending:
-                db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
-                clear_docs_flow(context)
-                await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
-                return
-
-            clear_docs_flow(context)
-            await update.message.reply_text("✅ Категория добавлена.", reply_markup=kb_help_settings())
-            return
-
-        # анкета — шаги
-        if context.chat_data.get(PROFILE_WIZ_ACTIVE):
-            if not await is_admin_scoped(update, context):
-                clear_profile_wiz(context)
-                await update.message.reply_text("❌ Только администраторы могут добавлять анкеты.")
-                return
-
-            step = context.chat_data.get(PROFILE_WIZ_STEP)
-            data = context.chat_data.get(PROFILE_WIZ_DATA) or {}
-
-            if step == "full_name":
-                if len(text.split()) < 2:
-                    await update.message.reply_text("❌ Нужно имя и фамилия. Пример: Иван Петров")
-                    return
-                data["full_name"] = text
-                context.chat_data[PROFILE_WIZ_DATA] = data
-                context.chat_data[PROFILE_WIZ_STEP] = "year_start"
-                await update.message.reply_text("Шаг 2/7: с какого года работает? Пример: 2022", reply_markup=kb_cancel_wizard_settings())
-                return
-
-            if step == "year_start":
-                if not re.fullmatch(r"\d{4}", text):
-                    await update.message.reply_text("❌ Введите год 4 цифрами. Пример: 2022")
-                    return
-                year = int(text)
-                cur_year = datetime.now(MOSCOW_TZ).year
-                if year < 1990 or year > cur_year:
-                    await update.message.reply_text(f"❌ Год должен быть в диапазоне 1990–{cur_year}.")
-                    return
-                data["year_start"] = year
-                context.chat_data[PROFILE_WIZ_DATA] = data
-                context.chat_data[PROFILE_WIZ_STEP] = "city"
-                await update.message.reply_text("Шаг 3/7: город проживания. Пример: Москва", reply_markup=kb_cancel_wizard_settings())
-                return
-
-            if step == "city":
-                if len(text) < 2:
-                    await update.message.reply_text("❌ Укажите город.")
-                    return
-                data["city"] = text
-                context.chat_data[PROFILE_WIZ_DATA] = data
-                context.chat_data[PROFILE_WIZ_STEP] = "birthday"
-                await update.message.reply_text(
-                    "Шаг 4/7: день рождения (формат <b>ДД.ММ</b>)\n"
-                    "Пример: <code>22.01</code>\n"
-                    "Если не хотите указывать — отправьте <code>-</code>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_cancel_wizard_settings()
-                )
-                return
-
-            if step == "birthday":
-                b = text.strip()
-                if b == "-":
-                    data["birthday"] = None
-                else:
-                    if not re.fullmatch(r"\d{2}\.\d{2}", b):
-                        await update.message.reply_text("❌ Формат ДД.ММ (пример 22.01) или '-'")
-                        return
-                    dd, mm = b.split(".")
+            if not sent:
+                for chat_id in db_list_chats():
                     try:
-                        dd_i = int(dd)
-                        mm_i = int(mm)
+                        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                        sent = True
+                        break
                     except Exception:
-                        await update.message.reply_text("❌ Формат ДД.ММ (пример 22.01) или '-'")
-                        return
-                    if not (1 <= dd_i <= 31 and 1 <= mm_i <= 12):
-                        await update.message.reply_text("❌ Некорректная дата. Пример: 22.01")
-                        return
-                    data["birthday"] = b
+                        pass
 
-                context.chat_data[PROFILE_WIZ_DATA] = data
-                context.chat_data[PROFILE_WIZ_STEP] = "about"
-                await update.message.reply_text("Шаг 5/7: кратко о себе (1–3 предложения)", reply_markup=kb_cancel_wizard_settings())
+            clear_ach_wiz(context)
+            await update.message.reply_text("✅ Ачивка выдана и опубликована в чате.", reply_markup=kb_help_settings())
+            return
+
+    # описание документа
+    if context.chat_data.get(WAITING_DOC_DESC):
+        if not await is_admin_scoped(update, context):
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут добавлять документы.")
+            return
+
+        pending = context.chat_data.get(PENDING_DOC_INFO)
+        if not pending:
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Не найден загруженный файл. Начните заново через /help.")
+            return
+
+        desc = None if text == "-" else text
+        if desc is not None:
+            desc = desc.strip()
+            if len(desc) < 3:
+                await update.message.reply_text("❌ Слишком коротко. Напишите чуть подробнее или отправьте <code>-</code>.", parse_mode=ParseMode.HTML)
                 return
+            desc = desc[:600]
 
-            if step == "about":
-                if len(text) < 5:
-                    await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
+        pending["description"] = desc
+        context.chat_data[PENDING_DOC_INFO] = pending
+        context.chat_data[WAITING_DOC_DESC] = False
+
+        await update.message.reply_text(
+            "✅ Описание сохранено.\n\nТеперь выберите категорию:",
+            reply_markup=kb_pick_category_for_new_doc(),
+        )
+        return
+
+    # перенос даты вручную
+        # ---------------- FAQ ADD FLOW ----------------
+    if context.chat_data.get(WAITING_FAQ_Q):
+        context.chat_data[WAITING_FAQ_Q] = False
+        context.chat_data[WAITING_FAQ_A] = True
+
+        q_html = (text_html or text or "").strip()
+        q_plain = (text or "").strip()
+        context.chat_data[PENDING_FAQ] = {"question_html": q_html, "question_plain": q_plain}
+
+        await update.message.reply_text(
+            "✅ Вопрос сохранён.\n\nТеперь отправьте <b>ответ</b> одним сообщением.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cancel_wizard_settings(),
+        )
+        return
+
+    if context.chat_data.get(WAITING_FAQ_A):
+        pending = context.chat_data.get(PENDING_FAQ) or {}
+        q_html = (pending.get("question_html") or "").strip()
+        a_html = (text_html or text or "").strip()
+        clear_faq_flow(context)
+
+        if not q_html or not a_html:
+            await update.message.reply_text("❌ Не удалось сохранить: пустой вопрос или ответ.")
+            return
+
+        db_faq_add(q_html, a_html)
+        await update.message.reply_text(
+            "✅ Вопрос добавлен в FAQ.",
+            reply_markup=kb_help_settings(),
+        )
+        return
+        db_faq_add(q_text, a_text)
+        await update.message.reply_text(
+            "✅ Вопрос добавлен в FAQ.",
+            reply_markup=kb_help_settings(),
+        )
+        return
+
+
+    if context.chat_data.get(WAITING_DATE_FLAG):
+        if not await is_admin_scoped(update, context):
+            clear_waiting_date(context)
+            await update.message.reply_text("❌ Только администраторы могут переносить встречу.")
+            return
+
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", text):
+            await update.message.reply_text("❌ Неверный формат. Нужно ДД.ММ.ГГ (например 22.01.26).")
+            return
+
+        try:
+            dd, mm, yy = text.split(".")
+            new_d = date(int("20" + yy), int(mm), int(dd))
+        except Exception:
+            await update.message.reply_text("❌ Не удалось распознать дату. Проверьте корректность.")
+            return
+
+        today_d = datetime.now(MOSCOW_TZ).date()
+        if new_d <= today_d:
+            await update.message.reply_text("❌ Дата переноса должна быть в будущем.")
+            return
+
+        meeting_type = context.chat_data.get(WAITING_MEETING_TYPE, MEETING_STANDUP)
+        db_set_canceled(meeting_type, today_d, "Перенос на другой день", reschedule_date=text)
+        db_upsert_reschedule(meeting_type, today_d, new_d)
+        clear_waiting_date(context)
+
+        title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
+        await update.message.reply_text(f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
+        return
+
+    # ввод названия категории
+    if context.chat_data.get(WAITING_NEW_CATEGORY_NAME):
+        if not await is_admin_scoped(update, context):
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут управлять категориями.")
+            return
+
+        if len(text) < 2:
+            await update.message.reply_text("❌ Слишком коротко. Отправьте нормальное название категории.")
+            return
+
+        try:
+            cid = db_docs_add_category(text)
+        except sqlite3.IntegrityError:
+            await update.message.reply_text("❌ Такая категория уже существует. Отправьте другое название.")
+            return
+
+        context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
+
+        pending = context.chat_data.get(PENDING_DOC_INFO)
+        if pending:
+            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
+            clear_docs_flow(context)
+            await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
+            return
+
+        clear_docs_flow(context)
+        await update.message.reply_text("✅ Категория добавлена.", reply_markup=kb_help_settings())
+        return
+
+    # анкета — шаги
+    if context.chat_data.get(PROFILE_WIZ_ACTIVE):
+        if not await is_admin_scoped(update, context):
+            clear_profile_wiz(context)
+            await update.message.reply_text("❌ Только администраторы могут добавлять анкеты.")
+            return
+
+        step = context.chat_data.get(PROFILE_WIZ_STEP)
+        data = context.chat_data.get(PROFILE_WIZ_DATA) or {}
+
+        if step == "full_name":
+            if len(text.split()) < 2:
+                await update.message.reply_text("❌ Нужно имя и фамилия. Пример: Иван Петров")
+                return
+            data["full_name"] = text
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "year_start"
+            await update.message.reply_text("Шаг 2/7: с какого года работает? Пример: 2022", reply_markup=kb_cancel_wizard_settings())
+            return
+
+        if step == "year_start":
+            if not re.fullmatch(r"\d{4}", text):
+                await update.message.reply_text("❌ Введите год 4 цифрами. Пример: 2022")
+                return
+            year = int(text)
+            cur_year = datetime.now(MOSCOW_TZ).year
+            if year < 1990 or year > cur_year:
+                await update.message.reply_text(f"❌ Год должен быть в диапазоне 1990–{cur_year}.")
+                return
+            data["year_start"] = year
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "city"
+            await update.message.reply_text("Шаг 3/7: город проживания. Пример: Москва", reply_markup=kb_cancel_wizard_settings())
+            return
+
+        if step == "city":
+            if len(text) < 2:
+                await update.message.reply_text("❌ Укажите город.")
+                return
+            data["city"] = text
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "birthday"
+            await update.message.reply_text(
+                "Шаг 4/7: день рождения (формат <b>ДД.ММ</b>)\n"
+                "Пример: <code>22.01</code>\n"
+                "Если не хотите указывать — отправьте <code>-</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings()
+            )
+            return
+
+        if step == "birthday":
+            b = text.strip()
+            if b == "-":
+                data["birthday"] = None
+            else:
+                if not re.fullmatch(r"\d{2}\.\d{2}", b):
+                    await update.message.reply_text("❌ Формат ДД.ММ (пример 22.01) или '-'")
                     return
-                data["about"] = text
-                context.chat_data[PROFILE_WIZ_DATA] = data
-                context.chat_data[PROFILE_WIZ_STEP] = "topics"
-                await update.message.reply_text("Шаг 6/7: по каким вопросам обращаться?", reply_markup=kb_cancel_wizard_settings())
-                return
-
-            if step == "topics":
-                if len(text) < 3:
-                    await update.message.reply_text("❌ Укажите темы/вопросы.")
+                dd, mm = b.split(".")
+                try:
+                    dd_i = int(dd)
+                    mm_i = int(mm)
+                except Exception:
+                    await update.message.reply_text("❌ Формат ДД.ММ (пример 22.01) или '-'")
                     return
-                data["topics"] = text
-                context.chat_data[PROFILE_WIZ_DATA] = data
-                context.chat_data[PROFILE_WIZ_STEP] = "tg_link"
-                await update.message.reply_text("Шаг 7/7: Telegram (@username или https://t.me/username)", reply_markup=kb_cancel_wizard_settings())
-                return
-
-            if step == "tg_link":
-                tg = text.strip()
-                ok = False
-                if tg.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", tg):
-                    ok = True
-                if tg.startswith("https://t.me/") or tg.startswith("http://t.me/"):
-                    ok = True
-                if re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
-                    ok = True
-                if not ok:
-                    await update.message.reply_text("❌ Не похоже на Telegram. Дайте @username или https://t.me/username")
+                if not (1 <= dd_i <= 31 and 1 <= mm_i <= 12):
+                    await update.message.reply_text("❌ Некорректная дата. Пример: 22.01")
                     return
+                data["birthday"] = b
 
-                data["tg_link"] = tg
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "about"
+            await update.message.reply_text("Шаг 5/7: кратко о себе (1–3 предложения)", reply_markup=kb_cancel_wizard_settings())
+            return
 
-                pid = db_profiles_add(
-                    full_name=data["full_name"],
-                    year_start=data["year_start"],
-                    city=data["city"],
-                    birthday=data.get("birthday"),
-                    about=data["about"],
-                    topics=data["topics"],
-                    tg_link=data["tg_link"],
-                )
-
-                clear_profile_wiz(context)
-                await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).", reply_markup=kb_help_settings())
+        if step == "about":
+            if len(text) < 5:
+                await update.message.reply_text("❌ Напишите чуть подробнее 🙂")
                 return
+            data["about"] = text
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "topics"
+            await update.message.reply_text("Шаг 6/7: по каким вопросам обращаться?", reply_markup=kb_cancel_wizard_settings())
+            return
+
+        if step == "topics":
+            if len(text) < 3:
+                await update.message.reply_text("❌ Укажите темы/вопросы.")
+                return
+            data["topics"] = text
+            context.chat_data[PROFILE_WIZ_DATA] = data
+            context.chat_data[PROFILE_WIZ_STEP] = "tg_link"
+            await update.message.reply_text("Шаг 7/7: Telegram (@username или https://t.me/username)", reply_markup=kb_cancel_wizard_settings())
+            return
+
+        if step == "tg_link":
+            tg = text.strip()
+            ok = False
+            if tg.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{4,}", tg):
+                ok = True
+            if tg.startswith("https://t.me/") or tg.startswith("http://t.me/"):
+                ok = True
+            if re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
+                ok = True
+            if not ok:
+                await update.message.reply_text("❌ Не похоже на Telegram. Дайте @username или https://t.me/username")
+                return
+
+            data["tg_link"] = tg
+
+            pid = db_profiles_add(
+                full_name=data["full_name"],
+                year_start=data["year_start"],
+                city=data["city"],
+                birthday=data.get("birthday"),
+                about=data["about"],
+                topics=data["topics"],
+                tg_link=data["tg_link"],
+            )
+
+            clear_profile_wiz(context)
+            await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).", reply_markup=kb_help_settings())
+            return
 
 
 
@@ -6514,8 +5407,6 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_cancel_manual_input, pattern=r"^reschedule:cancel_manual:(standup|industry)$"))
 
     # callbacks: help
-    app.add_handler(CallbackQueryHandler(cb_test, pattern=r"^test:"))
-
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
 
     # new members welcome
