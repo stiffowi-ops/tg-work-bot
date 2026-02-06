@@ -2138,13 +2138,13 @@ def get_links_catalog() -> dict[str, dict]:
             "desc": "Создаём лида в CRM при проработке новой компании. <b>ВАЖНО!!! ПРОВЕРЬ ДУБЛИ</b>\nИли используем при задаче на реанимацию от руководителя.",
         }
 
-
     if REANIMATION_REQUEST_URL:
         catalog["reanimation_request"] = {
             "title": "Запрос на реанимацию 🚑",
             "url": REANIMATION_REQUEST_URL,
             "desc": "Этот файл со ссылками на компании, которые требуют поиска новых контактов, возобновление старых",
         }
+
 
     return catalog
 
@@ -5217,13 +5217,31 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ok = False
                 if tg_user_id:
                     try:
+                        # compose employee notification with title + duration + motivation
+                        if time_limit_sec:
+                            duration_text = f"{int(time_limit_sec)//60} минут"
+                        else:
+                            duration_text = "без ограничения по времени"
+
+                        notify_text = (
+                            f"📝 Назначен тест: {title}
+
+"
+                            f"⏱ Длительность: {duration_text}
+
+"
+                            "💡 Результаты теста покажут твою подкованность в данной тематике.
+
+"
+                            "Нажми кнопку ниже, чтобы начать."
+                        )
+
                         await context.bot.send_message(
                             chat_id=tg_user_id,
-                            text=f"📝 Вам назначен тест: {title}",
+                            text=notify_text,
                             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Начать тест", callback_data=f"test:start:{aid}")]]),
                             disable_web_page_preview=True,
-                        )
-                        ok = True
+                        )ok = True
                     except Exception:
                         ok = False
 
