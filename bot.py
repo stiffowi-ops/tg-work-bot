@@ -595,6 +595,7 @@ def db_init():
             about TEXT NOT NULL,
             topics TEXT NOT NULL,
             tg_link TEXT NOT NULL,
+            tg_user_id INTEGER,
             created_at TEXT NOT NULL
         )
     """)
@@ -605,6 +606,14 @@ def db_init():
     except sqlite3.OperationalError:
         pass
 
+
+
+
+    # ✅ миграция для старых БД: tg_user_id
+    try:
+        cur.execute("ALTER TABLE profiles ADD COLUMN tg_user_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
 
     # ------- ACHIEVEMENTS: выдачи ачивок -------
     cur.execute("""
@@ -1223,7 +1232,7 @@ def db_profiles_get(pid: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, tg_user_id
         FROM profiles
         WHERE id=?
     """, (pid,))
@@ -1240,13 +1249,14 @@ def db_profiles_get(pid: int):
         "about": row[5],
         "topics": row[6],
         "tg_link": row[7],
+        "tg_user_id": row[8],
     }
 
 def db_profiles_get_by_tg_link(tg_link: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, tg_user_id
         FROM profiles
         WHERE tg_link=?
     """, (tg_link.strip(),))
@@ -1263,9 +1273,79 @@ def db_profiles_get_by_tg_link(tg_link: str):
         "about": row[5],
         "topics": row[6],
         "tg_link": row[7],
+        "tg_user_id": row[8],
     }
 
 
+
+
+
+# ===================== TESTING: TG USER ID SYNC (profiles) =========
+
+def db_profiles_set_tg_user_id(profile_id: int, tg_user_id: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("UPDATE profiles SET tg_user_id=? WHERE id=?", (int(tg_user_id), int(profile_id)))
+    con.commit()
+    con.close()
+
+
+def db_profiles_get_by_tg_user_id(tg_user_id: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, tg_user_id
+        FROM profiles
+        WHERE tg_user_id=?
+        """,
+        (int(tg_user_id),),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "full_name": row[1],
+        "year_start": row[2],
+        "city": row[3],
+        "birthday": row[4],
+        "about": row[5],
+        "topics": row[6],
+        "tg_link": row[7],
+        "tg_user_id": row[8],
+    }
+
+
+def _normalize_profile_tg_link(username: str | None) -> str | None:
+    if not username:
+        return None
+    u = username.strip().lstrip("@")
+    if not u:
+        return None
+    return "@" + u
+
+
+async def sync_profile_user_id_from_update(update: Update):
+    """
+    Если у пользователя есть @username, и в profiles.tg_link есть такой же,
+    то записываем tg_user_id = update.effective_user.id.
+
+    Это позволяет слать ЛС по user_id (chat_id), а не по @username.
+    """
+    user = update.effective_user
+    if not user:
+        return
+    tg_link = _normalize_profile_tg_link(getattr(user, "username", None))
+    if not tg_link:
+        return
+    prof = db_profiles_get_by_tg_link(tg_link)
+    if not prof:
+        return
+    if prof.get("tg_user_id") == user.id:
+        return
+    db_profiles_set_tg_user_id(int(prof["id"]), int(user.id))
 
 def db_profiles_add(full_name: str, year_start: int, city: str, birthday: str | None, about: str, topics: str, tg_link: str) -> int:
     con = sqlite3.connect(DB_PATH)
@@ -3968,6 +4048,9 @@ async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_T
 
 async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+
+    # ===================== TESTING: sync tg_user_id =============
+    await sync_profile_user_id_from_update(update)
     data = q.data or ""
     try:
         try:
@@ -4093,6 +4176,9 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await deny_no_access(update, context):
         return
+
+    # ===================== TESTING: sync tg_user_id =============
+    await sync_profile_user_id_from_update(update)
 
     q = update.callback_query
     data = q.data
@@ -4782,14 +4868,16 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             aid = db_test_create_assignment(template_id, int(pid), admin_id, d.get("time_limit_sec"))
 
             prof = db_profiles_get(int(pid))
-            chat_target = None
-            if prof:
-                chat_target = normalize_tg_mention(prof.get("tg_link") or "")
+
+            # ✅ Telegram doesn't allow sending DM by @username.
+            # We send only by stored tg_user_id (chat_id), which is saved when user first contacts the bot.
             delivered = False
-            if chat_target:
+            tg_user_id = int(prof.get("tg_user_id")) if prof and prof.get("tg_user_id") else None
+
+            if tg_user_id:
                 try:
                     await context.bot.send_message(
-                        chat_id=chat_target,
+                        chat_id=tg_user_id,
                         text=f"📝 Вам назначен тест: {title}",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Начать тест", callback_data=f"test:start:{aid}")]]),
                         disable_web_page_preview=True,
@@ -4804,7 +4892,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await q.edit_message_text(
                     "⚠️ Тест создан, но не доставлен в ЛС сотруднику.\n"
-                    "Сотрудник должен запустить бота, и/или должен быть указан корректный @username в анкете.",
+                    "Сотрудник должен запустить бота (/start) и написать боту любое сообщение, чтобы бот смог запомнить его Telegram user_id.",
                     reply_markup=kb_settings_test_menu(),
                 )
             return
@@ -5613,6 +5701,10 @@ async def on_meme_channel_post(update: Update, context: ContextTypes.DEFAULT_TYP
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
         return
+
+
+    # ===================== TESTING: sync tg_user_id =============
+    await sync_profile_user_id_from_update(update)
 
     user_id = update.effective_user.id if update.effective_user else None
     text = (update.message.text or "").strip()
