@@ -2312,6 +2312,9 @@ def kb_pick_profile_for_achievement():
 TEST_WIZ_ACTIVE = "test_wiz_active"
 TEST_WIZ_STEP = "test_wiz_step"
 TEST_WIZ_DATA = "test_wiz_data"
+TEST_WIZ_SELECTED_PIDS = "test_wiz_selected_pids"
+TEST_WIZ_TEMPLATE_ID = "test_wiz_template_id"
+TEST_WIZ_FROM_TEMPLATE_ID = "test_wiz_from_template_id"
 
 TEST_WIZ_STEP_TITLE = "title"
 TEST_WIZ_STEP_MENU = "menu"
@@ -2334,10 +2337,45 @@ def clear_test_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.user_data[TEST_WIZ_ACTIVE] = False
     context.user_data.pop(TEST_WIZ_STEP, None)
     context.user_data.pop(TEST_WIZ_DATA, None)
+    context.user_data.pop(TEST_WIZ_SELECTED_PIDS, None)
+    context.user_data.pop(TEST_WIZ_TEMPLATE_ID, None)
+    context.user_data.pop(TEST_WIZ_FROM_TEMPLATE_ID, None)
 
 def clear_active_test(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(ACTIVE_TEST_ASSIGNMENT_ID, None)
     context.user_data.pop(ACTIVE_TEST_MULTI_SELECTED, None)
+
+def _test_wiz_ensure_template_persisted(context: ContextTypes.DEFAULT_TYPE, created_by: int | None) -> int | None:
+    """
+    Ensures that current admin wizard has a persisted template (draft).
+    Creates test_templates + test_questions once, stores template_id in user_data.
+    Returns template_id or None if not enough data.
+    """
+    existing = context.user_data.get(TEST_WIZ_TEMPLATE_ID)
+    if existing:
+        try:
+            return int(existing)
+        except Exception:
+            pass
+
+    d = context.user_data.get(TEST_WIZ_DATA) or {}
+    title = (d.get("title") or "").strip()
+    qs = d.get("questions") or []
+    if not title or not qs:
+        return None
+
+    template_id = db_test_create_template(title, created_by)
+    for i, qq in enumerate(qs, start=1):
+        db_test_add_question(
+            template_id=template_id,
+            idx=i,
+            q_type=qq["q_type"],
+            question_text=qq["question_text"],
+            options=(qq.get("options") if qq["q_type"] in ("single", "multi") else None),
+            correct=(qq.get("correct") if qq["q_type"] in ("single", "multi") else None),
+        )
+    context.user_data[TEST_WIZ_TEMPLATE_ID] = int(template_id)
+    return int(template_id)
 
 def _now_iso() -> str:
     return datetime.utcnow().isoformat()
@@ -2583,6 +2621,80 @@ def db_test_delete_assignment_full(aid: int) -> bool:
     con.commit()
     con.close()
     return True
+def db_test_list_templates(limit: int = 50) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """SELECT id, title, created_at
+             FROM test_templates
+             ORDER BY created_at DESC
+             LIMIT ?""",
+        (int(limit),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [{"id": int(r[0]), "title": r[1], "created_at": r[2]} for r in rows]
+
+
+def db_test_get_template(tid: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id, title, created_by, created_at FROM test_templates WHERE id=?", (int(tid),))
+    r = cur.fetchone()
+    con.close()
+    if not r:
+        return None
+    return {"id": int(r[0]), "title": r[1], "created_by": r[2], "created_at": r[3]}
+
+
+def db_test_get_questions_for_template(tid: int) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """SELECT id, idx, q_type, question_text, options_json, correct_json
+             FROM test_questions
+             WHERE template_id=?
+             ORDER BY idx ASC""",
+        (int(tid),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    out=[]
+    for r in rows:
+        out.append({
+            "id": int(r[0]),
+            "idx": int(r[1]),
+            "q_type": r[2],
+            "question_text": r[3],
+            "options": _safe_json_loads(r[4], []),
+            "correct": _safe_json_loads(r[5], []),
+        })
+    return out
+
+
+def db_test_delete_template_full(tid: int) -> bool:
+    """
+    Полностью удаляет шаблон теста из 'Черновиков' и всю связанную историю:
+    assignments + answers + questions + template.
+    """
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        # collect assignment ids
+        cur.execute("SELECT id FROM test_assignments WHERE template_id=?", (int(tid),))
+        aids = [int(x[0]) for x in cur.fetchall()]
+
+        if aids:
+            cur.executemany("DELETE FROM test_answers WHERE assignment_id=?", [(aid,) for aid in aids])
+            cur.executemany("DELETE FROM test_assignments WHERE id=?", [(aid,) for aid in aids])
+
+        cur.execute("DELETE FROM test_questions WHERE template_id=?", (int(tid),))
+        cur.execute("DELETE FROM test_templates WHERE id=?", (int(tid),))
+        con.commit()
+        return True
+    finally:
+        con.close()
+
 
 def db_test_delete_answers(aid: int):
     con = sqlite3.connect(DB_PATH)
@@ -2596,6 +2708,7 @@ def db_test_delete_answers(aid: int):
 def kb_settings_test_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Создать и отправить тест", callback_data="help:settings:test:create")],
+        [InlineKeyboardButton("🗂 Черновики", callback_data="help:settings:test:drafts")],
         [InlineKeyboardButton("📋 Результаты (последние)", callback_data="help:settings:test:results")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
     ])
@@ -2654,22 +2767,61 @@ def kb_test_time_limit():
         [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")],
     ])
 
-def kb_pick_profile_for_test():
-    # reuse the same style as achievements selection
+def kb_pick_profiles_for_test(selected: set[int], back_cb: str = "help:settings:test"):
+    """
+    Multi-select profiles for test sending.
+    Reuses the same simple list style as achievements selection, but with toggles.
+    """
     people = db_profiles_list()
-    rows=[]
+    rows = []
     if not people:
         rows.append([InlineKeyboardButton("— анкет нет —", callback_data="noop")])
     else:
-        for pid,name in people[:60]:
-            rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:test:pick:{pid}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")])
+        for pid, name in people[:60]:
+            mark = "☑️" if int(pid) in selected else "⬜"
+            rows.append([InlineKeyboardButton(f"{mark} {name}", callback_data=f"help:settings:test:pick_toggle:{pid}")])
+    rows.append([InlineKeyboardButton("✅ Готово", callback_data="help:settings:test:pick_done")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_cb)])
     return InlineKeyboardMarkup(rows)
 
 def kb_test_confirm_send():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Отправить", callback_data="help:settings:test:send")],
+        [InlineKeyboardButton("👥 Изменить получателей", callback_data="help:settings:test:pick_open")],
+        [InlineKeyboardButton("💾 Сохранить в черновики", callback_data="help:settings:test:save_draft")],
         [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")],
+    ])
+
+# ---------------- TESTING: drafts UI ----------------
+
+def kb_settings_test_drafts_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")],
+    ])
+
+def kb_test_drafts_list(templates: list[dict]):
+    rows=[]
+    if not templates:
+        rows.append([InlineKeyboardButton("— черновиков нет —", callback_data="noop")])
+    else:
+        for t in templates[:40]:
+            title = t.get("title") or "— без названия —"
+            rows.append([InlineKeyboardButton(title, callback_data=f"help:settings:test:draft:open:{t['id']}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_test_draft_actions(tid: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Отправить сотрудникам", callback_data=f"help:settings:test:draft:send:{tid}")],
+        [InlineKeyboardButton("🗑 Удалить черновик", callback_data=f"help:settings:test:draft:delete:{tid}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test:drafts")],
+    ])
+
+def kb_test_draft_delete_confirm(tid: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"help:settings:test:draft:delete_yes:{tid}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"help:settings:test:draft:open:{tid}")],
     ])
 
 def kb_test_results_list(items: list[dict]):
@@ -4639,6 +4791,72 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        
+        if data == "help:settings:test:drafts":
+            clear_test_wiz(context)
+            templates = db_test_list_templates(limit=50)
+            await q.edit_message_text(
+                "🗂 <b>Черновики</b> (шаблоны тестов)\n\n"
+                "Здесь хранятся все созданные шаблоны тестов. Вы можете открыть шаблон и отправить его одному или нескольким сотрудникам.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_drafts_list(templates),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("help:settings:test:draft:open:"):
+            tid = int(data.split(":")[-1])
+            tpl = db_test_get_template(tid)
+            if not tpl:
+                await q.answer("Черновик не найден.", show_alert=True)
+                return
+            qs = db_test_get_questions_for_template(tid)
+            body = [f"🗂 <b>Черновик</b>\n", f"Название: <b>{escape(tpl.get('title') or '')}</b>", f"Вопросов: <b>{len(qs)}</b>"]
+            await q.edit_message_text("\n".join(body), parse_mode=ParseMode.HTML, reply_markup=kb_test_draft_actions(tid))
+            return
+
+        if data.startswith("help:settings:test:draft:delete:"):
+            tid = int(data.split(":")[-1])
+            await q.edit_message_text(
+                "🗑 <b>Удалить черновик?</b>\n\n"
+                "Будет удалён сам шаблон и вся история прохождений (если есть).",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_draft_delete_confirm(tid),
+            )
+            return
+
+        if data.startswith("help:settings:test:draft:delete_yes:"):
+            tid = int(data.split(":")[-1])
+            db_test_delete_template_full(tid)
+            templates = db_test_list_templates(limit=50)
+            await q.edit_message_text(
+                "✅ Черновик удалён.",
+                reply_markup=kb_test_drafts_list(templates),
+            )
+            return
+
+        if data.startswith("help:settings:test:draft:send:"):
+            tid = int(data.split(":")[-1])
+            tpl = db_test_get_template(tid)
+            if not tpl:
+                await q.answer("Черновик не найден.", show_alert=True)
+                return
+            # Start a lightweight wizard for sending existing template
+            clear_test_wiz(context)
+            context.user_data[TEST_WIZ_ACTIVE] = True
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_TIME_LIMIT
+            context.user_data[TEST_WIZ_DATA] = {"time_limit_sec": None, "profile_ids": []}
+            context.user_data[TEST_WIZ_SELECTED_PIDS] = set()
+            context.user_data[TEST_WIZ_TEMPLATE_ID] = int(tid)
+            context.user_data[TEST_WIZ_FROM_TEMPLATE_ID] = int(tid)
+
+            await q.edit_message_text(
+                f"📝 <b>Отправка черновика</b>\n\n"
+                f"Шаг 1/3: выберите лимит времени для теста «<b>{escape(tpl.get('title') or '')}</b>»:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_time_limit(),
+            )
+            return
         if data == "help:settings:test:cancel":
             clear_test_wiz(context)
             await q.edit_message_text(
@@ -4653,6 +4871,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data[TEST_WIZ_ACTIVE] = True
             context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_TITLE
             context.user_data[TEST_WIZ_DATA] = {"questions": []}
+            context.user_data[TEST_WIZ_SELECTED_PIDS] = set()
+            context.user_data.pop(TEST_WIZ_TEMPLATE_ID, None)
             await q.edit_message_text(
                 "📝 <b>Создание теста</b>\n\nШаг 1/5: введите <b>название теста</b> одним сообщением.",
                 parse_mode=ParseMode.HTML,
@@ -4843,90 +5063,202 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data[TEST_WIZ_DATA] = d
             context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_PICK_PROFILE
             await q.edit_message_text(
-                "Шаг 4/5: выберите сотрудника:",
+                "Шаг 4/5: выберите сотрудников (можно несколько):",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb_pick_profile_for_test(),
+                reply_markup=kb_pick_profiles_for_test(set(), back_cb="help:settings:test"),
             )
             return
 
-        if data.startswith("help:settings:test:pick:"):
+
+        if data == "help:settings:test:pick_open":
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            selected = set(context.user_data.get(TEST_WIZ_SELECTED_PIDS) or set())
+            await q.edit_message_text(
+                "Шаг 4/5: выберите сотрудников (можно несколько):",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_pick_profiles_for_test(selected, back_cb="help:settings:test"),
+            )
+            return
+
+        if data.startswith("help:settings:test:pick_toggle:"):
             if not context.user_data.get(TEST_WIZ_ACTIVE):
                 await q.answer()
                 return
             pid = int(data.split(":")[-1])
+            selected = set(context.user_data.get(TEST_WIZ_SELECTED_PIDS) or set())
+            if pid in selected:
+                selected.remove(pid)
+            else:
+                selected.add(pid)
+            context.user_data[TEST_WIZ_SELECTED_PIDS] = selected
+            await q.edit_message_reply_markup(reply_markup=kb_pick_profiles_for_test(selected, back_cb="help:settings:test"))
+            await q.answer()
+            return
+
+        if data == "help:settings:test:pick_done":
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            selected = list(context.user_data.get(TEST_WIZ_SELECTED_PIDS) or [])
+            if not selected:
+                await q.answer("Выберите хотя бы одного сотрудника.", show_alert=True)
+                return
+
             d = context.user_data.get(TEST_WIZ_DATA) or {}
-            d["profile_id"] = pid
+            # store for summary (legacy key kept for compatibility)
+            d["profile_ids"] = selected
             context.user_data[TEST_WIZ_DATA] = d
             context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_CONFIRM
 
-            prof = db_profiles_get(pid)
-            who = prof["full_name"] if prof else f"id={pid}"
+            # ensure template is persisted as a draft once we reached confirmation
+            admin_id = update.effective_user.id if update.effective_user else None
+            template_id = _test_wiz_ensure_template_persisted(context, admin_id)
+            if template_id:
+                context.user_data[TEST_WIZ_TEMPLATE_ID] = template_id
+
             qs = d.get("questions") or []
             tl = d.get("time_limit_sec")
             tl_txt = "без лимита" if not tl else f"{int(tl//60)} мин"
+
+            names = []
+            for pid in selected[:8]:
+                prof = db_profiles_get(pid)
+                names.append(prof["full_name"] if prof else f"id={pid}")
+            who_txt = ", ".join([escape(x) for x in names])
+            if len(selected) > 8:
+                who_txt += f" и ещё {len(selected) - 8}"
+
             summary = (
                 "📝 <b>Проверьте данные</b>\n\n"
                 f"Название: <b>{escape(d.get('title',''))}</b>\n"
                 f"Вопросов: <b>{len(qs)}</b>\n"
                 f"Лимит: <b>{tl_txt}</b>\n"
-                f"Сотрудник: <b>{escape(who)}</b>"
+                f"Сотрудники: <b>{who_txt}</b>"
             )
-            await q.edit_message_text(summary, parse_mode=ParseMode.HTML, reply_markup=kb_test_confirm_send(), disable_web_page_preview=True)
+            await q.edit_message_text(
+                summary,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_confirm_send(),
+                disable_web_page_preview=True
+            )
             return
 
-        if data == "help:settings:test:send":
+        if data == "help:settings:test:save_draft":
             if not context.user_data.get(TEST_WIZ_ACTIVE):
                 await q.answer()
                 return
-            d = context.user_data.get(TEST_WIZ_DATA) or {}
-            title = (d.get("title") or "").strip()
-            qs = d.get("questions") or []
-            pid = d.get("profile_id")
-            if not title or not qs or not pid:
-                await q.answer("Не хватает данных для отправки.", show_alert=True)
+            admin_id = update.effective_user.id if update.effective_user else None
+            tid = _test_wiz_ensure_template_persisted(context, admin_id)
+            # draft is saved by persisting template; exit wizard but keep template in DB
+            clear_test_wiz(context)
+            if tid:
+                await q.edit_message_text(
+                    "💾 Черновик сохранён.\n\nВы можете найти его в меню «Черновики».",
+                    reply_markup=kb_settings_test_menu(),
+                )
+            else:
+                await q.edit_message_text(
+                    "⚠️ Не удалось сохранить черновик: не хватает данных (название/вопросы).",
+                    reply_markup=kb_settings_test_menu(),
+                )
+            return
+
+        if data == "help:settings:test:send":
+
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
                 return
 
             admin_id = update.effective_user.id if update.effective_user else None
-            template_id = db_test_create_template(title, admin_id)
-            for i,qq in enumerate(qs, start=1):
-                db_test_add_question(
-                    template_id=template_id,
-                    idx=i,
-                    q_type=qq["q_type"],
-                    question_text=qq["question_text"],
-                    options=(qq.get("options") if qq["q_type"] in ("single","multi") else None),
-                    correct=(qq.get("correct") if qq["q_type"] in ("single","multi") else None),
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+
+            # recipients
+            profile_ids = d.get("profile_ids") or list(context.user_data.get(TEST_WIZ_SELECTED_PIDS) or [])
+            profile_ids = [int(x) for x in profile_ids]
+            if not profile_ids:
+                await q.answer("Выберите хотя бы одного сотрудника.", show_alert=True)
+                return
+
+            # template (persisted draft)
+            template_id = context.user_data.get(TEST_WIZ_TEMPLATE_ID)
+            if not template_id:
+                template_id = _test_wiz_ensure_template_persisted(context, admin_id)
+                if not template_id:
+                    await q.answer("Не хватает данных для создания теста.", show_alert=True)
+                    return
+                context.user_data[TEST_WIZ_TEMPLATE_ID] = template_id
+
+            tpl = db_test_get_template(int(template_id))
+            title = (tpl.get("title") if tpl else "") or (d.get("title") or "").strip() or "Тест"
+
+            time_limit_sec = d.get("time_limit_sec")
+
+            delivered = []
+            failed = []
+
+            for pid in profile_ids:
+                aid = db_test_create_assignment(int(template_id), int(pid), admin_id, time_limit_sec)
+
+                prof = db_profiles_get(int(pid))
+                who = (prof.get("full_name") if prof else f"id={pid}")
+
+                tg_user_id = int(prof.get("tg_user_id")) if prof and prof.get("tg_user_id") else None
+                ok = False
+                if tg_user_id:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=tg_user_id,
+                            text=f"📝 Вам назначен тест: {title}",
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Начать тест", callback_data=f"test:start:{aid}")]]),
+                            disable_web_page_preview=True,
+                        )
+                        ok = True
+                    except Exception:
+                        ok = False
+
+                if ok:
+                    delivered.append(who)
+                else:
+                    # mark assignment as canceled (not delivered)
+                    try:
+                        db_test_set_assignment_status(int(aid), "canceled")
+                    except Exception:
+                        pass
+                    failed.append(who)
+
+            # keep wizard active so admin can pick other recipients if needed; clear current selection
+            context.user_data[TEST_WIZ_SELECTED_PIDS] = set()
+            d["profile_ids"] = []
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_PICK_PROFILE
+
+            if delivered and not failed:
+                msg = "✅ Тест отправлен сотрудникам в личные сообщения."
+            elif delivered and failed:
+                msg = (
+                    "⚠️ Тест отправлен не всем.\n\n"
+                    f"Доставлено: {len(delivered)}\n"
+                    f"Не доставлено: {len(failed)}\n\n"
+                    "Если не доставлено — сотрудник должен запустить бота (/start) и написать любое сообщение, "
+                    "чтобы бот смог запомнить его Telegram user_id, либо сотрудник запретил сообщения."
                 )
-            aid = db_test_create_assignment(template_id, int(pid), admin_id, d.get("time_limit_sec"))
-
-            prof = db_profiles_get(int(pid))
-
-            # ✅ Telegram doesn't allow sending DM by @username.
-            # We send only by stored tg_user_id (chat_id), which is saved when user first contacts the bot.
-            delivered = False
-            tg_user_id = int(prof.get("tg_user_id")) if prof and prof.get("tg_user_id") else None
-
-            if tg_user_id:
-                try:
-                    await context.bot.send_message(
-                        chat_id=tg_user_id,
-                        text=f"📝 Вам назначен тест: {title}",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Начать тест", callback_data=f"test:start:{aid}")]]),
-                        disable_web_page_preview=True,
-                    )
-                    delivered = True
-                except Exception:
-                    delivered = False
-
-            clear_test_wiz(context)
-            if delivered:
-                await q.edit_message_text("✅ Тест создан и отправлен сотруднику в личные сообщения.", reply_markup=kb_settings_test_menu())
             else:
-                await q.edit_message_text(
-                    "⚠️ Тест создан, но не доставлен в ЛС сотруднику.\n"
-                    "Сотрудник должен запустить бота (/start) и написать боту любое сообщение, чтобы бот смог запомнить его Telegram user_id.",
-                    reply_markup=kb_settings_test_menu(),
+                msg = (
+                    "⚠️ Тест создан, но не доставлен никому.\n\n"
+                    "Сотрудники должны запустить бота (/start) и написать боту любое сообщение, "
+                    "чтобы бот смог запомнить их Telegram user_id."
                 )
+
+            await q.edit_message_text(
+                msg,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👥 Выбрать других сотрудников", callback_data="help:settings:test:pick_open")],
+                    [InlineKeyboardButton("🗂 Черновики", callback_data="help:settings:test:drafts")],
+                    [InlineKeyboardButton("🏠 В меню тестирования", callback_data="help:settings:test")],
+                ]),
+            )
             return
 
         if data == "help:settings:test:results":
@@ -5864,7 +6196,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d["time_limit_sec"] = mins * 60
             context.user_data[TEST_WIZ_DATA] = d
             context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_PICK_PROFILE
-            await update.message.reply_text("Шаг 4/5: выберите сотрудника:", reply_markup=kb_pick_profile_for_test())
+            await update.message.reply_text("Шаг 4/5: выберите сотрудников (можно несколько):", reply_markup=kb_pick_profiles_for_test(set(), back_cb="help:settings:test"))
             return
 
     # ---------------- BONUS CALC (FAQ) ----------------
