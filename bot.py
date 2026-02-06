@@ -7,6 +7,7 @@ import time
 import csv
 import io
 import zipfile
+import json
 import html as html_lib
 import httpx
 from pathlib import Path
@@ -643,6 +644,67 @@ def db_init():
         )
     """)
 
+
+
+    # ===================== TESTING (employees) DB =====================
+    # templates
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # questions
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER NOT NULL,
+            idx INTEGER NOT NULL,
+            q_type TEXT NOT NULL, -- open|single|multi
+            question_text TEXT NOT NULL,
+            options_json TEXT,    -- JSON list[str]
+            correct_json TEXT,    -- JSON list[int]
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(template_id) REFERENCES test_templates(id) ON DELETE CASCADE
+        )
+    """)
+
+    # assignments
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            assigned_by INTEGER,
+            assigned_at TEXT NOT NULL,
+            time_limit_sec INTEGER,
+            deadline_at TEXT,
+            status TEXT NOT NULL, -- assigned|in_progress|finished|expired|canceled|saved
+            started_at TEXT,
+            finished_at TEXT,
+            current_idx INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(template_id) REFERENCES test_templates(id) ON DELETE CASCADE,
+            FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+        )
+    """)
+
+    # answers
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            assignment_id INTEGER NOT NULL,
+            question_id INTEGER NOT NULL,
+            answer_json TEXT NOT NULL,
+            is_correct INTEGER, -- 1/0/NULL
+            answered_at TEXT NOT NULL,
+            UNIQUE(assignment_id, question_id),
+            FOREIGN KEY(assignment_id) REFERENCES test_assignments(id) ON DELETE CASCADE,
+            FOREIGN KEY(question_id) REFERENCES test_questions(id) ON DELETE CASCADE
+        )
+    """)
 
     con.commit()
     con.close()
@@ -2074,6 +2136,7 @@ def kb_help_settings():
         [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
         [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
         [InlineKeyboardButton("🏆 Ачивки", callback_data="help:settings:ach")],
+        [InlineKeyboardButton("📝 Тестирование", callback_data="help:settings:test")],
         [InlineKeyboardButton("❓ FAQ", callback_data="help:settings:faq")],
         [InlineKeyboardButton("📦 Скачать бэкап ZIP", callback_data="help:settings:backup_zip")],
         [InlineKeyboardButton("📥 Загрузить бэкап ZIP", callback_data="help:settings:restore_zip")],
@@ -2162,6 +2225,437 @@ def kb_pick_profile_for_achievement():
             rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:ach:pick:{pid}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:ach")])
     return InlineKeyboardMarkup(rows)
+
+
+# ===================== TESTING (employees) =====================
+# NOTE: Admin wizard state is kept in context.user_data (not chat_data).
+TEST_WIZ_ACTIVE = "test_wiz_active"
+TEST_WIZ_STEP = "test_wiz_step"
+TEST_WIZ_DATA = "test_wiz_data"
+
+TEST_WIZ_STEP_TITLE = "title"
+TEST_WIZ_STEP_MENU = "menu"
+TEST_WIZ_STEP_Q_TYPE = "q_type"
+TEST_WIZ_STEP_Q_TEXT = "q_text"
+TEST_WIZ_STEP_Q_OPTIONS = "q_options"
+TEST_WIZ_STEP_Q_CORRECT = "q_correct"
+TEST_WIZ_STEP_TIME = "time"
+TEST_WIZ_STEP_TIME_MANUAL = "time_manual"
+TEST_WIZ_STEP_PICK_PROFILE = "pick_profile"
+TEST_WIZ_STEP_CONFIRM = "confirm"
+
+ACTIVE_TEST_ASSIGNMENT_ID = "active_test_assignment_id"
+ACTIVE_TEST_MULTI_SELECTED = "active_test_multi_selected"  # dict[qid] -> set[int]
+
+EMPLOYEE_TEST_FINISH_TEXT = "✅ Отлично. Тест пройден. Результаты сообщит твой руководитель."
+EMPLOYEE_TEST_EXPIRED_TEXT = "⏳ Время на тестирование истекло.\n\n" + EMPLOYEE_TEST_FINISH_TEXT
+
+def clear_test_wiz(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[TEST_WIZ_ACTIVE] = False
+    context.user_data.pop(TEST_WIZ_STEP, None)
+    context.user_data.pop(TEST_WIZ_DATA, None)
+
+def clear_active_test(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(ACTIVE_TEST_ASSIGNMENT_ID, None)
+    context.user_data.pop(ACTIVE_TEST_MULTI_SELECTED, None)
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+def _safe_json_dumps(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False)
+
+def _safe_json_loads(s: str, default):
+    try:
+        return json.loads(s) if s else default
+    except Exception:
+        return default
+
+# ---------------- TESTING DB helpers ----------------
+
+def db_test_create_template(title: str, created_by: int | None) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO test_templates(title, created_by, created_at) VALUES(?, ?, ?)",
+        (title.strip(), created_by, _now_iso()),
+    )
+    con.commit()
+    tid = int(cur.lastrowid)
+    con.close()
+    return tid
+
+def db_test_add_question(template_id: int, idx: int, q_type: str, question_text: str, options: list[str] | None, correct: list[int] | None) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """INSERT INTO test_questions(template_id, idx, q_type, question_text, options_json, correct_json, created_at)
+             VALUES(?, ?, ?, ?, ?, ?, ?)""",
+        (
+            int(template_id),
+            int(idx),
+            q_type,
+            question_text.strip(),
+            _safe_json_dumps(options) if options is not None else None,
+            _safe_json_dumps(correct) if correct is not None else None,
+            _now_iso(),
+        ),
+    )
+    con.commit()
+    qid = int(cur.lastrowid)
+    con.close()
+    return qid
+
+def db_test_get_questions(template_id: int) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT id, idx, q_type, question_text, options_json, correct_json FROM test_questions WHERE template_id=? ORDER BY idx ASC",
+        (int(template_id),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    out=[]
+    for r in rows:
+        out.append({
+            "id": int(r[0]),
+            "idx": int(r[1]),
+            "q_type": r[2],
+            "question_text": r[3],
+            "options": _safe_json_loads(r[4], []),
+            "correct": _safe_json_loads(r[5], []),
+        })
+    return out
+
+def db_test_create_assignment(template_id: int, profile_id: int, assigned_by: int | None, time_limit_sec: int | None) -> int:
+    assigned_at = _now_iso()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """INSERT INTO test_assignments(template_id, profile_id, assigned_by, assigned_at, time_limit_sec, deadline_at, status, started_at, finished_at, current_idx)
+             VALUES(?, ?, ?, ?, ?, NULL, 'assigned', NULL, NULL, 0)""",
+        (int(template_id), int(profile_id), assigned_by, assigned_at, (int(time_limit_sec) if time_limit_sec is not None else None)),
+    )
+    con.commit()
+    aid = int(cur.lastrowid)
+    con.close()
+    return aid
+
+def db_test_get_assignment(aid: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """SELECT id, template_id, profile_id, assigned_by, assigned_at, time_limit_sec, deadline_at, status,
+                  started_at, finished_at, current_idx
+             FROM test_assignments WHERE id=?""",
+        (int(aid),),
+    )
+    r = cur.fetchone()
+    con.close()
+    if not r:
+        return None
+    return {
+        "id": int(r[0]),
+        "template_id": int(r[1]),
+        "profile_id": int(r[2]),
+        "assigned_by": r[3],
+        "assigned_at": r[4],
+        "time_limit_sec": r[5],
+        "deadline_at": r[6],
+        "status": r[7],
+        "started_at": r[8],
+        "finished_at": r[9],
+        "current_idx": int(r[10] or 0),
+    }
+
+def db_test_update_assignment_start(aid: int, deadline_at_iso: str | None):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """UPDATE test_assignments
+             SET status='in_progress', started_at=?, deadline_at=?, current_idx=0
+             WHERE id=?""",
+        (_now_iso(), deadline_at_iso, int(aid)),
+    )
+    con.commit()
+    con.close()
+
+def db_test_update_assignment_progress(aid: int, current_idx: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("UPDATE test_assignments SET current_idx=? WHERE id=?", (int(current_idx), int(aid)))
+    con.commit()
+    con.close()
+
+def db_test_finish_assignment(aid: int, status: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """UPDATE test_assignments
+             SET status=?, finished_at=?
+             WHERE id=?""",
+        (status, _now_iso(), int(aid)),
+    )
+    con.commit()
+    con.close()
+
+def db_test_set_assignment_status(aid: int, status: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("UPDATE test_assignments SET status=? WHERE id=?", (status, int(aid)))
+    con.commit()
+    con.close()
+
+def db_test_save_answer(assignment_id: int, question_id: int, answer_obj: dict, is_correct: int | None):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """INSERT INTO test_answers(assignment_id, question_id, answer_json, is_correct, answered_at)
+             VALUES(?, ?, ?, ?, ?)
+             ON CONFLICT(assignment_id, question_id) DO UPDATE SET
+               answer_json=excluded.answer_json,
+               is_correct=excluded.is_correct,
+               answered_at=excluded.answered_at""",
+        (int(assignment_id), int(question_id), _safe_json_dumps(answer_obj), is_correct, _now_iso()),
+    )
+    con.commit()
+    con.close()
+
+def db_test_list_recent_results(limit: int = 20) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """SELECT a.id, a.profile_id, a.status, a.finished_at, a.assigned_at, t.title
+             FROM test_assignments a
+             JOIN test_templates t ON t.id = a.template_id
+             WHERE a.status IN ('finished','expired','saved')
+             ORDER BY COALESCE(a.finished_at, a.assigned_at) DESC
+             LIMIT ?""",
+        (int(limit),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    out=[]
+    for r in rows:
+        out.append({
+            "id": int(r[0]),
+            "profile_id": int(r[1]),
+            "status": r[2],
+            "finished_at": r[3],
+            "assigned_at": r[4],
+            "title": r[5],
+        })
+    return out
+
+def db_test_get_answers_for_assignment(aid: int) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """SELECT q.idx, q.q_type, q.question_text, q.options_json, q.correct_json,
+                    ans.answer_json, ans.is_correct, ans.answered_at
+             FROM test_questions q
+             LEFT JOIN test_answers ans
+               ON ans.question_id = q.id AND ans.assignment_id = ?
+             WHERE q.template_id = (SELECT template_id FROM test_assignments WHERE id=?)
+             ORDER BY q.idx ASC""",
+        (int(aid), int(aid)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    out=[]
+    for r in rows:
+        out.append({
+            "idx": int(r[0]),
+            "q_type": r[1],
+            "question_text": r[2],
+            "options": _safe_json_loads(r[3], []),
+            "correct": _safe_json_loads(r[4], []),
+            "answer": _safe_json_loads(r[5], {}),
+            "is_correct": r[6],
+            "answered_at": r[7],
+        })
+    return out
+
+def db_test_delete_answers(aid: int):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM test_answers WHERE assignment_id=?", (int(aid),))
+    con.commit()
+    con.close()
+
+# ---------------- TESTING UI helpers ----------------
+
+def kb_settings_test_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Создать и отправить тест", callback_data="help:settings:test:create")],
+        [InlineKeyboardButton("📋 Результаты (последние)", callback_data="help:settings:test:results")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
+def kb_test_wiz_questions_menu(has_any: bool):
+    rows = [[InlineKeyboardButton("➕ Добавить вопрос", callback_data="help:settings:test:q:add")]]
+    if has_any:
+        rows.append([InlineKeyboardButton("✅ Закончить добавление вопросов", callback_data="help:settings:test:q:done")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_test_q_type():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Открытый (open)", callback_data="help:settings:test:q:type:open")],
+        [InlineKeyboardButton("🔘 Один вариант (single)", callback_data="help:settings:test:q:type:single")],
+        [InlineKeyboardButton("☑️ Несколько (multi)", callback_data="help:settings:test:q:type:multi")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")],
+    ])
+
+def kb_test_options_done(can_done: bool):
+    rows=[]
+    if can_done:
+        rows.append([InlineKeyboardButton("✅ Готово с вариантами", callback_data="help:settings:test:q:opts_done")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_test_correct_single(options: list[str]):
+    rows=[]
+    for i,opt in enumerate(options):
+        rows.append([InlineKeyboardButton(opt, callback_data=f"help:settings:test:q:correct_single:{i}")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_test_correct_multi(options: list[str], selected: set[int]):
+    rows=[]
+    for i,opt in enumerate(options):
+        mark = "☑️" if i in selected else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} {opt}", callback_data=f"help:settings:test:q:correct_toggle:{i}")])
+    rows.append([InlineKeyboardButton("✅ Готово", callback_data="help:settings:test:q:correct_done")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_test_time_limit():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("5", callback_data="help:settings:test:time:5"),
+            InlineKeyboardButton("10", callback_data="help:settings:test:time:10"),
+            InlineKeyboardButton("15", callback_data="help:settings:test:time:15"),
+        ],
+        [
+            InlineKeyboardButton("20", callback_data="help:settings:test:time:20"),
+            InlineKeyboardButton("30", callback_data="help:settings:test:time:30"),
+        ],
+        [InlineKeyboardButton("✍️ Ввести минуты вручную", callback_data="help:settings:test:time:manual")],
+        [InlineKeyboardButton("♾️ Без лимита", callback_data="help:settings:test:time:none")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")],
+    ])
+
+def kb_pick_profile_for_test():
+    # reuse the same style as achievements selection
+    people = db_profiles_list()
+    rows=[]
+    if not people:
+        rows.append([InlineKeyboardButton("— анкет нет —", callback_data="noop")])
+    else:
+        for pid,name in people[:60]:
+            rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:test:pick:{pid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_test_confirm_send():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Отправить", callback_data="help:settings:test:send")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")],
+    ])
+
+def kb_test_results_list(items: list[dict]):
+    rows=[]
+    if not items:
+        rows.append([InlineKeyboardButton("— пока нет —", callback_data="noop")])
+    else:
+        for it in items[:20]:
+            prof = db_profiles_get(int(it["profile_id"]))
+            who = prof["full_name"] if prof else f"id={it['profile_id']}"
+            when = (it["finished_at"] or it["assigned_at"] or "")[:16].replace("T"," ")
+            rows.append([InlineKeyboardButton(f"{who} • {it['status']} • {when}", callback_data=f"help:settings:test:results:open:{it['id']}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_test_results_actions(aid: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💾 Сохранить", callback_data=f"help:settings:test:results:save:{aid}")],
+        [InlineKeyboardButton("🗑 Удалить ответы", callback_data=f"help:settings:test:results:delete:{aid}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test:results")],
+    ])
+
+# ---------------- TESTING runtime (employee) ----------------
+
+def _parse_deadline(deadline_iso: str | None) -> datetime | None:
+    if not deadline_iso:
+        return None
+    try:
+        return datetime.fromisoformat(deadline_iso)
+    except Exception:
+        return None
+
+async def _expire_assignment_if_needed(assignment: dict, context: ContextTypes.DEFAULT_TYPE):
+    deadline = _parse_deadline(assignment.get("deadline_at"))
+    if deadline and datetime.utcnow() > deadline and assignment.get("status") in ("assigned","in_progress"):
+        db_test_finish_assignment(int(assignment["id"]), "expired")
+        # clear active state for user if we can infer current update user elsewhere
+        return True
+    return False
+
+def _is_correct_closed(selected: list[int], correct: list[int]) -> int:
+    return 1 if sorted(set(selected)) == sorted(set(correct or [])) else 0
+
+async def send_employee_question(context: ContextTypes.DEFAULT_TYPE, chat_id, assignment: dict):
+    questions = db_test_get_questions(int(assignment["template_id"]))
+    total = len(questions)
+    idx = int(assignment.get("current_idx") or 0)
+    if idx >= total:
+        return
+    q = questions[idx]
+    qid = int(q["id"])
+    qtype = q["q_type"]
+    title = f"Вопрос {idx+1}/{total}:\n{q['question_text']}"
+    if qtype == "open":
+        await context.bot.send_message(chat_id=chat_id, text=title)
+        return
+    options = q.get("options") or []
+    if qtype == "single":
+        rows=[]
+        for i,opt in enumerate(options):
+            rows.append([InlineKeyboardButton(opt, callback_data=f"test:single:{assignment['id']}:{qid}:{i}")])
+        kb = InlineKeyboardMarkup(rows)
+        await context.bot.send_message(chat_id=chat_id, text=title, reply_markup=kb)
+        return
+    if qtype == "multi":
+        # init selection state
+        selmap = context.user_data.get(ACTIVE_TEST_MULTI_SELECTED) or {}
+        selmap[str(qid)] = list(selmap.get(str(qid), []))  # keep if exists
+        context.user_data[ACTIVE_TEST_MULTI_SELECTED] = selmap
+        kb = kb_employee_multi(assignment["id"], qid, options, set(selmap.get(str(qid), [])))
+        await context.bot.send_message(chat_id=chat_id, text=title, reply_markup=kb)
+        return
+
+def kb_employee_multi(aid: int, qid: int, options: list[str], selected: set[int]):
+    rows=[]
+    for i,opt in enumerate(options):
+        mark = "☑️" if i in selected else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} {opt}", callback_data=f"test:toggle:{aid}:{qid}:{i}")])
+    rows.append([InlineKeyboardButton("✅ Ответить", callback_data=f"test:multi_submit:{aid}:{qid}")])
+    return InlineKeyboardMarkup(rows)
+
+async def _notify_admin_test_done(context: ContextTypes.DEFAULT_TYPE, assignment: dict, status_text: str):
+    admin_id = assignment.get("assigned_by")
+    if not admin_id:
+        return
+    prof = db_profiles_get(int(assignment["profile_id"]))
+    who = prof["full_name"] if prof else f"id={assignment['profile_id']}"
+    msg = f"📝 Тест {status_text}: {who}.\nСмотреть: /help → Настройки → Тестирование"
+    try:
+        await context.bot.send_message(chat_id=int(admin_id), text=msg)
+    except Exception:
+        pass
+
+
 
 def kb_pick_profile_to_delete():
     people = db_profiles_list()
@@ -3469,6 +3963,133 @@ async def cb_cancel_manual_input(update: Update, context: ContextTypes.DEFAULT_T
 
 # ---------------- CALLBACKS: HELP ----------------
 
+
+# ===================== TESTING (employees) callbacks =====================
+
+async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    try:
+        try:
+            await q.answer()
+        except (TimedOut, NetworkError):
+            pass
+    except (TimedOut, NetworkError):
+        pass
+
+    if not data.startswith("test:"):
+        return
+
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    user_id = update.effective_user.id if update.effective_user else None
+    if not user_id:
+        return
+
+    # start
+    if action == "start" and len(parts) >= 3:
+        aid = int(parts[2])
+        a = db_test_get_assignment(aid)
+        if not a:
+            return
+
+        # deadline check (assigned but already expired is rare)
+        if await _expire_assignment_if_needed(a, context):
+            clear_active_test(context)
+            await context.bot.send_message(chat_id=user_id, text=EMPLOYEE_TEST_EXPIRED_TEXT)
+            await _notify_admin_test_done(context, a, "истёк")
+            return
+
+        # mark started
+        deadline_iso = None
+        if a.get("time_limit_sec"):
+            deadline_iso = (datetime.utcnow() + timedelta(seconds=int(a["time_limit_sec"]))).isoformat()
+        db_test_update_assignment_start(aid, deadline_iso)
+        context.user_data[ACTIVE_TEST_ASSIGNMENT_ID] = aid
+        context.user_data[ACTIVE_TEST_MULTI_SELECTED] = {}
+        a = db_test_get_assignment(aid)
+        await send_employee_question(context, user_id, a)
+        return
+
+    # other actions require active assignment
+    if len(parts) < 4:
+        return
+    aid = int(parts[2])
+    qid = int(parts[3])
+    a = db_test_get_assignment(aid)
+    if not a:
+        return
+
+    # deadline check
+    if await _expire_assignment_if_needed(a, context):
+        clear_active_test(context)
+        await context.bot.send_message(chat_id=user_id, text=EMPLOYEE_TEST_EXPIRED_TEXT)
+        await _notify_admin_test_done(context, a, "истёк")
+        return
+
+    questions = db_test_get_questions(int(a["template_id"]))
+    qmap = {int(x["id"]): x for x in questions}
+    qinfo = qmap.get(qid)
+    if not qinfo:
+        return
+
+    if action == "single" and len(parts) >= 5:
+        opt = int(parts[4])
+        correct = qinfo.get("correct") or []
+        is_corr = _is_correct_closed([opt], correct)
+        db_test_save_answer(aid, qid, {"selected": [opt]}, is_corr)
+
+        # advance
+        next_idx = int(a.get("current_idx") or 0) + 1
+        db_test_update_assignment_progress(aid, next_idx)
+        a = db_test_get_assignment(aid)
+
+        if next_idx >= len(questions):
+            db_test_finish_assignment(aid, "finished")
+            clear_active_test(context)
+            await context.bot.send_message(chat_id=user_id, text=EMPLOYEE_TEST_FINISH_TEXT)
+            await _notify_admin_test_done(context, a, "пройден")
+            return
+
+        await send_employee_question(context, user_id, a)
+        return
+
+    if action == "toggle" and len(parts) >= 5:
+        opt = int(parts[4])
+        selmap = context.user_data.get(ACTIVE_TEST_MULTI_SELECTED) or {}
+        cur = set(selmap.get(str(qid), []))
+        if opt in cur:
+            cur.remove(opt)
+        else:
+            cur.add(opt)
+        selmap[str(qid)] = sorted(cur)
+        context.user_data[ACTIVE_TEST_MULTI_SELECTED] = selmap
+
+        opts = qinfo.get("options") or []
+        await q.edit_message_reply_markup(reply_markup=kb_employee_multi(aid, qid, opts, set(cur)))
+        return
+
+    if action == "multi_submit":
+        selmap = context.user_data.get(ACTIVE_TEST_MULTI_SELECTED) or {}
+        selected = list(selmap.get(str(qid), []))
+        correct = qinfo.get("correct") or []
+        is_corr = _is_correct_closed(selected, correct)
+        db_test_save_answer(aid, qid, {"selected": selected}, is_corr)
+
+        next_idx = int(a.get("current_idx") or 0) + 1
+        db_test_update_assignment_progress(aid, next_idx)
+        a = db_test_get_assignment(aid)
+
+        if next_idx >= len(questions):
+            db_test_finish_assignment(aid, "finished")
+            clear_active_test(context)
+            await context.bot.send_message(chat_id=user_id, text=EMPLOYEE_TEST_FINISH_TEXT)
+            await _notify_admin_test_done(context, a, "пройден")
+            return
+
+        await send_employee_question(context, user_id, a)
+        return
+
 async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await deny_no_access(update, context):
         return
@@ -3885,6 +4506,368 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb_cancel_wizard_settings(),
             )
             await q.answer()
+            return
+
+
+        # ===================== TESTING (employees) help/settings =====================
+        if data == "help:settings:test":
+            clear_test_wiz(context)
+            await q.edit_message_text(
+                "📝 <b>Тестирование</b>\n\n"
+                "Создание и отправка тестов сотрудникам, а также просмотр результатов.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_settings_test_menu(),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data == "help:settings:test:cancel":
+            clear_test_wiz(context)
+            await q.edit_message_text(
+                "⚙️ <b>Настройки</b>\n\nВыберите действие:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_help_settings(),
+            )
+            return
+
+        if data == "help:settings:test:create":
+            clear_test_wiz(context)
+            context.user_data[TEST_WIZ_ACTIVE] = True
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_TITLE
+            context.user_data[TEST_WIZ_DATA] = {"questions": []}
+            await q.edit_message_text(
+                "📝 <b>Создание теста</b>\n\nШаг 1/5: введите <b>название теста</b> одним сообщением.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")]]),
+            )
+            return
+
+        if data == "help:settings:test:q:add":
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+            if len(d.get("questions", [])) >= 10:
+                await q.answer("Максимум 10 вопросов.", show_alert=True)
+                return
+            d["pending_q"] = {"options": [], "correct": []}
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_Q_TYPE
+            await q.edit_message_text(
+                "Шаг 2/5: выберите тип вопроса:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_q_type(),
+            )
+            return
+
+        if data.startswith("help:settings:test:q:type:"):
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            qtype = data.split(":")[-1]
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+            pq = d.get("pending_q") or {"options": [], "correct": []}
+            pq["q_type"] = qtype
+            d["pending_q"] = pq
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_Q_TEXT
+            await q.edit_message_text(
+                "Введите <b>текст вопроса</b> одним сообщением.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")]]),
+            )
+            return
+
+        if data == "help:settings:test:q:opts_done":
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+            pq = d.get("pending_q") or {}
+            opts = pq.get("options") or []
+            if len(opts) < 2:
+                await q.answer("Нужно минимум 2 варианта.", show_alert=True)
+                return
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_Q_CORRECT
+            if pq.get("q_type") == "single":
+                await q.edit_message_text(
+                    "Выберите <b>правильный</b> вариант:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_test_correct_single(opts),
+                )
+            else:
+                pq["correct_set"] = set()
+                d["pending_q"] = pq
+                context.user_data[TEST_WIZ_DATA] = d
+                await q.edit_message_text(
+                    "Отметьте <b>правильные</b> варианты (можно несколько), затем нажмите «Готово»:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_test_correct_multi(opts, set()),
+                )
+            return
+
+        if data.startswith("help:settings:test:q:correct_single:"):
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            i = int(data.split(":")[-1])
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+            pq = d.get("pending_q") or {}
+            pq["correct"] = [i]
+            d["pending_q"] = pq
+            # commit question
+            qs = d.get("questions") or []
+            qs.append({
+                "q_type": pq.get("q_type"),
+                "question_text": pq.get("question_text"),
+                "options": pq.get("options") or [],
+                "correct": pq.get("correct") or [],
+            })
+            d["questions"] = qs
+            d.pop("pending_q", None)
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_MENU
+            await q.edit_message_text(
+                f"Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_wiz_questions_menu(has_any=len(qs)>0),
+            )
+            return
+
+        if data.startswith("help:settings:test:q:correct_toggle:"):
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            i = int(data.split(":")[-1])
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+            pq = d.get("pending_q") or {}
+            sel = set(pq.get("correct_set") or [])
+            if i in sel:
+                sel.remove(i)
+            else:
+                sel.add(i)
+            pq["correct_set"] = sel
+            d["pending_q"] = pq
+            context.user_data[TEST_WIZ_DATA] = d
+            opts = pq.get("options") or []
+            await q.edit_message_text(
+                "Отметьте правильные варианты и нажмите «Готово»:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_correct_multi(opts, sel),
+            )
+            return
+
+        if data == "help:settings:test:q:correct_done":
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+            pq = d.get("pending_q") or {}
+            sel = sorted(set(pq.get("correct_set") or []))
+            if not sel:
+                await q.answer("Нужно выбрать хотя бы 1 вариант.", show_alert=True)
+                return
+            pq["correct"] = sel
+            qs = d.get("questions") or []
+            qs.append({
+                "q_type": pq.get("q_type"),
+                "question_text": pq.get("question_text"),
+                "options": pq.get("options") or [],
+                "correct": pq.get("correct") or [],
+            })
+            d["questions"] = qs
+            d.pop("pending_q", None)
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_MENU
+            await q.edit_message_text(
+                f"Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_wiz_questions_menu(has_any=len(qs)>0),
+            )
+            return
+
+        if data == "help:settings:test:q:done":
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+            qs = d.get("questions") or []
+            if not qs:
+                await q.answer("Добавьте хотя бы 1 вопрос.", show_alert=True)
+                return
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_TIME
+            await q.edit_message_text(
+                "Шаг 3/5: выберите лимит времени (в минутах) или «без лимита»:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_time_limit(),
+            )
+            return
+
+        if data.startswith("help:settings:test:time:"):
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            tail = data.split(":")[-1]
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+            if tail == "manual":
+                context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_TIME_MANUAL
+                await q.edit_message_text(
+                    "Введите количество минут (целое число), одним сообщением:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="help:settings:test:cancel")]]),
+                )
+                return
+            if tail == "none":
+                d["time_limit_sec"] = None
+            else:
+                mins = int(tail)
+                d["time_limit_sec"] = mins * 60
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_PICK_PROFILE
+            await q.edit_message_text(
+                "Шаг 4/5: выберите сотрудника:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_pick_profile_for_test(),
+            )
+            return
+
+        if data.startswith("help:settings:test:pick:"):
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            pid = int(data.split(":")[-1])
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+            d["profile_id"] = pid
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_CONFIRM
+
+            prof = db_profiles_get(pid)
+            who = prof["full_name"] if prof else f"id={pid}"
+            qs = d.get("questions") or []
+            tl = d.get("time_limit_sec")
+            tl_txt = "без лимита" if not tl else f"{int(tl//60)} мин"
+            summary = (
+                "📝 <b>Проверьте данные</b>\n\n"
+                f"Название: <b>{escape(d.get('title',''))}</b>\n"
+                f"Вопросов: <b>{len(qs)}</b>\n"
+                f"Лимит: <b>{tl_txt}</b>\n"
+                f"Сотрудник: <b>{escape(who)}</b>"
+            )
+            await q.edit_message_text(summary, parse_mode=ParseMode.HTML, reply_markup=kb_test_confirm_send(), disable_web_page_preview=True)
+            return
+
+        if data == "help:settings:test:send":
+            if not context.user_data.get(TEST_WIZ_ACTIVE):
+                await q.answer()
+                return
+            d = context.user_data.get(TEST_WIZ_DATA) or {}
+            title = (d.get("title") or "").strip()
+            qs = d.get("questions") or []
+            pid = d.get("profile_id")
+            if not title or not qs or not pid:
+                await q.answer("Не хватает данных для отправки.", show_alert=True)
+                return
+
+            admin_id = update.effective_user.id if update.effective_user else None
+            template_id = db_test_create_template(title, admin_id)
+            for i,qq in enumerate(qs, start=1):
+                db_test_add_question(
+                    template_id=template_id,
+                    idx=i,
+                    q_type=qq["q_type"],
+                    question_text=qq["question_text"],
+                    options=(qq.get("options") if qq["q_type"] in ("single","multi") else None),
+                    correct=(qq.get("correct") if qq["q_type"] in ("single","multi") else None),
+                )
+            aid = db_test_create_assignment(template_id, int(pid), admin_id, d.get("time_limit_sec"))
+
+            prof = db_profiles_get(int(pid))
+            chat_target = None
+            if prof:
+                chat_target = normalize_tg_mention(prof.get("tg_link") or "")
+            delivered = False
+            if chat_target:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_target,
+                        text=f"📝 Вам назначен тест: {title}",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Начать тест", callback_data=f"test:start:{aid}")]]),
+                        disable_web_page_preview=True,
+                    )
+                    delivered = True
+                except Exception:
+                    delivered = False
+
+            clear_test_wiz(context)
+            if delivered:
+                await q.edit_message_text("✅ Тест создан и отправлен сотруднику в личные сообщения.", reply_markup=kb_settings_test_menu())
+            else:
+                await q.edit_message_text(
+                    "⚠️ Тест создан, но не доставлен в ЛС сотруднику.\n"
+                    "Сотрудник должен запустить бота, и/или должен быть указан корректный @username в анкете.",
+                    reply_markup=kb_settings_test_menu(),
+                )
+            return
+
+        if data == "help:settings:test:results":
+            items = db_test_list_recent_results(20)
+            await q.edit_message_text(
+                "📋 <b>Результаты (последние)</b>\n\nВыберите тест:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_results_list(items),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("help:settings:test:results:open:"):
+            aid = int(data.split(":")[-1])
+            a = db_test_get_assignment(aid)
+            if not a:
+                await q.answer("Не найдено.", show_alert=True)
+                return
+            prof = db_profiles_get(int(a["profile_id"]))
+            who = prof["full_name"] if prof else f"id={a['profile_id']}"
+            answers = db_test_get_answers_for_assignment(aid)
+
+            parts=[f"📝 <b>{escape(who)}</b> — статус: <b>{escape(a['status'])}</b>\n"]
+            for item in answers:
+                parts.append(f"<b>Q{item['idx']}.</b> {escape(item['question_text'])}")
+                if item["q_type"] == "open":
+                    txt = (item["answer"].get("text") if isinstance(item["answer"], dict) else "") or "—"
+                    parts.append(f"Ответ: {escape(txt)}")
+                else:
+                    sel = (item["answer"].get("selected") if isinstance(item["answer"], dict) else []) or []
+                    opts = item["options"] or []
+                    chosen = []
+                    for si in sel:
+                        if 0 <= int(si) < len(opts):
+                            chosen.append(opts[int(si)])
+                    parts.append("Ответ: " + escape(", ".join(chosen) if chosen else "—"))
+                parts.append("")
+            await q.edit_message_text(
+                "\n".join(parts).strip(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_results_actions(aid),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("help:settings:test:results:save:"):
+            aid = int(data.split(":")[-1])
+            db_test_set_assignment_status(aid, "saved")
+            await q.answer("Сохранено")
+            # refresh view
+            a = db_test_get_assignment(aid)
+            if a:
+                await _notify_admin_test_done(context, a, "сохранён")
+            await q.edit_message_reply_markup(reply_markup=kb_test_results_actions(aid))
+            return
+
+        if data.startswith("help:settings:test:results:delete:"):
+            aid = int(data.split(":")[-1])
+            db_test_delete_answers(aid)
+            await q.answer("Ответы удалены")
+            await q.edit_message_reply_markup(reply_markup=kb_test_results_actions(aid))
             return
 
         if data == "help:settings:ach":
@@ -4635,6 +5618,124 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     text_html = (message_to_html(update.message) or "").strip()
+
+
+    # ===================== TESTING (employees) on_text routing =====================
+
+    # (1) Employee active test: open question answer
+    active_aid = context.user_data.get(ACTIVE_TEST_ASSIGNMENT_ID)
+    if active_aid:
+        a = db_test_get_assignment(int(active_aid))
+        if a:
+            # deadline check
+            if await _expire_assignment_if_needed(a, context):
+                clear_active_test(context)
+                try:
+                    await update.message.reply_text(EMPLOYEE_TEST_EXPIRED_TEXT)
+                except Exception:
+                    pass
+                await _notify_admin_test_done(context, a, "истёк")
+                return
+
+            questions = db_test_get_questions(int(a["template_id"]))
+            idx = int(a.get("current_idx") or 0)
+            if 0 <= idx < len(questions):
+                qinfo = questions[idx]
+                if qinfo["q_type"] == "open":
+                    # Save text answer (never show any scoring to employee)
+                    db_test_save_answer(int(active_aid), int(qinfo["id"]), {"text": text}, None)
+
+                    next_idx = idx + 1
+                    db_test_update_assignment_progress(int(active_aid), next_idx)
+                    a = db_test_get_assignment(int(active_aid))
+
+                    if next_idx >= len(questions):
+                        db_test_finish_assignment(int(active_aid), "finished")
+                        clear_active_test(context)
+                        await update.message.reply_text(EMPLOYEE_TEST_FINISH_TEXT)
+                        await _notify_admin_test_done(context, a, "пройден")
+                        return
+
+                    await send_employee_question(context, update.effective_chat.id, a)
+                    return
+
+    # (2) Admin test wizard: free-text inputs
+    if context.user_data.get(TEST_WIZ_ACTIVE):
+        step = context.user_data.get(TEST_WIZ_STEP) or ""
+        d = context.user_data.get(TEST_WIZ_DATA) or {}
+
+        # title input
+        if step == TEST_WIZ_STEP_TITLE:
+            d["title"] = text
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_MENU
+            await update.message.reply_text(
+                f"Шаг 2/5: добавление вопросов. Сейчас вопросов: <b>{len(d.get('questions') or [])}</b>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_wiz_questions_menu(has_any=len(d.get('questions') or [])>0),
+            )
+            return
+
+        # question text input
+        if step == TEST_WIZ_STEP_Q_TEXT:
+            pq = d.get("pending_q") or {"options": [], "correct": []}
+            pq["question_text"] = text
+            d["pending_q"] = pq
+            context.user_data[TEST_WIZ_DATA] = d
+            if pq.get("q_type") == "open":
+                # commit open question
+                qs = d.get("questions") or []
+                qs.append({"q_type": "open", "question_text": pq["question_text"], "options": [], "correct": []})
+                d["questions"] = qs
+                d.pop("pending_q", None)
+                context.user_data[TEST_WIZ_DATA] = d
+                context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_MENU
+                await update.message.reply_text(
+                    f"Вопрос добавлен. Сейчас вопросов: <b>{len(qs)}</b>.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_test_wiz_questions_menu(has_any=True),
+                )
+                return
+
+            # need options
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_Q_OPTIONS
+            await update.message.reply_text(
+                "Пришлите варианты ответа по одному сообщению (мин 2, макс 8).\nКогда закончите — нажмите «Готово с вариантами».",
+                reply_markup=kb_test_options_done(can_done=False),
+            )
+            return
+
+        # options input
+        if step == TEST_WIZ_STEP_Q_OPTIONS:
+            pq = d.get("pending_q") or {}
+            opts = pq.get("options") or []
+            if len(opts) >= 8:
+                await update.message.reply_text("Максимум 8 вариантов. Нажмите «Готово с вариантами».", reply_markup=kb_test_options_done(can_done=True))
+                return
+            opts.append(text)
+            pq["options"] = opts
+            d["pending_q"] = pq
+            context.user_data[TEST_WIZ_DATA] = d
+            await update.message.reply_text(
+                f"Вариант добавлен ({len(opts)}/8).",
+                reply_markup=kb_test_options_done(can_done=(len(opts) >= 2)),
+            )
+            return
+
+        # manual time
+        if step == TEST_WIZ_STEP_TIME_MANUAL:
+            try:
+                mins = int(re.sub(r"\D", "", text))
+                if mins <= 0:
+                    raise ValueError()
+            except Exception:
+                await update.message.reply_text("Введите целое число минут, например 12.")
+                return
+            d["time_limit_sec"] = mins * 60
+            context.user_data[TEST_WIZ_DATA] = d
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_PICK_PROFILE
+            await update.message.reply_text("Шаг 4/5: выберите сотрудника:", reply_markup=kb_pick_profile_for_test())
+            return
 
     # ---------------- BONUS CALC (FAQ) ----------------
     if context.chat_data.get(WAITING_BONUS_CALC):
@@ -5405,6 +6506,9 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_reschedule_pick, pattern=r"^reschedule:pick:(standup|industry):\d{2}\.\d{2}\.\d{2}$"))
     app.add_handler(CallbackQueryHandler(cb_reschedule_manual, pattern=r"^reschedule:manual:(standup|industry)$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_manual_input, pattern=r"^reschedule:cancel_manual:(standup|industry)$"))
+
+    # callbacks: testing
+    app.add_handler(CallbackQueryHandler(cb_test, pattern=r"^test:"))
 
     # callbacks: help
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
