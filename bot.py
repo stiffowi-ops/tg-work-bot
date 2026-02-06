@@ -2556,6 +2556,34 @@ def db_test_get_answers_for_assignment(aid: int) -> list[dict]:
         })
     return out
 
+
+def db_test_delete_assignment_full(aid: int) -> bool:
+    """Полностью удаляет тестирование из истории: assignment + ответы + вопросы + шаблон.
+
+    Важно: SQLite по умолчанию может быть без PRAGMA foreign_keys=ON, поэтому удаляем явно.
+    """
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    cur.execute("SELECT template_id FROM test_assignments WHERE id=?", (int(aid),))
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        return False
+    template_id = int(row[0])
+
+    # 1) answers
+    cur.execute("DELETE FROM test_answers WHERE assignment_id=?", (int(aid),))
+    # 2) assignment
+    cur.execute("DELETE FROM test_assignments WHERE id=?", (int(aid),))
+    # 3) questions + template (в вашем потоке template создаётся под 1 assignment)
+    cur.execute("DELETE FROM test_questions WHERE template_id=?", (int(template_id),))
+    cur.execute("DELETE FROM test_templates WHERE id=?", (int(template_id),))
+
+    con.commit()
+    con.close()
+    return True
+
 def db_test_delete_answers(aid: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -2652,15 +2680,19 @@ def kb_test_results_list(items: list[dict]):
         for it in items[:20]:
             prof = db_profiles_get(int(it["profile_id"]))
             who = prof["full_name"] if prof else f"id={it['profile_id']}"
-            when = (it["finished_at"] or it["assigned_at"] or "")[:16].replace("T"," ")
-            rows.append([InlineKeyboardButton(f"{who} • {it['status']} • {when}", callback_data=f"help:settings:test:results:open:{it['id']}")])
+            title = (it.get("title") or "").strip()
+            status = (it.get("status") or "").strip()
+            label = f"{who} — {status} — {title}" if title else f"{who} — {status}"
+            if len(label) > 64:
+                label = label[:61] + "…"
+            rows.append([InlineKeyboardButton(label, callback_data=f"help:settings:test:results:open:{it['id']}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")])
     return InlineKeyboardMarkup(rows)
 
 def kb_test_results_actions(aid: int):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💾 Сохранить", callback_data=f"help:settings:test:results:save:{aid}")],
-        [InlineKeyboardButton("🗑 Удалить ответы", callback_data=f"help:settings:test:results:delete:{aid}")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f"help:settings:test:results:delete:{aid}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test:results")],
     ])
 
@@ -4953,9 +4985,15 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("help:settings:test:results:delete:"):
             aid = int(data.split(":")[-1])
-            db_test_delete_answers(aid)
-            await q.answer("Ответы удалены")
-            await q.edit_message_reply_markup(reply_markup=kb_test_results_actions(aid))
+            ok = db_test_delete_assignment_full(aid)
+            await q.answer("Удалено" if ok else "Не найдено")
+            items = db_test_list_recent_results(20)
+            await q.edit_message_text(
+                "📋 <b>Результаты (последние)</b>\n\nВыберите тест:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_test_results_list(items),
+                disable_web_page_preview=True,
+            )
             return
 
         if data == "help:settings:ach":
