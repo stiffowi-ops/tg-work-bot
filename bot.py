@@ -5223,12 +5223,19 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         else:
                             duration_text = "без ограничения по времени"
 
- notify_text = (
+notify_text = (
     f"📝 Назначен тест: {title}\n"
     f"⏱ Длительность: {duration_text}\n\n"
     "Результаты теста покажут твою подкованность в данной тематике 💪"
     "Нажми кнопку ниже, чтобы начать."
 )
+await context.bot.send_message(
+    chat_id=tg_user_id,
+    text=notify_text,
+    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Начать тест", callback_data=f"test:start:{aid}")]]),
+    disable_web_page_preview=True,
+)
+ok = True
 await context.bot.send_message(
                             chat_id=tg_user_id,
                             text=notify_text,
