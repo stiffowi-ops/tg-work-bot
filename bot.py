@@ -5224,8 +5224,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             duration_text = "без ограничения по времени"
 
                         notify_text = (
-                            f"📝 Назначен тест: {title}
-
+                            f"📝 Назначен тест: {title}\n
 "
                             f"⏱ Длительность: {duration_text}
 
