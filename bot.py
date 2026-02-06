@@ -4844,7 +4844,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Start a lightweight wizard for sending existing template
             clear_test_wiz(context)
             context.user_data[TEST_WIZ_ACTIVE] = True
-            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_TIME_LIMIT
+            context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_TIME
             context.user_data[TEST_WIZ_DATA] = {"time_limit_sec": None, "profile_ids": []}
             context.user_data[TEST_WIZ_SELECTED_PIDS] = set()
             context.user_data[TEST_WIZ_TEMPLATE_ID] = int(tid)
