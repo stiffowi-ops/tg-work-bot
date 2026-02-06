@@ -179,6 +179,7 @@ STAFF_URL = os.getenv("STAFF_URL", "")
 SITE_URL = os.getenv("SITE_URL", "")
 LITE_FORM_URL = os.getenv("LITE_FORM_URL", "")
 LEAD_CRM_URL = os.getenv("LEAD_CRM_URL", "")
+REANIMATION_REQUEST_URL = os.getenv("REANIMATION_REQUEST_URL", "")
 HELPY_BOT_URL = os.getenv("HELPY_BOT_URL", "")
 
 if not BOT_TOKEN:
@@ -2135,6 +2136,14 @@ def get_links_catalog() -> dict[str, dict]:
             "title": "Заведение лида в CRM 🧾",
             "url": LEAD_CRM_URL,
             "desc": "Создаём лида в CRM при проработке новой компании. <b>ВАЖНО!!! ПРОВЕРЬ ДУБЛИ</b>\nИли используем при задаче на реанимацию от руководителя.",
+        }
+
+
+    if REANIMATION_REQUEST_URL:
+        catalog["reanimation_request"] = {
+            "title": "Запрос на реанимацию 🚑",
+            "url": REANIMATION_REQUEST_URL,
+            "desc": "Этот файл со ссылками на компании, которые требуют поиска новых контактов, возобновление старых",
         }
 
     return catalog
