@@ -3495,6 +3495,9 @@ def export_backup_zip_bytes() -> bytes:
         con.close()
     files["doc_categories.csv"] = buf.getvalue()
 
+    # legacy name (для совместимости со старым импортом, который ищет categories.csv)
+    files["categories.csv"] = buf.getvalue()
+
     # docs.csv
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=[
