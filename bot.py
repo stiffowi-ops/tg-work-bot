@@ -3736,6 +3736,41 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
             con.commit()
             con.close()
 
+        # Если файл категорий отсутствует/пустой — попробуем восстановить категории из docs.csv
+        # (на случай, если в старом бэкапе категории не выгружались отдельным файлом).
+        if stats.get("categories", 0) == 0 and "docs.csv" in names:
+            try:
+                raw_docs = zf.read("docs.csv").decode("utf-8", errors="replace")
+                rdr_docs = csv.DictReader(io.StringIO(raw_docs))
+                titles = []
+                seen = set()
+                for row in rdr_docs:
+                    t = (row.get("category_title") or row.get("category") or "").strip()
+                    if not t:
+                        continue
+                    key = t.casefold()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    titles.append(t)
+                if titles:
+                    con = sqlite3.connect(DB_PATH)
+                    cur = con.cursor()
+                    for t in titles:
+                        cur.execute(
+                            \"\"\"INSERT INTO doc_categories(title, created_at)
+                                   VALUES(?, ?)
+                                   ON CONFLICT(title) DO UPDATE SET created_at=excluded.created_at
+                            \"\"\",
+                            (t, datetime.utcnow().isoformat()),
+                        )
+                        stats["categories"] += 1
+                    con.commit()
+                    con.close()
+            except Exception:
+                # не критично — продолжим восстановление документов
+                pass
+
         # helper: get category_id by title (create if missing)
         def _ensure_category(title: str) -> int:
             con = sqlite3.connect(DB_PATH)
@@ -5914,7 +5949,27 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             db_docs_ensure_category(title)
                             ok_cats += 1
 
-                # profiles
+                                # если categories.csv отсутствует или пустой — восстановим категории из docs.csv
+                if ok_cats == 0:
+                    raw_docs = _read_csv_from_zip(zf, "docs.csv")
+                    if raw_docs:
+                        try:
+                            rdr_docs = csv.DictReader(io.StringIO(raw_docs))
+                            seen = set()
+                            for r0 in rdr_docs:
+                                t = (r0.get("category_title") or r0.get("category") or "").strip()
+                                if not t:
+                                    continue
+                                key = t.casefold()
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                db_docs_ensure_category(t)
+                                ok_cats += 1
+                        except Exception:
+                            pass
+
+# profiles
                 raw = _read_csv_from_zip(zf, "profiles.csv")
                 id_map: dict[str, int] = {}
                 if raw:
