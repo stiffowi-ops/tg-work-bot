@@ -1248,7 +1248,7 @@ def db_profiles_get(pid: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, tg_user_id, avg_test_score
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, tg_user_id, avg_test_score
         FROM profiles
         WHERE id=?
     """, (pid,))
@@ -1273,7 +1273,7 @@ def db_profiles_get_by_tg_link(tg_link: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, tg_user_id, avg_test_score
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, tg_user_id, avg_test_score
         FROM profiles
         WHERE tg_link=?
     """, (tg_link.strip(),))
@@ -1323,7 +1323,7 @@ def db_profiles_get_by_tg_user_id(tg_user_id: int):
     cur = con.cursor()
     cur.execute(
         """
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, tg_user_id, avg_test_score
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, tg_user_id, avg_test_score
         FROM profiles
         WHERE tg_user_id=?
         """,
