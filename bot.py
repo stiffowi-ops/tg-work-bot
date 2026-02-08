@@ -170,7 +170,7 @@ MEME_CHANNEL_ID = int(os.getenv("MEME_CHANNEL_ID", "-1003761916249"))
 ACCESS_CHAT_ID = -1003399576556
 
 NO_ACCESS_TEXT = (
-    "🕵️‍♂️ Еще никогда Штирлиц не был так близок к провалу!\n\n"
+    "🕵️♂️ Еще никогда Штирлиц не был так близок к провалу!\n\n"
     "🚫 Не нашёл Вас в чате — данные вам недоступны!"
 )
 
@@ -663,16 +663,9 @@ def db_init():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             created_by INTEGER,
-            created_at TEXT NOT NULL,
-            is_draft_visible INTEGER NOT NULL DEFAULT 1
+            created_at TEXT NOT NULL
         )
     """)
-    # миграция для старых БД: is_draft_visible (логическое удаление черновиков)
-    try:
-        cur.execute("ALTER TABLE test_templates ADD COLUMN is_draft_visible INTEGER NOT NULL DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass
-
 
     # questions
     cur.execute("""
@@ -2411,7 +2404,7 @@ def db_test_create_template(title: str, created_by: int | None) -> int:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO test_templates(title, created_by, created_at, is_draft_visible) VALUES(?, ?, ?, 1)",
+        "INSERT INTO test_templates(title, created_by, created_at) VALUES(?, ?, ?)",
         (title.strip(), created_by, _now_iso()),
     )
     con.commit()
@@ -2643,7 +2636,6 @@ def db_test_list_templates(limit: int = 50) -> list[dict]:
     cur.execute(
         """SELECT id, title, created_at
              FROM test_templates
-             WHERE is_draft_visible=1
              ORDER BY created_at DESC
              LIMIT ?""",
         (int(limit),),
@@ -2712,61 +2704,6 @@ def db_test_delete_template_full(tid: int) -> bool:
     finally:
         con.close()
 
-
-
-def db_test_template_has_assignments(tid: int) -> bool:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM test_assignments WHERE template_id=? LIMIT 1", (int(tid),))
-    ok = cur.fetchone() is not None
-    con.close()
-    return ok
-
-
-def db_test_hide_template(tid: int):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("UPDATE test_templates SET is_draft_visible=0 WHERE id=?", (int(tid),))
-    con.commit()
-    con.close()
-
-
-def db_test_delete_draft_only(tid: int) -> bool:
-    """Удаляет только черновик (шаблон) из списка черновиков.
-
-    Если по шаблону уже есть назначения/результаты — делаем логическое удаление (скрываем из черновиков),
-    чтобы результаты в «Результаты» продолжали открываться.
-    """
-    # Если есть назначения — просто скрываем
-    if db_test_template_has_assignments(int(tid)):
-        db_test_hide_template(int(tid))
-        return True
-
-    # Иначе можно удалить полностью (вместе с вопросами), т.к. результатов нет
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    try:
-        cur.execute("DELETE FROM test_questions WHERE template_id=?", (int(tid),))
-        cur.execute("DELETE FROM test_templates WHERE id=?", (int(tid),))
-        con.commit()
-        return True
-    finally:
-        con.close()
-
-
-def db_test_delete_assignment_only(aid: int) -> bool:
-    """Удаляет только результат (assignment + ответы), не трогая шаблон/черновик."""
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT id FROM test_assignments WHERE id=?", (int(aid),))
-    if not cur.fetchone():
-        con.close()
-        return False
-    cur.execute("DELETE FROM test_answers WHERE assignment_id=?", (int(aid),))
-    cur.execute("DELETE FROM test_assignments WHERE id=?", (int(aid),))
-    con.commit()
-    con.close()
-    return True
 
 def db_test_delete_answers(aid: int):
     con = sqlite3.connect(DB_PATH)
@@ -4891,7 +4828,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tid = int(data.split(":")[-1])
             await q.edit_message_text(
                 "🗑 <b>Удалить черновик?</b>\n\n"
-                "Будет удалён только черновик. Результаты (если есть) останутся в разделе «Результаты».",
+                "Будет удалён сам шаблон и вся история прохождений (если есть).",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_test_draft_delete_confirm(tid),
             )
@@ -4899,7 +4836,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("help:settings:test:draft:delete_yes:"):
             tid = int(data.split(":")[-1])
-            db_test_delete_draft_only(tid)
+            db_test_delete_template_full(tid)
             templates = db_test_list_templates(limit=50)
             await q.edit_message_text(
                 "✅ Черновик удалён.",
@@ -5379,6 +5316,13 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if 0 <= int(si) < len(opts):
                             chosen.append(opts[int(si)])
                     parts.append("Ответ: " + escape(", ".join(chosen) if chosen else "—"))
+                    corr = item.get("is_correct")
+                    if corr == 1:
+                        parts.append("Оценка: ✅ Верно")
+                    elif corr == 0:
+                        parts.append("Оценка: ❌ Неверно")
+                    else:
+                        parts.append("Оценка: —")
                 parts.append("")
             await q.edit_message_text(
                 "\n".join(parts).strip(),
@@ -5401,7 +5345,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("help:settings:test:results:delete:"):
             aid = int(data.split(":")[-1])
-            ok = db_test_delete_assignment_only(aid)
+            ok = db_test_delete_assignment_full(aid)
             await q.answer("Удалено" if ok else "Не найдено")
             items = db_test_list_recent_results(20)
             await q.edit_message_text(
