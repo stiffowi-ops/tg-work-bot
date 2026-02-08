@@ -3758,10 +3758,7 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
                     cur = con.cursor()
                     for t in titles:
                         cur.execute(
-                            \"\"\"INSERT INTO doc_categories(title, created_at)
-                                   VALUES(?, ?)
-                                   ON CONFLICT(title) DO UPDATE SET created_at=excluded.created_at
-                            \"\"\",
+                            "INSERT INTO doc_categories(title, created_at) VALUES(?, ?) ON CONFLICT(title) DO UPDATE SET created_at=excluded.created_at",
                             (t, datetime.utcnow().isoformat()),
                         )
                         stats["categories"] += 1
