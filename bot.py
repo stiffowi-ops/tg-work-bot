@@ -617,6 +617,13 @@ def db_init():
     except sqlite3.OperationalError:
         pass
 
+    # ✅ миграция для старых БД: avg_test_score (средний балл тестирования, %)
+    try:
+        cur.execute("ALTER TABLE profiles ADD COLUMN avg_test_score INTEGER")
+    except sqlite3.OperationalError:
+        pass
+
+
     # ------- ACHIEVEMENTS: выдачи ачивок -------
     cur.execute("""
     CREATE TABLE IF NOT EXISTS achievement_awards (
