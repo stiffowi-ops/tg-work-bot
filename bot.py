@@ -597,6 +597,7 @@ def db_init():
             topics TEXT NOT NULL,
             tg_link TEXT NOT NULL,
             tg_user_id INTEGER,
+            avg_test_score INTEGER,
             created_at TEXT NOT NULL
         )
     """)
@@ -1240,7 +1241,7 @@ def db_profiles_get(pid: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, tg_user_id
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, tg_user_id, avg_test_score
         FROM profiles
         WHERE id=?
     """, (pid,))
@@ -1258,13 +1259,14 @@ def db_profiles_get(pid: int):
         "topics": row[6],
         "tg_link": row[7],
         "tg_user_id": row[8],
+        "avg_test_score": row[9],
     }
 
 def db_profiles_get_by_tg_link(tg_link: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, tg_user_id
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, tg_user_id, avg_test_score
         FROM profiles
         WHERE tg_link=?
     """, (tg_link.strip(),))
@@ -1282,6 +1284,7 @@ def db_profiles_get_by_tg_link(tg_link: str):
         "topics": row[6],
         "tg_link": row[7],
         "tg_user_id": row[8],
+        "avg_test_score": row[9],
     }
 
 
@@ -1297,13 +1300,23 @@ def db_profiles_set_tg_user_id(profile_id: int, tg_user_id: int):
     con.commit()
     con.close()
 
+def db_profiles_set_avg_test_score(profile_id: int, avg_test_score: int | None):
+    """Устанавливает средний балл тестирования (в процентах) для карточки сотрудника."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("UPDATE profiles SET avg_test_score=? WHERE id=?", (avg_test_score, int(profile_id)))
+    con.commit()
+    con.close()
+
+
+
 
 def db_profiles_get_by_tg_user_id(tg_user_id: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
         """
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, tg_user_id
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, tg_user_id, avg_test_score
         FROM profiles
         WHERE tg_user_id=?
         """,
@@ -1323,6 +1336,7 @@ def db_profiles_get_by_tg_user_id(tg_user_id: int):
         "topics": row[6],
         "tg_link": row[7],
         "tg_user_id": row[8],
+        "avg_test_score": row[9],
     }
 
 
@@ -1660,6 +1674,8 @@ PROFILE_WIZ_ACTIVE = "profile_wiz_active"
 # csv import flow
 WAITING_CSV_IMPORT = "waiting_csv_import"
 WAITING_ZIP_IMPORT = "waiting_zip_import"
+WAITING_TEST_AVGSCORE = "waiting_test_avgscore"
+WAITING_TEST_AVGSCORE_PID = "waiting_test_avgscore_pid"
 
 
 
@@ -2782,6 +2798,7 @@ def kb_settings_test_menu():
         [InlineKeyboardButton("➕ Создать и отправить тест", callback_data="help:settings:test:create")],
         [InlineKeyboardButton("🗂 Черновики", callback_data="help:settings:test:drafts")],
         [InlineKeyboardButton("📋 Результаты (последние)", callback_data="help:settings:test:results")],
+        [InlineKeyboardButton("📈 Указать средний балл тестирования", callback_data="help:settings:test:avgscore")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
     ])
 
@@ -3003,6 +3020,19 @@ def kb_pick_profile_to_delete():
             rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:del_profile:{pid}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
     return InlineKeyboardMarkup(rows)
+
+
+def kb_pick_profile_for_avgscore():
+    people = db_profiles_list()
+    rows = []
+    if not people:
+        rows.append([InlineKeyboardButton("— анкет нет —", callback_data="noop")])
+    else:
+        for pid, name in people[:60]:
+            rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:test:avgscore:pick:{pid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:test")])
+    return InlineKeyboardMarkup(rows)
+
 
 def kb_cancel_wizard_settings():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="help:settings:cancel")]])
@@ -3559,12 +3589,13 @@ def export_backup_zip_bytes() -> bytes:
         "about",
         "topics",
         "tg_link",
+        "avg_test_score",
     ])
     w.writeheader()
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score
         FROM profiles
         ORDER BY id ASC
     """)
@@ -3578,6 +3609,7 @@ def export_backup_zip_bytes() -> bytes:
             "about": row[5] or "",
             "topics": row[6] or "",
             "tg_link": row[7] or "",
+            "avg_test_score": row[8] if row[8] is not None else "",
         })
     con.close()
     files["profiles.csv"] = buf.getvalue()
@@ -3660,13 +3692,21 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
                 topics = (row.get("topics") or "").strip()
                 tg_link = (row.get("tg_link") or "").strip()
 
+                avg_raw = (row.get("avg_test_score") or "").strip()
+                avg_test_score = None
+                if avg_raw:
+                    try:
+                        avg_test_score = int(float(avg_raw))
+                    except Exception:
+                        avg_test_score = None
+
                 created_at = datetime.utcnow().isoformat()
 
                 # upsert by id if present, else by (tg_link, full_name) heuristic
                 if pid.isdigit():
                     cur.execute(
-                        """INSERT INTO profiles(id, full_name, year_start, city, birthday, about, topics, tg_link, created_at)
-                               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """INSERT INTO profiles(id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, created_at)
+                               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                ON CONFLICT(id) DO UPDATE SET
                                  full_name=excluded.full_name,
                                  year_start=excluded.year_start,
@@ -3674,9 +3714,10 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
                                  birthday=excluded.birthday,
                                  about=excluded.about,
                                  topics=excluded.topics,
-                                 tg_link=excluded.tg_link
+                                 tg_link=excluded.tg_link,
+                                 avg_test_score=excluded.avg_test_score
                         """,
-                        (int(pid), full_name, int(year_start), city, birthday, about, topics, tg_link, created_at),
+                        (int(pid), full_name, int(year_start), city, birthday, about, topics, tg_link, avg_test_score, created_at),
                     )
                     new_id = int(pid)
                 else:
@@ -3694,10 +3735,10 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
                             new_id = int(r[0])
                     if new_id is None:
                         cur.execute(
-                            """INSERT INTO profiles(full_name, year_start, city, birthday, about, topics, tg_link, created_at)
-                                   VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                            """INSERT INTO profiles(full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, created_at)
+                                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
-                            (full_name, int(year_start), city, birthday, about, topics, tg_link, created_at),
+                            (full_name, int(year_start), city, birthday, about, topics, tg_link, avg_test_score, created_at),
                         )
                         new_id = int(cur.lastrowid)
 
@@ -3933,6 +3974,7 @@ def export_backup_csv_bytes() -> bytes:
         "profile_about",
         "profile_topics",
         "profile_tg_link",
+        "profile_avg_test_score",
     ])
     writer.writeheader()
 
@@ -4038,6 +4080,7 @@ async def cmd_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "profile_about",
         "profile_topics",
         "profile_tg_link",
+        "profile_avg_test_score",
     ])
     writer.writeheader()
 
@@ -4075,20 +4118,21 @@ async def cmd_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score
         FROM profiles
         ORDER BY full_name COLLATE NOCASE ASC
     """)
     for row in cur.fetchall():
         writer.writerow({
             "kind": "profile",
-            "profile_full_name": row[0],
-            "profile_year_start": row[1],
-            "profile_city": row[2],
-            "profile_birthday": row[3] or "",
-            "profile_about": row[4],
-            "profile_topics": row[5],
-            "profile_tg_link": row[6],
+            "profile_full_name": row[1] or "",
+            "profile_year_start": row[2] or "",
+            "profile_city": row[3] or "",
+            "profile_birthday": row[4] or "",
+            "profile_about": row[5] or "",
+            "profile_topics": row[6] or "",
+            "profile_tg_link": row[7] or "",
+            "profile_avg_test_score": row[8] if row[8] is not None else "",
         })
     con.close()
 
@@ -4666,7 +4710,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎂 День рождения: <b>{bday}</b>\n\n"
             f"📝 <b>Кратко о себе</b>\n{p['about']}\n\n"
             f"❓ <b>По каким вопросам обращаться</b>\n{p['topics']}\n\n"
-            f"🔗 <b>TG:</b> {p['tg_link']}\n\n"
+            f"🔗 <b>TG:</b> {p['tg_link']}\n"
+            f"📈 <b>Средний балл тестирования:</b> <b>{(str(p.get('avg_test_score')) + '%' ) if (p.get('avg_test_score') is not None and str(p.get('avg_test_score')).strip() != '') else '—'}</b>\n\n"
             f"━━━━━━━━━━━━━━\n\n"
             f"🏆 <b>Ачивки</b>\n\n{format_achievements_for_profile(p['id'])}"
         )
@@ -4899,6 +4944,46 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         
+        
+
+        if data == "help:settings:test:avgscore":
+            # ручная установка среднего балла тестирования в карточке сотрудника
+            clear_test_wiz(context)
+            context.chat_data[WAITING_TEST_AVGSCORE] = False
+            context.chat_data.pop(WAITING_TEST_AVGSCORE_PID, None)
+
+            await q.edit_message_text(
+                "📈 <b>Средний балл тестирования</b>\n\n"
+                "Выберите сотрудника, чтобы вручную указать значение в процентах.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_pick_profile_for_avgscore(),
+            )
+            return
+
+        if data.startswith("help:settings:test:avgscore:pick:"):
+            pid = int(data.split(":")[-1])
+            p = db_profiles_get(pid)
+            if not p:
+                await q.answer("Анкета не найдена.", show_alert=True)
+                return
+
+            context.chat_data[WAITING_TEST_AVGSCORE] = True
+            context.chat_data[WAITING_TEST_AVGSCORE_PID] = pid
+
+            current = p.get("avg_test_score")
+            cur_txt = f"{int(current)}%" if current is not None and str(current).strip() != "" else "—"
+
+            await q.edit_message_text(
+                f"👤 <b>{escape(p['full_name'])}</b>\n"
+                f"Текущее значение: <b>{escape(cur_txt)}</b>\n\n"
+                "Отправьте следующим сообщением число от <b>0</b> до <b>100</b> (в процентах).\n"
+                "Чтобы очистить значение — отправьте <code>0</code>.\n\n"
+                "Отмена: /help → Настройки → Тестирование",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
         if data == "help:settings:test:drafts":
             clear_test_wiz(context)
             templates = db_test_list_templates(limit=50)
@@ -5984,6 +6069,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if not (year_start and city and about and topics and tg_link):
                             continue
                         pid = db_profiles_upsert(full_name, year_start, city, birthday, about, topics, tg_link)
+                        if avg_val is not None:
+                            if avg_val < 0:
+                                avg_val = 0
+                            if avg_val > 100:
+                                avg_val = 100
+                            db_profiles_set_avg_test_score(int(pid), None if int(avg_val) == 0 else int(avg_val))
                         ok_profiles += 1
                         if tg_link:
                             id_map[tg_link] = pid
@@ -6139,6 +6230,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 about = (row.get("profile_about") or "").strip()
                 topics = (row.get("profile_topics") or "").strip()
                 tg_link = (row.get("profile_tg_link") or "").strip()
+                avg_raw = (row.get("profile_avg_test_score") or "").strip()
+                avg_val = None
+                if avg_raw:
+                    try:
+                        avg_val = int(float(avg_raw.replace("%","").strip()))
+                    except Exception:
+                        avg_val = None
                 if not (year_start and city and about and topics and tg_link):
                     # базовая валидация, чтобы не засорять базу
                     continue
@@ -6742,6 +6840,40 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # перенос даты вручную
+
+    # ---------------- TEST AVG SCORE (manual) ----------------
+    if context.chat_data.get(WAITING_TEST_AVGSCORE):
+        pid = context.chat_data.get(WAITING_TEST_AVGSCORE_PID)
+        if not pid:
+            context.chat_data[WAITING_TEST_AVGSCORE] = False
+        else:
+            raw = (text or "").replace("%", "").strip()
+            try:
+                val = int(float(raw))
+            except Exception:
+                await update.message.reply_text("Введите число от 0 до 100 (можно с %).")
+                return
+
+            if val < 0 or val > 100:
+                await update.message.reply_text("Значение должно быть в диапазоне 0–100.")
+                return
+
+            # 0 трактуем как очистку значения
+            db_profiles_set_avg_test_score(int(pid), None if val == 0 else val)
+
+            context.chat_data[WAITING_TEST_AVGSCORE] = False
+            context.chat_data.pop(WAITING_TEST_AVGSCORE_PID, None)
+
+            p = db_profiles_get(int(pid))
+            who = p["full_name"] if p else f"id={pid}"
+            shown = "—" if val == 0 else f"{val}%"
+
+            await update.message.reply_text(
+                f"✅ Сохранено. {who}: средний балл тестирования = {shown}"
+            )
+        return
+
+
         # ---------------- FAQ ADD FLOW ----------------
     if context.chat_data.get(WAITING_FAQ_Q):
         context.chat_data[WAITING_FAQ_Q] = False
