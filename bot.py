@@ -7745,7 +7745,7 @@ async def cb_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await q.edit_message_text(
             f"✅ Приглашение отправлено: <b>{p2.full_name}</b>\n\n"
-            "Ждём принятия приглашения (всё в личке).",
+            "Ждём ответ от коллеги.Время на ответ 5 минут",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_sb_host_wait(game_id),
         )
