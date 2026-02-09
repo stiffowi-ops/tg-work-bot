@@ -7380,6 +7380,7 @@ SB_USER_GAME = "sb_user_game" # context.application.bot_data[SB_USER_GAME] -> di
 SB_SIZE = 10
 SB_SHIPS = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
 SB_TURN_SECONDS = 180  # 3 minutes
+SB_INVITE_SECONDS = 300  # 5 минут ожидания ответа на приглашение
 
 
 @dataclass
@@ -7401,6 +7402,7 @@ class SBGame:
     status: str = "inviting"   # inviting/setup/playing/finished
     turn_user_id: int | None = None
     last_turn_job_name: str | None = None
+    last_invite_job_name: str | None = None
 
 
 def _sb_store(context: ContextTypes.DEFAULT_TYPE):
@@ -7511,10 +7513,17 @@ def kb_sb_invite(game_id: str):
     ])
 
 
+
+def kb_sb_host_wait(game_id: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отменить приглашение", callback_data=f"sb:invite_cancel:{game_id}")],
+        [InlineKeyboardButton("🏠 В меню", callback_data="help:main")],
+    ])
+
 def kb_sb_setup(game_id: str):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Перерасставить", callback_data=f"sb:setup_reroll:{game_id}")],
-        [InlineKeyboardButton("✅ Подтвердить", callback_data=f"sb:setup_confirm:{game_id}")],
+        [InlineKeyboardButton("🔄 Сгенерировать другое расположение", callback_data=f"sb:setup_reroll:{game_id}")],
+        [InlineKeyboardButton("✅ Подтвердить. В бой!", callback_data=f"sb:setup_confirm:{game_id}")],
     ])
 
 
@@ -7568,6 +7577,60 @@ def _sb_cancel_turn_job(context: ContextTypes.DEFAULT_TYPE, g: SBGame):
                 pass
         g.last_turn_job_name = None
 
+
+
+def _sb_cancel_invite_job(context: ContextTypes.DEFAULT_TYPE, g: SBGame):
+    if g.last_invite_job_name:
+        jobs = context.job_queue.get_jobs_by_name(g.last_invite_job_name)
+        for j in jobs:
+            try:
+                j.schedule_removal()
+            except Exception:
+                pass
+        g.last_invite_job_name = None
+
+
+async def _sb_invite_timeout_job(context: ContextTypes.DEFAULT_TYPE):
+    data = getattr(context.job, "data", None) or {}
+    game_id = data.get("game_id")
+    games, user_map = _sb_store(context)
+    g: SBGame | None = games.get(game_id)
+    if not g or g.status != "inviting":
+        return
+
+    g.status = "finished"
+    _sb_cancel_invite_job(context, g)
+
+    try:
+        await context.bot.send_message(
+            chat_id=g.p1.user_id,
+            text="⏰ Приглашение истекло (5 минут без ответа). Ты можешь пригласить другого коллегу.",
+        )
+    except Exception:
+        pass
+    try:
+        await context.bot.send_message(
+            chat_id=g.p2.user_id,
+            text="⏰ Приглашение в «Морской бой» истекло (5 минут без ответа).",
+        )
+    except Exception:
+        pass
+
+    games.pop(game_id, None)
+    user_map.pop(g.p1.user_id, None)
+    user_map.pop(g.p2.user_id, None)
+
+
+def _sb_schedule_invite_timer(context: ContextTypes.DEFAULT_TYPE, g: SBGame):
+    _sb_cancel_invite_job(context, g)
+    name = f"sb_invite:{g.game_id}"
+    g.last_invite_job_name = name
+    context.job_queue.run_once(
+        _sb_invite_timeout_job,
+        when=SB_INVITE_SECONDS,
+        name=name,
+        data={"game_id": g.game_id},
+    )
 
 async def _sb_turn_timeout_job(context: ContextTypes.DEFAULT_TYPE):
     data = getattr(context.job, "data", None) or {}
@@ -7675,11 +7738,14 @@ async def cb_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_map[user_id] = game_id
         user_map[opp_user_id] = game_id
 
+
+        _sb_schedule_invite_timer(context, g)
+
         await q.edit_message_text(
             f"✅ Приглашение отправлено: <b>{p2.full_name}</b>\n\n"
             "Ждём принятия приглашения (всё в личке).",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В меню", callback_data="help:main")]]),
+            reply_markup=kb_sb_host_wait(game_id),
         )
 
         try:
@@ -7710,6 +7776,8 @@ async def cb_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != g.p2.user_id:
             await q.answer("Это приглашение не для тебя.", show_alert=True)
             return
+
+        _sb_cancel_invite_job(context, g)
 
         if data.startswith("sb:invite_decline:"):
             try:
