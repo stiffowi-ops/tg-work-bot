@@ -2038,8 +2038,10 @@ def kb_help_main(is_admin_user: bool):
 def help_text_leisure() -> str:
     return (
         "🎮 <b>Досуг</b>\n\n"
-        "Здесь можно сыграть с коллегой прямо в личных сообщениях.\n"
-        "Никаких сообщений в рабочий чат не отправляется."
+        "Выбирай коллегу ⚔️\n\n"
+        "Сражайся прямо в боте ⚓  \n"
+        "Никаких уведомлений в рабочем чате —  \n"
+        "только чистый кайф от игры с твоим оппонентом 🎮🔥"
     )
 
 
@@ -7552,9 +7554,9 @@ async def _sb_send_setup(context: ContextTypes.DEFAULT_TYPE, g: SBGame, p: SBPla
     text = (
         "⚓ <b>Морской бой</b>\n\n"
         "Перед началом игры:\n"
-        "• Бот автоматически расставит корабли.\n"
-        "• Можно перерасставить сколько угодно раз.\n"
-        "• Когда оба подтвердят — игра начнётся.\n\n"
+        "• Бот автоматически расставит корабли\n"
+        "• Можно менять положение кораблей сколько угодно раз\n"
+        "• Игроки подтвердили участие — игра начинается\n\n"
         "<b>Правило времени:</b> на каждый ход даётся <b>3 минуты</b>. "
         "Если время вышло — поражение.\n\n"
         "<b>Твоё поле:</b>\n<pre>" + board + "</pre>"
@@ -7765,7 +7767,41 @@ async def cb_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Не удалось отправить приглашение в личку.", show_alert=True)
         return
 
-    # invite accept/decline
+    
+    # invite cancel by host
+    if data.startswith("sb:invite_cancel:"):
+        game_id = data.split(":")[-1]
+        g: SBGame | None = games.get(game_id)
+        if not g or g.status != "inviting":
+            await q.answer("Приглашение уже неактуально.", show_alert=True)
+            return
+        if user_id != g.p1.user_id:
+            await q.answer("Отменить может только инициатор.", show_alert=True)
+            return
+
+        _sb_cancel_invite_job(context, g)
+
+        # notify opponent (if possible)
+        try:
+            await context.bot.send_message(chat_id=g.p2.user_id, text="❌ Приглашение в «Морской бой» отменено.")
+        except Exception:
+            pass
+
+        # confirm to host + cleanup
+        try:
+            await q.edit_message_text("❌ Приглашение отменено. Можешь пригласить другого коллегу.")
+        except Exception:
+            try:
+                await q.answer("Приглашение отменено ✅")
+            except Exception:
+                pass
+
+        games.pop(game_id, None)
+        user_map.pop(g.p1.user_id, None)
+        user_map.pop(g.p2.user_id, None)
+        return
+
+# invite accept/decline
     if data.startswith("sb:invite_accept:") or data.startswith("sb:invite_decline:"):
         game_id = data.split(":")[-1]
         g: SBGame | None = games.get(game_id)
@@ -7820,8 +7856,24 @@ async def cb_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             p.setup_confirmed = False
             board = _sb_render_own_board(p)
             await q.edit_message_text(
-                "⚓ <b>Морской бой</b>\n\n"
-                "<b>Твоё поле:</b>\n<pre>" + board + "</pre>",
+                "⚓ <b>Морской бой</b>
+
+"
+                "Перед началом игры:
+"
+                "• Бот автоматически расставит корабли
+"
+                "• Можно менять положение кораблей сколько угодно раз
+"
+                "• Игроки подтвердили участие — игра начинается
+
+"
+                "<b>Правило времени:</b> на каждый ход даётся <b>3 минуты</b>. "
+                "Если время вышло — поражение.
+
+"
+                "<b>Твоё поле:</b>
+<pre>" + board + "</pre>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_sb_setup(g.game_id),
             )
