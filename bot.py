@@ -7419,40 +7419,50 @@ def _sb_store(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _sb_render_own_board(p: SBPlayerState) -> str:
-    header = "   " + " ".join([str(i) for i in range(1, 11)])
+    """
+    ASCII board renderer to avoid emoji width issues in Telegram <pre>.
+    Symbols:
+      ■ ship
+      · unknown water
+      X hit
+      o miss
+    """
+    header = "   " + " ".join(f"{i:>2}" for i in range(1, 11))
     lines = [header]
     for r in range(SB_SIZE):
         row_label = chr(ord("A") + r)
-        cells = []
+        row_syms = []
         for c in range(SB_SIZE):
             cc = (r, c)
             if cc in p.ships and cc in p.hits:
-                cells.append("🔥")
+                sym = "X"
             elif cc in p.ships:
-                cells.append("🚢")
+                sym = "■"
             elif cc in p.misses_by_enemy:
-                cells.append("❌")
+                sym = "o"
             else:
-                cells.append("🟦")
-        lines.append(f"{row_label}  " + " ".join(cells))
+                sym = "·"
+            row_syms.append(sym)
+        lines.append(f"{row_label} " + "".join(f" {s}" for s in row_syms))
     return "\n".join(lines)
 
 
 def _sb_render_enemy_board(p_enemy: SBPlayerState) -> str:
-    header = "   " + " ".join([str(i) for i in range(1, 11)])
+    header = "   " + " ".join(f"{i:>2}" for i in range(1, 11))
     lines = [header]
     for r in range(SB_SIZE):
         row_label = chr(ord("A") + r)
-        cells = []
+        row_syms = []
         for c in range(SB_SIZE):
             cc = (r, c)
             if cc in p_enemy.hits:
-                cells.append("🔥")
+                sym = "X"
             elif cc in p_enemy.misses_by_enemy:
-                cells.append("❌")
+                sym = "o"
             else:
-                cells.append("🟦")
-        lines.append(f"{row_label}  " + " ".join(cells))
+                sym = "·"
+            row_syms.append(sym)
+        lines.append(f"{row_label} " + "".join(f" {s}" for s in row_syms))
     return "\n".join(lines)
 
 
