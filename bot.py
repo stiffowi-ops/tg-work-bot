@@ -2038,9 +2038,7 @@ def kb_help_main(is_admin_user: bool):
 def help_text_leisure() -> str:
     return (
         "🎮 <b>Досуг</b>\n\n"
-        "🎮 Досуг
-
-В разработке 🚧\n\n"
+        "Выбирай коллегу ⚔️\n\n"
         "Сражайся прямо в боте ⚓  \n"
         "Никаких уведомлений в рабочем чате —  \n"
         "только чистый кайф от игры с твоим оппонентом 🎮🔥"
@@ -2049,7 +2047,7 @@ def help_text_leisure() -> str:
 
 def kb_help_leisure():
     return InlineKeyboardMarkup([
-        
+        [InlineKeyboardButton("⚓ Игра «Морской бой»", callback_data="help:leisure:sb")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
 
@@ -7385,7 +7383,6 @@ SB_SIZE = 10
 SB_SHIPS = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
 SB_TURN_SECONDS = 180  # 3 minutes
 SB_INVITE_SECONDS = 300  # 5 минут ожидания ответа на приглашение
-SB_WARN_SECONDS = 150  # напоминание за 30 секунд до конца хода
 
 
 @dataclass
@@ -7408,9 +7405,6 @@ class SBGame:
     turn_user_id: int | None = None
     last_turn_job_name: str | None = None
     last_invite_job_name: str | None = None
-    last_warn_job_name: str | None = None
-    last_shots: dict[int, tuple[str, str]] = field(default_factory=dict)  # shooter_id -> (cell, result_emoji)
-    scan_used: set[int] = field(default_factory=set)  # user_ids who already used scan
 
 
 def _sb_store(context: ContextTypes.DEFAULT_TYPE):
@@ -7421,50 +7415,40 @@ def _sb_store(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _sb_render_own_board(p: SBPlayerState) -> str:
-    """
-    ASCII board renderer to avoid emoji width issues in Telegram <pre>.
-    Symbols:
-      ■ ship
-      · unknown water
-      X hit
-      o miss
-    """
-    header = "   " + " ".join(f"{i:>2}" for i in range(1, 11))
+    header = "   " + " ".join([str(i) for i in range(1, 11)])
     lines = [header]
     for r in range(SB_SIZE):
         row_label = chr(ord("A") + r)
-        row_syms = []
+        cells = []
         for c in range(SB_SIZE):
             cc = (r, c)
             if cc in p.ships and cc in p.hits:
-                sym = "X"
+                cells.append("🔥")
             elif cc in p.ships:
-                sym = "■"
+                cells.append("🚢")
             elif cc in p.misses_by_enemy:
-                sym = "o"
+                cells.append("❌")
             else:
-                sym = "·"
-            row_syms.append(sym)
-        lines.append(f"{row_label} " + "".join(f" {s}" for s in row_syms))
+                cells.append("🟦")
+        lines.append(f"{row_label}  " + " ".join(cells))
     return "\n".join(lines)
 
 
 def _sb_render_enemy_board(p_enemy: SBPlayerState) -> str:
-    header = "   " + " ".join(f"{i:>2}" for i in range(1, 11))
+    header = "   " + " ".join([str(i) for i in range(1, 11)])
     lines = [header]
     for r in range(SB_SIZE):
         row_label = chr(ord("A") + r)
-        row_syms = []
+        cells = []
         for c in range(SB_SIZE):
             cc = (r, c)
             if cc in p_enemy.hits:
-                sym = "X"
+                cells.append("🔥")
             elif cc in p_enemy.misses_by_enemy:
-                sym = "o"
+                cells.append("❌")
             else:
-                sym = "·"
-            row_syms.append(sym)
-        lines.append(f"{row_label} " + "".join(f" {s}" for s in row_syms))
+                cells.append("🟦")
+        lines.append(f"{row_label}  " + " ".join(cells))
     return "\n".join(lines)
 
 
@@ -7565,46 +7549,6 @@ def kb_sb_pick_cell(game_id: str, row_letter: str):
     return InlineKeyboardMarkup(rows)
 
 
-
-def kb_sb_after_game(opponent_user_id: int):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔁 Реванш", callback_data=f"sb:rematch:{opponent_user_id}")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="help:main")],
-    ])
-
-
-def kb_sb_scan_pick_row(game_id: str):
-    letters = [chr(ord("A") + i) for i in range(10)]
-    rows = [
-        [InlineKeyboardButton(ch, callback_data=f"sb:scan_row:{game_id}:{ch}") for ch in letters[:5]],
-        [InlineKeyboardButton(ch, callback_data=f"sb:scan_row:{game_id}:{ch}") for ch in letters[5:]],
-    ]
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"sb:back_to_game:{game_id}")])
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_sb_scan_pick_cell(game_id: str, row_letter: str):
-    nums = list(range(1, 11))
-    rows = [
-        [InlineKeyboardButton(str(n), callback_data=f"sb:scan_cell:{game_id}:{row_letter}:{n}") for n in nums[:5]],
-        [InlineKeyboardButton(str(n), callback_data=f"sb:scan_cell:{game_id}:{row_letter}:{n}") for n in nums[5:]],
-    ]
-    rows.append([InlineKeyboardButton("⬅️ К буквам", callback_data=f"sb:scan_pick:{game_id}")])
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_sb_turn(game_id: str, can_scan: bool):
-    letters = [chr(ord("A") + i) for i in range(10)]
-    rows = []
-    if can_scan:
-        rows.append([InlineKeyboardButton("🛰️ Скан 3×3 (1)", callback_data=f"sb:scan_pick:{game_id}")])
-    rows.append([InlineKeyboardButton(ch, callback_data=f"sb:shot_row:{game_id}:{ch}") for ch in letters[:5]])
-    rows.append([InlineKeyboardButton(ch, callback_data=f"sb:shot_row:{game_id}:{ch}") for ch in letters[5:]])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"sb:back_to_game:{game_id}")])
-    return InlineKeyboardMarkup(rows)
-
-
-
 async def _sb_send_setup(context: ContextTypes.DEFAULT_TYPE, g: SBGame, p: SBPlayerState):
     board = _sb_render_own_board(p)
     text = (
@@ -7634,15 +7578,6 @@ def _sb_cancel_turn_job(context: ContextTypes.DEFAULT_TYPE, g: SBGame):
             except Exception:
                 pass
         g.last_turn_job_name = None
-
-    if g.last_warn_job_name:
-        jobs = context.job_queue.get_jobs_by_name(g.last_warn_job_name)
-        for j in jobs:
-            try:
-                j.schedule_removal()
-            except Exception:
-                pass
-        g.last_warn_job_name = None
 
 
 
@@ -7699,40 +7634,6 @@ def _sb_schedule_invite_timer(context: ContextTypes.DEFAULT_TYPE, g: SBGame):
         data={"game_id": g.game_id},
     )
 
-
-
-async def _sb_turn_warn_job(context: ContextTypes.DEFAULT_TYPE):
-    data = getattr(context.job, "data", None) or {}
-    game_id = data.get("game_id")
-    games, _user_map = _sb_store(context)
-    g: SBGame | None = games.get(game_id)
-    if not g or g.status != "playing" or not g.turn_user_id:
-        return
-
-    try:
-        await context.bot.send_message(chat_id=g.turn_user_id, text="⏰ Осталось 30 секунд! Успей сделать ход.")
-    except Exception:
-        pass
-
-
-def _sb_schedule_turn_warn(context: ContextTypes.DEFAULT_TYPE, g: SBGame):
-    if g.last_warn_job_name:
-        jobs = context.job_queue.get_jobs_by_name(g.last_warn_job_name)
-        for j in jobs:
-            try:
-                j.schedule_removal()
-            except Exception:
-                pass
-        g.last_warn_job_name = None
-
-    name = f"sb_warn:{g.game_id}"
-    g.last_warn_job_name = name
-    context.job_queue.run_once(
-        _sb_turn_warn_job,
-        when=SB_WARN_SECONDS,
-        name=name,
-        data={"game_id": g.game_id},
-    )
 async def _sb_turn_timeout_job(context: ContextTypes.DEFAULT_TYPE):
     data = getattr(context.job, "data", None) or {}
     game_id = data.get("game_id")
@@ -7749,11 +7650,11 @@ async def _sb_turn_timeout_job(context: ContextTypes.DEFAULT_TYPE):
     _sb_cancel_turn_job(context, g)
 
     try:
-        await context.bot.send_message(chat_id=winner, text="🏆 Победа! Соперник не успел сделать ход за 3 минуты.", reply_markup=kb_sb_after_game(loser))
+        await context.bot.send_message(chat_id=winner, text="🏆 Победа! Соперник не успел сделать ход за 3 минуты.")
     except Exception:
         pass
     try:
-        await context.bot.send_message(chat_id=loser, text="⏰ Поражение: ты не успел сделать ход за 3 минуты.", reply_markup=kb_sb_after_game(winner))
+        await context.bot.send_message(chat_id=loser, text="⏰ Поражение: ты не успел сделать ход за 3 минуты.")
     except Exception:
         pass
 
@@ -7773,8 +7674,6 @@ def _sb_schedule_turn_timer(context: ContextTypes.DEFAULT_TYPE, g: SBGame):
         name=name,
         data={"game_id": g.game_id},
     )
-    _sb_schedule_turn_warn(context, g)
-
 
 
 async def _sb_send_turn_state(context: ContextTypes.DEFAULT_TYPE, g: SBGame):
@@ -7782,24 +7681,13 @@ async def _sb_send_turn_state(context: ContextTypes.DEFAULT_TYPE, g: SBGame):
         own = _sb_render_own_board(p)
         opp = _sb_render_enemy_board(enemy)
         turn_line = "🎯 <b>Твой ход</b>" if g.turn_user_id == p.user_id else "⏳ Ход соперника"
-
-        last = g.last_shots.get(enemy.user_id)
-        last_line = ""
-        if last:
-            cell_label, res_emoji = last
-            last_line = f"🎯 Последний выстрел соперника: <b>{cell_label}</b> {res_emoji}\n"
-
-        title = f"⚓ <b>Морской бой</b> — <b>{p.full_name}</b> vs <b>{enemy.full_name}</b>\n\n"
         text = (
-            title
-            + turn_line + "\n"
-            + last_line
-            + f"\n<b>Твоё поле:</b>\n<pre>{own}</pre>\n"
-            + f"\n<b>Поле соперника:</b>\n<pre>{opp}</pre>\n"
+            "⚓ <b>Морской бой</b>\n\n"
+            f"{turn_line}\n"
+            f"<b>Твоё поле:</b>\n<pre>{own}</pre>\n"
+            f"<b>Поле соперника:</b>\n<pre>{opp}</pre>\n"
         )
-
-        can_scan = (g.turn_user_id == p.user_id) and (p.user_id not in g.scan_used)
-        kb = kb_sb_turn(g.game_id, can_scan=can_scan) if g.turn_user_id == p.user_id else None
+        kb = kb_sb_pick_row(g.game_id) if g.turn_user_id == p.user_id else None
         await context.bot.send_message(chat_id=p.user_id, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
@@ -7824,120 +7712,6 @@ async def cb_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     games, user_map = _sb_store(context)
     user_id = update.effective_user.id if update.effective_user else None
     if not user_id:
-        return
-
-
-
-    # rematch: create a new invitation to the same opponent
-    if data.startswith("sb:rematch:"):
-        opp_user_id = int(data.split(":")[-1])
-
-        if user_map.get(user_id) or user_map.get(opp_user_id):
-            await q.answer("Кто-то из вас уже в игре. Завершите текущую игру.", show_alert=True)
-            return
-
-        game_id = secrets.token_hex(4)
-        p1 = SBPlayerState(user_id=user_id, full_name=(update.effective_user.full_name or "Игрок 1"))
-        p2 = SBPlayerState(user_id=opp_user_id, full_name="Игрок 2")
-        g = SBGame(game_id=game_id, host_id=user_id, p1=p1, p2=p2, status="inviting")
-
-        games[game_id] = g
-        user_map[user_id] = game_id
-        user_map[opp_user_id] = game_id
-
-        _sb_schedule_invite_timer(context, g)
-
-        await q.edit_message_text(
-            f"✅ Приглашение отправлено: <b>{p2.full_name}</b>\n\n"
-            "Ждём принятия приглашения (всё в личке).",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_sb_host_wait(game_id),
-        )
-
-        try:
-            await context.bot.send_message(
-                chat_id=opp_user_id,
-                text=(
-                    "🔁 <b>Реванш?</b>\n\n"
-                    f"👤 Противник: <b>{p1.full_name}</b>\n"
-                    "Нажми «Принять», чтобы начать новую игру."
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_sb_invite(game_id),
-            )
-        except Exception:
-            games.pop(game_id, None)
-            user_map.pop(user_id, None)
-            user_map.pop(opp_user_id, None)
-            await q.answer("Не удалось отправить приглашение в личку.", show_alert=True)
-        return
-
-    # scan navigation
-    if data.startswith("sb:scan_pick:"):
-        game_id = data.split(":")[-1]
-        g = games.get(game_id)
-        if not g or g.status != "playing":
-            await q.answer("Игра недоступна.", show_alert=True)
-            return
-        if g.turn_user_id != user_id:
-            await q.answer("Сейчас ход соперника.", show_alert=True)
-            return
-        if user_id in g.scan_used:
-            await q.answer("Скан уже использован.", show_alert=True)
-            return
-        await q.edit_message_reply_markup(reply_markup=kb_sb_scan_pick_row(game_id))
-        return
-
-    if data.startswith("sb:scan_row:"):
-        _, _, game_id, row_letter = data.split(":")
-        g = games.get(game_id)
-        if not g or g.status != "playing":
-            await q.answer("Игра недоступна.", show_alert=True)
-            return
-        if g.turn_user_id != user_id:
-            await q.answer("Сейчас ход соперника.", show_alert=True)
-            return
-        if user_id in g.scan_used:
-            await q.answer("Скан уже использован.", show_alert=True)
-            return
-        await q.edit_message_reply_markup(reply_markup=kb_sb_scan_pick_cell(game_id, row_letter))
-        return
-
-    if data.startswith("sb:scan_cell:"):
-        _, _, game_id, row_letter, n_str = data.split(":")
-        g: SBGame | None = games.get(game_id)
-        if not g or g.status != "playing":
-            await q.answer("Игра недоступна.", show_alert=True)
-            return
-        if g.turn_user_id != user_id:
-            await q.answer("Сейчас ход соперника.", show_alert=True)
-            return
-        if user_id in g.scan_used:
-            await q.answer("Скан уже использован.", show_alert=True)
-            return
-
-        row = ord(row_letter) - ord("A")
-        col = int(n_str) - 1
-
-        shooter = g.p1 if user_id == g.p1.user_id else g.p2
-        target = g.p2 if shooter is g.p1 else g.p1
-
-        count = 0
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                rr = row + dr
-                cc = col + dc
-                if 0 <= rr < SB_SIZE and 0 <= cc < SB_SIZE and (rr, cc) in target.ships:
-                    count += 1
-
-        g.scan_used.add(user_id)
-
-        await q.answer(f"🛰️ Скан: в зоне 3×3 найдено корабельных клеток: {count}", show_alert=True)
-
-        # scan consumes the turn
-        g.turn_user_id = target.user_id
-        _sb_schedule_turn_timer(context, g)
-        await _sb_send_turn_state(context, g)
         return
 
     # new game: pick opponent profile id
@@ -8082,18 +7856,24 @@ async def cb_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             p.setup_confirmed = False
             board = _sb_render_own_board(p)
             await q.edit_message_text(
-                (
-                    "⚓ <b>Морской бой</b>\n\n"
-                    "Перед началом игры:\n"
-                    "• Бот автоматически расставит корабли\n"
-                    "• Можно менять положение кораблей сколько угодно раз\n"
-                    "• Игроки подтвердили участие — игра начинается\n\n"
-                    "Правило времени:\n"
-                    "на каждый ход даётся 3 минуты.\n"
-                    "Если время вышло — поражение.\n\n"
-                    "Твоё поле:\n"
-                    "<pre>" + board + "</pre>"
-                ),
+                "⚓ <b>Морской бой</b>
+
+"
+                "Перед началом игры:
+"
+                "• Бот автоматически расставит корабли
+"
+                "• Можно менять положение кораблей сколько угодно раз
+"
+                "• Игроки подтвердили участие — игра начинается
+
+"
+                "<b>Правило времени:</b> на каждый ход даётся <b>3 минуты</b>. "
+                "Если время вышло — поражение.
+
+"
+                "<b>Твоё поле:</b>
+<pre>" + board + "</pre>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_sb_setup(g.game_id),
             )
@@ -8178,11 +7958,9 @@ async def cb_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hit = cell in target.ships
         if hit:
             target.hits.add(cell)
-            g.last_shots[user_id] = (_sb_coord_to_label(row, col), "🔥")
             await q.answer("🔥 Попадание!")
         else:
             target.misses_by_enemy.add(cell)
-            g.last_shots[user_id] = (_sb_coord_to_label(row, col), "❌")
             await q.answer("❌ Мимо")
             g.turn_user_id = target.user_id
 
@@ -8192,11 +7970,11 @@ async def cb_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             g.status = "finished"
             _sb_cancel_turn_job(context, g)
             try:
-                await context.bot.send_message(chat_id=shooter.user_id, text="🏆 Победа! Ты уничтожил весь флот соперника.", reply_markup=kb_sb_after_game(target.user_id))
+                await context.bot.send_message(chat_id=shooter.user_id, text="🏆 Победа! Ты уничтожил весь флот соперника.")
             except Exception:
                 pass
             try:
-                await context.bot.send_message(chat_id=target.user_id, text="☠️ Поражение. Твой флот уничтожен.", reply_markup=kb_sb_after_game(shooter.user_id))
+                await context.bot.send_message(chat_id=target.user_id, text="☠️ Поражение. Твой флот уничтожен.")
             except Exception:
                 pass
             games.pop(game_id, None)
@@ -8213,7 +7991,7 @@ async def cb_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not g:
             await q.answer("Игра недоступна.", show_alert=True)
             return
-        kb = kb_sb_turn(game_id, can_scan=(user_id not in g.scan_used)) if (g.status == "playing" and g.turn_user_id == user_id) else None
+        kb = kb_sb_pick_row(game_id) if (g.status == "playing" and g.turn_user_id == user_id) else None
         await q.edit_message_reply_markup(reply_markup=kb)
         return
 
