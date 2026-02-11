@@ -2038,7 +2038,9 @@ def kb_help_main(is_admin_user: bool):
 def help_text_leisure() -> str:
     return (
         "🎮 <b>Досуг</b>\n\n"
-        "Выбирай коллегу ⚔️\n\n"
+        "🎮 Досуг
+
+В разработке 🚧\n\n"
         "Сражайся прямо в боте ⚓  \n"
         "Никаких уведомлений в рабочем чате —  \n"
         "только чистый кайф от игры с твоим оппонентом 🎮🔥"
@@ -2047,7 +2049,7 @@ def help_text_leisure() -> str:
 
 def kb_help_leisure():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚓ Игра «Морской бой»", callback_data="help:leisure:sb")],
+        
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
 
