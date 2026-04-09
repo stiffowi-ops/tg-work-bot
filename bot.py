@@ -1388,6 +1388,22 @@ def db_profiles_add(full_name: str, year_start: int, city: str, birthday: str | 
     con.close()
     return pid
 
+def db_profiles_update(pid: int, full_name: str, year_start: int, city: str, birthday: str | None, about: str, topics: str, tg_link: str) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE profiles
+        SET full_name=?, year_start=?, city=?, birthday=?, about=?, topics=?, tg_link=?
+        WHERE id=?
+        """,
+        (full_name.strip(), int(year_start), city.strip(), (birthday or None), about.strip(), topics.strip(), tg_link.strip(), int(pid)),
+    )
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
 def db_profiles_delete(pid: int) -> bool:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -1697,6 +1713,8 @@ ACH_WIZ_STEP = "ach_wiz_step"
 ACH_WIZ_DATA = "ach_wiz_data"
 PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
+PROFILE_WIZ_MODE = "profile_wiz_mode"          # admin_add|admin_edit|self_create
+PROFILE_WIZ_EDIT_PID = "profile_wiz_edit_pid"
 
 # suggest box flow
 WAITING_SUGGESTION_TEXT = "waiting_suggestion_text"
@@ -1740,6 +1758,8 @@ def clear_profile_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[PROFILE_WIZ_ACTIVE] = False
     context.chat_data.pop(PROFILE_WIZ_STEP, None)
     context.chat_data.pop(PROFILE_WIZ_DATA, None)
+    context.chat_data.pop(PROFILE_WIZ_MODE, None)
+    context.chat_data.pop(PROFILE_WIZ_EDIT_PID, None)
 
 def clear_zip_import(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_ZIP_IMPORT] = False
@@ -2217,9 +2237,11 @@ def kb_help_link_card(url: str):
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:links")],
     ])
 
-def kb_help_team():
+def kb_help_team(can_create_profile: bool = False):
     people = db_profiles_list()
     rows = []
+    if can_create_profile:
+        rows.append([InlineKeyboardButton("➕ Создать анкету", callback_data="help:team:create_profile")])
     if not people:
         rows.append([InlineKeyboardButton("— анкет пока нет —", callback_data="noop")])
     else:
@@ -2253,6 +2275,7 @@ def kb_help_settings():
         [InlineKeyboardButton("➖ Удалить файл", callback_data="help:settings:del_doc")],
         [InlineKeyboardButton("🗂️ Редактировать категории", callback_data="help:settings:cats")],
         [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
+        [InlineKeyboardButton("✏️ Редактировать анкету человека", callback_data="help:settings:edit_profile")],
         [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
         [InlineKeyboardButton("🏆 Ачивки", callback_data="help:settings:ach")],
         [InlineKeyboardButton("📝 Тестирование", callback_data="help:settings:test")],
@@ -3029,6 +3052,18 @@ def kb_pick_profile_to_delete():
     return InlineKeyboardMarkup(rows)
 
 
+def kb_pick_profile_to_edit():
+    people = db_profiles_list()
+    rows = []
+    if not people:
+        rows.append([InlineKeyboardButton("— анкет нет —", callback_data="noop")])
+    else:
+        for pid, name in people[:40]:
+            rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:edit_profile:{pid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
+    return InlineKeyboardMarkup(rows)
+
+
 def kb_pick_profile_for_avgscore():
     people = db_profiles_list()
     rows = []
@@ -3043,6 +3078,46 @@ def kb_pick_profile_for_avgscore():
 
 def kb_cancel_wizard_settings():
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="help:settings:cancel")]])
+
+
+def _profile_wiz_finish_text(mode: str, profile_id: int, is_admin: bool, updated: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    action = "обновлена" if updated else "добавлена"
+    if mode == "self_create":
+        return f"✅ Ваша анкета {action}.", kb_help_team(can_create_profile=False)
+    return f"✅ Анкета {action} (ID {profile_id}).", (kb_help_settings() if is_admin else kb_help_main(is_admin_user=False))
+
+
+def start_profile_wizard(context: ContextTypes.DEFAULT_TYPE, user_id: int, mode: str, initial_data: dict | None = None, edit_pid: int | None = None):
+    clear_profile_wiz(context)
+    context.chat_data[PROFILE_WIZ_ACTIVE] = True
+    context.chat_data[PROFILE_WIZ_STEP] = "full_name"
+    context.chat_data[PROFILE_WIZ_DATA] = dict(initial_data or {})
+    context.chat_data[PROFILE_WIZ_MODE] = mode
+    if edit_pid is not None:
+        context.chat_data[PROFILE_WIZ_EDIT_PID] = int(edit_pid)
+    context.chat_data[WAITING_USER_ID] = user_id
+    context.chat_data[WAITING_SINCE_TS] = int(time.time())
+
+
+def get_profile_for_user(update: Update) -> dict | None:
+    user = update.effective_user
+    if not user:
+        return None
+    prof = db_profiles_get_by_tg_user_id(int(user.id))
+    if prof:
+        return prof
+    tg_link = _normalize_profile_tg_link(getattr(user, "username", None))
+    if tg_link:
+        return db_profiles_get_by_tg_link(tg_link)
+    return None
+
+
+async def can_create_own_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not update.effective_user:
+        return False
+    if await is_admin_scoped(update, context):
+        return False
+    return get_profile_for_user(update) is None
 
 # ---------------- COMMANDS ----------------
 
@@ -4698,7 +4773,32 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help:team":
         text = "👥 <b>Познакомиться с командой</b>\n\nЗдесь вы можете познакомиться с коллегами.\nВыберите человека, чтобы посмотреть его профиль 👇"
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_team())
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_team(can_create_profile=await can_create_own_profile(update, context)),
+        )
+        return
+
+    if data == "help:team:create_profile":
+        existing = get_profile_for_user(update)
+        if existing:
+            await q.answer("У вас уже есть анкета ✅", show_alert=True)
+            await q.edit_message_text(
+                "👥 <b>Познакомиться с командой</b>\n\nВаша анкета уже создана. Ниже можно посмотреть анкеты коллег 👇",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_help_team(can_create_profile=False),
+            )
+            return
+
+        start_profile_wizard(context, update.effective_user.id, mode="self_create")
+        await q.edit_message_text(
+            "➕ <b>Создание анкеты</b>\n\n"
+            "Шаг 1/7: отправьте <b>Имя и Фамилию</b>.\n"
+            "Пример: <code>Иван Петров</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cancel_wizard_settings(),
+        )
         return
 
     if data.startswith("help:team:person:"):
@@ -5845,16 +5945,46 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "help:settings:add_profile":
-            clear_profile_wiz(context)
-            context.chat_data[PROFILE_WIZ_ACTIVE] = True
-            context.chat_data[PROFILE_WIZ_STEP] = "full_name"
-            context.chat_data[PROFILE_WIZ_DATA] = {}
-            context.chat_data[WAITING_USER_ID] = update.effective_user.id
-            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            start_profile_wizard(context, update.effective_user.id, mode="admin_add")
             await q.edit_message_text(
                 "➕ <b>Добавление анкеты</b>\n\n"
                 "Шаг 1/7: отправьте <b>Имя и Фамилию</b>.\n"
                 "Пример: <code>Иван Петров</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if data == "help:settings:edit_profile":
+            clear_profile_wiz(context)
+            await q.edit_message_text(
+                "✏️ <b>Редактирование анкеты</b>\n\nВыберите человека:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_pick_profile_to_edit(),
+            )
+            return
+
+        if data.startswith("help:settings:edit_profile:"):
+            pid = int(data.split(":")[-1])
+            p = db_profiles_get(pid)
+            if not p:
+                try:
+                    await q.answer("Анкета не найдена", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
+                await q.edit_message_text(
+                    "✏️ <b>Редактирование анкеты</b>\n\nАнкета не найдена.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_pick_profile_to_edit(),
+                )
+                return
+
+            start_profile_wizard(context, update.effective_user.id, mode="admin_edit", initial_data=p, edit_pid=pid)
+            await q.edit_message_text(
+                "✏️ <b>Редактирование анкеты</b>\n\n"
+                f"Сейчас редактируем: <b>{html_lib.escape(p['full_name'])}</b>\n\n"
+                "Шаг 1/7: отправьте <b>Имя и Фамилию</b>.\n"
+                f"Текущее значение: <code>{html_lib.escape(p['full_name'])}</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_cancel_wizard_settings(),
             )
@@ -6984,9 +7114,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # анкета — шаги
     if context.chat_data.get(PROFILE_WIZ_ACTIVE):
-        if not await is_admin_scoped(update, context):
+        mode = context.chat_data.get(PROFILE_WIZ_MODE) or "admin_add"
+        is_admin_here = await is_admin_scoped(update, context)
+        if mode in ("admin_add", "admin_edit") and not is_admin_here:
             clear_profile_wiz(context)
-            await update.message.reply_text("❌ Только администраторы могут добавлять анкеты.")
+            await update.message.reply_text("❌ Только администраторы могут управлять анкетами.")
+            return
+        if mode == "self_create" and is_admin_here:
+            clear_profile_wiz(context)
+            await update.message.reply_text("❌ Для этого сценария используйте раздел настроек администратора.")
             return
 
         step = context.chat_data.get(PROFILE_WIZ_STEP)
@@ -7093,18 +7229,39 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             data["tg_link"] = tg
 
-            pid = db_profiles_add(
-                full_name=data["full_name"],
-                year_start=data["year_start"],
-                city=data["city"],
-                birthday=data.get("birthday"),
-                about=data["about"],
-                topics=data["topics"],
-                tg_link=data["tg_link"],
-            )
+            if mode == "admin_edit":
+                edit_pid = context.chat_data.get(PROFILE_WIZ_EDIT_PID)
+                if not edit_pid or not db_profiles_update(
+                    pid=int(edit_pid),
+                    full_name=data["full_name"],
+                    year_start=data["year_start"],
+                    city=data["city"],
+                    birthday=data.get("birthday"),
+                    about=data["about"],
+                    topics=data["topics"],
+                    tg_link=data["tg_link"],
+                ):
+                    clear_profile_wiz(context)
+                    await update.message.reply_text("❌ Не удалось обновить анкету.", reply_markup=kb_help_settings())
+                    return
+                pid = int(edit_pid)
+            else:
+                pid = db_profiles_add(
+                    full_name=data["full_name"],
+                    year_start=data["year_start"],
+                    city=data["city"],
+                    birthday=data.get("birthday"),
+                    about=data["about"],
+                    topics=data["topics"],
+                    tg_link=data["tg_link"],
+                )
+
+            if mode == "self_create" and update.effective_user:
+                db_profiles_set_tg_user_id(pid, int(update.effective_user.id))
 
             clear_profile_wiz(context)
-            await update.message.reply_text(f"✅ Анкета добавлена (ID {pid}).", reply_markup=kb_help_settings())
+            msg, markup = _profile_wiz_finish_text(mode, pid, is_admin_here, updated=(mode == "admin_edit"))
+            await update.message.reply_text(msg, reply_markup=markup)
             return
 
 
