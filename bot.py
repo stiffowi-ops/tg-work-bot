@@ -4640,7 +4640,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await q.message.reply_text(
             "🧮 <b>Калькулятор премии</b>\n\n"
-            "Требования к премии:\n• Минимальный порог — <b>70%</b> плана\n• Максимальный порог — <b>200%</b> плана\n\nШаг 1/2: введите <b>оклад</b> (например: 40 000)",
+            "Требования к премии:\n• Минимальный порог — <b>80%</b> плана\n• Максимальный порог — <b>200%</b> плана\n\nШаг 1/2: введите <b>оклад</b> (например: 40 000)",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")]
@@ -6725,7 +6725,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         percent_in = val
 
         # clamp rules
-        if percent_in < 70:
+        if percent_in < 80:
             bonus = 0.0
         else:
             percent_eff = min(percent_in, 200.0)
@@ -6742,7 +6742,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         note = ""
         if percent_in > 200:
             note = "\n\n<b>🔥 Вау, я поражён твоими результатами!</b>\nТак держать — видно, что ты умеешь выходить за рамки!"
-        elif percent_in < 70:
+        elif percent_in < 80:
             note = "\n\n<b>🌱 Каждый результат — это шаг вперёд.</b>\nПродолжай — и всё обязательно получится"
 
         percent_used = 0.0 if percent_in < 0 else min(percent_in, 200.0)
