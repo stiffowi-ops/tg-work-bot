@@ -1006,6 +1006,30 @@ def db_docs_add_category(title: str) -> int:
     con.close()
     return cid
 
+def db_docs_get_category(category_id: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id, title FROM doc_categories WHERE id=?", (int(category_id),))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {"id": int(row[0]), "title": row[1]}
+
+
+def db_docs_rename_category(category_id: int, new_title: str) -> bool:
+    title = (new_title or "").strip()
+    if len(title) < 2:
+        return False
+
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("UPDATE doc_categories SET title=? WHERE id=?", (title, int(category_id)))
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
 def db_docs_delete_category_if_empty(category_id: int) -> bool:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -1683,6 +1707,7 @@ WAITING_DOC_UPLOAD = "waiting_doc_upload"
 WAITING_DOC_DESC = "waiting_doc_desc"
 PENDING_DOC_INFO = "pending_doc_info"
 WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
+WAITING_EDIT_CATEGORY_ID = "waiting_edit_category_id"
 
 
 # faq add flow
@@ -1736,6 +1761,7 @@ def clear_docs_flow(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DOC_DESC] = False
     context.chat_data.pop(PENDING_DOC_INFO, None)
     context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
+    context.chat_data.pop(WAITING_EDIT_CATEGORY_ID, None)
 
 
 def clear_faq_flow(context: ContextTypes.DEFAULT_TYPE):
@@ -2315,8 +2341,21 @@ def kb_settings_categories():
         [InlineKeyboardButton("➕ Добавить категорию", callback_data="help:settings:cats:add")]
     ]
     if cats:
+        rows.append([InlineKeyboardButton("✏️ Переименовать категорию", callback_data="help:settings:cats:rename")])
         rows.append([InlineKeyboardButton("➖ Удалить категорию (только пустую)", callback_data="help:settings:cats:del")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_pick_category_to_rename():
+    cats = db_docs_list_categories()
+    rows = []
+    if not cats:
+        rows.append([InlineKeyboardButton("— категорий нет —", callback_data="noop")])
+    else:
+        for cid, title in cats:
+            rows.append([InlineKeyboardButton(f"✏️ {title}", callback_data=f"help:settings:cats:rename:{cid}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:cats")])
     return InlineKeyboardMarkup(rows)
 
 def kb_pick_category_for_new_doc():
@@ -5819,6 +5858,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(
                 "🗂️ <b>Категории документов</b>\n\n"
                 "• ➕ Добавить категорию — бот попросит название\n"
+                "• ✏️ Переименовать категорию — изменить название без переноса файлов\n"
                 "• ➖ Удалить категорию — удаляется только пустая",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_settings_categories(),
@@ -5834,6 +5874,43 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "➕ <b>Добавление категории</b>\n\n"
                 "Отправьте название категории одним сообщением.\n"
                 "Пример: <code>Регламенты</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if data == "help:settings:cats:rename":
+            clear_docs_flow(context)
+            await q.edit_message_text(
+                "✏️ <b>Переименование категории</b>\n\nВыберите категорию, которую нужно переименовать:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_pick_category_to_rename(),
+            )
+            return
+
+        if data.startswith("help:settings:cats:rename:"):
+            cid = int(data.split(":")[-1])
+            cat = db_docs_get_category(cid)
+            if not cat:
+                try:
+                    await q.answer("Категория не найдена", show_alert=True)
+                except (TimedOut, NetworkError):
+                    pass
+                await q.edit_message_text(
+                    "✏️ <b>Переименование категории</b>\n\nКатегория не найдена.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_pick_category_to_rename(),
+                )
+                return
+
+            clear_docs_flow(context)
+            context.chat_data[WAITING_EDIT_CATEGORY_ID] = cid
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "✏️ <b>Переименование категории</b>\n\n"
+                f"Текущее название: <code>{escape(cat['title'])}</code>\n\n"
+                "Отправьте новое название одним сообщением.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_cancel_wizard_settings(),
             )
@@ -7080,6 +7157,47 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
         await update.message.reply_text(f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
+        return
+
+    # переименование категории
+    if context.chat_data.get(WAITING_EDIT_CATEGORY_ID):
+        if not await is_admin_scoped(update, context):
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут управлять категориями.")
+            return
+
+        cid = int(context.chat_data.get(WAITING_EDIT_CATEGORY_ID))
+        new_title = text.strip()
+        if len(new_title) < 2:
+            await update.message.reply_text("❌ Слишком коротко. Отправьте нормальное название категории.")
+            return
+
+        cat = db_docs_get_category(cid)
+        if not cat:
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Категория не найдена. Начните заново через /help.", reply_markup=kb_help_settings())
+            return
+
+        old_title = cat["title"]
+        if old_title.strip() == new_title:
+            clear_docs_flow(context)
+            await update.message.reply_text("ℹ️ Название не изменилось.", reply_markup=kb_settings_categories())
+            return
+
+        try:
+            ok = db_docs_rename_category(cid, new_title)
+        except sqlite3.IntegrityError:
+            await update.message.reply_text("❌ Такая категория уже существует. Отправьте другое название.")
+            return
+
+        clear_docs_flow(context)
+        if ok:
+            await update.message.reply_text(
+                f"✅ Категория переименована:\n{old_title} → {new_title}",
+                reply_markup=kb_settings_categories(),
+            )
+        else:
+            await update.message.reply_text("❌ Не удалось переименовать категорию.", reply_markup=kb_help_settings())
         return
 
     # ввод названия категории
