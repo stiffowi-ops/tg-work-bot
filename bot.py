@@ -196,6 +196,9 @@ MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 MEETING_STANDUP = "standup"
 MEETING_INDUSTRY = "industry"
 
+# Уведомления о встречах и изменениях расписания живут в чате 10 минут.
+MEETING_MESSAGE_TTL_SECONDS = 10 * 60
+
 # где хранить контекст, из какого чата пользователь открыл /help
 HELP_SCOPE_CHAT_ID = "help_scope_chat_id"
 
@@ -469,6 +472,26 @@ async def job_delete_message(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         # не критично (нет прав/сообщение уже удалено)
         pass
+
+
+def schedule_message_delete(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    delay_seconds: int = MEETING_MESSAGE_TTL_SECONDS,
+):
+    """Ставит отправленное ботом сообщение в очередь на автоудаление."""
+    if not message or not context.job_queue:
+        return
+
+    context.job_queue.run_once(
+        job_delete_message,
+        when=delay_seconds,
+        data={
+            "chat_id": message.chat_id,
+            "message_id": message.message_id,
+        },
+        name=f"delete:{message.chat_id}:{message.message_id}",
+    )
 
 # ---------------- DB ----------------
 
@@ -2846,13 +2869,14 @@ async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_
 
     for chat_id in chat_ids:
         try:
-            await context.bot.send_message(
+            sent_message = await context.bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=kb_cancel_menu(meeting_type),
             )
+            schedule_message_delete(context, sent_message)
         except Exception as e:
             logger.exception("Cannot send %s to %s: %s", meeting_type, chat_id, e)
 
@@ -6012,7 +6036,11 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_set_canceled(meeting_type, today_d, reason_text)
         await query.edit_message_reply_markup(reply_markup=None)
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
+        notice = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"{title}\nПричина: {reason_text}",
+        )
+        schedule_message_delete(context, notice)
         try:
             await query.answer("Отменено.")
         except (TimedOut, NetworkError):
@@ -6024,7 +6052,11 @@ async def cb_cancel_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_set_canceled(meeting_type, today_d, reason_text)
         await query.edit_message_reply_markup(reply_markup=None)
         title = "✅ Сегодняшняя планёрка отменена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча отменена"
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"{title}\nПричина: {reason_text}")
+        notice = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"{title}\nПричина: {reason_text}",
+        )
+        schedule_message_delete(context, notice)
         try:
             await query.answer("Ок.")
         except (TimedOut, NetworkError):
@@ -6079,10 +6111,11 @@ async def cb_reschedule_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_reply_markup(reply_markup=None)
 
     title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
-    await context.bot.send_message(
+    notice = await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=f"{title}\nНовая дата: {picked} 📌\nСледите за расписанием или чатом"
+        text=f"{title}\nНовая дата: {picked} 📌\nСледите за расписанием или чатом",
     )
+    schedule_message_delete(context, notice)
     try:
         await query.answer("Перенесено.")
     except (TimedOut, NetworkError):
@@ -9777,7 +9810,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_waiting_date(context)
 
         title = "✅ Сегодняшняя планёрка перенесена" if meeting_type == MEETING_STANDUP else "✅ Сегодняшняя отраслевая встреча перенесена"
-        await update.message.reply_text(f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом")
+        notice = await update.message.reply_text(
+            f"{title}\nНовая дата: {text} 📌\nСледите за расписанием или чатом"
+        )
+        schedule_message_delete(context, notice)
         return
 
     # переименование категории
