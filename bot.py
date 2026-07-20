@@ -635,9 +635,41 @@ def db_init():
         description TEXT NOT NULL,
         awarded_at TEXT NOT NULL,
         awarded_by INTEGER,
+        achievement_key TEXT,
+        level INTEGER NOT NULL DEFAULT 1,
         FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
     )
 """)
+
+    # Миграции для старых БД: ключ и уровень ачивки.
+    try:
+        cur.execute("ALTER TABLE achievement_awards ADD COLUMN achievement_key TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE achievement_awards ADD COLUMN level INTEGER NOT NULL DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass
+
+    # ------- ACHIEVEMENT NOMINATIONS: номинации от коллег -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS achievement_nominations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_chat_id INTEGER NOT NULL,
+            nominator_user_id INTEGER,
+            nominator_profile_id INTEGER,
+            nominee_profile_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            reviewed_at TEXT,
+            reviewed_by INTEGER,
+            award_id INTEGER,
+            FOREIGN KEY(nominator_profile_id) REFERENCES profiles(id) ON DELETE SET NULL,
+            FOREIGN KEY(nominee_profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
+            FOREIGN KEY(award_id) REFERENCES achievement_awards(id) ON DELETE SET NULL
+        )
+    """)
     # ------- MEMES: пул мемов из канала -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS memes (
@@ -1466,13 +1498,31 @@ def db_profiles_birthdays(ddmm: str) -> list[dict]:
 
 # ---------------- ACHIEVEMENTS (awards) ----------------
 
+def normalize_achievement_key(title: str) -> str:
+    """Стабильный ключ для группировки одинаковых ачивок по уровням."""
+    value = (title or "achievement").strip().lower().replace("ё", "е")
+    value = re.sub(r"[^a-zа-я0-9]+", "_", value, flags=re.IGNORECASE)
+    value = value.strip("_")
+    return value[:80] or "achievement"
+
+
+def achievement_level_label(level: int | None) -> str:
+    try:
+        value = max(1, int(level or 1))
+    except (TypeError, ValueError):
+        value = 1
+    roman = {1: "I", 2: "II", 3: "III"}
+    return roman.get(value, str(value))
+
+
 def db_achievements_list(profile_id: int) -> list[dict]:
-    """Список ачивок для профиля (последние сверху)."""
+    """Список ачивок профиля: последние сверху, с уровнем."""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
         """
-        SELECT emoji, title, description, awarded_at
+        SELECT id, emoji, title, description, awarded_at, awarded_by,
+               COALESCE(achievement_key, ''), COALESCE(level, 1)
         FROM achievement_awards
         WHERE profile_id=?
         ORDER BY id DESC
@@ -1482,34 +1532,281 @@ def db_achievements_list(profile_id: int) -> list[dict]:
     rows = cur.fetchall()
     con.close()
     return [
-        {"emoji": r[0], "title": r[1], "description": r[2], "awarded_at": r[3]}
+        {
+            "id": int(r[0]),
+            "emoji": r[1],
+            "title": r[2],
+            "description": r[3],
+            "awarded_at": r[4],
+            "awarded_by": r[5],
+            "achievement_key": r[6] or normalize_achievement_key(r[2]),
+            "level": int(r[7] or 1),
+        }
         for r in rows
     ]
 
 
-def db_achievement_award_add(profile_id: int, emoji: str, title: str, description: str, awarded_by: int | None = None) -> int:
+
+def db_achievement_award_add(
+    profile_id: int,
+    emoji: str,
+    title: str,
+    description: str,
+    awarded_by: int | None = None,
+    level: int = 1,
+    achievement_key: str | None = None,
+) -> int:
+    clean_title = (title or "Ачивка").strip()
+    clean_key = (achievement_key or normalize_achievement_key(clean_title)).strip()[:80]
+    clean_level = max(1, min(int(level or 1), 99))
+
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO achievement_awards(profile_id, emoji, title, description, awarded_at, awarded_by)
-        VALUES(?, ?, ?, ?, ?, ?)
+        INSERT INTO achievement_awards(
+            profile_id, emoji, title, description, awarded_at,
+            awarded_by, achievement_key, level
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (int(profile_id), emoji.strip(), title.strip(), description.strip(), datetime.utcnow().isoformat(), awarded_by),
+        (
+            int(profile_id),
+            (emoji or "🏆").strip(),
+            clean_title,
+            (description or "").strip(),
+            datetime.utcnow().isoformat(),
+            awarded_by,
+            clean_key,
+            clean_level,
+        ),
     )
     con.commit()
-    aid = cur.lastrowid
+    aid = int(cur.lastrowid)
     con.close()
     return aid
 
 
-def export_achievement_awards_rows() -> list[dict]:
-    """Для CSV/ZIP бэкапа: все выданные ачивки."""
+def db_achievement_next_level(profile_id: int, achievement_key: str, max_level: int = 3) -> int:
+    """Следующий уровень конкретной ачивки сотрудника, максимум max_level."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """SELECT COALESCE(MAX(level), 0)
+           FROM achievement_awards
+           WHERE profile_id=? AND achievement_key=?""",
+        (int(profile_id), achievement_key),
+    )
+    current = int((cur.fetchone() or [0])[0] or 0)
+    con.close()
+    return min(max(1, current + 1), max(1, int(max_level)))
+
+
+def db_achievements_count(profile_id: int) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM achievement_awards WHERE profile_id=?", (int(profile_id),))
+    count = int((cur.fetchone() or [0])[0] or 0)
+    con.close()
+    return count
+
+
+def db_nomination_create(
+    scope_chat_id: int,
+    nominator_user_id: int | None,
+    nominator_profile_id: int | None,
+    nominee_profile_id: int,
+    reason: str,
+) -> int:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
         """
-        SELECT a.id, p.id, p.full_name, p.tg_link, a.emoji, a.title, a.description, a.awarded_at, a.awarded_by
+        INSERT INTO achievement_nominations(
+            scope_chat_id, nominator_user_id, nominator_profile_id,
+            nominee_profile_id, reason, status, created_at
+        )
+        VALUES(?, ?, ?, ?, ?, 'pending', ?)
+        """,
+        (
+            int(scope_chat_id),
+            int(nominator_user_id) if nominator_user_id else None,
+            int(nominator_profile_id) if nominator_profile_id else None,
+            int(nominee_profile_id),
+            reason.strip(),
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    con.commit()
+    nomination_id = int(cur.lastrowid)
+    con.close()
+    return nomination_id
+
+
+def db_nomination_get(nomination_id: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT n.id, n.scope_chat_id, n.nominator_user_id,
+               n.nominator_profile_id, n.nominee_profile_id,
+               n.reason, n.status, n.created_at, n.reviewed_at,
+               n.reviewed_by, n.award_id,
+               COALESCE(p_from.full_name, 'Сотрудник'),
+               COALESCE(p_to.full_name, 'Сотрудник'),
+               COALESCE(p_to.tg_link, ''), p_to.tg_user_id
+        FROM achievement_nominations n
+        LEFT JOIN profiles p_from ON p_from.id = n.nominator_profile_id
+        JOIN profiles p_to ON p_to.id = n.nominee_profile_id
+        WHERE n.id=?
+        """,
+        (int(nomination_id),),
+    )
+    r = cur.fetchone()
+    con.close()
+    if not r:
+        return None
+    return {
+        "id": int(r[0]),
+        "scope_chat_id": int(r[1]),
+        "nominator_user_id": r[2],
+        "nominator_profile_id": r[3],
+        "nominee_profile_id": int(r[4]),
+        "reason": r[5],
+        "status": r[6],
+        "created_at": r[7],
+        "reviewed_at": r[8],
+        "reviewed_by": r[9],
+        "award_id": r[10],
+        "nominator_name": r[11],
+        "nominee_name": r[12],
+        "nominee_tg_link": r[13],
+        "nominee_tg_user_id": r[14],
+    }
+
+
+def db_nominations_pending(limit: int = 30) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT n.id, n.created_at, n.reason,
+               COALESCE(p_from.full_name, 'Сотрудник'),
+               COALESCE(p_to.full_name, 'Сотрудник')
+        FROM achievement_nominations n
+        LEFT JOIN profiles p_from ON p_from.id = n.nominator_profile_id
+        JOIN profiles p_to ON p_to.id = n.nominee_profile_id
+        WHERE n.status='pending'
+        ORDER BY n.id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {
+            "id": int(r[0]),
+            "created_at": r[1],
+            "reason": r[2],
+            "nominator_name": r[3],
+            "nominee_name": r[4],
+        }
+        for r in rows
+    ]
+
+
+def db_nomination_approve(nomination_id: int, reviewed_by: int) -> dict | None:
+    """Атомарно одобряет номинацию и выдаёт уровневую ачивку."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        cur = con.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute(
+            """SELECT nominee_profile_id, reason
+               FROM achievement_nominations
+               WHERE id=? AND status='pending'""",
+            (int(nomination_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            con.rollback()
+            return None
+
+        nominee_profile_id = int(row[0])
+        reason = row[1]
+        achievement_key = "team_contribution"
+        cur.execute(
+            """SELECT COALESCE(MAX(level), 0)
+               FROM achievement_awards
+               WHERE profile_id=? AND achievement_key=?""",
+            (nominee_profile_id, achievement_key),
+        )
+        current_level = int((cur.fetchone() or [0])[0] or 0)
+        new_level = min(max(1, current_level + 1), 3)
+
+        cur.execute(
+            """
+            INSERT INTO achievement_awards(
+                profile_id, emoji, title, description, awarded_at,
+                awarded_by, achievement_key, level
+            )
+            VALUES(?, '🤝', 'Командный вклад', ?, ?, ?, ?, ?)
+            """,
+            (
+                nominee_profile_id,
+                reason,
+                datetime.utcnow().isoformat(),
+                int(reviewed_by),
+                achievement_key,
+                new_level,
+            ),
+        )
+        award_id = int(cur.lastrowid)
+        cur.execute(
+            """
+            UPDATE achievement_nominations
+            SET status='approved', reviewed_at=?, reviewed_by=?, award_id=?
+            WHERE id=? AND status='pending'
+            """,
+            (datetime.utcnow().isoformat(), int(reviewed_by), award_id, int(nomination_id)),
+        )
+        if cur.rowcount != 1:
+            con.rollback()
+            return None
+        con.commit()
+        return {"award_id": award_id, "level": new_level}
+    finally:
+        con.close()
+
+
+def db_nomination_reject(nomination_id: int, reviewed_by: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE achievement_nominations
+        SET status='rejected', reviewed_at=?, reviewed_by=?
+        WHERE id=? AND status='pending'
+        """,
+        (datetime.utcnow().isoformat(), int(reviewed_by), int(nomination_id)),
+    )
+    ok = cur.rowcount == 1
+    con.commit()
+    con.close()
+    return ok
+
+
+
+def export_achievement_awards_rows() -> list[dict]:
+    """Для CSV/ZIP-бэкапа: все выданные ачивки, включая уровни."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT a.id, p.id, p.full_name, p.tg_link,
+               a.emoji, a.title, a.description, a.awarded_at, a.awarded_by,
+               COALESCE(a.achievement_key, ''), COALESCE(a.level, 1)
         FROM achievement_awards a
         JOIN profiles p ON p.id = a.profile_id
         ORDER BY a.id ASC
@@ -1529,8 +1826,11 @@ def export_achievement_awards_rows() -> list[dict]:
             "description": r[6] or "",
             "awarded_at": r[7] or "",
             "awarded_by": r[8] or "",
+            "achievement_key": r[9] or normalize_achievement_key(r[5] or "Ачивка"),
+            "level": int(r[10] or 1),
         })
     return out
+
 
 
 # ---------------- TEXT (meetings) ----------------
@@ -1746,6 +2046,11 @@ BONUS_DATA = "bonus_data"
 ACH_WIZ_ACTIVE = "ach_wiz_active"
 ACH_WIZ_STEP = "ach_wiz_step"
 ACH_WIZ_DATA = "ach_wiz_data"
+
+# colleague nomination flow (обычный сотрудник)
+NOMINATION_ACTIVE = "nomination_active"
+NOMINATION_STEP = "nomination_step"
+NOMINATION_DATA = "nomination_data"
 PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
 PROFILE_WIZ_MODE = "profile_wiz_mode"          # admin_add|admin_edit|self_create
@@ -1805,6 +2110,12 @@ def clear_ach_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop(ACH_WIZ_STEP, None)
     context.chat_data.pop(ACH_WIZ_DATA, None)
 
+
+def clear_nomination_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[NOMINATION_ACTIVE] = False
+    context.user_data.pop(NOMINATION_STEP, None)
+    context.user_data.pop(NOMINATION_DATA, None)
+
 def clear_suggest_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data[WAITING_SUGGESTION_TEXT] = False
     context.user_data.pop(SUGGESTION_MODE, None)
@@ -1856,14 +2167,19 @@ def normalize_tg_mention(tg_link: str) -> str | None:
     return None
 
 
-def format_achievements_for_profile(profile_id: int) -> str:
+def format_achievements_for_profile(profile_id: int, limit: int = 10) -> str:
     items = db_achievements_list(profile_id)
     if not items:
         return "— Всё ещё впереди —"
     parts = []
-    for it in items[:10]:
-        parts.append(f"{escape(it['emoji'])} <b>{escape(it['title'])}</b>\n{escape(it['description'])}")
+    for it in items[:max(1, int(limit))]:
+        level = achievement_level_label(it.get("level"))
+        parts.append(
+            f"{escape(it['emoji'])} <b>{escape(it['title'])} · уровень {level}</b>\n"
+            f"{escape(it['description'])}"
+        )
     return "\n\n".join(parts)
+
 
 
 BDAY_TEMPLATES: list[str] = [
@@ -2063,29 +2379,227 @@ async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
 def help_text_main(bot_username: str) -> str:
     return (
         "🤖 <b>Меню «Помогатор Говорун»</b>\n\n"
-        "Здесь собраны все полезные материалы и инструменты для команды 👇\n\n"
-        "📄 <b>Документы</b>\n"
-        "🔗 <b>Полезные ссылки</b>\n"
-        "👥 <b>Краткая инфо о команде</b>\n"
+        "Здесь собраны рабочие материалы и инструменты команды 👇\n\n"
+        "👤 <b>Мой кабинет</b> — анкета, тесты и достижения\n"
+        "🙌 <b>Номинация</b> — отметить вклад коллеги\n"
+        "📄 <b>Документы и полезные ссылки</b>\n"
+        "👥 <b>Наша команда</b>\n"
         "❓ <b>FAQ и калькулятор премии</b>\n"
         "💡 <b>Предложка</b>\n"
     )
 
 
+
 def kb_help_main(is_admin_user: bool):
     rows = [
-        [InlineKeyboardButton("📄 Документы", callback_data="help:docs")],
-        [InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links")],
-        [InlineKeyboardButton("👥 Краткая инфо о команде", callback_data="help:team")],
+        [
+            InlineKeyboardButton("👤 Мой кабинет", callback_data="help:me"),
+            InlineKeyboardButton("🙌 Номинация", callback_data="help:nomination"),
+        ],
+        [InlineKeyboardButton("👥 Наша команда", callback_data="help:team")],
+        [
+            InlineKeyboardButton("📄 Документы", callback_data="help:docs"),
+            InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links"),
+        ],
         [
             InlineKeyboardButton("❓ FAQ и калькулятор", callback_data="help:faq"),
             InlineKeyboardButton("💡 Предложка", callback_data="help:suggest"),
         ],
     ]
     if is_admin_user:
-        rows.append([InlineKeyboardButton("⚙️ Настройки", callback_data="help:settings")])
+        rows.append([InlineKeyboardButton("⚙️ Управление ботом", callback_data="help:settings")])
     return InlineKeyboardMarkup(rows)
 
+
+
+
+
+def _profile_team_page(profile_id: int) -> int:
+    people = db_profiles_list()
+    for index, (pid, _name) in enumerate(people):
+        if int(pid) == int(profile_id):
+            return index // TEAM_PAGE_SIZE
+    return 0
+
+
+def _format_short_date(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        return datetime.fromisoformat(value).strftime("%d.%m.%Y")
+    except Exception:
+        return str(value)[:10]
+
+
+def build_my_account_text(profile: dict) -> str:
+    tests = db_profile_test_summary(int(profile["id"]))
+    achievements_count = db_achievements_count(int(profile["id"]))
+    avg = profile.get("avg_test_score")
+    avg_text = f"{int(avg)}%" if avg is not None and str(avg).strip() else "—"
+    birthday = (profile.get("birthday") or "—").strip() or "—"
+    return (
+        f"👤 <b>Мой кабинет</b>\n\n"
+        f"<b>{escape(profile['full_name'])}</b>\n"
+        f"🏙️ {escape(profile.get('city') or '—')}\n"
+        f"📅 В команде с: <b>{escape(str(profile.get('year_start') or '—'))}</b>\n"
+        f"🎂 День рождения: <b>{escape(birthday)}</b>\n\n"
+        f"🏆 Достижений: <b>{achievements_count}</b>\n"
+        f"📝 Назначено тестов: <b>{tests['assigned']}</b>\n"
+        f"⏳ В процессе: <b>{tests['in_progress']}</b>\n"
+        f"✅ Завершено: <b>{tests['finished']}</b>\n"
+        f"📈 Средний балл: <b>{escape(avg_text)}</b>"
+    )
+
+
+def kb_my_account(profile: dict):
+    page = _profile_team_page(int(profile["id"]))
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏆 Мои достижения", callback_data="help:me:achievements"),
+            InlineKeyboardButton("📝 Мои тесты", callback_data="help:me:tests"),
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 Моя карточка в команде",
+                callback_data=f"help:team:person:{int(profile['id'])}:{page}",
+            )
+        ],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+    ])
+
+
+def kb_my_tests(profile_id: int):
+    tests = db_profile_tests(profile_id, limit=10)
+    rows = []
+    status_label = {
+        "assigned": "▶️ Назначен",
+        "in_progress": "⏳ В процессе",
+        "finished": "✅ Завершён",
+        "saved": "💾 Сохранён",
+        "expired": "⌛ Истёк",
+        "canceled": "❌ Отменён",
+    }
+    if not tests:
+        rows.append([InlineKeyboardButton("— тестов пока нет —", callback_data="noop")])
+    else:
+        for item in tests:
+            title = item["title"] if len(item["title"]) <= 34 else item["title"][:31] + "…"
+            status = item.get("status") or ""
+            if status == "assigned":
+                rows.append([
+                    InlineKeyboardButton(
+                        f"▶️ {title}",
+                        callback_data=f"test:start:{item['id']}",
+                    )
+                ])
+            elif status == "in_progress":
+                rows.append([
+                    InlineKeyboardButton(
+                        f"⏳ Продолжить: {title}",
+                        callback_data=f"help:me:test:continue:{item['id']}",
+                    )
+                ])
+            else:
+                rows.append([
+                    InlineKeyboardButton(
+                        f"{status_label.get(status, '•')} · {title}",
+                        callback_data="noop",
+                    )
+                ])
+    rows.append([InlineKeyboardButton("⬅️ В мой кабинет", callback_data="help:me")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_no_profile_for_account(can_create: bool):
+    rows = []
+    if can_create:
+        rows.append([InlineKeyboardButton("➕ Создать мою анкету", callback_data="help:team:create_profile")])
+    rows.append([InlineKeyboardButton("👥 Открыть команду", callback_data="help:team")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+NOMINATION_PAGE_SIZE = 8
+
+
+def kb_nomination_intro():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🙌 Номинировать коллегу", callback_data="help:nomination:start")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+    ])
+
+
+def kb_nomination_people(page: int, exclude_profile_id: int):
+    people = [(pid, name) for pid, name in db_profiles_list() if int(pid) != int(exclude_profile_id)]
+    total_pages = max(1, (len(people) + NOMINATION_PAGE_SIZE - 1) // NOMINATION_PAGE_SIZE)
+    page = max(0, min(int(page), total_pages - 1))
+    chunk = people[page * NOMINATION_PAGE_SIZE:(page + 1) * NOMINATION_PAGE_SIZE]
+
+    rows = []
+    for i in range(0, len(chunk), 2):
+        row = []
+        for pid, name in chunk[i:i + 2]:
+            label = name if len(name) <= 24 else name[:21] + "…"
+            row.append(InlineKeyboardButton(label, callback_data=f"help:nomination:pick:{pid}:{page}"))
+        rows.append(row)
+    if not chunk:
+        rows.append([InlineKeyboardButton("— других анкет пока нет —", callback_data="noop")])
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"help:nomination:page:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1} / {total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f"help:nomination:page:{page + 1}"))
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:nomination:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_nomination_cancel():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отменить номинацию", callback_data="help:nomination:cancel")]
+    ])
+
+
+def kb_nomination_admin_actions(nomination_id: int):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"help:nomination:admin:approve:{nomination_id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"help:nomination:admin:reject:{nomination_id}"),
+        ]
+    ])
+
+
+def kb_pending_nominations():
+    items = db_nominations_pending(30)
+    rows = []
+    if not items:
+        rows.append([InlineKeyboardButton("— новых номинаций нет —", callback_data="noop")])
+    else:
+        for item in items:
+            label = f"{item['nominee_name']} ← {item['nominator_name']}"
+            if len(label) > 48:
+                label = label[:45] + "…"
+            rows.append([
+                InlineKeyboardButton(label, callback_data=f"help:nomination:admin:open:{item['id']}")
+            ])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:ach")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_achievement_level_select():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🥉 Уровень I", callback_data="help:settings:ach:level:1"),
+            InlineKeyboardButton("🥈 Уровень II", callback_data="help:settings:ach:level:2"),
+        ],
+        [InlineKeyboardButton("🥇 Уровень III", callback_data="help:settings:ach:level:3")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:cancel")],
+    ])
 
 
 def kb_suggest_modes():
@@ -2107,7 +2621,7 @@ def kb_bcast_files_menu():
         [InlineKeyboardButton("✅ Отправить", callback_data="help:settings:bcast:send")],
         [InlineKeyboardButton("🗑️ Очистить файлы", callback_data="help:settings:bcast:clear_files")],
         [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:communications")],
     ])
 
 def kb_help_docs_categories():
@@ -2443,28 +2957,70 @@ def kb_help_profile_card(profile: dict, page: int = 0):
 
 def kb_help_settings():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Добавить файл", callback_data="help:settings:add_doc")],
-        [InlineKeyboardButton("➖ Удалить файл", callback_data="help:settings:del_doc")],
-        [InlineKeyboardButton("🗂️ Редактировать категории", callback_data="help:settings:cats")],
-        [InlineKeyboardButton("➕ Добавить анкету человека", callback_data="help:settings:add_profile")],
-        [InlineKeyboardButton("✏️ Редактировать анкету человека", callback_data="help:settings:edit_profile")],
-        [InlineKeyboardButton("➖ Удалить анкету человека", callback_data="help:settings:del_profile")],
-        [InlineKeyboardButton("🏆 Ачивки", callback_data="help:settings:ach")],
-        [InlineKeyboardButton("📝 Тестирование", callback_data="help:settings:test")],
-        [InlineKeyboardButton("❓ FAQ", callback_data="help:settings:faq")],
-        [InlineKeyboardButton("📦 Скачать бэкап ZIP", callback_data="help:settings:backup_zip")],
-        [InlineKeyboardButton("📥 Загрузить бэкап ZIP", callback_data="help:settings:restore_zip")],
-        [InlineKeyboardButton("📣 Рассылка", callback_data="help:settings:bcast")],
+        [
+            InlineKeyboardButton("📄 Контент", callback_data="help:settings:content"),
+            InlineKeyboardButton("👥 Сотрудники", callback_data="help:settings:people"),
+        ],
+        [
+            InlineKeyboardButton("🏆 Ачивки и номинации", callback_data="help:settings:ach"),
+            InlineKeyboardButton("📝 Тестирование", callback_data="help:settings:test"),
+        ],
+        [
+            InlineKeyboardButton("📣 Коммуникации", callback_data="help:settings:communications"),
+            InlineKeyboardButton("🛠 Система", callback_data="help:settings:system"),
+        ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
+
+
+def kb_settings_content():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Добавить файл", callback_data="help:settings:add_doc"),
+            InlineKeyboardButton("➖ Удалить файл", callback_data="help:settings:del_doc"),
+        ],
+        [InlineKeyboardButton("🗂️ Категории документов", callback_data="help:settings:cats")],
+        [InlineKeyboardButton("❓ Управление FAQ", callback_data="help:settings:faq")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
+
+def kb_settings_people():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить анкету", callback_data="help:settings:add_profile")],
+        [InlineKeyboardButton("✏️ Редактировать анкету", callback_data="help:settings:edit_profile")],
+        [InlineKeyboardButton("➖ Удалить анкету", callback_data="help:settings:del_profile")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
+
+def kb_settings_communications():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📣 Создать рассылку", callback_data="help:settings:bcast")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
+
+def kb_settings_system():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Скачать бэкап ZIP", callback_data="help:settings:backup_zip")],
+        [InlineKeyboardButton("📥 Восстановить бэкап ZIP", callback_data="help:settings:restore_zip")],
+        [
+            InlineKeyboardButton("📤 Экспорт CSV", callback_data="help:settings:export_csv"),
+            InlineKeyboardButton("📥 Импорт CSV", callback_data="help:settings:import_csv"),
+        ],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
 
 
 def kb_settings_faq():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить вопрос", callback_data="help:settings:faq:add")],
         [InlineKeyboardButton("➖ Удалить вопрос", callback_data="help:settings:faq:del")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:content")],
     ])
+
 
 
 def kb_pick_faq_to_delete():
@@ -2489,8 +3045,9 @@ def kb_settings_categories():
     if cats:
         rows.append([InlineKeyboardButton("✏️ Переименовать категорию", callback_data="help:settings:cats:rename")])
         rows.append([InlineKeyboardButton("➖ Удалить категорию (только пустую)", callback_data="help:settings:cats:del")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:content")])
     return InlineKeyboardMarkup(rows)
+
 
 
 def kb_pick_category_to_rename():
@@ -2533,14 +3090,22 @@ def kb_pick_doc_to_delete():
         for did, cat_title, doc_title in rows_db:
             rows.append([InlineKeyboardButton(f"{cat_title}: {doc_title}", callback_data=f"help:settings:del_doc:{did}")])
 
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:content")])
     return InlineKeyboardMarkup(rows)
 
 def kb_achievements_menu():
+    pending_count = len(db_nominations_pending(1000))
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎁 Выдать ачивку", callback_data="help:settings:ach:give")],
+        [
+            InlineKeyboardButton(
+                f"📨 Номинации на рассмотрении ({pending_count})",
+                callback_data="help:settings:ach:nominations",
+            )
+        ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
     ])
+
 
 def kb_pick_profile_for_achievement():
     people = db_profiles_list()
@@ -2552,6 +3117,7 @@ def kb_pick_profile_for_achievement():
             rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:ach:pick:{pid}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:ach")])
     return InlineKeyboardMarkup(rows)
+
 
 
 # ===================== TESTING (employees) =====================
@@ -3233,7 +3799,7 @@ def kb_pick_profile_to_delete():
     else:
         for pid, name in people[:40]:
             rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:del_profile:{pid}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:people")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3245,7 +3811,7 @@ def kb_pick_profile_to_edit():
     else:
         for pid, name in people[:40]:
             rows.append([InlineKeyboardButton(name, callback_data=f"help:settings:edit_profile:{pid}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:people")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3303,6 +3869,62 @@ async def can_create_own_profile(update: Update, context: ContextTypes.DEFAULT_T
     if await is_admin_scoped(update, context):
         return False
     return get_profile_for_user(update) is None
+
+
+
+def db_profile_test_summary(profile_id: int) -> dict:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(*),
+               SUM(CASE WHEN status='assigned' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN status='in_progress' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN status IN ('finished','saved') THEN 1 ELSE 0 END),
+               SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END)
+        FROM test_assignments
+        WHERE profile_id=?
+        """,
+        (int(profile_id),),
+    )
+    row = cur.fetchone() or (0, 0, 0, 0, 0)
+    con.close()
+    return {
+        "total": int(row[0] or 0),
+        "assigned": int(row[1] or 0),
+        "in_progress": int(row[2] or 0),
+        "finished": int(row[3] or 0),
+        "expired": int(row[4] or 0),
+    }
+
+
+def db_profile_tests(profile_id: int, limit: int = 10) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT a.id, t.title, a.status, a.assigned_at, a.started_at, a.finished_at
+        FROM test_assignments a
+        JOIN test_templates t ON t.id = a.template_id
+        WHERE a.profile_id=?
+        ORDER BY a.id DESC
+        LIMIT ?
+        """,
+        (int(profile_id), int(limit)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {
+            "id": int(r[0]),
+            "title": r[1],
+            "status": r[2],
+            "assigned_at": r[3],
+            "started_at": r[4],
+            "finished_at": r[5],
+        }
+        for r in rows
+    ]
 
 # ---------------- COMMANDS ----------------
 
@@ -3763,6 +4385,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_profile_wiz(context)
     clear_csv_import(context)
     clear_suggest_flow(context)
+    clear_nomination_flow(context)
     clear_bcast_flow(context)
     await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты/CSV/предложка/рассылка).")
 
@@ -3905,6 +4528,8 @@ def export_backup_zip_bytes() -> bytes:
         "description",
         "awarded_at",
         "awarded_by",
+        "achievement_key",
+        "level",
     ])
     w.writeheader()
     for r in export_achievement_awards_rows():
@@ -4176,6 +4801,11 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
                 awarded_at = (row.get("awarded_at") or "").strip() or datetime.utcnow().isoformat()
                 awarded_by = (row.get("awarded_by") or "").strip()
                 awarded_by_val = int(awarded_by) if awarded_by.isdigit() else None
+                achievement_key = (row.get("achievement_key") or normalize_achievement_key(title)).strip()
+                try:
+                    level = max(1, int(row.get("level") or 1))
+                except (TypeError, ValueError):
+                    level = 1
 
                 target_pid = None
                 if pid_old and pid_old in profile_id_map:
@@ -4208,9 +4838,14 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
                     continue
 
                 cur.execute(
-                    """INSERT INTO achievement_awards(profile_id, emoji, title, description, awarded_at, awarded_by)
-                           VALUES(?, ?, ?, ?, ?, ?)""",
-                    (int(target_pid), emoji, title, description, awarded_at, awarded_by_val),
+                    """INSERT INTO achievement_awards(
+                           profile_id, emoji, title, description, awarded_at, awarded_by,
+                           achievement_key, level
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        int(target_pid), emoji, title, description, awarded_at, awarded_by_val,
+                        achievement_key, level,
+                    ),
                 )
                 stats["achievements_awards"] += 1
 
@@ -4677,6 +5312,10 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         a = db_test_get_assignment(aid)
         if not a:
             return
+        user_profile = get_profile_for_user(update)
+        if not user_profile or int(a.get("profile_id") or 0) != int(user_profile["id"]):
+            await q.answer("Этот тест назначен другому сотруднику.", show_alert=True)
+            return
 
         # deadline check (assigned but already expired is rare)
         if await _expire_assignment_if_needed(a, context):
@@ -4804,6 +5443,187 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=kb_help_main(is_admin_user=is_adm),
             disable_web_page_preview=True,
+        )
+        return
+
+
+    # ---------------- Мой кабинет ----------------
+    if data == "help:me":
+        profile = get_profile_for_user(update)
+        if not profile:
+            can_create = await can_create_own_profile(update, context)
+            await q.edit_message_text(
+                "👤 <b>Мой кабинет</b>\n\n"
+                "Не удалось связать ваш Telegram с анкетой сотрудника.\n"
+                "Проверьте, что в анкете указан актуальный @username.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_no_profile_for_account(can_create),
+            )
+            return
+        await q.edit_message_text(
+            build_my_account_text(profile),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_my_account(profile),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:me:achievements":
+        profile = get_profile_for_user(update)
+        if not profile:
+            await q.answer("Анкета не найдена.", show_alert=True)
+            return
+        count = db_achievements_count(int(profile["id"]))
+        text = (
+            f"🏆 <b>Мои достижения</b>\n\n"
+            f"Всего: <b>{count}</b>\n\n"
+            f"{format_achievements_for_profile(int(profile['id']), limit=30)}"
+        )
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ В мой кабинет", callback_data="help:me")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
+            ]),
+        )
+        return
+
+    if data == "help:me:tests":
+        profile = get_profile_for_user(update)
+        if not profile:
+            await q.answer("Анкета не найдена.", show_alert=True)
+            return
+        summary = db_profile_test_summary(int(profile["id"]))
+        text = (
+            "📝 <b>Мои тесты</b>\n\n"
+            f"Новые: <b>{summary['assigned']}</b>\n"
+            f"В процессе: <b>{summary['in_progress']}</b>\n"
+            f"Завершено: <b>{summary['finished']}</b>\n"
+            f"Истекло: <b>{summary['expired']}</b>\n\n"
+            "Ниже показаны последние тесты."
+        )
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_my_tests(int(profile["id"])),
+        )
+        return
+
+    if data.startswith("help:me:test:continue:"):
+        profile = get_profile_for_user(update)
+        if not profile:
+            await q.answer("Анкета не найдена.", show_alert=True)
+            return
+        assignment_id = int(data.split(":")[-1])
+        assignment = db_test_get_assignment(assignment_id)
+        if not assignment or int(assignment["profile_id"]) != int(profile["id"]):
+            await q.answer("Тест не найден.", show_alert=True)
+            return
+        if assignment.get("status") != "in_progress":
+            await q.answer("Этот тест уже не находится в процессе.", show_alert=True)
+            return
+        if await _expire_assignment_if_needed(assignment, context):
+            await q.edit_message_text(
+                EMPLOYEE_TEST_EXPIRED_TEXT,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В мой кабинет", callback_data="help:me")]]),
+            )
+            return
+        context.user_data[ACTIVE_TEST_ASSIGNMENT_ID] = assignment_id
+        context.user_data[ACTIVE_TEST_MULTI_SELECTED] = {}
+        await q.edit_message_text(
+            "⏳ Продолжаем тест. Следующий вопрос отправлен отдельным сообщением.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В мой кабинет", callback_data="help:me")]]),
+        )
+        await send_employee_question(context, update.effective_user.id, assignment)
+        return
+
+    # ---------------- Номинация коллеги ----------------
+    if data == "help:nomination":
+        clear_nomination_flow(context)
+        await q.edit_message_text(
+            "🙌 <b>Номинация коллеги</b>\n\n"
+            "Здесь ты можешь предложить номинировать коллегу за помощь "
+            "или иной вклад в команду.\n\n"
+            "Номинация отправится администраторам на рассмотрение. "
+            "После одобрения сотрудник получит ачивку «Командный вклад» "
+            "с уровнем I, II или III.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_nomination_intro(),
+        )
+        return
+
+    if data == "help:nomination:start" or data.startswith("help:nomination:page:"):
+        profile = get_profile_for_user(update)
+        if not profile:
+            await q.edit_message_text(
+                "🙌 <b>Номинация</b>\n\n"
+                "Сначала нужна анкета сотрудника, связанная с вашим Telegram.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_no_profile_for_account(await can_create_own_profile(update, context)),
+            )
+            return
+        page = 0
+        if data.startswith("help:nomination:page:"):
+            try:
+                page = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                page = 0
+        clear_nomination_flow(context)
+        scope_chat_id = get_scope_chat_id(update, context) or ACCESS_CHAT_ID
+        context.user_data[NOMINATION_DATA] = {
+            "nominator_profile_id": int(profile["id"]),
+            "nominator_name": profile["full_name"],
+            "scope_chat_id": int(scope_chat_id),
+            "created_ts": int(time.time()),
+        }
+        await q.edit_message_text(
+            "🙌 <b>Номинация коллеги</b>\n\n"
+            "Шаг 1/2: выберите коллегу, чей вклад хотите отметить.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_nomination_people(page, int(profile["id"])),
+        )
+        return
+
+    if data.startswith("help:nomination:pick:"):
+        parts = data.split(":")
+        try:
+            nominee_id = int(parts[3])
+        except (IndexError, ValueError):
+            await q.answer("Не удалось выбрать сотрудника.", show_alert=True)
+            return
+        profile = get_profile_for_user(update)
+        nominee = db_profiles_get(nominee_id)
+        if not profile or not nominee or int(profile["id"]) == nominee_id:
+            await q.answer("Нельзя выбрать эту анкету.", show_alert=True)
+            return
+        nomination_data = context.user_data.get(NOMINATION_DATA) or {}
+        nomination_data.update({
+            "nominator_profile_id": int(profile["id"]),
+            "nominator_name": profile["full_name"],
+            "nominee_profile_id": nominee_id,
+            "nominee_name": nominee["full_name"],
+            "scope_chat_id": int(nomination_data.get("scope_chat_id") or get_scope_chat_id(update, context) or ACCESS_CHAT_ID),
+            "created_ts": int(time.time()),
+        })
+        context.user_data[NOMINATION_ACTIVE] = True
+        context.user_data[NOMINATION_STEP] = "reason"
+        context.user_data[NOMINATION_DATA] = nomination_data
+        await q.edit_message_text(
+            f"🙌 Номинируем: <b>{escape(nominee['full_name'])}</b>\n\n"
+            "Шаг 2/2: напишите, за какую помощь или вклад в команду "
+            "вы хотите отметить коллегу.\n\n"
+            "Лучше привести конкретный пример — так администратору будет проще принять решение.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_nomination_cancel(),
+        )
+        return
+
+    if data == "help:nomination:cancel":
+        clear_nomination_flow(context)
+        await q.edit_message_text(
+            "✅ Номинация отменена.",
+            reply_markup=kb_help_main(is_admin_user=is_adm),
         )
         return
 
@@ -5050,6 +5870,136 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+
+    # ---------------- Рассмотрение номинаций администратором ----------------
+    if data.startswith("help:nomination:admin:"):
+        parts = data.split(":")
+        action = parts[3] if len(parts) > 3 else ""
+        try:
+            nomination_id = int(parts[4])
+        except (IndexError, ValueError):
+            await q.answer("Номинация не найдена.", show_alert=True)
+            return
+        nomination = db_nomination_get(nomination_id)
+        if not nomination:
+            await q.answer("Номинация не найдена.", show_alert=True)
+            return
+        admin_user_id = update.effective_user.id if update.effective_user else 0
+        if not admin_user_id or not await is_admin_in_chat(
+            int(nomination["scope_chat_id"]), admin_user_id, context
+        ):
+            await q.answer("Доступно только администраторам чата.", show_alert=True)
+            return
+        context.user_data[HELP_SCOPE_CHAT_ID] = int(nomination["scope_chat_id"])
+
+        if action == "open":
+            status_map = {"pending": "Ожидает решения", "approved": "Одобрена", "rejected": "Отклонена"}
+            text = (
+                f"🙌 <b>Номинация №{nomination_id}</b>\n\n"
+                f"От: <b>{escape(nomination['nominator_name'])}</b>\n"
+                f"Кого: <b>{escape(nomination['nominee_name'])}</b>\n"
+                f"Статус: <b>{status_map.get(nomination['status'], nomination['status'])}</b>\n\n"
+                f"Причина:\n{escape(nomination['reason'])}"
+            )
+            markup = kb_nomination_admin_actions(nomination_id) if nomination["status"] == "pending" else InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ К номинациям", callback_data="help:settings:ach:nominations")]
+            ])
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            return
+
+        if nomination["status"] != "pending":
+            await q.answer("Эта номинация уже рассмотрена.", show_alert=True)
+            return
+
+        if action == "approve":
+            result = db_nomination_approve(nomination_id, admin_user_id)
+            if not result:
+                await q.answer("Номинация уже обработана другим администратором.", show_alert=True)
+                return
+            level_text = achievement_level_label(result["level"])
+            approved_text = (
+                f"✅ <b>Номинация одобрена</b>\n\n"
+                f"{escape(nomination['nominee_name'])} получил(а) ачивку "
+                f"🤝 <b>Командный вклад · уровень {level_text}</b>.\n\n"
+                f"Причина:\n{escape(nomination['reason'])}"
+            )
+            await q.edit_message_text(
+                approved_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📨 К номинациям", callback_data="help:settings:ach:nominations")]
+                ]),
+            )
+
+            mention = normalize_tg_mention(nomination.get("nominee_tg_link") or "")
+            who = mention if mention else f"<b>{escape(nomination['nominee_name'])}</b>"
+            public_text = (
+                f"🎉 <b>Поздравляем, {who}!</b>\n\n"
+                f"Коллега отметил твой вклад в команду, и номинация была одобрена.\n\n"
+                f"🤝 <b>Командный вклад · уровень {level_text}</b>\n"
+                f"За: «{escape(nomination['reason'])}»\n\n"
+                f"Спасибо за помощь и поддержку команды! 🚀"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=int(nomination["scope_chat_id"]),
+                    text=public_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception as exc:
+                logger.exception("Cannot publish approved nomination: %s", exc)
+
+            nominee_tg_user_id = nomination.get("nominee_tg_user_id")
+            if nominee_tg_user_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(nominee_tg_user_id),
+                        text=(
+                            f"🎉 Вы получили ачивку: 🤝 Командный вклад · уровень {level_text}\n\n"
+                            f"За: {nomination['reason']}"
+                        ),
+                    )
+                except Exception:
+                    pass
+            nominator_user_id = nomination.get("nominator_user_id")
+            if nominator_user_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(nominator_user_id),
+                        text=f"✅ Ваша номинация для {nomination['nominee_name']} одобрена. Спасибо, что отмечаете вклад коллег!",
+                    )
+                except Exception:
+                    pass
+            return
+
+        if action == "reject":
+            if not db_nomination_reject(nomination_id, admin_user_id):
+                await q.answer("Номинация уже обработана другим администратором.", show_alert=True)
+                return
+            await q.edit_message_text(
+                f"❌ <b>Номинация отклонена</b>\n\n"
+                f"Кандидат: <b>{escape(nomination['nominee_name'])}</b>\n\n"
+                f"Причина номинации:\n{escape(nomination['reason'])}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📨 К номинациям", callback_data="help:settings:ach:nominations")]
+                ]),
+            )
+            nominator_user_id = nomination.get("nominator_user_id")
+            if nominator_user_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(nominator_user_id),
+                        text=(
+                            f"Номинация для {nomination['nominee_name']} рассмотрена, "
+                            "но в этот раз не была одобрена. Спасибо за инициативу."
+                        ),
+                    )
+                except Exception:
+                    pass
+            return
+
     if data == "help:settings":
         if not is_adm:
             try:
@@ -5058,11 +6008,54 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         text = (
-            "⚙️ <b>Настройки</b>\n\n"
-            "Управление документами, категориями и анкетами.\n"
-            "Все действия делаются тут, в ЛС — в чате флудить не будем 🙂"
+            "⚙️ <b>Управление ботом</b>\n\n"
+            "Настройки разделены по направлениям, чтобы нужное действие было проще найти."
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+        return
+
+    if data == "help:settings:content":
+        if not is_adm:
+            await q.answer("Доступно администраторам.", show_alert=True)
+            return
+        await q.edit_message_text(
+            "📄 <b>Контент</b>\n\nДокументы, категории и FAQ.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_settings_content(),
+        )
+        return
+
+    if data == "help:settings:people":
+        if not is_adm:
+            await q.answer("Доступно администраторам.", show_alert=True)
+            return
+        await q.edit_message_text(
+            "👥 <b>Сотрудники</b>\n\nДобавление, редактирование и удаление анкет.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_settings_people(),
+        )
+        return
+
+    if data == "help:settings:communications":
+        if not is_adm:
+            await q.answer("Доступно администраторам.", show_alert=True)
+            return
+        await q.edit_message_text(
+            "📣 <b>Коммуникации</b>\n\nРассылки и сообщения для команды.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_settings_communications(),
+        )
+        return
+
+    if data == "help:settings:system":
+        if not is_adm:
+            await q.answer("Доступно администраторам.", show_alert=True)
+            return
+        await q.edit_message_text(
+            "🛠 <b>Система</b>\n\nРезервные копии, восстановление и обмен данными.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_settings_system(),
+        )
         return
 
     if data == "help:settings:faq":
@@ -5130,6 +6123,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_csv_import(context)
             clear_zip_import(context)
             clear_suggest_flow(context)
+            clear_nomination_flow(context)
             clear_ach_wiz(context)
             clear_bcast_flow(context)
             await q.edit_message_text("✅ Действие отменено.", reply_markup=kb_help_settings(), parse_mode=ParseMode.HTML)
@@ -5154,7 +6148,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "help:settings:bcast:cancel":
             clear_bcast_flow(context)
-            await q.edit_message_text("✅ Рассылка отменена.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+            await q.edit_message_text("✅ Рассылка отменена.", parse_mode=ParseMode.HTML, reply_markup=kb_settings_communications())
             return
 
         if data == "help:settings:bcast:clear_files":
@@ -5987,14 +6981,21 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_bcast_flow(context)
             clear_ach_wiz(context)
             await q.edit_message_text(
-                "🏆 <b>Ачивки</b>\n\n"
-                "Здесь можно выдать ачивку сотруднику из анкеты.\n"
-                "Ачивки гибкие: эмодзи, название и описание задаются при выдаче.",
+                "🏆 <b>Ачивки и номинации</b>\n\n"
+                "Можно выдать ачивку вручную или рассмотреть номинации коллег.\n\n"
+                "У каждой ачивки есть уровень: I, II или III. "
+                "Для одобренных номинаций уровень «Командного вклада» повышается автоматически.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎁 Выдать ачивку", callback_data="help:settings:ach:give")],
-                    [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
-                ]),
+                reply_markup=kb_achievements_menu(),
+            )
+            return
+
+        if data == "help:settings:ach:nominations":
+            await q.edit_message_text(
+                "📨 <b>Номинации на рассмотрении</b>\n\n"
+                "Выберите номинацию, чтобы посмотреть причину и принять решение.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_pending_nominations(),
             )
             return
 
@@ -6027,7 +7028,30 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.chat_data[WAITING_SINCE_TS] = int(time.time())
             await q.edit_message_text(
                 f"🎁 Выдаём ачивку для: <b>{escape(p.get('full_name',''))}</b>\n\n"
-                "Шаг 2/4: отправьте <b>эмодзи</b> (пример: 🏅)",
+                "Шаг 2/5: отправьте <b>эмодзи</b> (пример: 🏅)",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if data.startswith("help:settings:ach:level:"):
+            if not context.chat_data.get(ACH_WIZ_ACTIVE) or context.chat_data.get(ACH_WIZ_STEP) != "level":
+                await q.answer("Сначала начните выдачу ачивки.", show_alert=True)
+                return
+            try:
+                level = int(data.split(":")[-1])
+            except ValueError:
+                level = 1
+            level = max(1, min(level, 3))
+            achievement_data = context.chat_data.get(ACH_WIZ_DATA) or {}
+            achievement_data["level"] = level
+            achievement_data["achievement_key"] = normalize_achievement_key(achievement_data.get("title", "Ачивка"))
+            context.chat_data[ACH_WIZ_DATA] = achievement_data
+            context.chat_data[ACH_WIZ_STEP] = "description"
+            await q.edit_message_text(
+                f"🎁 Ачивка: <b>{escape(achievement_data.get('title', 'Ачивка'))}</b>\n"
+                f"Уровень: <b>{achievement_level_label(level)}</b>\n\n"
+                "Шаг 5/5: напишите <b>описание</b> — за что выдаётся ачивка 🙂",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_cancel_wizard_settings(),
             )
@@ -6558,8 +7582,16 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         emoji = (row.get("emoji") or "").strip() or "🏆"
                         title = (row.get("title") or "").strip() or "Ачивка"
                         description = (row.get("description") or "").strip() or ""
+                        achievement_key = (row.get("achievement_key") or normalize_achievement_key(title)).strip()
+                        try:
+                            level = max(1, int(row.get("level") or 1))
+                        except (TypeError, ValueError):
+                            level = 1
                         # не тащим awarded_at/awarded_by в точности — создаём новую запись восстановления
-                        db_achievement_award_add(int(pid), emoji, title, description, None)
+                        db_achievement_award_add(
+                            int(pid), emoji, title, description, None,
+                            level=level, achievement_key=achievement_key,
+                        )
                         ok_ach += 1
 
         except zipfile.BadZipFile:
@@ -7035,10 +8067,62 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_profile_wiz(context)
         clear_csv_import(context)
         clear_suggest_flow(context)
+        clear_nomination_flow(context)
         clear_bcast_flow(context)
         await update.message.reply_text("⏳ Время ожидания истекло. Начните действие заново через /help.")
         return
 
+
+
+    # номинация коллеги: ждём текст причины
+    if context.user_data.get(NOMINATION_ACTIVE):
+        nomination_step = context.user_data.get(NOMINATION_STEP)
+        nomination_data = context.user_data.get(NOMINATION_DATA) or {}
+        if nomination_step != "reason":
+            clear_nomination_flow(context)
+            await update.message.reply_text("Не удалось продолжить номинацию. Начните заново через /help.")
+            return
+        created_ts = int(nomination_data.get("created_ts") or 0)
+        if created_ts and int(time.time()) - created_ts > 15 * 60:
+            clear_nomination_flow(context)
+            await update.message.reply_text("⏳ Время заполнения номинации истекло. Начните заново через /help.")
+            return
+        if len(text) < 10:
+            await update.message.reply_text(
+                "Напишите чуть подробнее — минимум 10 символов. "
+                "Например, какую помощь оказал коллега и почему это было важно."
+            )
+            return
+        reason = text[:1000]
+        nominee_profile_id = nomination_data.get("nominee_profile_id")
+        nominator_profile_id = nomination_data.get("nominator_profile_id")
+        scope_chat_id = int(nomination_data.get("scope_chat_id") or ACCESS_CHAT_ID)
+        if not nominee_profile_id or not nominator_profile_id:
+            clear_nomination_flow(context)
+            await update.message.reply_text("Не удалось определить анкеты. Начните номинацию заново через /help.")
+            return
+
+        nomination_id = db_nomination_create(
+            scope_chat_id=scope_chat_id,
+            nominator_user_id=user_id,
+            nominator_profile_id=int(nominator_profile_id),
+            nominee_profile_id=int(nominee_profile_id),
+            reason=reason,
+        )
+        sent_ok, sent_fail = await send_nomination_to_admins(nomination_id, context)
+        nominee_name = nomination_data.get("nominee_name") or "коллеги"
+        clear_nomination_flow(context)
+        status_note = "Администраторы получили уведомление." if sent_ok else "Номинация сохранена и доступна администраторам в разделе ачивок."
+        await update.message.reply_text(
+            f"✅ Номинация для <b>{escape(nominee_name)}</b> отправлена.\n\n"
+            f"{status_note}\n"
+            "Спасибо, что отмечаете вклад коллег 🙌",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")]
+            ]),
+        )
+        return
 
     # предложка (в ЛС): ждём текст  # anti-spam
     if context.user_data.get(WAITING_SUGGESTION_TEXT):
@@ -7139,7 +8223,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.chat_data[ACH_WIZ_DATA] = d
             context.chat_data[ACH_WIZ_STEP] = "title"
             await update.message.reply_text(
-                "Шаг 3/4: отправьте <b>название ачивки</b> (будет жирным).",
+                "Шаг 3/5: отправьте <b>название ачивки</b> (будет жирным).",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_cancel_wizard_settings(),
             )
@@ -7151,12 +8235,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Слишком коротко. Напишите название ачивки.")
                 return
             d["title"] = title[:80]
+            d["achievement_key"] = normalize_achievement_key(d["title"])
             context.chat_data[ACH_WIZ_DATA] = d
-            context.chat_data[ACH_WIZ_STEP] = "description"
+            context.chat_data[ACH_WIZ_STEP] = "level"
             await update.message.reply_text(
-                "Шаг 4/4: напишите <b>описание</b> — за что выдаётся ачивка 🙂",
+                "Шаг 4/5: выберите <b>уровень ачивки</b>.\n\n"
+                "I — первое достижение, II — уверенное развитие, III — высокий уровень вклада.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb_cancel_wizard_settings(),
+                reply_markup=kb_achievement_level_select(),
             )
             return
 
@@ -7174,14 +8260,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             admin_id = update.effective_user.id if update.effective_user else None
-            db_achievement_award_add(int(pid), d.get("emoji", "🏆"), d.get("title", "Ачивка"), d.get("description", ""), admin_id)
+            level = max(1, min(int(d.get("level") or 1), 3))
+            db_achievement_award_add(
+                int(pid),
+                d.get("emoji", "🏆"),
+                d.get("title", "Ачивка"),
+                d.get("description", ""),
+                admin_id,
+                level=level,
+                achievement_key=d.get("achievement_key") or normalize_achievement_key(d.get("title", "Ачивка")),
+            )
 
             scope_chat_id = get_scope_chat_id(update, context)
             mention = normalize_tg_mention(d.get("tg_link", "") or "")
             who = mention if mention else f"<b>{escape(d.get('full_name', 'Сотрудник'))}</b>"
             msg = (
                 f"🎉 <b>Поздравляем, {who}!</b>\n\n"
-                f"В твой профиль добавлена новая ачивка: <b>{escape(d.get('emoji', '🏆'))} {escape(d.get('title', 'Ачивка'))}</b>\n\n"
+                f"В твой профиль добавлена новая ачивка: <b>{escape(d.get('emoji', '🏆'))} {escape(d.get('title', 'Ачивка'))} · уровень {achievement_level_label(level)}</b>\n\n"
                 f"Достижение получено за: «{escape(d.get('description', ''))}»\n\n"
                 f"Так держать! 🚀🔥\n\n"
                 f"Посмотреть можно в /help"
@@ -7568,6 +8663,57 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, reply_markup=markup)
             return
 
+
+
+async def send_nomination_to_admins(
+    nomination_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[int, int]:
+    """Отправляет новую номинацию администраторам исходного чата."""
+    nomination = db_nomination_get(nomination_id)
+    if not nomination:
+        return (0, 0)
+
+    scope_chat_id = int(nomination["scope_chat_id"])
+    try:
+        chat = await context.bot.get_chat(scope_chat_id)
+        chat_title = chat.title or str(scope_chat_id)
+    except Exception:
+        chat_title = str(scope_chat_id)
+
+    text = (
+        f"🙌 <b>Новая номинация №{nomination_id}</b>\n\n"
+        f"Чат: <b>{escape(chat_title)}</b>\n"
+        f"От: <b>{escape(nomination['nominator_name'])}</b>\n"
+        f"Кого номинируют: <b>{escape(nomination['nominee_name'])}</b>\n\n"
+        f"Причина:\n{escape(nomination['reason'])}\n\n"
+        "При одобрении будет выдана ачивка 🤝 «Командный вклад» "
+        "со следующим доступным уровнем."
+    )
+
+    try:
+        admins = await context.bot.get_chat_administrators(scope_chat_id)
+    except Exception as exc:
+        logger.exception("Cannot get admins for nomination: %s", exc)
+        return (0, 0)
+
+    sent_ok = 0
+    sent_fail = 0
+    for member in admins:
+        if getattr(member.user, "is_bot", False):
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=member.user.id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_nomination_admin_actions(nomination_id),
+                disable_web_page_preview=True,
+            )
+            sent_ok += 1
+        except Exception:
+            sent_fail += 1
+    return sent_ok, sent_fail
 
 
 # ---------------- SUGGEST BOX ----------------
