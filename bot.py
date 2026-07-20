@@ -10192,6 +10192,1724 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception:
         pass
 
+# ===================== TESTING V2: COMPLETE SUBSYSTEM =====================
+# This block intentionally overrides the legacy testing UI while preserving
+# compatibility with already-created templates, assignments and answers.
+
+TEST_V2_BUILD = "TESTING-V2-ALL-FEATURES-2026-07-20"
+TV2_STATE = "tv2_state"
+TV2_DATA = "tv2_data"
+TV2_MULTI = "tv2_multi"
+TV2_ACTIVE_ASSIGNMENT = "tv2_active_assignment"
+TV2_ADMIN_PAGE_SIZE = 8
+TV2_MY_PAGE_SIZE = 6
+
+_tv2_legacy_db_init = db_init
+_tv2_legacy_cb_help = cb_help
+_tv2_legacy_cb_test = cb_test
+_tv2_legacy_on_text = on_text
+_tv2_legacy_check_and_send_jobs = check_and_send_jobs
+
+
+def _tv2_add_column(cur, table: str, definition: str):
+    try:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+    except sqlite3.OperationalError:
+        pass
+
+
+def db_init():
+    _tv2_legacy_db_init()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    # Optional organizational field used for group test assignment.
+    _tv2_add_column(cur, "profiles", "department TEXT")
+
+    # Template settings, versioning and publication.
+    for definition in (
+        "passing_score INTEGER NOT NULL DEFAULT 70",
+        "max_attempts INTEGER NOT NULL DEFAULT 1",
+        "scoring_policy TEXT NOT NULL DEFAULT 'best'",
+        "result_mode TEXT NOT NULL DEFAULT 'errors'",
+        "test_mode TEXT NOT NULL DEFAULT 'exam'",
+        "shuffle_questions INTEGER NOT NULL DEFAULT 0",
+        "shuffle_options INTEGER NOT NULL DEFAULT 0",
+        "allow_back INTEGER NOT NULL DEFAULT 0",
+        "allow_skip INTEGER NOT NULL DEFAULT 1",
+        "immediate_feedback INTEGER NOT NULL DEFAULT 0",
+        "default_time_limit_sec INTEGER",
+        "version INTEGER NOT NULL DEFAULT 1",
+        "parent_template_id INTEGER",
+        "is_published INTEGER NOT NULL DEFAULT 0",
+        "published_at TEXT",
+        "updated_at TEXT",
+    ):
+        _tv2_add_column(cur, "test_templates", definition)
+
+    # Rich question metadata.
+    for definition in (
+        "points REAL NOT NULL DEFAULT 1",
+        "explanation TEXT",
+        "category TEXT",
+        "difficulty INTEGER NOT NULL DEFAULT 1",
+        "tags TEXT",
+    ):
+        _tv2_add_column(cur, "test_questions", definition)
+
+    # Assignment lifecycle, attempts, scoring, navigation and reminders.
+    for definition in (
+        "due_at TEXT",
+        "attempt_no INTEGER NOT NULL DEFAULT 1",
+        "attempt_group TEXT",
+        "parent_assignment_id INTEGER",
+        "score_percent REAL",
+        "points_earned REAL",
+        "points_total REAL",
+        "passed INTEGER",
+        "review_status TEXT NOT NULL DEFAULT 'none'",
+        "reviewer_comment TEXT",
+        "question_order_json TEXT",
+        "option_order_json TEXT",
+        "flagged_json TEXT",
+        "reminder_24_sent INTEGER NOT NULL DEFAULT 0",
+        "reminder_2_sent INTEGER NOT NULL DEFAULT 0",
+        "overdue_notice_sent INTEGER NOT NULL DEFAULT 0",
+    ):
+        _tv2_add_column(cur, "test_assignments", definition)
+
+    # Per-answer manual review and partial scoring.
+    for definition in (
+        "awarded_points REAL",
+        "review_status TEXT NOT NULL DEFAULT 'auto'",
+        "reviewer_comment TEXT",
+        "is_flagged INTEGER NOT NULL DEFAULT 0",
+    ):
+        _tv2_add_column(cur, "test_answers", definition)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_question_bank (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            q_type TEXT NOT NULL,
+            question_text TEXT NOT NULL,
+            options_json TEXT,
+            correct_json TEXT,
+            points REAL NOT NULL DEFAULT 1,
+            explanation TEXT,
+            category TEXT,
+            difficulty INTEGER NOT NULL DEFAULT 1,
+            tags TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_attempt_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            assignment_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS test_admin_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            assignment_id INTEGER NOT NULL,
+            admin_user_id INTEGER,
+            comment TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_test_assign_profile_status ON test_assignments(profile_id, status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_test_assign_due ON test_assignments(due_at, status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_test_answers_assignment ON test_answers(assignment_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_test_bank_category ON test_question_bank(category, is_active)")
+
+    # Existing legacy templates are drafts; assignments keep working as-is.
+    cur.execute("UPDATE test_templates SET updated_at=COALESCE(updated_at, created_at)")
+    cur.execute("UPDATE test_questions SET points=1 WHERE points IS NULL OR points<=0")
+    cur.execute("UPDATE test_assignments SET attempt_group=COALESCE(attempt_group, 'legacy-' || id)")
+    con.commit()
+    con.close()
+    logger.warning("=== %s | FILE=%s | DB=%s ===", TEST_V2_BUILD, os.path.abspath(__file__), os.path.abspath(DB_PATH))
+
+
+def tv2_connect():
+    con = sqlite3.connect(DB_PATH, timeout=20)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=20000")
+    return con
+
+
+def tv2_clear(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(TV2_STATE, None)
+    context.user_data.pop(TV2_DATA, None)
+    context.user_data.pop(TV2_MULTI, None)
+
+
+def tv2_set_state(context: ContextTypes.DEFAULT_TYPE, state: str, **data):
+    context.user_data[TV2_STATE] = state
+    context.user_data[TV2_DATA] = dict(data)
+
+
+def tv2_parse_dt(value: str) -> str | None:
+    value = (value or "").strip().lower()
+    if value in ("нет", "без срока", "-", "none"):
+        return None
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%d.%m.%y %H:%M", "%d.%m.%y"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if "%H" not in fmt:
+                dt = dt.replace(hour=23, minute=59)
+            localized = MOSCOW_TZ.localize(dt)
+            return localized.astimezone(pytz.UTC).replace(tzinfo=None).isoformat()
+        except Exception:
+            continue
+    return "INVALID"
+
+
+def tv2_fmt_dt(value: str | None) -> str:
+    if not value:
+        return "без срока"
+    try:
+        dt = datetime.fromisoformat(value).replace(tzinfo=pytz.UTC).astimezone(MOSCOW_TZ)
+        return dt.strftime("%d.%m.%Y %H:%M МСК")
+    except Exception:
+        return str(value)
+
+
+def tv2_template_defaults(mode: str) -> dict:
+    if mode == "learning":
+        return {
+            "passing_score": 70, "max_attempts": 99, "scoring_policy": "best",
+            "result_mode": "all", "test_mode": "learning", "shuffle_questions": 0,
+            "shuffle_options": 0, "allow_back": 1, "allow_skip": 1,
+            "immediate_feedback": 1,
+        }
+    return {
+        "passing_score": 80, "max_attempts": 1, "scoring_policy": "last",
+        "result_mode": "score", "test_mode": "exam", "shuffle_questions": 1,
+        "shuffle_options": 1, "allow_back": 0, "allow_skip": 0,
+        "immediate_feedback": 0,
+    }
+
+
+def tv2_create_template(title: str, created_by: int | None, mode: str = "exam") -> int:
+    cfg = tv2_template_defaults(mode)
+    now = datetime.utcnow().isoformat()
+    with tv2_connect() as con:
+        cur = con.execute(
+            """INSERT INTO test_templates(
+                   title, created_by, created_at, is_draft_visible,
+                   passing_score, max_attempts, scoring_policy, result_mode,
+                   test_mode, shuffle_questions, shuffle_options, allow_back,
+                   allow_skip, immediate_feedback, version, is_published, updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (title.strip(), created_by, now, 1, cfg["passing_score"], cfg["max_attempts"],
+             cfg["scoring_policy"], cfg["result_mode"], cfg["test_mode"],
+             cfg["shuffle_questions"], cfg["shuffle_options"], cfg["allow_back"],
+             cfg["allow_skip"], cfg["immediate_feedback"], 1, 0, now),
+        )
+        return int(cur.lastrowid)
+
+
+def tv2_get_template(tid: int) -> dict | None:
+    with tv2_connect() as con:
+        row = con.execute("SELECT * FROM test_templates WHERE id=?", (int(tid),)).fetchone()
+    return dict(row) if row else None
+
+
+def tv2_list_templates(published: int | None = None, limit: int = 100) -> list[dict]:
+    sql = "SELECT * FROM test_templates WHERE is_draft_visible=1"
+    args = []
+    if published is not None:
+        sql += " AND is_published=?"
+        args.append(int(published))
+    sql += " ORDER BY COALESCE(updated_at, created_at) DESC LIMIT ?"
+    args.append(int(limit))
+    with tv2_connect() as con:
+        return [dict(r) for r in con.execute(sql, args).fetchall()]
+
+
+def tv2_questions(tid: int) -> list[dict]:
+    with tv2_connect() as con:
+        rows = con.execute("SELECT * FROM test_questions WHERE template_id=? ORDER BY idx", (int(tid),)).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["options"] = _safe_json_loads(d.get("options_json"), [])
+        d["correct"] = _safe_json_loads(d.get("correct_json"), [])
+        out.append(d)
+    return out
+
+
+def tv2_add_question(tid: int, q_type: str, text: str, options: list[str] | None,
+                     correct: list[int] | None, points: float = 1, explanation: str = "",
+                     category: str = "", difficulty: int = 1, tags: str = "") -> int:
+    with tv2_connect() as con:
+        idx = int(con.execute("SELECT COALESCE(MAX(idx),0)+1 FROM test_questions WHERE template_id=?", (int(tid),)).fetchone()[0])
+        cur = con.execute(
+            """INSERT INTO test_questions(
+                   template_id, idx, q_type, question_text, options_json, correct_json,
+                   created_at, points, explanation, category, difficulty, tags
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (int(tid), idx, q_type, text.strip(), _safe_json_dumps(options or []),
+             _safe_json_dumps(correct or []), datetime.utcnow().isoformat(), float(points),
+             (explanation or "").strip() or None, (category or "").strip() or None,
+             max(1, min(int(difficulty or 1), 5)), (tags or "").strip() or None),
+        )
+        con.execute("UPDATE test_templates SET updated_at=? WHERE id=?", (datetime.utcnow().isoformat(), int(tid)))
+        return int(cur.lastrowid)
+
+
+def tv2_update_question(qid: int, field: str, value):
+    allowed = {"question_text", "options_json", "correct_json", "points", "explanation", "category", "difficulty", "tags"}
+    if field not in allowed:
+        raise ValueError("unsupported field")
+    with tv2_connect() as con:
+        con.execute(f"UPDATE test_questions SET {field}=? WHERE id=?", (value, int(qid)))
+
+
+def tv2_delete_question(qid: int):
+    with tv2_connect() as con:
+        row = con.execute("SELECT template_id, idx FROM test_questions WHERE id=?", (int(qid),)).fetchone()
+        if not row:
+            return False
+        con.execute("DELETE FROM test_questions WHERE id=?", (int(qid),))
+        con.execute("UPDATE test_questions SET idx=idx-1 WHERE template_id=? AND idx>?", (int(row[0]), int(row[1])))
+        return True
+
+
+def tv2_move_question(qid: int, delta: int):
+    with tv2_connect() as con:
+        row = con.execute("SELECT template_id, idx FROM test_questions WHERE id=?", (int(qid),)).fetchone()
+        if not row:
+            return False
+        tid, idx = int(row[0]), int(row[1])
+        other = con.execute("SELECT id, idx FROM test_questions WHERE template_id=? AND idx=?", (tid, idx + int(delta))).fetchone()
+        if not other:
+            return False
+        con.execute("UPDATE test_questions SET idx=-1 WHERE id=?", (int(qid),))
+        con.execute("UPDATE test_questions SET idx=? WHERE id=?", (idx, int(other[0])))
+        con.execute("UPDATE test_questions SET idx=? WHERE id=?", (idx + int(delta), int(qid)))
+        return True
+
+
+def tv2_publish_template(tid: int, user_id: int | None = None) -> int:
+    src = tv2_get_template(tid)
+    if not src:
+        raise ValueError("template not found")
+    if int(src.get("is_published") or 0) == 1:
+        return int(tid)
+    root_id = int(src.get("parent_template_id") or src["id"])
+    with tv2_connect() as con:
+        max_ver = int(con.execute(
+            "SELECT COALESCE(MAX(version),0) FROM test_templates WHERE id=? OR parent_template_id=?",
+            (root_id, root_id),
+        ).fetchone()[0] or 0)
+        version = max(1, max_ver + 1)
+        fields = [
+            "title", "created_by", "created_at", "is_draft_visible", "passing_score",
+            "max_attempts", "scoring_policy", "result_mode", "test_mode",
+            "shuffle_questions", "shuffle_options", "allow_back", "allow_skip",
+            "immediate_feedback", "default_time_limit_sec", "version",
+            "parent_template_id", "is_published", "published_at", "updated_at",
+        ]
+        now = datetime.utcnow().isoformat()
+        vals = [src.get("title"), user_id or src.get("created_by"), now, 1,
+                src.get("passing_score", 70), src.get("max_attempts", 1),
+                src.get("scoring_policy", "best"), src.get("result_mode", "errors"),
+                src.get("test_mode", "exam"), src.get("shuffle_questions", 0),
+                src.get("shuffle_options", 0), src.get("allow_back", 0),
+                src.get("allow_skip", 1), src.get("immediate_feedback", 0),
+                src.get("default_time_limit_sec"), version, root_id, 1, now, now]
+        placeholders = ",".join("?" for _ in fields)
+        cur = con.execute(f"INSERT INTO test_templates({','.join(fields)}) VALUES({placeholders})", vals)
+        pub_id = int(cur.lastrowid)
+        for q in tv2_questions(tid):
+            con.execute(
+                """INSERT INTO test_questions(
+                       template_id, idx, q_type, question_text, options_json, correct_json,
+                       created_at, points, explanation, category, difficulty, tags
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (pub_id, q["idx"], q["q_type"], q["question_text"], q.get("options_json"),
+                 q.get("correct_json"), now, q.get("points", 1), q.get("explanation"),
+                 q.get("category"), q.get("difficulty", 1), q.get("tags")),
+            )
+        return pub_id
+
+
+def tv2_bank_add(q_type: str, text: str, options: list[str], correct: list[int],
+                 points: float, explanation: str, category: str, difficulty: int,
+                 tags: str, created_by: int | None) -> int:
+    with tv2_connect() as con:
+        cur = con.execute(
+            """INSERT INTO test_question_bank(
+                   q_type, question_text, options_json, correct_json, points,
+                   explanation, category, difficulty, tags, created_by, created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (q_type, text.strip(), _safe_json_dumps(options), _safe_json_dumps(correct),
+             float(points), explanation.strip() or None, category.strip() or "Без категории",
+             max(1, min(int(difficulty), 5)), tags.strip() or None, created_by,
+             datetime.utcnow().isoformat()),
+        )
+        return int(cur.lastrowid)
+
+
+def tv2_bank_list(category: str | None = None, limit: int = 100) -> list[dict]:
+    sql = "SELECT * FROM test_question_bank WHERE is_active=1"
+    args = []
+    if category:
+        sql += " AND category=?"
+        args.append(category)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(int(limit))
+    with tv2_connect() as con:
+        rows = con.execute(sql, args).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["options"] = _safe_json_loads(d.get("options_json"), [])
+        d["correct"] = _safe_json_loads(d.get("correct_json"), [])
+        out.append(d)
+    return out
+
+
+def tv2_bank_categories() -> list[str]:
+    with tv2_connect() as con:
+        return [str(r[0]) for r in con.execute(
+            "SELECT DISTINCT COALESCE(category,'Без категории') FROM test_question_bank WHERE is_active=1 ORDER BY 1"
+        ).fetchall()]
+
+
+def tv2_copy_bank_question(bank_id: int, tid: int) -> bool:
+    with tv2_connect() as con:
+        row = con.execute("SELECT * FROM test_question_bank WHERE id=? AND is_active=1", (int(bank_id),)).fetchone()
+    if not row:
+        return False
+    d = dict(row)
+    tv2_add_question(tid, d["q_type"], d["question_text"],
+                     _safe_json_loads(d.get("options_json"), []),
+                     _safe_json_loads(d.get("correct_json"), []),
+                     d.get("points") or 1, d.get("explanation") or "",
+                     d.get("category") or "", d.get("difficulty") or 1,
+                     d.get("tags") or "")
+    return True
+
+
+def tv2_profile_ids_for_rule(rule: str, value: str | None = None, template_id: int | None = None) -> list[int]:
+    with tv2_connect() as con:
+        if rule == "all":
+            rows = con.execute("SELECT id FROM profiles ORDER BY full_name").fetchall()
+        elif rule == "city":
+            rows = con.execute("SELECT id FROM profiles WHERE city=? ORDER BY full_name", (value or "",)).fetchall()
+        elif rule == "department":
+            rows = con.execute("SELECT id FROM profiles WHERE COALESCE(department, '')=? ORDER BY full_name", (value or "",)).fetchall()
+        elif rule == "failed" and template_id:
+            root = tv2_get_template(template_id)
+            root_id = int((root or {}).get("parent_template_id") or template_id)
+            rows = con.execute(
+                """SELECT DISTINCT p.id FROM profiles p
+                   JOIN test_assignments a ON a.profile_id=p.id
+                   JOIN test_templates t ON t.id=a.template_id
+                   WHERE (t.id=? OR t.parent_template_id=?) AND COALESCE(a.passed,0)=0""",
+                (root_id, root_id),
+            ).fetchall()
+        else:
+            return []
+    return [int(r[0]) for r in rows]
+
+
+def tv2_create_assignment(template_id: int, profile_id: int, assigned_by: int | None,
+                          due_at: str | None, time_limit_sec: int | None,
+                          attempt_no: int = 1, attempt_group: str | None = None,
+                          parent_assignment_id: int | None = None) -> int:
+    template = tv2_get_template(template_id) or {}
+    questions = tv2_questions(template_id)
+    order = [int(q["id"]) for q in questions]
+    if int(template.get("shuffle_questions") or 0):
+        random.shuffle(order)
+    option_orders = {}
+    if int(template.get("shuffle_options") or 0):
+        for q in questions:
+            indexes = list(range(len(q.get("options") or [])))
+            random.shuffle(indexes)
+            option_orders[str(q["id"])] = indexes
+    group = attempt_group or f"{profile_id}-{template_id}-{int(time.time())}-{random.randint(1000,9999)}"
+    now = datetime.utcnow().isoformat()
+    with tv2_connect() as con:
+        cur = con.execute(
+            """INSERT INTO test_assignments(
+                   template_id, profile_id, assigned_by, assigned_at, time_limit_sec,
+                   deadline_at, status, current_idx, due_at, attempt_no, attempt_group,
+                   parent_assignment_id, review_status, question_order_json,
+                   option_order_json, flagged_json
+               ) VALUES(?,?,?,?,?,NULL,'assigned',0,?,?,?,?,?,?,?,?)""",
+            (int(template_id), int(profile_id), assigned_by, now, time_limit_sec,
+             due_at, int(attempt_no), group, parent_assignment_id, "none",
+             _safe_json_dumps(order), _safe_json_dumps(option_orders), _safe_json_dumps([])),
+        )
+        return int(cur.lastrowid)
+
+
+def tv2_get_assignment(aid: int) -> dict | None:
+    with tv2_connect() as con:
+        row = con.execute(
+            """SELECT a.*, t.title, t.passing_score, t.max_attempts, t.scoring_policy,
+                      t.result_mode, t.test_mode, t.shuffle_questions, t.shuffle_options,
+                      t.allow_back, t.allow_skip, t.immediate_feedback, t.version,
+                      p.full_name, p.tg_user_id, p.tg_link
+               FROM test_assignments a
+               JOIN test_templates t ON t.id=a.template_id
+               JOIN profiles p ON p.id=a.profile_id
+               WHERE a.id=?""",
+            (int(aid),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def tv2_assignment_order(a: dict) -> list[int]:
+    order = _safe_json_loads(a.get("question_order_json"), [])
+    if order:
+        return [int(x) for x in order]
+    return [int(q["id"]) for q in tv2_questions(int(a["template_id"]))]
+
+
+def tv2_question_by_id(qid: int) -> dict | None:
+    with tv2_connect() as con:
+        row = con.execute("SELECT * FROM test_questions WHERE id=?", (int(qid),)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["options"] = _safe_json_loads(d.get("options_json"), [])
+    d["correct"] = _safe_json_loads(d.get("correct_json"), [])
+    return d
+
+
+def tv2_answer(aid: int, qid: int) -> dict | None:
+    with tv2_connect() as con:
+        row = con.execute("SELECT * FROM test_answers WHERE assignment_id=? AND question_id=?", (int(aid), int(qid))).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["answer"] = _safe_json_loads(d.get("answer_json"), {})
+    return d
+
+
+def tv2_save_answer(aid: int, qid: int, answer: dict, is_correct: int | None,
+                    awarded_points: float | None, review_status: str = "auto"):
+    now = datetime.utcnow().isoformat()
+    with tv2_connect() as con:
+        con.execute(
+            """INSERT INTO test_answers(
+                   assignment_id, question_id, answer_json, is_correct, answered_at,
+                   awarded_points, review_status
+               ) VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(assignment_id, question_id) DO UPDATE SET
+                   answer_json=excluded.answer_json,
+                   is_correct=excluded.is_correct,
+                   answered_at=excluded.answered_at,
+                   awarded_points=excluded.awarded_points,
+                   review_status=excluded.review_status""",
+            (int(aid), int(qid), _safe_json_dumps(answer), is_correct, now,
+             awarded_points, review_status),
+        )
+        con.execute("INSERT INTO test_attempt_events(assignment_id,event_type,payload_json,created_at) VALUES(?,?,?,?)",
+                    (int(aid), "answer_saved", _safe_json_dumps({"question_id": qid}), now))
+
+
+def tv2_set_current(aid: int, idx: int):
+    with tv2_connect() as con:
+        con.execute("UPDATE test_assignments SET current_idx=? WHERE id=?", (max(0, int(idx)), int(aid)))
+
+
+def tv2_toggle_flag(aid: int, qid: int) -> bool:
+    a = tv2_get_assignment(aid)
+    flags = set(int(x) for x in _safe_json_loads((a or {}).get("flagged_json"), []))
+    if int(qid) in flags:
+        flags.remove(int(qid)); active = False
+    else:
+        flags.add(int(qid)); active = True
+    with tv2_connect() as con:
+        con.execute("UPDATE test_assignments SET flagged_json=? WHERE id=?", (_safe_json_dumps(sorted(flags)), int(aid)))
+    return active
+
+
+def tv2_start_assignment(aid: int):
+    a = tv2_get_assignment(aid)
+    if not a:
+        return
+    deadline = None
+    if a.get("time_limit_sec"):
+        deadline = (datetime.utcnow() + timedelta(seconds=int(a["time_limit_sec"]))).isoformat()
+    with tv2_connect() as con:
+        con.execute(
+            """UPDATE test_assignments SET status='in_progress',
+                   started_at=COALESCE(started_at,?), deadline_at=COALESCE(deadline_at,?)
+               WHERE id=? AND status IN ('assigned','saved','in_progress')""",
+            (datetime.utcnow().isoformat(), deadline, int(aid)),
+        )
+
+
+def tv2_is_expired(a: dict) -> bool:
+    now = datetime.utcnow()
+    for key in ("due_at", "deadline_at"):
+        value = a.get(key)
+        if value:
+            try:
+                if now >= datetime.fromisoformat(value):
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def tv2_mark_expired(aid: int):
+    with tv2_connect() as con:
+        con.execute("UPDATE test_assignments SET status='expired', finished_at=? WHERE id=? AND status NOT IN ('finished','reviewed','expired','canceled')",
+                    (datetime.utcnow().isoformat(), int(aid)))
+
+
+def tv2_calculate(aid: int, finalize: bool = True) -> dict:
+    a = tv2_get_assignment(aid)
+    if not a:
+        return {"percent": 0, "earned": 0, "total": 0, "pending": 0, "passed": False}
+    qs = tv2_questions(int(a["template_id"]))
+    total = float(sum(float(q.get("points") or 1) for q in qs))
+    with tv2_connect() as con:
+        rows = con.execute("SELECT question_id, awarded_points, review_status FROM test_answers WHERE assignment_id=?", (int(aid),)).fetchall()
+    earned = 0.0
+    pending = 0
+    amap = {int(r[0]): r for r in rows}
+    for q in qs:
+        r = amap.get(int(q["id"]))
+        if q["q_type"] == "open":
+            if r and str(r[2]) in ("pending", ""):
+                pending += 1
+            elif r:
+                earned += float(r[1] or 0)
+        elif r:
+            earned += float(r[1] or 0)
+    percent = round((earned / total * 100) if total > 0 else 0, 2)
+    passed = percent >= float(a.get("passing_score") or 70)
+    if finalize:
+        status = "needs_review" if pending else "finished"
+        review_status = "pending" if pending else "reviewed"
+        with tv2_connect() as con:
+            con.execute(
+                """UPDATE test_assignments SET status=?, review_status=?, finished_at=?,
+                       score_percent=?, points_earned=?, points_total=?, passed=?
+                   WHERE id=?""",
+                (status, review_status, datetime.utcnow().isoformat(), percent, earned, total,
+                 1 if passed and not pending else 0, int(aid)),
+            )
+        if not pending:
+            tv2_update_profile_average(int(a["profile_id"]))
+            tv2_award_test_achievements(int(a["profile_id"]), aid, percent, passed)
+    return {"percent": percent, "earned": earned, "total": total, "pending": pending, "passed": passed and not pending}
+
+
+def tv2_update_profile_average(profile_id: int):
+    with tv2_connect() as con:
+        row = con.execute(
+            """SELECT AVG(score_percent) FROM test_assignments
+               WHERE profile_id=? AND status='finished' AND score_percent IS NOT NULL""",
+            (int(profile_id),),
+        ).fetchone()
+        avg = int(round(float(row[0]))) if row and row[0] is not None else None
+        con.execute("UPDATE profiles SET avg_test_score=? WHERE id=?", (avg, int(profile_id)))
+
+
+def tv2_has_achievement(profile_id: int, key: str, level: int | None = None) -> bool:
+    with tv2_connect() as con:
+        if level is None:
+            row = con.execute("SELECT 1 FROM achievement_awards WHERE profile_id=? AND achievement_key=? LIMIT 1", (int(profile_id), key)).fetchone()
+        else:
+            row = con.execute("SELECT 1 FROM achievement_awards WHERE profile_id=? AND achievement_key=? AND level=? LIMIT 1", (int(profile_id), key, int(level))).fetchone()
+    return bool(row)
+
+
+def tv2_award_test_achievements(profile_id: int, aid: int, percent: float, passed: bool):
+    if percent >= 100 and not tv2_has_achievement(profile_id, "test_perfect"):
+        db_achievement_award_add(profile_id, "💯", "Без единой ошибки",
+                                 "Первый тест, завершённый с результатом 100%.",
+                                 awarded_by=None, level=1, achievement_key="test_perfect")
+    if passed:
+        with tv2_connect() as con:
+            count = int(con.execute("SELECT COUNT(*) FROM test_assignments WHERE profile_id=? AND status='finished' AND passed=1", (int(profile_id),)).fetchone()[0])
+        for threshold, level in ((3, 1), (7, 2), (15, 3)):
+            if count >= threshold and not tv2_has_achievement(profile_id, "test_growth", level):
+                db_achievement_award_add(profile_id, "📚", "Стабильное развитие",
+                                         f"Успешно пройдено не менее {threshold} тестов.",
+                                         awarded_by=None, level=level, achievement_key="test_growth")
+
+
+def tv2_attempts_summary(a: dict) -> dict:
+    with tv2_connect() as con:
+        rows = con.execute(
+            "SELECT attempt_no, score_percent, status, passed FROM test_assignments WHERE attempt_group=? ORDER BY attempt_no",
+            (a.get("attempt_group"),),
+        ).fetchall()
+    scores = [float(r[1]) for r in rows if r[1] is not None and r[2] == "finished"]
+    policy = a.get("scoring_policy") or "best"
+    final = None
+    if scores:
+        final = max(scores) if policy == "best" else (scores[-1] if policy == "last" else sum(scores) / len(scores))
+    return {"count": len(rows), "scores": scores, "final": final}
+
+
+def tv2_can_retry(a: dict) -> bool:
+    if a.get("status") not in ("finished", "expired"):
+        return False
+    return int(a.get("attempt_no") or 1) < int(a.get("max_attempts") or 1)
+
+
+def tv2_create_retry(aid: int, user_id: int | None) -> int | None:
+    a = tv2_get_assignment(aid)
+    if not a or not tv2_can_retry(a):
+        return None
+    return tv2_create_assignment(int(a["template_id"]), int(a["profile_id"]), user_id,
+                                 a.get("due_at"), a.get("time_limit_sec"),
+                                 int(a.get("attempt_no") or 1) + 1,
+                                 a.get("attempt_group"), int(aid))
+
+
+def tv2_my_tests(profile_id: int, status_filter: str = "all", page: int = 0):
+    where = "a.profile_id=?"
+    args = [int(profile_id)]
+    if status_filter == "new":
+        where += " AND a.status='assigned'"
+    elif status_filter == "progress":
+        where += " AND a.status IN ('in_progress','saved')"
+    elif status_filter == "done":
+        where += " AND a.status IN ('finished','needs_review')"
+    elif status_filter == "expired":
+        where += " AND a.status='expired'"
+    with tv2_connect() as con:
+        total = int(con.execute(f"SELECT COUNT(*) FROM test_assignments a WHERE {where}", args).fetchone()[0])
+        rows = con.execute(
+            f"""SELECT a.*, t.title, t.passing_score, t.max_attempts, t.test_mode
+                FROM test_assignments a JOIN test_templates t ON t.id=a.template_id
+                WHERE {where} ORDER BY a.assigned_at DESC LIMIT ? OFFSET ?""",
+            args + [TV2_MY_PAGE_SIZE, max(0, int(page)) * TV2_MY_PAGE_SIZE],
+        ).fetchall()
+    return [dict(r) for r in rows], total
+
+
+def tv2_result_text(aid: int) -> str:
+    a = tv2_get_assignment(aid)
+    if not a:
+        return "Тест не найден."
+    calc = tv2_calculate(aid, finalize=False)
+    lines = [f"📝 <b>{escape(a['title'])}</b>", ""]
+    if a.get("status") == "needs_review":
+        lines.append("⏳ <b>Ожидает проверки открытых ответов</b>")
+    else:
+        lines.append(f"Результат: <b>{calc['percent']:.0f}%</b>")
+        lines.append(f"Баллы: <b>{calc['earned']:.1f} из {calc['total']:.1f}</b>")
+        lines.append(f"Проходной балл: <b>{int(a.get('passing_score') or 70)}%</b>")
+        lines.append("Статус: " + ("✅ успешно пройден" if calc["passed"] else "❌ не пройден"))
+    summary = tv2_attempts_summary(a)
+    lines.append(f"Попытка: <b>{int(a.get('attempt_no') or 1)} из {int(a.get('max_attempts') or 1)}</b>")
+    if summary.get("final") is not None:
+        policy_names = {"best": "лучший", "last": "последний", "average": "средний"}
+        lines.append(f"Зачётный результат ({policy_names.get(a.get('scoring_policy'),'лучший')}): <b>{summary['final']:.0f}%</b>")
+    if a.get("reviewer_comment"):
+        lines.extend(["", "💬 <b>Комментарий руководителя</b>", escape(a["reviewer_comment"])])
+    return "\n".join(lines)
+
+
+def tv2_render_result_details(aid: int) -> str:
+    a = tv2_get_assignment(aid)
+    if not a:
+        return "Тест не найден."
+    mode = a.get("result_mode") or "errors"
+    base = tv2_result_text(aid)
+    if mode in ("score", "hidden") or a.get("status") == "needs_review":
+        return base
+    lines = [base, "", "<b>Разбор ответов</b>"]
+    for q in tv2_questions(int(a["template_id"])):
+        ans = tv2_answer(aid, int(q["id"]))
+        is_corr = ans.get("is_correct") if ans else None
+        if mode == "errors" and is_corr == 1:
+            continue
+        marker = "✅" if is_corr == 1 else ("❌" if is_corr == 0 else "⏳")
+        lines.append(f"\n{marker} <b>{int(q['idx'])}. {escape(q['question_text'])}</b>")
+        if ans:
+            payload = ans.get("answer") or {}
+            if q["q_type"] == "open":
+                lines.append(escape(str(payload.get("text") or "—")))
+            else:
+                selected = payload.get("selected") or []
+                names = [q.get("options", [])[i] for i in selected if 0 <= int(i) < len(q.get("options") or [])]
+                lines.append("Ответ: " + escape(", ".join(names) or "—"))
+        if q.get("explanation"):
+            lines.append("💡 " + escape(q["explanation"]))
+    return "\n".join(lines)[:4000]
+
+
+def tv2_kb_admin_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Создать тест", callback_data="help:testv2:create")],
+        [InlineKeyboardButton("🗂 Черновики и версии", callback_data="help:testv2:drafts:0")],
+        [InlineKeyboardButton("📚 Банк вопросов", callback_data="help:testv2:bank")],
+        [InlineKeyboardButton("👥 Назначить тест", callback_data="help:testv2:assign")],
+        [InlineKeyboardButton("🧑‍🏫 Проверить открытые ответы", callback_data="help:testv2:review")],
+        [InlineKeyboardButton("📊 Результаты и аналитика", callback_data="help:testv2:analytics")],
+        [InlineKeyboardButton("⌛ Просроченные", callback_data="help:testv2:overdue")],
+        [InlineKeyboardButton("🏢 Отделы сотрудников", callback_data="help:testv2:departments:0")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
+
+def tv2_kb_cancel(back: str = "help:testv2:admin"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data=back)]])
+
+
+def tv2_kb_drafts(page: int = 0):
+    items = tv2_list_templates(published=None, limit=200)
+    total_pages = max(1, (len(items) + TV2_ADMIN_PAGE_SIZE - 1) // TV2_ADMIN_PAGE_SIZE)
+    page = max(0, min(int(page), total_pages - 1))
+    chunk = items[page * TV2_ADMIN_PAGE_SIZE:(page + 1) * TV2_ADMIN_PAGE_SIZE]
+    rows = []
+    for t in chunk:
+        icon = "🔒" if int(t.get("is_published") or 0) else "✏️"
+        label = f"{icon} {t['title']} · v{int(t.get('version') or 1)}"
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"help:testv2:template:{int(t['id'])}")])
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("◀️", callback_data=f"help:testv2:drafts:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+    if page + 1 < total_pages: nav.append(InlineKeyboardButton("▶️", callback_data=f"help:testv2:drafts:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:testv2:admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tv2_template_text(tid: int) -> str:
+    t = tv2_get_template(tid)
+    if not t: return "Шаблон не найден."
+    qs = tv2_questions(tid)
+    mode = {"learning": "📚 Обучение", "exam": "🎓 Аттестация", "custom": "⚙️ Свой"}.get(t.get("test_mode"), t.get("test_mode"))
+    result_mode = {"score": "только балл", "errors": "ошибки", "all": "все ответы", "hidden": "скрыто"}.get(t.get("result_mode"), t.get("result_mode"))
+    return (
+        f"📝 <b>{escape(t['title'])}</b>\n"
+        f"Версия: <b>{int(t.get('version') or 1)}</b> · {'опубликована' if int(t.get('is_published') or 0) else 'черновик'}\n\n"
+        f"Режим: <b>{escape(str(mode))}</b>\n"
+        f"Вопросов: <b>{len(qs)}</b>\n"
+        f"Проходной балл: <b>{int(t.get('passing_score') or 70)}%</b>\n"
+        f"Попыток: <b>{int(t.get('max_attempts') or 1)}</b>\n"
+        f"Зачёт: <b>{escape(str(t.get('scoring_policy') or 'best'))}</b>\n"
+        f"Показывать результат: <b>{escape(str(result_mode))}</b>\n"
+        f"Перемешивать вопросы: <b>{'да' if int(t.get('shuffle_questions') or 0) else 'нет'}</b>\n"
+        f"Перемешивать варианты: <b>{'да' if int(t.get('shuffle_options') or 0) else 'нет'}</b>\n"
+        f"Назад/пропуск: <b>{'да' if int(t.get('allow_back') or 0) else 'нет'} / {'да' if int(t.get('allow_skip') or 0) else 'нет'}</b>"
+    )
+
+
+def tv2_kb_template(tid: int):
+    t = tv2_get_template(tid) or {}
+    rows = [[InlineKeyboardButton("👁 Предпросмотр", callback_data=f"help:testv2:preview:{tid}")]]
+    if not int(t.get("is_published") or 0):
+        rows += [
+            [InlineKeyboardButton("➕ Добавить вопрос", callback_data=f"help:testv2:qadd:{tid}")],
+            [InlineKeyboardButton("📚 Добавить из банка", callback_data=f"help:testv2:bankpick:{tid}:0")],
+            [InlineKeyboardButton("🎲 Добавить 10 случайных", callback_data=f"help:testv2:bankrandom:{tid}")],
+            [InlineKeyboardButton("✏️ Редактор вопросов", callback_data=f"help:testv2:qeditlist:{tid}:0")],
+            [InlineKeyboardButton("⚙️ Настройки теста", callback_data=f"help:testv2:settings:{tid}")],
+            [InlineKeyboardButton("🔒 Опубликовать версию", callback_data=f"help:testv2:publishconfirm:{tid}")],
+            [InlineKeyboardButton("🗑 Удалить черновик", callback_data=f"help:testv2:templatedeleteconfirm:{tid}")],
+        ]
+    rows += [
+        [InlineKeyboardButton("👥 Назначить", callback_data=f"help:testv2:assign_template:{tid}")],
+        [InlineKeyboardButton("📊 Аналитика", callback_data=f"help:testv2:analytic:{tid}")],
+        [InlineKeyboardButton("⬅️ К шаблонам", callback_data="help:testv2:drafts:0")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def tv2_kb_settings(tid: int):
+    t = tv2_get_template(tid) or {}
+    def yn(v): return "✅" if int(v or 0) else "❌"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Режим: {t.get('test_mode','exam')}", callback_data=f"help:testv2:set:mode:{tid}")],
+        [InlineKeyboardButton(f"Проходной: {int(t.get('passing_score') or 70)}%", callback_data=f"help:testv2:set:passing:{tid}")],
+        [InlineKeyboardButton(f"Попыток: {int(t.get('max_attempts') or 1)}", callback_data=f"help:testv2:set:attempts:{tid}")],
+        [InlineKeyboardButton(f"Зачёт: {t.get('scoring_policy','best')}", callback_data=f"help:testv2:set:policy:{tid}")],
+        [InlineKeyboardButton(f"Результаты: {t.get('result_mode','errors')}", callback_data=f"help:testv2:set:result:{tid}")],
+        [InlineKeyboardButton(f"{yn(t.get('shuffle_questions'))} Перемешивать вопросы", callback_data=f"help:testv2:toggle:shuffleq:{tid}")],
+        [InlineKeyboardButton(f"{yn(t.get('shuffle_options'))} Перемешивать варианты", callback_data=f"help:testv2:toggle:shuffleo:{tid}")],
+        [InlineKeyboardButton(f"{yn(t.get('allow_back'))} Разрешить назад", callback_data=f"help:testv2:toggle:back:{tid}")],
+        [InlineKeyboardButton(f"{yn(t.get('allow_skip'))} Разрешить пропуск", callback_data=f"help:testv2:toggle:skip:{tid}")],
+        [InlineKeyboardButton(f"{yn(t.get('immediate_feedback'))} Мгновенная обратная связь", callback_data=f"help:testv2:toggle:feedback:{tid}")],
+        [InlineKeyboardButton("⏱ Время после запуска", callback_data=f"help:testv2:set:time:{tid}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"help:testv2:template:{tid}")],
+    ])
+
+
+def tv2_kb_question_list(tid: int, page: int = 0):
+    qs = tv2_questions(tid)
+    total_pages = max(1, (len(qs) + TV2_ADMIN_PAGE_SIZE - 1)//TV2_ADMIN_PAGE_SIZE)
+    page = max(0, min(page, total_pages-1))
+    rows=[]
+    for q in qs[page*TV2_ADMIN_PAGE_SIZE:(page+1)*TV2_ADMIN_PAGE_SIZE]:
+        rows.append([InlineKeyboardButton(f"{q['idx']}. {q['question_text'][:45]}", callback_data=f"help:testv2:qedit:{int(q['id'])}")])
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton("◀️", callback_data=f"help:testv2:qeditlist:{tid}:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+    if page+1<total_pages: nav.append(InlineKeyboardButton("▶️", callback_data=f"help:testv2:qeditlist:{tid}:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"help:testv2:template:{tid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tv2_question_text(q: dict) -> str:
+    opts = q.get("options") or []
+    correct = set(int(x) for x in (q.get("correct") or []))
+    lines=[f"❓ <b>{int(q['idx'])}. {escape(q['question_text'])}</b>",
+           f"Тип: <b>{escape(q['q_type'])}</b> · Баллы: <b>{float(q.get('points') or 1):g}</b>"]
+    for i,opt in enumerate(opts):
+        lines.append(f"{'✅' if i in correct else '▫️'} {i+1}. {escape(opt)}")
+    if q.get("explanation"): lines.extend(["", "💡 "+escape(q["explanation"])])
+    return "\n".join(lines)
+
+
+def tv2_kb_question_edit(q: dict):
+    qid=int(q["id"]); tid=int(q["template_id"])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Текст", callback_data=f"help:testv2:qfield:text:{qid}"), InlineKeyboardButton("⭐ Баллы", callback_data=f"help:testv2:qfield:points:{qid}")],
+        [InlineKeyboardButton("📋 Варианты", callback_data=f"help:testv2:qfield:options:{qid}"), InlineKeyboardButton("✅ Правильный", callback_data=f"help:testv2:qfield:correct:{qid}")],
+        [InlineKeyboardButton("💡 Пояснение", callback_data=f"help:testv2:qfield:explanation:{qid}")],
+        [InlineKeyboardButton("⬆️", callback_data=f"help:testv2:qmove:{qid}:-1"), InlineKeyboardButton("⬇️", callback_data=f"help:testv2:qmove:{qid}:1")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f"help:testv2:qdeleteconfirm:{qid}")],
+        [InlineKeyboardButton("⬅️ К вопросам", callback_data=f"help:testv2:qeditlist:{tid}:0")],
+    ])
+
+
+def tv2_kb_my(profile_id: int, status_filter: str = "all", page: int = 0):
+    items,total=tv2_my_tests(profile_id,status_filter,page)
+    rows=[
+        [InlineKeyboardButton("🔴 Новые", callback_data="help:testv2:my:new:0"), InlineKeyboardButton("🟡 В процессе", callback_data="help:testv2:my:progress:0")],
+        [InlineKeyboardButton("🟢 История", callback_data="help:testv2:my:done:0"), InlineKeyboardButton("⌛ Истекли", callback_data="help:testv2:my:expired:0")],
+    ]
+    labels={"assigned":"▶️","in_progress":"⏳","saved":"💾","finished":"✅","needs_review":"🧑‍🏫","expired":"⌛","canceled":"❌"}
+    for a in items:
+        score = f" · {float(a['score_percent']):.0f}%" if a.get("score_percent") is not None else ""
+        rows.append([InlineKeyboardButton(f"{labels.get(a['status'],'📝')} {a['title']}{score}"[:60], callback_data=f"help:testv2:myopen:{int(a['id'])}")])
+    pages=max(1,(total+TV2_MY_PAGE_SIZE-1)//TV2_MY_PAGE_SIZE)
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton("◀️",callback_data=f"help:testv2:my:{status_filter}:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="noop"))
+    if page+1<pages: nav.append(InlineKeyboardButton("▶️",callback_data=f"help:testv2:my:{status_filter}:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("⬅️ В мой кабинет",callback_data="help:me")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tv2_my_open_text(a: dict) -> str:
+    status_names={"assigned":"не начат","in_progress":"в процессе","saved":"сохранён","finished":"завершён","needs_review":"ожидает проверки","expired":"просрочен","canceled":"отменён"}
+    qcount=len(tv2_questions(int(a["template_id"])))
+    duration=f"{int(a['time_limit_sec'])//60} мин." if a.get("time_limit_sec") else "без ограничения"
+    text=(f"📝 <b>{escape(a['title'])}</b>\n\n"
+          f"Статус: <b>{status_names.get(a['status'],a['status'])}</b>\n"
+          f"Вопросов: <b>{qcount}</b>\n"
+          f"Время после запуска: <b>{duration}</b>\n"
+          f"Пройти до: <b>{escape(tv2_fmt_dt(a.get('due_at')))}</b>\n"
+          f"Проходной балл: <b>{int(a.get('passing_score') or 70)}%</b>\n"
+          f"Попытка: <b>{int(a.get('attempt_no') or 1)} из {int(a.get('max_attempts') or 1)}</b>")
+    if a.get("status") in ("finished","needs_review"):
+        text += "\n\n" + tv2_result_text(int(a["id"]))
+    return text
+
+
+def tv2_kb_my_open(a: dict):
+    aid=int(a["id"]); rows=[]
+    if a["status"]=="assigned": rows.append([InlineKeyboardButton("▶️ Начать",callback_data=f"test:v2:start:{aid}")])
+    elif a["status"] in ("in_progress","saved"): rows.append([InlineKeyboardButton("⏳ Продолжить",callback_data=f"test:v2:continue:{aid}")])
+    if a["status"] in ("finished","needs_review"):
+        rows.append([InlineKeyboardButton("📊 Результат",callback_data=f"help:testv2:result:{aid}")])
+    if tv2_can_retry(a): rows.append([InlineKeyboardButton("🔄 Повторить",callback_data=f"test:v2:retry:{aid}")])
+    rows.append([InlineKeyboardButton("⬅️ К моим тестам",callback_data="help:testv2:my:all:0")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tv2_question_display(a: dict, q: dict, position: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    order=tv2_assignment_order(a); aid=int(a["id"]); qid=int(q["id"])
+    remaining=""
+    if a.get("deadline_at"):
+        try:
+            sec=max(0,int((datetime.fromisoformat(a["deadline_at"])-datetime.utcnow()).total_seconds()))
+            remaining=f" · ⏱ {sec//60:02d}:{sec%60:02d}"
+        except Exception: pass
+    flags=set(int(x) for x in _safe_json_loads(a.get("flagged_json"),[]))
+    text=f"📝 <b>{escape(a['title'])}</b>\nВопрос <b>{position+1} из {len(order)}</b>{remaining}\n\n<b>{escape(q['question_text'])}</b>"
+    if q["q_type"]=="open":
+        text += "\n\nОтправьте ответ следующим сообщением."
+        rows=[]
+    else:
+        rows=[]
+        option_order=_safe_json_loads(a.get("option_order_json"),{}).get(str(qid),list(range(len(q.get("options") or []))))
+        selected=set((context_selected := []))
+        # Current multi selection is read in callback renderer; default empty here.
+        for original_idx in option_order:
+            if 0 <= int(original_idx) < len(q.get("options") or []):
+                label=q["options"][int(original_idx)]
+                if q["q_type"]=="single":
+                    rows.append([InlineKeyboardButton(label[:60],callback_data=f"test:v2:single:{aid}:{qid}:{int(original_idx)}")])
+                else:
+                    rows.append([InlineKeyboardButton("▫️ "+label[:55],callback_data=f"test:v2:toggle:{aid}:{qid}:{int(original_idx)}")])
+        if q["q_type"]=="multi": rows.append([InlineKeyboardButton("✅ Сохранить ответ",callback_data=f"test:v2:multisubmit:{aid}:{qid}")])
+    nav=[]
+    if int(a.get("allow_back") or 0) and position>0: nav.append(InlineKeyboardButton("◀️ Назад",callback_data=f"test:v2:goto:{aid}:{position-1}"))
+    nav.append(InlineKeyboardButton("🚩" if qid in flags else "🏳️",callback_data=f"test:v2:flag:{aid}:{qid}"))
+    if int(a.get("allow_skip") or 0) and position+1<len(order): nav.append(InlineKeyboardButton("Пропустить ▶️",callback_data=f"test:v2:goto:{aid}:{position+1}"))
+    if nav: rows.append(nav)
+    rows.append([InlineKeyboardButton("📋 Проверить ответы",callback_data=f"test:v2:reviewpage:{aid}")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def tv2_send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, aid: int, position: int | None = None):
+    a=tv2_get_assignment(aid)
+    if not a: return
+    if tv2_is_expired(a):
+        tv2_mark_expired(aid)
+        await context.bot.send_message(update.effective_user.id,"⌛ Время или срок прохождения теста истёк.")
+        return
+    order=tv2_assignment_order(a)
+    if position is None: position=int(a.get("current_idx") or 0)
+    position=max(0,min(int(position),max(0,len(order)-1)))
+    tv2_set_current(aid,position)
+    q=tv2_question_by_id(order[position]) if order else None
+    if not q:
+        await context.bot.send_message(update.effective_user.id,"В тесте нет вопросов.")
+        return
+    context.user_data[TV2_ACTIVE_ASSIGNMENT]=aid
+    if q["q_type"]=="open":
+        tv2_set_state(context,"open_answer",assignment_id=aid,question_id=int(q["id"]),position=position)
+    else:
+        context.user_data.pop(TV2_STATE, None)
+        context.user_data.pop(TV2_DATA, None)
+    text,kb=tv2_question_display(tv2_get_assignment(aid),q,position)
+    cq=update.callback_query
+    if cq:
+        try:
+            await cq.edit_message_text(text,parse_mode=ParseMode.HTML,reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await context.bot.send_message(update.effective_user.id,text,parse_mode=ParseMode.HTML,reply_markup=kb)
+
+
+def tv2_review_page_text(aid: int) -> tuple[str, InlineKeyboardMarkup]:
+    a=tv2_get_assignment(aid); order=tv2_assignment_order(a or {})
+    flags=set(int(x) for x in _safe_json_loads((a or {}).get("flagged_json"),[]))
+    answered=[]; missing=[]
+    rows=[]
+    for pos,qid in enumerate(order):
+        ans=tv2_answer(aid,qid)
+        if ans: answered.append(qid)
+        else: missing.append(qid)
+        marker="🚩" if qid in flags else ("✅" if ans else "⚪")
+        rows.append([InlineKeyboardButton(f"{marker} Вопрос {pos+1}",callback_data=f"test:v2:goto:{aid}:{pos}")])
+    text=(f"📋 <b>Проверка ответов</b>\n\n"
+          f"✅ Отвечено: <b>{len(answered)}</b>\n"
+          f"⚪ Без ответа: <b>{len(missing)}</b>\n"
+          f"🚩 Отмечено: <b>{len(flags)}</b>")
+    rows.append([InlineKeyboardButton("✅ Завершить тест",callback_data=f"test:v2:finishconfirm:{aid}")])
+    return text,InlineKeyboardMarkup(rows)
+
+
+def tv2_admin_review_list():
+    with tv2_connect() as con:
+        rows=con.execute("""SELECT a.id,t.title,p.full_name,a.finished_at
+                            FROM test_assignments a JOIN test_templates t ON t.id=a.template_id
+                            JOIN profiles p ON p.id=a.profile_id
+                            WHERE a.status='needs_review' ORDER BY a.finished_at""").fetchall()
+    return [dict(r) for r in rows]
+
+
+def tv2_analytics(tid: int) -> dict:
+    t=tv2_get_template(tid) or {}
+    root=int(t.get("parent_template_id") or tid)
+    with tv2_connect() as con:
+        row=con.execute("""SELECT COUNT(*),
+                            SUM(CASE WHEN a.status!='assigned' THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN a.status IN ('finished','needs_review') THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN a.status='expired' THEN 1 ELSE 0 END),
+                            AVG(CASE WHEN a.status='finished' THEN a.score_percent END),
+                            SUM(CASE WHEN a.passed=1 THEN 1 ELSE 0 END)
+                            FROM test_assignments a JOIN test_templates t ON t.id=a.template_id
+                            WHERE t.id=? OR t.parent_template_id=?""",(root,root)).fetchone()
+        hard=con.execute("""SELECT q.question_text,
+                            AVG(CASE WHEN ans.is_correct=1 THEN 1.0 ELSE 0.0 END) rate,
+                            COUNT(ans.id) cnt
+                            FROM test_questions q JOIN test_templates t ON t.id=q.template_id
+                            LEFT JOIN test_answers ans ON ans.question_id=q.id
+                            WHERE (t.id=? OR t.parent_template_id=?) AND q.q_type!='open'
+                            GROUP BY q.id HAVING cnt>0 ORDER BY rate ASC LIMIT 5""",(root,root)).fetchall()
+    return {"assigned":int(row[0] or 0),"started":int(row[1] or 0),"completed":int(row[2] or 0),
+            "expired":int(row[3] or 0),"avg":float(row[4] or 0),"passed":int(row[5] or 0),
+            "hard":[(str(r[0]),float(r[1] or 0),int(r[2] or 0)) for r in hard]}
+
+
+async def tv2_notify_assignment(context, aid: int):
+    a=tv2_get_assignment(aid)
+    if not a or not a.get("tg_user_id"): return False
+    text=(f"📝 Вам назначен тест: <b>{escape(a['title'])}</b>\n"
+          f"⏱ После запуска: <b>{int(a['time_limit_sec'])//60 if a.get('time_limit_sec') else 'без ограничения'}"
+          f"{' минут' if a.get('time_limit_sec') else ''}</b>\n"
+          f"📅 Пройти до: <b>{escape(tv2_fmt_dt(a.get('due_at')))}</b>\n"
+          f"🎯 Проходной балл: <b>{int(a.get('passing_score') or 70)}%</b>")
+    try:
+        await context.bot.send_message(int(a["tg_user_id"]),text,parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Открыть тест",callback_data=f"help:testv2:myopen:{aid}")]]))
+        return True
+    except Exception:
+        return False
+
+
+async def tv2_send_reminders(context):
+    now=datetime.utcnow(); soon24=(now+timedelta(hours=24)).isoformat(); soon2=(now+timedelta(hours=2)).isoformat()
+    with tv2_connect() as con:
+        rows=con.execute("""SELECT a.id,a.due_at,a.reminder_24_sent,a.reminder_2_sent,a.overdue_notice_sent,
+                                   p.tg_user_id,t.title,a.status
+                            FROM test_assignments a JOIN profiles p ON p.id=a.profile_id
+                            JOIN test_templates t ON t.id=a.template_id
+                            WHERE a.status IN ('assigned','in_progress','saved') AND a.due_at IS NOT NULL""").fetchall()
+    for r in rows:
+        aid=int(r[0]); due=r[1]; uid=r[5]
+        if not uid: continue
+        try: due_dt=datetime.fromisoformat(due)
+        except Exception: continue
+        remaining=(due_dt-now).total_seconds()
+        flag=None; text=None
+        if remaining<=0 and not int(r[4] or 0):
+            tv2_mark_expired(aid); flag="overdue_notice_sent"; text=f"⌛ Срок теста «{r[6]}» истёк."
+        elif remaining<=7200 and not int(r[3] or 0):
+            flag="reminder_2_sent"; text=f"⏰ До срока теста «{r[6]}» осталось менее 2 часов."
+        elif remaining<=86400 and not int(r[2] or 0):
+            flag="reminder_24_sent"; text=f"⏰ До срока теста «{r[6]}» осталось менее суток."
+        if text and flag:
+            try:
+                await context.bot.send_message(int(uid),text,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Открыть",callback_data=f"help:testv2:myopen:{aid}")]]))
+                with tv2_connect() as con: con.execute(f"UPDATE test_assignments SET {flag}=1 WHERE id=?",(aid,))
+            except Exception: pass
+
+
+async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
+    await _tv2_legacy_check_and_send_jobs(context)
+    try:
+        await tv2_send_reminders(context)
+    except Exception as e:
+        logger.exception("TEST V2 reminder error: %s",e)
+
+
+async def tv2_admin_guard(update, context) -> bool:
+    if not await is_admin_scoped(update,context):
+        try: await update.callback_query.answer("Только для администратора",show_alert=True)
+        except Exception: pass
+        return False
+    return True
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data=(update.callback_query.data or "") if update.callback_query else ""
+    if data=="help:settings:test": data="help:testv2:admin"
+    if data=="help:me:tests": data="help:testv2:my:all:0"
+    if not data.startswith("help:testv2:"):
+        return await _tv2_legacy_cb_help(update,context)
+    q=update.callback_query
+    try: await q.answer()
+    except Exception: pass
+    await sync_profile_user_id_from_update(update)
+
+    if data=="help:testv2:admin":
+        if not await tv2_admin_guard(update,context): return
+        tv2_clear(context)
+        await q.edit_message_text("📝 <b>Тестирование 2.0</b>\n\nСоздание, версии, банк вопросов, проверки, аналитика и напоминания.",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_admin_menu())
+        return
+
+    if data.startswith("help:testv2:departments:"):
+        if not await tv2_admin_guard(update,context): return
+        page=int(data.rsplit(":",1)[-1]); people=db_profiles_list(); pages=max(1,(len(people)+7)//8); page=max(0,min(page,pages-1)); rows=[]
+        with tv2_connect() as con:
+            depmap={int(r[0]):(r[1] or "—") for r in con.execute("SELECT id,department FROM profiles").fetchall()}
+        for pid,name in people[page*8:(page+1)*8]:
+            rows.append([InlineKeyboardButton(f"{name[:38]} · {str(depmap.get(int(pid),'—'))[:18]}",callback_data=f"help:testv2:departmentprofile:{int(pid)}:{page}")])
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("◀️",callback_data=f"help:testv2:departments:{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="noop"))
+        if page+1<pages: nav.append(InlineKeyboardButton("▶️",callback_data=f"help:testv2:departments:{page+1}"))
+        rows.append(nav); rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:admin")])
+        await q.edit_message_text("🏢 <b>Отделы сотрудников</b>\n\nВыберите сотрудника, чтобы указать отдел.",parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:departmentprofile:"):
+        parts=data.split(":"); pid=int(parts[-2]); page=int(parts[-1]); p=db_profiles_get(pid)
+        if not p: await q.answer("Анкета не найдена",show_alert=True); return
+        tv2_set_state(context,"profile_department",profile_id=pid,page=page)
+        with tv2_connect() as con:
+            row=con.execute("SELECT COALESCE(department,'') FROM profiles WHERE id=?",(pid,)).fetchone()
+        await q.edit_message_text(f"🏢 <b>{escape(p['full_name'])}</b>\nТекущий отдел: <b>{escape((row[0] if row else '') or '—')}</b>\n\nВведите название отдела или '-' чтобы очистить.",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_cancel(f"help:testv2:departments:{page}")); return
+
+    if data.startswith("help:testv2:my:"):
+        profile=get_profile_for_user(update)
+        if not profile:
+            await q.answer("Анкета не найдена",show_alert=True); return
+        parts=data.split(":"); filt=parts[3] if len(parts)>3 else "all"; page=int(parts[4]) if len(parts)>4 else 0
+        items,total=tv2_my_tests(int(profile["id"]),filt,page)
+        counts={}
+        for key in ("new","progress","done","expired"):
+            counts[key]=tv2_my_tests(int(profile["id"]),key,0)[1]
+        text=("📝 <b>Мои тесты</b>\n\n"
+              f"🔴 Новые: <b>{counts['new']}</b>\n🟡 В процессе: <b>{counts['progress']}</b>\n"
+              f"🟢 Завершены: <b>{counts['done']}</b>\n⌛ Истекли: <b>{counts['expired']}</b>")
+        await q.edit_message_text(text,parse_mode=ParseMode.HTML,reply_markup=tv2_kb_my(int(profile["id"]),filt,page))
+        return
+
+    if data.startswith("help:testv2:myopen:"):
+        aid=int(data.rsplit(":",1)[-1]); a=tv2_get_assignment(aid); p=get_profile_for_user(update)
+        if not a or not p or int(a["profile_id"])!=int(p["id"]): await q.answer("Тест не найден",show_alert=True); return
+        await q.edit_message_text(tv2_my_open_text(a),parse_mode=ParseMode.HTML,reply_markup=tv2_kb_my_open(a))
+        return
+
+    if data.startswith("help:testv2:result:"):
+        aid=int(data.rsplit(":",1)[-1]); a=tv2_get_assignment(aid); p=get_profile_for_user(update)
+        if not a or (not await is_admin_scoped(update,context) and (not p or int(a["profile_id"])!=int(p["id"]))): return
+        is_admin = await is_admin_scoped(update, context)
+        rows=[]
+        if is_admin:
+            rows.append([InlineKeyboardButton("🗑 Удалить результат",callback_data=f"help:testv2:resultdeleteconfirm:{aid}")])
+            rows.append([InlineKeyboardButton("⬅️ К аналитике",callback_data="help:testv2:analytics")])
+        else:
+            rows.append([InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:myopen:{aid}")])
+        await q.edit_message_text(tv2_render_result_details(aid),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if not await tv2_admin_guard(update,context): return
+
+    if data=="help:testv2:create":
+        tv2_set_state(context,"create_title")
+        await q.edit_message_text("➕ <b>Новый тест</b>\n\nВведите название теста.",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_cancel())
+        return
+
+    if data.startswith("help:testv2:createmode:"):
+        mode=data.rsplit(":",1)[-1]; d=context.user_data.get(TV2_DATA) or {}; title=d.get("title")
+        tid=tv2_create_template(title,update.effective_user.id,mode); tv2_clear(context)
+        await q.edit_message_text(tv2_template_text(tid),parse_mode=ParseMode.HTML,reply_markup=tv2_kb_template(tid))
+        return
+
+    if data.startswith("help:testv2:drafts:"):
+        page=int(data.rsplit(":",1)[-1]); await q.edit_message_text("🗂 <b>Шаблоны и опубликованные версии</b>",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_drafts(page)); return
+
+    if data.startswith("help:testv2:template:"):
+        tid=int(data.rsplit(":",1)[-1]); await q.edit_message_text(tv2_template_text(tid),parse_mode=ParseMode.HTML,reply_markup=tv2_kb_template(tid)); return
+
+    if data.startswith("help:testv2:preview:"):
+        tid=int(data.rsplit(":",1)[-1]); qs=tv2_questions(tid); lines=[tv2_template_text(tid),"","<b>Предпросмотр вопросов</b>"]
+        for x in qs[:20]: lines.append(f"\n{x['idx']}. {escape(x['question_text'])} · {float(x.get('points') or 1):g} б.")
+        await q.edit_message_text("\n".join(lines)[:4000],parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:template:{tid}")]])); return
+
+    if data.startswith("help:testv2:qadd:"):
+        tid=int(data.rsplit(":",1)[-1]); context.user_data[TV2_DATA]={"template_id":tid,"target":"template"}
+        await q.edit_message_text("Выберите тип вопроса:",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Открытый",callback_data="help:testv2:qtype:open")],
+            [InlineKeyboardButton("🔘 Один вариант",callback_data="help:testv2:qtype:single")],
+            [InlineKeyboardButton("☑️ Несколько вариантов",callback_data="help:testv2:qtype:multi")],
+            [InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:template:{tid}")],])); return
+
+    if data.startswith("help:testv2:qtype:"):
+        qtype=data.rsplit(":",1)[-1]; d=context.user_data.get(TV2_DATA) or {}; d["q_type"]=qtype; context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="q_text"
+        await q.edit_message_text("Введите текст вопроса:",reply_markup=tv2_kb_cancel(f"help:testv2:template:{d.get('template_id',0)}")); return
+
+    if data.startswith("help:testv2:qeditlist:"):
+        parts=data.split(":"); tid=int(parts[-2]); page=int(parts[-1]); await q.edit_message_text("✏️ <b>Редактор вопросов</b>",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_question_list(tid,page)); return
+
+    if data.startswith("help:testv2:qedit:"):
+        qid=int(data.rsplit(":",1)[-1]); qq=tv2_question_by_id(qid)
+        if qq: await q.edit_message_text(tv2_question_text(qq),parse_mode=ParseMode.HTML,reply_markup=tv2_kb_question_edit(qq))
+        return
+
+    if data.startswith("help:testv2:qfield:"):
+        parts=data.split(":"); field=parts[-2]; qid=int(parts[-1]); qq=tv2_question_by_id(qid)
+        state_map={"text":"edit_q_text","points":"edit_q_points","options":"edit_q_options","correct":"edit_q_correct","explanation":"edit_q_explanation"}
+        tv2_set_state(context,state_map[field],question_id=qid,template_id=int(qq["template_id"]))
+        prompts={"text":"Введите новый текст вопроса:","points":"Введите количество баллов, например 1 или 2.5:","options":"Введите варианты, каждый с новой строки:","correct":"Введите номера правильных вариантов через запятую:","explanation":"Введите пояснение или '-' для очистки:"}
+        await q.edit_message_text(prompts[field],reply_markup=tv2_kb_cancel(f"help:testv2:qedit:{qid}")); return
+
+    if data.startswith("help:testv2:qmove:"):
+        parts=data.split(":"); qid=int(parts[-2]); delta=int(parts[-1]); tv2_move_question(qid,delta); qq=tv2_question_by_id(qid)
+        await q.edit_message_text(tv2_question_text(qq),parse_mode=ParseMode.HTML,reply_markup=tv2_kb_question_edit(qq)); return
+
+    if data.startswith("help:testv2:qdeleteconfirm:"):
+        qid=int(data.rsplit(":",1)[-1]); qq=tv2_question_by_id(qid)
+        await q.edit_message_text("⚠️ Удалить вопрос? Это действие нельзя отменить.",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Да, удалить",callback_data=f"help:testv2:qdelete:{qid}")],
+            [InlineKeyboardButton("Отмена",callback_data=f"help:testv2:qedit:{qid}")],])); return
+
+    if data.startswith("help:testv2:qdelete:"):
+        qid=int(data.rsplit(":",1)[-1]); qq=tv2_question_by_id(qid); tid=int(qq["template_id"]); tv2_delete_question(qid)
+        await q.edit_message_text("Вопрос удалён.",reply_markup=tv2_kb_question_list(tid,0)); return
+
+    if data.startswith("help:testv2:settings:"):
+        tid=int(data.rsplit(":",1)[-1]); await q.edit_message_text("⚙️ <b>Настройки теста</b>",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_settings(tid)); return
+
+    if data.startswith("help:testv2:toggle:"):
+        parts=data.split(":"); key=parts[-2]; tid=int(parts[-1]); col={"shuffleq":"shuffle_questions","shuffleo":"shuffle_options","back":"allow_back","skip":"allow_skip","feedback":"immediate_feedback"}[key]
+        with tv2_connect() as con: con.execute(f"UPDATE test_templates SET {col}=CASE WHEN COALESCE({col},0)=1 THEN 0 ELSE 1 END, updated_at=? WHERE id=?",(datetime.utcnow().isoformat(),tid))
+        await q.edit_message_text("⚙️ <b>Настройки теста</b>",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_settings(tid)); return
+
+    if data.startswith("help:testv2:set:"):
+        parts=data.split(":"); setting=parts[-2]; tid=int(parts[-1])
+        choices={
+            "mode":[("📚 Обучение","learning"),("🎓 Аттестация","exam"),("⚙️ Свой","custom")],
+            "passing":[("60%","60"),("70%","70"),("80%","80"),("90%","90"),("✍️ Ввести","custom")],
+            "attempts":[("1","1"),("2","2"),("3","3"),("Без ограничений","99")],
+            "policy":[("Лучший","best"),("Последний","last"),("Средний","average")],
+            "result":[("Только балл","score"),("Ошибки","errors"),("Все ответы","all"),("Скрыть","hidden")],
+            "time":[("Без ограничения","0"),("10 минут","600"),("20 минут","1200"),("30 минут","1800"),("✍️ Ввести","custom")],
+        }
+        rows=[]
+        for label,val in choices[setting]: rows.append([InlineKeyboardButton(label,callback_data=f"help:testv2:setvalue:{setting}:{tid}:{val}")])
+        rows.append([InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:settings:{tid}")])
+        await q.edit_message_text("Выберите значение:",reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:setvalue:"):
+        parts=data.split(":"); setting=parts[-3]; tid=int(parts[-2]); val=parts[-1]
+        if val=="custom":
+            tv2_set_state(context,f"custom_{setting}",template_id=tid)
+            prompt="Введите число:" if setting!="time" else "Введите длительность в минутах:"
+            await q.edit_message_text(prompt,reply_markup=tv2_kb_cancel(f"help:testv2:settings:{tid}")); return
+        col={"mode":"test_mode","passing":"passing_score","attempts":"max_attempts","policy":"scoring_policy","result":"result_mode","time":"default_time_limit_sec"}[setting]
+        value=int(val) if setting in ("passing","attempts","time") else val
+        with tv2_connect() as con:
+            con.execute(f"UPDATE test_templates SET {col}=?, updated_at=? WHERE id=?",(value,datetime.utcnow().isoformat(),tid))
+            if setting=="mode" and val in ("learning","exam"):
+                cfg=tv2_template_defaults(val)
+                con.execute("""UPDATE test_templates SET passing_score=?,max_attempts=?,scoring_policy=?,result_mode=?,
+                               shuffle_questions=?,shuffle_options=?,allow_back=?,allow_skip=?,immediate_feedback=? WHERE id=?""",
+                            (cfg["passing_score"],cfg["max_attempts"],cfg["scoring_policy"],cfg["result_mode"],cfg["shuffle_questions"],cfg["shuffle_options"],cfg["allow_back"],cfg["allow_skip"],cfg["immediate_feedback"],tid))
+        await q.edit_message_text("⚙️ <b>Настройки теста</b>",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_settings(tid)); return
+
+    if data.startswith("help:testv2:publishconfirm:"):
+        tid=int(data.rsplit(":",1)[-1]); await q.edit_message_text("🔒 Опубликовать неизменяемую версию теста?",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Опубликовать",callback_data=f"help:testv2:publish:{tid}")],
+            [InlineKeyboardButton("Отмена",callback_data=f"help:testv2:template:{tid}")],])); return
+
+    if data.startswith("help:testv2:publish:"):
+        tid=int(data.rsplit(":",1)[-1]); pub=tv2_publish_template(tid,update.effective_user.id)
+        await q.edit_message_text("✅ Версия опубликована. Назначения будут ссылаться на неизменяемую копию.",reply_markup=tv2_kb_template(pub)); return
+
+    if data.startswith("help:testv2:templatedeleteconfirm:"):
+        tid=int(data.rsplit(":",1)[-1])
+        await q.edit_message_text("⚠️ Удалить черновик и все его вопросы? Это действие нельзя отменить.",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Да, удалить",callback_data=f"help:testv2:templatedelete:{tid}")],
+            [InlineKeyboardButton("Отмена",callback_data=f"help:testv2:template:{tid}")],
+        ])); return
+
+    if data.startswith("help:testv2:templatedelete:"):
+        tid=int(data.rsplit(":",1)[-1])
+        with tv2_connect() as con:
+            has_assign=con.execute("SELECT 1 FROM test_assignments WHERE template_id=? LIMIT 1",(tid,)).fetchone()
+            if has_assign:
+                con.execute("UPDATE test_templates SET is_draft_visible=0 WHERE id=?",(tid,))
+            else:
+                con.execute("DELETE FROM test_questions WHERE template_id=?",(tid,)); con.execute("DELETE FROM test_templates WHERE id=?",(tid,))
+        await q.edit_message_text("✅ Черновик удалён из списка.",reply_markup=tv2_kb_drafts(0)); return
+
+    if data.startswith("help:testv2:resultdeleteconfirm:"):
+        aid=int(data.rsplit(":",1)[-1])
+        await q.edit_message_text("⚠️ Удалить результат теста и все ответы сотрудника?",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Да, удалить",callback_data=f"help:testv2:resultdelete:{aid}")],
+            [InlineKeyboardButton("Отмена",callback_data=f"help:testv2:result:{aid}")],
+        ])); return
+
+    if data.startswith("help:testv2:resultdelete:"):
+        aid=int(data.rsplit(":",1)[-1]); a=tv2_get_assignment(aid)
+        with tv2_connect() as con:
+            con.execute("DELETE FROM test_answers WHERE assignment_id=?",(aid,)); con.execute("DELETE FROM test_attempt_events WHERE assignment_id=?",(aid,)); con.execute("DELETE FROM test_admin_comments WHERE assignment_id=?",(aid,)); con.execute("DELETE FROM test_assignments WHERE id=?",(aid,))
+        if a: tv2_update_profile_average(int(a["profile_id"]))
+        await q.edit_message_text("✅ Результат удалён.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К аналитике",callback_data="help:testv2:analytics")]])); return
+
+    if data=="help:testv2:bank":
+        cats=tv2_bank_categories(); rows=[[InlineKeyboardButton(c,callback_data=f"help:testv2:bankcat:{c}")] for c in cats[:30]]
+        rows.append([InlineKeyboardButton("➕ Добавить вопрос в банк",callback_data="help:testv2:bankadd")]); rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:admin")])
+        await q.edit_message_text("📚 <b>Банк вопросов</b>\n\nВыберите категорию.",parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data=="help:testv2:bankadd":
+        context.user_data[TV2_DATA]={"target":"bank"}
+        await q.edit_message_text("Выберите тип вопроса:",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Открытый",callback_data="help:testv2:qtype:open")],[InlineKeyboardButton("🔘 Один вариант",callback_data="help:testv2:qtype:single")],[InlineKeyboardButton("☑️ Несколько",callback_data="help:testv2:qtype:multi")],[InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:bank")],])); return
+
+    if data.startswith("help:testv2:bankcat:"):
+        cat=data.split(":",3)[-1]; items=tv2_bank_list(cat); rows=[[InlineKeyboardButton(x["question_text"][:55],callback_data="noop")] for x in items[:30]]
+        rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:bank")]); await q.edit_message_text(f"📚 <b>{escape(cat)}</b>\nВопросов: {len(items)}",parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:bankpick:"):
+        parts=data.split(":"); tid=int(parts[-2]); page=int(parts[-1]); items=tv2_bank_list(limit=200); pages=max(1,(len(items)+7)//8); page=max(0,min(page,pages-1)); rows=[]
+        for x in items[page*8:(page+1)*8]: rows.append([InlineKeyboardButton(f"➕ {x['question_text'][:50]}",callback_data=f"help:testv2:bankcopy:{tid}:{int(x['id'])}")])
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("◀️",callback_data=f"help:testv2:bankpick:{tid}:{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="noop"))
+        if page+1<pages: nav.append(InlineKeyboardButton("▶️",callback_data=f"help:testv2:bankpick:{tid}:{page+1}"))
+        rows.append(nav); rows.append([InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:template:{tid}")])
+        await q.edit_message_text("📚 Выберите вопрос для добавления:",reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:bankcopy:"):
+        parts=data.split(":"); tid=int(parts[-2]); bid=int(parts[-1]); tv2_copy_bank_question(bid,tid)
+        await q.answer("Добавлено",show_alert=False); await q.edit_message_text(tv2_template_text(tid),parse_mode=ParseMode.HTML,reply_markup=tv2_kb_template(tid)); return
+
+    if data.startswith("help:testv2:bankrandom:"):
+        tid=int(data.rsplit(":",1)[-1])
+        with tv2_connect() as con:
+            ids=[int(r[0]) for r in con.execute("SELECT id FROM test_question_bank WHERE is_active=1 ORDER BY RANDOM() LIMIT 10").fetchall()]
+        for bid in ids: tv2_copy_bank_question(bid,tid)
+        await q.edit_message_text(f"✅ Добавлено случайных вопросов: {len(ids)}\n\n"+tv2_template_text(tid),parse_mode=ParseMode.HTML,reply_markup=tv2_kb_template(tid)); return
+
+    if data=="help:testv2:assign":
+        items=tv2_list_templates(limit=100); rows=[[InlineKeyboardButton(f"{x['title']} · v{x.get('version',1)}",callback_data=f"help:testv2:assign_template:{int(x['id'])}")] for x in items[:40]]; rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:admin")])
+        await q.edit_message_text("👥 Выберите тест для назначения:",reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:assign_template:"):
+        tid=int(data.rsplit(":",1)[-1]); t=tv2_get_template(tid); pub=tid if int(t.get("is_published") or 0) else tv2_publish_template(tid,update.effective_user.id)
+        context.user_data[TV2_DATA]={"template_id":pub,"source_template_id":tid,"selected":[]}
+        await q.edit_message_text("Кому назначить тест?",reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Всем",callback_data="help:testv2:recipients:all")],
+            [InlineKeyboardButton("🏢 По отделу",callback_data="help:testv2:recipients:department")],
+            [InlineKeyboardButton("🏙 По городу",callback_data="help:testv2:recipients:city")],
+            [InlineKeyboardButton("👤 Выбрать вручную",callback_data="help:testv2:recipients:manual:0")],
+            [InlineKeyboardButton("🔁 Только не прошедшим",callback_data="help:testv2:recipients:failed")],
+            [InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:template:{tid}")],])); return
+
+    if data.startswith("help:testv2:recipients:"):
+        parts=data.split(":"); rule=parts[3]; d=context.user_data.get(TV2_DATA) or {}; tid=int(d.get("template_id"))
+        if rule=="all": d["selected"]=tv2_profile_ids_for_rule("all"); context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Выбрано сотрудников: {len(d['selected'])}\n\nВведите срок в формате ДД.ММ.ГГГГ ЧЧ:ММ или «нет»:",reply_markup=tv2_kb_cancel()); return
+        if rule=="failed": d["selected"]=tv2_profile_ids_for_rule("failed",template_id=tid); context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Выбрано сотрудников: {len(d['selected'])}\n\nВведите срок или «нет»:",reply_markup=tv2_kb_cancel()); return
+        if rule=="department":
+            with tv2_connect() as con: deps=[str(r[0]) for r in con.execute("SELECT DISTINCT department FROM profiles WHERE COALESCE(department,'')!='' ORDER BY department").fetchall()]
+            context.user_data["tv2_department_options"]=deps
+            rows=[[InlineKeyboardButton(dep[:55],callback_data=f"help:testv2:deptpick:{i}")] for i,dep in enumerate(deps[:40])]; rows.append([InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:assign_template:{d.get('source_template_id',tid)}")]); await q.edit_message_text("Выберите отдел:",reply_markup=InlineKeyboardMarkup(rows)); return
+        if rule=="city":
+            with tv2_connect() as con: cities=[str(r[0]) for r in con.execute("SELECT DISTINCT city FROM profiles WHERE city!='' ORDER BY city").fetchall()]
+            rows=[[InlineKeyboardButton(c,callback_data=f"help:testv2:citypick:{c}")] for c in cities[:40]]; rows.append([InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:assign_template:{d.get('source_template_id',tid)}")]); await q.edit_message_text("Выберите город:",reply_markup=InlineKeyboardMarkup(rows)); return
+        if rule=="manual":
+            page=int(parts[4]) if len(parts)>4 else 0; people=db_profiles_list(); selected=set(d.get("selected") or []); pages=max(1,(len(people)+7)//8); page=max(0,min(page,pages-1)); rows=[]
+            for pid,name in people[page*8:(page+1)*8]: rows.append([InlineKeyboardButton(("✅ " if int(pid) in selected else "▫️ ")+name[:50],callback_data=f"help:testv2:manualtoggle:{int(pid)}:{page}")])
+            nav=[]
+            if page>0: nav.append(InlineKeyboardButton("◀️",callback_data=f"help:testv2:recipients:manual:{page-1}"))
+            nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="noop"))
+            if page+1<pages: nav.append(InlineKeyboardButton("▶️",callback_data=f"help:testv2:recipients:manual:{page+1}"))
+            rows.append(nav); rows.append([InlineKeyboardButton(f"Готово ({len(selected)})",callback_data="help:testv2:manualdone")]); await q.edit_message_text("Выберите сотрудников:",reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:deptpick:"):
+        idx=int(data.rsplit(":",1)[-1]); deps=context.user_data.get("tv2_department_options") or []; dep=deps[idx] if 0<=idx<len(deps) else ""; d=context.user_data.get(TV2_DATA) or {}; d["selected"]=tv2_profile_ids_for_rule("department",dep); context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Отдел: {escape(dep)}\nВыбрано: {len(d['selected'])}\n\nВведите срок или «нет»:",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_cancel()); return
+
+    if data.startswith("help:testv2:citypick:"):
+        city=data.split(":",3)[-1]; d=context.user_data.get(TV2_DATA) or {}; d["selected"]=tv2_profile_ids_for_rule("city",city); context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Город: {escape(city)}\nВыбрано: {len(d['selected'])}\n\nВведите срок или «нет»:",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_cancel()); return
+
+    if data.startswith("help:testv2:manualtoggle:"):
+        parts=data.split(":"); pid=int(parts[-2]); page=int(parts[-1]); d=context.user_data.get(TV2_DATA) or {}; s=set(d.get("selected") or [])
+        if pid in s: s.remove(pid)
+        else: s.add(pid)
+        d["selected"]=sorted(s); context.user_data[TV2_DATA]=d
+        people=db_profiles_list(); pages=max(1,(len(people)+7)//8); page=max(0,min(page,pages-1)); rows=[]
+        for person_id,name in people[page*8:(page+1)*8]:
+            rows.append([InlineKeyboardButton(("✅ " if int(person_id) in s else "▫️ ")+name[:50],callback_data=f"help:testv2:manualtoggle:{int(person_id)}:{page}")])
+        nav=[]
+        if page>0: nav.append(InlineKeyboardButton("◀️",callback_data=f"help:testv2:recipients:manual:{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="noop"))
+        if page+1<pages: nav.append(InlineKeyboardButton("▶️",callback_data=f"help:testv2:recipients:manual:{page+1}"))
+        rows.append(nav); rows.append([InlineKeyboardButton(f"Готово ({len(s)})",callback_data="help:testv2:manualdone")])
+        await q.edit_message_text("Выберите сотрудников:",reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data=="help:testv2:manualdone":
+        d=context.user_data.get(TV2_DATA) or {}; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Выбрано сотрудников: {len(d.get('selected') or [])}\n\nВведите срок или «нет»:",reply_markup=tv2_kb_cancel()); return
+
+    if data=="help:testv2:assignconfirm":
+        d=context.user_data.get(TV2_DATA) or {}; tid=int(d["template_id"]); selected=d.get("selected") or []; t=tv2_get_template(tid) or {}; duration=d.get("time_limit_sec",t.get("default_time_limit_sec"))
+        lines=["📋 <b>Проверка назначения</b>","",f"Тест: <b>{escape(t.get('title',''))}</b>",f"Получателей: <b>{len(selected)}</b>",f"Срок: <b>{escape(tv2_fmt_dt(d.get('due_at')))}</b>",f"Время после запуска: <b>{int(duration)//60 if duration else 'без ограничения'}</b>"]
+        await q.edit_message_text("\n".join(lines),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Назначить",callback_data="help:testv2:assignsend")],[InlineKeyboardButton("❌ Отмена",callback_data="help:testv2:admin")]])); return
+
+    if data=="help:testv2:assignsend":
+        d=context.user_data.get(TV2_DATA) or {}; tid=int(d["template_id"]); selected=d.get("selected") or []; t=tv2_get_template(tid) or {}; duration=d.get("time_limit_sec",t.get("default_time_limit_sec")); aids=[]
+        for pid in selected:
+            aid=tv2_create_assignment(tid,int(pid),update.effective_user.id,d.get("due_at"),duration); aids.append(aid); await tv2_notify_assignment(context,aid)
+        tv2_clear(context); await q.edit_message_text(f"✅ Назначено сотрудникам: {len(aids)}",reply_markup=tv2_kb_admin_menu()); return
+
+    if data=="help:testv2:review":
+        items=tv2_admin_review_list(); rows=[[InlineKeyboardButton(f"{x['full_name']} · {x['title']}",callback_data=f"help:testv2:reviewopen:{int(x['id'])}")] for x in items[:40]]; rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:admin")]); await q.edit_message_text(f"🧑‍🏫 <b>Ожидают проверки: {len(items)}</b>",parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:reviewopen:"):
+        aid=int(data.rsplit(":",1)[-1]); a=tv2_get_assignment(aid); rows=[]
+        for qq in tv2_questions(int(a["template_id"])):
+            if qq["q_type"]=="open":
+                ans=tv2_answer(aid,int(qq["id"])); marker="✅" if ans and ans.get("review_status") not in ("pending",None) else "⏳"; rows.append([InlineKeyboardButton(f"{marker} {qq['idx']}. {qq['question_text'][:45]}",callback_data=f"help:testv2:reviewanswer:{aid}:{int(qq['id'])}")])
+        rows.append([InlineKeyboardButton("💬 Общий комментарий",callback_data=f"help:testv2:reviewcomment:{aid}")]); rows.append([InlineKeyboardButton("⬅️ К списку",callback_data="help:testv2:review")]); await q.edit_message_text(f"🧑‍🏫 <b>{escape(a['full_name'])}</b> · {escape(a['title'])}",parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:reviewanswer:"):
+        parts=data.split(":"); aid=int(parts[-2]); qid=int(parts[-1]); qq=tv2_question_by_id(qid); ans=tv2_answer(aid,qid); answer_text=((ans or {}).get("answer") or {}).get("text") or "—"; pts=float(qq.get("points") or 1)
+        text=f"❓ <b>{escape(qq['question_text'])}</b>\n\nОтвет:\n{escape(answer_text)}\n\nМаксимум: {pts:g} балла"
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Верно",callback_data=f"help:testv2:grade:{aid}:{qid}:100"),InlineKeyboardButton("🟡 Частично",callback_data=f"help:testv2:grade:{aid}:{qid}:50"),InlineKeyboardButton("❌ Неверно",callback_data=f"help:testv2:grade:{aid}:{qid}:0")],[InlineKeyboardButton("💬 Комментарий к ответу",callback_data=f"help:testv2:answercomment:{aid}:{qid}")],[InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:reviewopen:{aid}")]])
+        await q.edit_message_text(text,parse_mode=ParseMode.HTML,reply_markup=kb); return
+
+    if data.startswith("help:testv2:grade:"):
+        parts=data.split(":"); aid=int(parts[-3]); qid=int(parts[-2]); pct=int(parts[-1]); qq=tv2_question_by_id(qid); awarded=float(qq.get("points") or 1)*pct/100; status={100:"full",50:"partial",0:"wrong"}[pct]
+        with tv2_connect() as con: con.execute("UPDATE test_answers SET awarded_points=?,is_correct=?,review_status=? WHERE assignment_id=? AND question_id=?",(awarded,1 if pct==100 else 0,status,aid,qid))
+        calc=tv2_calculate(aid,finalize=True); await q.answer("Оценка сохранена",show_alert=False)
+        if calc["pending"]==0:
+            a=tv2_get_assignment(aid)
+            try: await context.bot.send_message(int(a["tg_user_id"]),"✅ Проверка теста завершена. Результат доступен в «Моих тестах».",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Открыть результат",callback_data=f"help:testv2:result:{aid}")]]))
+            except Exception: pass
+            await q.edit_message_text("✅ Все открытые ответы проверены.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Результат",callback_data=f"help:testv2:result:{aid}")],[InlineKeyboardButton("⬅️ К проверкам",callback_data="help:testv2:review")]])); return
+        a=tv2_get_assignment(aid); rows=[]
+        for open_q in tv2_questions(int(a["template_id"])):
+            if open_q["q_type"]=="open":
+                open_ans=tv2_answer(aid,int(open_q["id"])); marker="✅" if open_ans and open_ans.get("review_status") not in ("pending",None) else "⏳"
+                rows.append([InlineKeyboardButton(f"{marker} {open_q['idx']}. {open_q['question_text'][:45]}",callback_data=f"help:testv2:reviewanswer:{aid}:{int(open_q['id'])}")])
+        rows.append([InlineKeyboardButton("💬 Общий комментарий",callback_data=f"help:testv2:reviewcomment:{aid}")])
+        rows.append([InlineKeyboardButton("⬅️ К списку",callback_data="help:testv2:review")])
+        await q.edit_message_text(f"🧑‍🏫 <b>{escape(a['full_name'])}</b> · {escape(a['title'])}",parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:reviewcomment:"):
+        aid=int(data.rsplit(":",1)[-1]); tv2_set_state(context,"review_comment",assignment_id=aid); await q.edit_message_text("Введите общий комментарий руководителя:",reply_markup=tv2_kb_cancel(f"help:testv2:reviewopen:{aid}")); return
+
+    if data.startswith("help:testv2:answercomment:"):
+        parts=data.split(":"); aid=int(parts[-2]); qid=int(parts[-1]); tv2_set_state(context,"answer_comment",assignment_id=aid,question_id=qid); await q.edit_message_text("Введите комментарий к ответу:",reply_markup=tv2_kb_cancel(f"help:testv2:reviewanswer:{aid}:{qid}")); return
+
+    if data=="help:testv2:analytics":
+        items=tv2_list_templates(limit=100); rows=[[InlineKeyboardButton(x["title"][:55],callback_data=f"help:testv2:analytic:{int(x['id'])}")] for x in items[:50]]; rows.append([InlineKeyboardButton("📋 Фильтры результатов",callback_data="help:testv2:resultsfilters")]); rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:admin")]); await q.edit_message_text("📊 Выберите тест:",reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:analytic:"):
+        tid=int(data.rsplit(":",1)[-1]); t=tv2_get_template(tid); s=tv2_analytics(tid); lines=[f"📊 <b>{escape(t['title'])}</b>","",f"Назначено: <b>{s['assigned']}</b>",f"Начали: <b>{s['started']}</b>",f"Завершили: <b>{s['completed']}</b>",f"Просрочили: <b>{s['expired']}</b>",f"Средний результат: <b>{s['avg']:.0f}%</b>",f"Успешно прошли: <b>{s['passed']}</b>","","<b>Самые сложные вопросы</b>"]
+        for i,(text,rate,cnt) in enumerate(s["hard"],1): lines.append(f"{i}. {escape(text[:80])} — {rate*100:.0f}% правильных ({cnt})")
+        await q.edit_message_text("\n".join(lines),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:analytics")]])); return
+
+    if data=="help:testv2:resultsfilters":
+        rows=[[InlineKeyboardButton("❌ Не прошли",callback_data="help:testv2:results:failed")],[InlineKeyboardButton("🧑‍🏫 Ожидают проверки",callback_data="help:testv2:results:review")],[InlineKeyboardButton("⌛ Просрочены",callback_data="help:testv2:results:expired")],[InlineKeyboardButton("✅ Успешные",callback_data="help:testv2:results:passed")],[InlineKeyboardButton("👤 По сотрудникам",callback_data="help:testv2:resultspeople")],[InlineKeyboardButton("📅 За 7 дней",callback_data="help:testv2:resultsperiod:7"),InlineKeyboardButton("📅 За 30 дней",callback_data="help:testv2:resultsperiod:30")],[InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:analytics")]]; await q.edit_message_text("📋 Фильтр результатов:",reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data=="help:testv2:resultspeople":
+        with tv2_connect() as con:
+            people=con.execute("""SELECT p.id,p.full_name,COUNT(a.id) cnt FROM profiles p JOIN test_assignments a ON a.profile_id=p.id GROUP BY p.id ORDER BY p.full_name""").fetchall()
+        rows=[[InlineKeyboardButton(f"{r[1]} · {int(r[2])}",callback_data=f"help:testv2:resultsperson:{int(r[0])}")] for r in people[:60]]
+        rows.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:resultsfilters")])
+        await q.edit_message_text("👤 Выберите сотрудника:",reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if data.startswith("help:testv2:resultsperson:"):
+        pid=int(data.rsplit(":",1)[-1])
+        with tv2_connect() as con:
+            rows=con.execute("""SELECT a.id,t.title,a.status,a.score_percent FROM test_assignments a JOIN test_templates t ON t.id=a.template_id WHERE a.profile_id=? ORDER BY a.assigned_at DESC LIMIT 50""",(pid,)).fetchall()
+            person=con.execute("SELECT full_name FROM profiles WHERE id=?",(pid,)).fetchone()
+        kb=[[InlineKeyboardButton(f"{r[1]} · {r[2]}{(' · '+str(round(r[3]))+'%') if r[3] is not None else ''}"[:60],callback_data=f"help:testv2:result:{int(r[0])}")] for r in rows]
+        kb.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:resultspeople")])
+        await q.edit_message_text(f"Результаты: {escape(person[0] if person else str(pid))}",parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup(kb)); return
+
+    if data.startswith("help:testv2:resultsperiod:"):
+        days=int(data.rsplit(":",1)[-1]); cutoff=(datetime.utcnow()-timedelta(days=days)).isoformat()
+        with tv2_connect() as con:
+            rows=con.execute("""SELECT a.id,p.full_name,t.title,a.status,a.score_percent FROM test_assignments a JOIN profiles p ON p.id=a.profile_id JOIN test_templates t ON t.id=a.template_id WHERE COALESCE(a.finished_at,a.assigned_at)>=? ORDER BY COALESCE(a.finished_at,a.assigned_at) DESC LIMIT 60""",(cutoff,)).fetchall()
+        kb=[[InlineKeyboardButton(f"{r[1]} · {r[2]}{(' · '+str(round(r[4]))+'%') if r[4] is not None else ''}"[:60],callback_data=f"help:testv2:result:{int(r[0])}")] for r in rows]
+        kb.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:resultsfilters")])
+        await q.edit_message_text(f"📅 Результаты за {days} дней: {len(rows)}",reply_markup=InlineKeyboardMarkup(kb)); return
+
+    if data.startswith("help:testv2:results:"):
+        filt=data.rsplit(":",1)[-1]; conditions={"failed":"a.status='finished' AND COALESCE(a.passed,0)=0","review":"a.status='needs_review'","expired":"a.status='expired'","passed":"a.status='finished' AND a.passed=1"};
+        with tv2_connect() as con: rows=con.execute(f"""SELECT a.id,p.full_name,t.title,a.score_percent FROM test_assignments a JOIN profiles p ON p.id=a.profile_id JOIN test_templates t ON t.id=a.template_id WHERE {conditions[filt]} ORDER BY COALESCE(a.finished_at,a.assigned_at) DESC LIMIT 50""").fetchall()
+        kb=[[InlineKeyboardButton(f"{r[1]} · {r[2]}{(' · '+str(round(r[3]))+'%') if r[3] is not None else ''}"[:60],callback_data=f"help:testv2:result:{int(r[0])}")] for r in rows]; kb.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:resultsfilters")]); await q.edit_message_text(f"Найдено: {len(rows)}",reply_markup=InlineKeyboardMarkup(kb)); return
+
+    if data=="help:testv2:overdue":
+        with tv2_connect() as con: rows=con.execute("""SELECT a.id,p.full_name,t.title,a.due_at FROM test_assignments a JOIN profiles p ON p.id=a.profile_id JOIN test_templates t ON t.id=a.template_id WHERE a.status='expired' ORDER BY a.due_at DESC LIMIT 50""").fetchall()
+        kb=[[InlineKeyboardButton(f"⌛ {r[1]} · {r[2]}"[:60],callback_data=f"help:testv2:result:{int(r[0])}")] for r in rows]; kb.append([InlineKeyboardButton("⬅️ Назад",callback_data="help:testv2:admin")]); await q.edit_message_text(f"⌛ Просроченные тесты: {len(rows)}",reply_markup=InlineKeyboardMarkup(kb)); return
+
+
+async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data=(update.callback_query.data or "") if update.callback_query else ""
+    if not data.startswith("test:v2:"):
+        return await _tv2_legacy_cb_test(update,context)
+    q=update.callback_query
+    try: await q.answer()
+    except Exception: pass
+    parts=data.split(":"); action=parts[2]; aid=int(parts[3]) if len(parts)>3 else 0
+    a=tv2_get_assignment(aid); p=get_profile_for_user(update)
+    if not a or not p or int(a["profile_id"])!=int(p["id"]): await q.answer("Тест назначен другому сотруднику",show_alert=True); return
+
+    if action in ("start","continue"):
+        if tv2_is_expired(a): tv2_mark_expired(aid); await q.edit_message_text("⌛ Срок теста истёк."); return
+        tv2_start_assignment(aid); tv2_clear(context); await tv2_send_question(update,context,aid); return
+
+    if action=="retry":
+        new_id=tv2_create_retry(aid,update.effective_user.id)
+        if not new_id: await q.answer("Повторная попытка недоступна",show_alert=True); return
+        await q.edit_message_text("🔄 Новая попытка создана.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Начать",callback_data=f"test:v2:start:{new_id}")]])); return
+
+    if tv2_is_expired(a): tv2_mark_expired(aid); await q.edit_message_text("⌛ Время теста истекло."); return
+    order=tv2_assignment_order(a)
+
+    if action=="single":
+        qid=int(parts[4]); opt=int(parts[5]); qq=tv2_question_by_id(qid); correct=set(int(x) for x in qq.get("correct") or []); ok=1 if {opt}==correct else 0; pts=float(qq.get("points") or 1) if ok else 0
+        tv2_save_answer(aid,qid,{"selected":[opt]},ok,pts,"auto")
+        if int(a.get("immediate_feedback") or 0):
+            text=("✅ Верно" if ok else "❌ Неверно")+(f"\n\n💡 {qq.get('explanation')}" if qq.get("explanation") else "")
+            await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Далее ▶️",callback_data=f"test:v2:next:{aid}")]])); return
+        return await cb_test_goto_next(update,context,aid)
+
+    if action=="toggle":
+        qid=int(parts[4]); opt=int(parts[5]); selmap=context.user_data.get(TV2_MULTI) or {}; cur=set(selmap.get(str(qid),[])); cur.discard(opt) if opt in cur else cur.add(opt); selmap[str(qid)]=sorted(cur); context.user_data[TV2_MULTI]=selmap; qq=tv2_question_by_id(qid); a=tv2_get_assignment(aid); pos=tv2_assignment_order(a).index(qid); text,kb=tv2_question_display(a,qq,pos)
+        rows=[]
+        for row in kb.inline_keyboard:
+            new=[]
+            for b in row:
+                if b.callback_data and b.callback_data.startswith(f"test:v2:toggle:{aid}:{qid}:"):
+                    oi=int(b.callback_data.rsplit(":",1)[-1]); label=("✅ " if oi in cur else "▫️ ")+qq["options"][oi][:55]; new.append(InlineKeyboardButton(label,callback_data=b.callback_data))
+                else:new.append(b)
+            rows.append(new)
+        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows)); return
+
+    if action=="multisubmit":
+        qid=int(parts[4]); qq=tv2_question_by_id(qid); selected=set((context.user_data.get(TV2_MULTI) or {}).get(str(qid),[])); correct=set(int(x) for x in qq.get("correct") or []); ok=1 if selected==correct else 0; pts=float(qq.get("points") or 1) if ok else 0; tv2_save_answer(aid,qid,{"selected":sorted(selected)},ok,pts,"auto")
+        if int(a.get("immediate_feedback") or 0):
+            text=("✅ Верно" if ok else "❌ Неверно")+(f"\n\n💡 {qq.get('explanation')}" if qq.get("explanation") else ""); await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Далее ▶️",callback_data=f"test:v2:next:{aid}")]])); return
+        return await cb_test_goto_next(update,context,aid)
+
+    if action=="next": return await cb_test_goto_next(update,context,aid)
+    if action=="goto": return await tv2_send_question(update,context,aid,int(parts[4]))
+    if action=="flag":
+        qid=int(parts[4]); tv2_toggle_flag(aid,qid); pos=tv2_assignment_order(tv2_get_assignment(aid)).index(qid); return await tv2_send_question(update,context,aid,pos)
+    if action=="reviewpage":
+        text,kb=tv2_review_page_text(aid); await q.edit_message_text(text,parse_mode=ParseMode.HTML,reply_markup=kb); return
+    if action=="finishconfirm":
+        unanswered=sum(1 for qid in order if not tv2_answer(aid,qid)); await q.edit_message_text(f"Завершить тест?\n\nБез ответа: {unanswered}\nПосле завершения изменить ответы будет нельзя.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Да, завершить",callback_data=f"test:v2:finish:{aid}")],[InlineKeyboardButton("◀️ Вернуться",callback_data=f"test:v2:reviewpage:{aid}")]])); return
+    if action=="finish":
+        calc=tv2_calculate(aid,finalize=True); tv2_clear(context); await q.edit_message_text(tv2_result_text(aid),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Подробнее",callback_data=f"help:testv2:result:{aid}")],[InlineKeyboardButton("⬅️ Мои тесты",callback_data="help:testv2:my:all:0")]])); return
+
+
+async def cb_test_goto_next(update,context,aid:int):
+    a=tv2_get_assignment(aid); order=tv2_assignment_order(a); pos=int(a.get("current_idx") or 0)+1
+    if pos>=len(order):
+        text,kb=tv2_review_page_text(aid); await update.callback_query.edit_message_text(text,parse_mode=ParseMode.HTML,reply_markup=kb); return
+    await tv2_send_question(update,context,aid,pos)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state=context.user_data.get(TV2_STATE)
+    if not state:
+        return await _tv2_legacy_on_text(update,context)
+    if await deny_no_access(update,context): return
+    await sync_profile_user_id_from_update(update)
+    text=(update.message.text or "").strip(); d=context.user_data.get(TV2_DATA) or {}
+
+    if state=="profile_department":
+        pid=int(d["profile_id"]); page=int(d.get("page") or 0); value=None if text=="-" else text[:120]
+        with tv2_connect() as con: con.execute("UPDATE profiles SET department=? WHERE id=?",(value,pid))
+        tv2_clear(context); await update.message.reply_text("✅ Отдел сохранён.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К сотрудникам",callback_data=f"help:testv2:departments:{page}")]])); return
+
+    if state=="create_title":
+        if len(text)<3: await update.message.reply_text("Название слишком короткое."); return
+        context.user_data[TV2_DATA]={"title":text}; context.user_data[TV2_STATE]="create_mode"
+        await update.message.reply_text("Выберите режим:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📚 Обучение",callback_data="help:testv2:createmode:learning")],[InlineKeyboardButton("🎓 Аттестация",callback_data="help:testv2:createmode:exam")],[InlineKeyboardButton("⚙️ Свой",callback_data="help:testv2:createmode:custom")]])); return
+
+    if state=="q_text":
+        d["question_text"]=text; context.user_data[TV2_DATA]=d
+        if d.get("q_type")=="open": context.user_data[TV2_STATE]="q_points"; await update.message.reply_text("Сколько баллов даёт вопрос?"); return
+        context.user_data[TV2_STATE]="q_options"; await update.message.reply_text("Введите варианты ответа, каждый с новой строки (минимум 2):"); return
+
+    if state=="q_options":
+        opts=[x.strip() for x in text.splitlines() if x.strip()]
+        if len(opts)<2: await update.message.reply_text("Нужно минимум два варианта."); return
+        d["options"]=opts; context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="q_correct"; await update.message.reply_text("Введите номера правильных вариантов через запятую, например 1 или 1,3:"); return
+
+    if state=="q_correct":
+        try: indexes=sorted(set(int(x.strip())-1 for x in re.split(r"[,; ]+",text) if x.strip()))
+        except Exception: await update.message.reply_text("Не удалось разобрать номера."); return
+        if not indexes or any(i<0 or i>=len(d.get("options") or []) for i in indexes): await update.message.reply_text("Проверьте номера вариантов."); return
+        if d.get("q_type")=="single" and len(indexes)!=1: await update.message.reply_text("Для одиночного выбора нужен один номер."); return
+        d["correct"]=indexes; context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="q_points"; await update.message.reply_text("Сколько баллов даёт вопрос?"); return
+
+    if state=="q_points":
+        try: pts=float(text.replace(",",".")); assert pts>0
+        except Exception: await update.message.reply_text("Введите положительное число."); return
+        d["points"]=pts; context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="q_explanation"; await update.message.reply_text("Введите пояснение к правильному ответу или '-' если оно не нужно:"); return
+
+    if state=="q_explanation":
+        d["explanation"]="" if text=="-" else text
+        if d.get("target")=="bank": context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="q_bank_meta"; await update.message.reply_text("Введите: категория | сложность 1-5 | теги через запятую\nНапример: CRM | 2 | лиды, синхронизация"); return
+        tv2_add_question(int(d["template_id"]),d["q_type"],d["question_text"],d.get("options",[]),d.get("correct",[]),d["points"],d["explanation"]); tid=int(d["template_id"]); tv2_clear(context); await update.message.reply_text("✅ Вопрос добавлен.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Открыть тест",callback_data=f"help:testv2:template:{tid}")]])); return
+
+    if state=="q_bank_meta":
+        parts=[x.strip() for x in text.split("|")]
+        category=parts[0] if parts else "Без категории"
+        try: difficulty=int(parts[1]) if len(parts)>1 else 1
+        except Exception: difficulty=1
+        tags=parts[2] if len(parts)>2 else ""
+        bid=tv2_bank_add(d["q_type"],d["question_text"],d.get("options",[]),d.get("correct",[]),d["points"],d.get("explanation", ""),category,difficulty,tags,update.effective_user.id); tv2_clear(context); await update.message.reply_text(f"✅ Вопрос добавлен в банк (ID {bid}).",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Банк вопросов",callback_data="help:testv2:bank")]])); return
+
+    if state.startswith("edit_q_"):
+        qid=int(d["question_id"]); qq=tv2_question_by_id(qid)
+        if state=="edit_q_text": tv2_update_question(qid,"question_text",text)
+        elif state=="edit_q_points":
+            try: tv2_update_question(qid,"points",float(text.replace(",",".")))
+            except Exception: await update.message.reply_text("Введите число."); return
+        elif state=="edit_q_options":
+            opts=[x.strip() for x in text.splitlines() if x.strip()]
+            if len(opts)<2: await update.message.reply_text("Минимум два варианта."); return
+            tv2_update_question(qid,"options_json",_safe_json_dumps(opts))
+        elif state=="edit_q_correct":
+            try: idx=[int(x)-1 for x in re.split(r"[,; ]+",text) if x]
+            except Exception: await update.message.reply_text("Проверьте номера."); return
+            tv2_update_question(qid,"correct_json",_safe_json_dumps(idx))
+        elif state=="edit_q_explanation": tv2_update_question(qid,"explanation",None if text=="-" else text)
+        tv2_clear(context); await update.message.reply_text("✅ Изменение сохранено.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Открыть вопрос",callback_data=f"help:testv2:qedit:{qid}")]])); return
+
+    if state.startswith("custom_"):
+        setting=state[len("custom_"):]; tid=int(d["template_id"])
+        try: value=int(text); assert value>=0
+        except Exception: await update.message.reply_text("Введите целое неотрицательное число."); return
+        col={"passing":"passing_score","time":"default_time_limit_sec"}[setting]
+        if setting=="time": value*=60
+        with tv2_connect() as con: con.execute(f"UPDATE test_templates SET {col}=? WHERE id=?",(value,tid))
+        tv2_clear(context); await update.message.reply_text("✅ Настройка сохранена.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Настройки",callback_data=f"help:testv2:settings:{tid}")]])); return
+
+    if state=="assign_due":
+        due=tv2_parse_dt(text)
+        if due=="INVALID": await update.message.reply_text("Формат: ДД.ММ.ГГГГ ЧЧ:ММ или «нет»."); return
+        d["due_at"]=due; context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_time"; t=tv2_get_template(int(d["template_id"])) or {}; current=t.get("default_time_limit_sec"); await update.message.reply_text(f"Введите время после запуска в минутах или «по умолчанию» ({int(current)//60 if current else 'без ограничения'}):"); return
+
+    if state=="assign_time":
+        t=tv2_get_template(int(d["template_id"])) or {}
+        if text.lower() in ("по умолчанию","default","-"): duration=t.get("default_time_limit_sec")
+        elif text.lower() in ("нет","0","без ограничения"): duration=None
+        else:
+            try: duration=int(text)*60; assert duration>0
+            except Exception: await update.message.reply_text("Введите число минут, «нет» или «по умолчанию»."); return
+        d["time_limit_sec"]=duration; context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_ready"; await update.message.reply_text("Настройки назначения готовы.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Проверить",callback_data="help:testv2:assignconfirm")],[InlineKeyboardButton("❌ Отмена",callback_data="help:testv2:admin")]])); return
+
+    if state=="open_answer":
+        aid=int(d["assignment_id"]); qid=int(d["question_id"]); qq=tv2_question_by_id(qid); tv2_save_answer(aid,qid,{"text":text},None,None,"pending"); tv2_clear(context); a=tv2_get_assignment(aid); pos=int(d.get("position") or 0)+1; order=tv2_assignment_order(a)
+        if pos>=len(order):
+            review,kb=tv2_review_page_text(aid); await update.message.reply_text(review,parse_mode=ParseMode.HTML,reply_markup=kb)
+        else:
+            # synthetic update without callback: sends next question as a new message
+            await tv2_send_question(update,context,aid,pos)
+        return
+
+    if state=="review_comment":
+        aid=int(d["assignment_id"])
+        with tv2_connect() as con: con.execute("UPDATE test_assignments SET reviewer_comment=? WHERE id=?",(text,aid)); con.execute("INSERT INTO test_admin_comments(assignment_id,admin_user_id,comment,created_at) VALUES(?,?,?,?)",(aid,update.effective_user.id,text,datetime.utcnow().isoformat()))
+        tv2_clear(context); await update.message.reply_text("✅ Общий комментарий сохранён.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться к проверке",callback_data=f"help:testv2:reviewopen:{aid}")]])); return
+
+    if state=="answer_comment":
+        aid=int(d["assignment_id"]); qid=int(d["question_id"])
+        with tv2_connect() as con: con.execute("UPDATE test_answers SET reviewer_comment=? WHERE assignment_id=? AND question_id=?",(text,aid,qid))
+        tv2_clear(context); await update.message.reply_text("✅ Комментарий сохранён.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Вернуться",callback_data=f"help:testv2:reviewanswer:{aid}:{qid}")]])); return
+
+    return await _tv2_legacy_on_text(update,context)
+
+# =================== END TESTING V2 ===================
+
 # ---------------- APP ----------------
 
 def main():
