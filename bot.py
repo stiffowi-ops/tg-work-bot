@@ -2273,22 +2273,152 @@ def kb_help_link_card(url: str):
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:links")],
     ])
 
-def kb_help_team(can_create_profile: bool = False):
+# ---------------- TEAM CATALOG: pagination + profile carousel ----------------
+
+TEAM_PAGE_SIZE = 8
+TEAM_COLUMNS = 2
+
+
+def compact_team_name(name: str, limit: int = 22) -> str:
+    """Укорачивает подпись кнопки, чтобы две кнопки помещались в одну строку."""
+    value = re.sub(r"\s+", " ", (name or "Без имени").strip())
+    if len(value) <= limit:
+        return value
+    return value[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _team_total_pages(people_count: int) -> int:
+    return max(1, (int(people_count) + TEAM_PAGE_SIZE - 1) // TEAM_PAGE_SIZE)
+
+
+def _team_clamp_page(page: int, people_count: int) -> int:
+    total_pages = _team_total_pages(people_count)
+    return max(0, min(int(page), total_pages - 1))
+
+
+def kb_help_team(page: int = 0, can_create_profile: bool = False):
+    """Компактный каталог: 8 сотрудников на странице, по 2 кнопки в строке."""
     people = db_profiles_list()
+    page = _team_clamp_page(page, len(people))
+    total_pages = _team_total_pages(len(people))
+
+    start = page * TEAM_PAGE_SIZE
+    page_people = people[start:start + TEAM_PAGE_SIZE]
+
     rows = []
+
     if can_create_profile:
-        rows.append([InlineKeyboardButton("➕ Создать анкету", callback_data="help:team:create_profile")])
-    if not people:
-        rows.append([InlineKeyboardButton("— анкет пока нет —", callback_data="noop")])
+        rows.append([
+            InlineKeyboardButton(
+                "➕ Создать анкету",
+                callback_data="help:team:create_profile",
+            )
+        ])
+
+    if not page_people:
+        rows.append([
+            InlineKeyboardButton(
+                "— анкет пока нет —",
+                callback_data="noop",
+            )
+        ])
     else:
-        for pid, name in people[:40]:
-            rows.append([InlineKeyboardButton(name, callback_data=f"help:team:person:{pid}")])
+        for index in range(0, len(page_people), TEAM_COLUMNS):
+            keyboard_row = []
+            for pid, name in page_people[index:index + TEAM_COLUMNS]:
+                keyboard_row.append(
+                    InlineKeyboardButton(
+                        compact_team_name(name),
+                        callback_data=f"help:team:person:{pid}:{page}",
+                    )
+                )
+            rows.append(keyboard_row)
+
+    # Навигация появляется только тогда, когда страниц больше одной.
+    if total_pages > 1:
+        navigation_row = []
+
+        if page > 0:
+            navigation_row.append(
+                InlineKeyboardButton(
+                    "◀️",
+                    callback_data=f"help:team:page:{page - 1}",
+                )
+            )
+
+        navigation_row.append(
+            InlineKeyboardButton(
+                f"{page + 1} / {total_pages}",
+                callback_data="noop",
+            )
+        )
+
+        if page < total_pages - 1:
+            navigation_row.append(
+                InlineKeyboardButton(
+                    "▶️",
+                    callback_data=f"help:team:page:{page + 1}",
+                )
+            )
+
+        rows.append(navigation_row)
+
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
-def kb_help_profile_card(profile: dict):
+
+def kb_help_profile_card(profile: dict, page: int = 0):
+    """Карточка сотрудника с переходами к предыдущему и следующему профилю."""
     rows = []
-    tg = profile["tg_link"].strip()
+    people = db_profiles_list()
+
+    # Находим текущего сотрудника в общем алфавитном списке.
+    current_index = next(
+        (index for index, (pid, _name) in enumerate(people) if int(pid) == int(profile["id"])),
+        None,
+    )
+
+    if current_index is not None:
+        current_page = current_index // TEAM_PAGE_SIZE
+    else:
+        current_page = _team_clamp_page(page, len(people))
+
+    # Циклическая карусель: после последнего сотрудника открывается первый.
+    if current_index is not None and len(people) > 1:
+        if len(people) == 2:
+            # При двух сотрудниках предыдущий и следующий совпадают,
+            # поэтому оставляем одну понятную кнопку.
+            other_index = 1 - current_index
+            other_pid, other_name = people[other_index]
+            other_page = other_index // TEAM_PAGE_SIZE
+            rows.append([
+                InlineKeyboardButton(
+                    f"Следующий: {compact_team_name(other_name, 25)} ▶️",
+                    callback_data=f"help:team:person:{other_pid}:{other_page}",
+                )
+            ])
+        else:
+            previous_index = (current_index - 1) % len(people)
+            next_index = (current_index + 1) % len(people)
+
+            previous_pid, previous_name = people[previous_index]
+            next_pid, next_name = people[next_index]
+
+            previous_page = previous_index // TEAM_PAGE_SIZE
+            next_page = next_index // TEAM_PAGE_SIZE
+
+            rows.append([
+                InlineKeyboardButton(
+                    f"◀️ {compact_team_name(previous_name, 15)}",
+                    callback_data=f"help:team:person:{previous_pid}:{previous_page}",
+                ),
+                InlineKeyboardButton(
+                    f"{compact_team_name(next_name, 15)} ▶️",
+                    callback_data=f"help:team:person:{next_pid}:{next_page}",
+                ),
+            ])
+
+    tg = (profile.get("tg_link") or "").strip()
     if tg:
         if tg.startswith("@"):
             url = f"https://t.me/{tg[1:]}"
@@ -2301,7 +2431,13 @@ def kb_help_profile_card(profile: dict):
                 url = ""
         if url:
             rows.append([InlineKeyboardButton("🔗 Открыть Telegram", url=url)])
-    rows.append([InlineKeyboardButton("⬅️ Назад к списку", callback_data="help:team")])
+
+    rows.append([
+        InlineKeyboardButton(
+            "⬅️ Назад к списку",
+            callback_data=f"help:team:page:{current_page}",
+        )
+    ])
     rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -4820,12 +4956,34 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "help:team":
-        text = "👥 <b>Познакомиться с командой</b>\n\nЗдесь вы можете познакомиться с коллегами.\nВыберите человека, чтобы посмотреть его профиль 👇"
+    if data == "help:team" or data.startswith("help:team:page:"):
+        page = 0
+        if data.startswith("help:team:page:"):
+            try:
+                page = int(data.rsplit(":", 1)[-1])
+            except (TypeError, ValueError):
+                page = 0
+
+        people_count = len(db_profiles_list())
+        page = _team_clamp_page(page, people_count)
+        total_pages = _team_total_pages(people_count)
+
+        text = (
+            "👥 <b>Познакомиться с командой</b>\n\n"
+            "Здесь вы можете познакомиться с коллегами.\n"
+            "Выберите человека, чтобы посмотреть его профиль 👇\n\n"
+            f"Коллег: <b>{people_count}</b>"
+        )
+        if total_pages > 1:
+            text += f" · страница <b>{page + 1}/{total_pages}</b>"
+
         await q.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_team(can_create_profile=await can_create_own_profile(update, context)),
+            reply_markup=kb_help_team(
+                page=page,
+                can_create_profile=await can_create_own_profile(update, context),
+            ),
         )
         return
 
@@ -4851,10 +5009,23 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("help:team:person:"):
-        pid = int(data.split(":")[-1])
+        parts = data.split(":")
+        try:
+            pid = int(parts[3])
+            page = int(parts[4]) if len(parts) > 4 else 0
+        except (IndexError, TypeError, ValueError):
+            await q.answer("Не удалось открыть анкету.", show_alert=True)
+            return
+
         p = db_profiles_get(pid)
         if not p:
-            await q.edit_message_text("Анкета не найдена (возможно удалена).", reply_markup=kb_help_team())
+            await q.edit_message_text(
+                "Анкета не найдена (возможно, она была удалена).",
+                reply_markup=kb_help_team(
+                    page=page,
+                    can_create_profile=await can_create_own_profile(update, context),
+                ),
+            )
             return
 
         bday = (p.get("birthday") or "").strip() or "—"
@@ -4871,7 +5042,12 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━\n\n"
             f"🏆 <b>Ачивки</b>\n\n{format_achievements_for_profile(p['id'])}"
         )
-        await q.edit_message_text(card, parse_mode=ParseMode.HTML, reply_markup=kb_help_profile_card(p), disable_web_page_preview=True)
+        await q.edit_message_text(
+            card,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_profile_card(p, page=page),
+            disable_web_page_preview=True,
+        )
         return
 
     if data == "help:settings":
