@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "DASHBOARD-NOTIFICATIONS-PHOTOS-REACTIONS-2026-07-20-V4"
+BUILD_VERSION = "DASHBOARD-FULL-NAME-SELF-EDIT-2026-07-20-V7"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -2536,7 +2536,7 @@ NOMINATION_STEP = "nomination_step"
 NOMINATION_DATA = "nomination_data"
 PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
-PROFILE_WIZ_MODE = "profile_wiz_mode"          # admin_add|admin_edit|self_create
+PROFILE_WIZ_MODE = "profile_wiz_mode"          # admin_add|admin_edit|self_create|self_edit
 PROFILE_WIZ_EDIT_PID = "profile_wiz_edit_pid"
 
 # suggest box flow
@@ -2892,9 +2892,14 @@ def help_text_main(
     profile: dict | None = None,
     unread_count: int = 0,
     is_admin_user: bool = False,
+    user_full_name: str | None = None,
 ) -> str:
     if profile:
-        first_name = (profile.get("full_name") or "Коллега").strip().split()[0]
+        # Для приветствия используем полное имя Telegram в естественном порядке
+        # (имя + фамилия). Если фамилия в Telegram не заполнена, берём полное
+        # имя из анкеты сотрудника без обрезания до первого слова.
+        profile_full_name = (profile.get("full_name") or "Коллега").strip()
+        display_name = (user_full_name or "").strip() or profile_full_name
         tests = db_profile_test_summary(int(profile["id"]))
         achievements_count = db_achievements_count(int(profile["id"]))
         attention = []
@@ -2912,7 +2917,7 @@ def help_text_main(
             if pending:
                 admin_line = f"\n⚙️ Ожидают решения номинации: <b>{pending}</b>\n"
         return (
-            f"👋 <b>Привет, {escape(first_name)}!</b>\n\n"
+            f"👋 <b>Привет, {escape(display_name)}!</b>\n\n"
             "Это твоя рабочая панель. Здесь видно, что требует внимания, "
             "и доступны основные разделы команды.\n\n"
             "📌 <b>Сейчас:</b>\n• " + "\n• ".join(attention) + "\n"
@@ -2999,6 +3004,9 @@ def kb_my_account(profile: dict):
         [
             InlineKeyboardButton("🏆 Мои достижения", callback_data="help:me:achievements"),
             InlineKeyboardButton("📝 Мои тесты", callback_data="help:me:tests"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Редактировать мою анкету", callback_data="help:me:edit")
         ],
         [
             InlineKeyboardButton(
@@ -4599,6 +4607,15 @@ def _profile_wiz_finish_text(mode: str, profile_id: int, is_admin: bool, updated
     action = "обновлена" if updated else "добавлена"
     if mode == "self_create":
         return f"✅ Ваша анкета {action}.", kb_help_team(can_create_profile=False)
+    if mode == "self_edit":
+        return (
+            "✅ Ваша анкета обновлена. Изменения уже отображаются в карточке команды.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("👤 Вернуться в мой кабинет", callback_data="help:me")],
+                [InlineKeyboardButton("👥 Открыть мою карточку", callback_data=f"help:team:person:{int(profile_id)}:{_profile_team_page(int(profile_id))}")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
+            ]),
+        )
     return f"✅ Анкета {action} (ID {profile_id}).", (kb_help_settings() if is_admin else kb_help_main(is_admin_user=False))
 
 
@@ -4625,11 +4642,29 @@ async def finalize_profile_wizard(update: Update, context: ContextTypes.DEFAULT_
         clear_profile_wiz(context)
         return False, "❌ Не хватает данных анкеты. Начните заполнение заново.", kb_help_main(is_admin_user=is_admin_here)
 
-    if mode == "admin_edit":
+    if mode in ("admin_edit", "self_edit"):
         edit_pid = context.chat_data.get(PROFILE_WIZ_EDIT_PID)
         if not edit_pid:
             clear_profile_wiz(context)
-            return False, "❌ Не удалось определить редактируемую анкету.", kb_help_settings()
+            fallback = kb_help_settings() if mode == "admin_edit" else kb_help_main(is_admin_user=is_admin_here)
+            return False, "❌ Не удалось определить редактируемую анкету.", fallback
+
+        # Самостоятельно можно изменять только собственную анкету.
+        if mode == "self_edit":
+            owner_profile = get_profile_for_user(update)
+            current_user = update.effective_user
+            if (
+                not current_user
+                or not owner_profile
+                or int(owner_profile["id"]) != int(edit_pid)
+            ):
+                clear_profile_wiz(context)
+                return (
+                    False,
+                    "❌ Не удалось подтвердить, что эта анкета принадлежит вам. Редактирование отменено.",
+                    kb_help_main(is_admin_user=is_admin_here),
+                )
+
         keep_existing_photo = data.get("photo_action") not in ("replace", "remove")
         ok = db_profiles_update(
             pid=int(edit_pid),
@@ -4645,7 +4680,8 @@ async def finalize_profile_wizard(update: Update, context: ContextTypes.DEFAULT_
         )
         if not ok:
             clear_profile_wiz(context)
-            return False, "❌ Не удалось обновить анкету.", kb_help_settings()
+            fallback = kb_help_settings() if mode == "admin_edit" else kb_help_main(is_admin_user=is_admin_here)
+            return False, "❌ Не удалось обновить анкету.", fallback
         pid = int(edit_pid)
     else:
         pid = db_profiles_add(
@@ -4659,11 +4695,17 @@ async def finalize_profile_wizard(update: Update, context: ContextTypes.DEFAULT_
             photo_file_id=data.get("photo_file_id"),
         )
 
-    if mode == "self_create" and update.effective_user:
+    if mode in ("self_create", "self_edit") and update.effective_user:
+        # Закрепляем анкету за Telegram ID владельца, даже если @username изменился.
         db_profiles_set_tg_user_id(pid, int(update.effective_user.id))
 
     clear_profile_wiz(context)
-    msg, markup = _profile_wiz_finish_text(mode, pid, is_admin_here, updated=(mode == "admin_edit"))
+    msg, markup = _profile_wiz_finish_text(
+        mode,
+        pid,
+        is_admin_here,
+        updated=(mode in ("admin_edit", "self_edit")),
+    )
     return True, msg, markup
 
 
@@ -4771,7 +4813,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_adm = await is_admin_scoped(update, context)
     profile = get_profile_for_user(update)
     unread_count = db_notifications_unread_count(update.effective_user.id if update.effective_user else None)
-    text = help_text_main(bot_username, profile=profile, unread_count=unread_count, is_admin_user=is_adm)
+    text = help_text_main(
+        bot_username,
+        profile=profile,
+        unread_count=unread_count,
+        is_admin_user=is_adm,
+        user_full_name=(update.effective_user.full_name if update.effective_user else None),
+    )
 
     orig_msg = update.message  # чтобы (по возможности) удалить /help в группе
 
@@ -6266,7 +6314,13 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await replace_callback_message_with_text(
             q,
             context,
-            help_text_main(bot_username, profile=profile, unread_count=unread_count, is_admin_user=is_adm),
+            help_text_main(
+                bot_username,
+                profile=profile,
+                unread_count=unread_count,
+                is_admin_user=is_adm,
+                user_full_name=(update.effective_user.full_name if update.effective_user else None),
+            ),
             parse_mode=ParseMode.HTML,
             reply_markup=kb_help_main(is_admin_user=is_adm, unread_count=unread_count),
             disable_web_page_preview=True,
@@ -6410,6 +6464,30 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "help:me:edit":
+        profile = get_profile_for_user(update)
+        if not profile:
+            await q.answer("Ваша анкета не найдена.", show_alert=True)
+            return
+
+        # В мастер передаётся только анкета текущего пользователя.
+        start_profile_wizard(
+            context,
+            update.effective_user.id,
+            mode="self_edit",
+            initial_data=profile,
+            edit_pid=int(profile["id"]),
+        )
+        await q.edit_message_text(
+            "✏️ <b>Редактирование моей анкеты</b>\n\n"
+            "Вы можете обновить имя, год начала работы, город, день рождения, "
+            "описание, темы для обращений, Telegram и фотографию.\n\n"
+            "Шаг 1/8: отправьте <b>Имя и Фамилию</b>.\n"
+            f"Текущее значение: <code>{html_lib.escape(profile['full_name'])}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cancel_wizard_settings(),
+        )
+        return
     if data == "help:me:achievements":
         profile = get_profile_for_user(update)
         if not profile:
@@ -7056,6 +7134,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 profile=profile,
                 unread_count=unread_count,
                 is_admin_user=is_adm,
+                user_full_name=(update.effective_user.full_name if update.effective_user else None),
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=kb_help_main(is_admin_user=is_adm, unread_count=unread_count),
@@ -9784,6 +9863,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_profile_wiz(context)
             await update.message.reply_text("❌ Для этого сценария используйте раздел настроек администратора.")
             return
+        if mode == "self_edit":
+            own_profile = get_profile_for_user(update)
+            edit_pid = context.chat_data.get(PROFILE_WIZ_EDIT_PID)
+            if not own_profile or not edit_pid or int(own_profile["id"]) != int(edit_pid):
+                clear_profile_wiz(context)
+                await update.message.reply_text(
+                    "❌ Не удалось подтвердить владельца анкеты. Редактирование отменено.",
+                    reply_markup=kb_help_main(is_admin_user=is_admin_here),
+                )
+                return
 
         step = context.chat_data.get(PROFILE_WIZ_STEP)
         data = context.chat_data.get(PROFILE_WIZ_DATA) or {}
