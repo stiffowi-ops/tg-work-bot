@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "TEAM-UPCOMING-BIRTHDAYS-2026-07-21-V8"
+BUILD_VERSION = "DOCUMENTS-KNOWLEDGE-BASE-2026-07-21-V9"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -599,7 +599,69 @@ def db_init():
     except sqlite3.OperationalError:
         pass
 
-    
+    # Дата последнего изменения карточки или файла.
+    try:
+        cur.execute("ALTER TABLE docs ADD COLUMN updated_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+    cur.execute("UPDATE docs SET updated_at=uploaded_at WHERE updated_at IS NULL OR updated_at='' ")
+
+    # ------- DOCUMENTS: теги, избранное, история и подборки -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS doc_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS doc_tag_links (
+            doc_id INTEGER NOT NULL,
+            tag_id INTEGER NOT NULL,
+            PRIMARY KEY (doc_id, tag_id),
+            FOREIGN KEY(doc_id) REFERENCES docs(id) ON DELETE CASCADE,
+            FOREIGN KEY(tag_id) REFERENCES doc_tags(id) ON DELETE CASCADE
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS doc_favorites (
+            user_id INTEGER NOT NULL,
+            doc_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, doc_id),
+            FOREIGN KEY(doc_id) REFERENCES docs(id) ON DELETE CASCADE
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS doc_views (
+            user_id INTEGER NOT NULL,
+            doc_id INTEGER NOT NULL,
+            last_viewed_at TEXT NOT NULL,
+            view_count INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (user_id, doc_id),
+            FOREIGN KEY(doc_id) REFERENCES docs(id) ON DELETE CASCADE
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS doc_collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            description TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS doc_collection_items (
+            collection_id INTEGER NOT NULL,
+            doc_id INTEGER NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (collection_id, doc_id),
+            FOREIGN KEY(collection_id) REFERENCES doc_collections(id) ON DELETE CASCADE,
+            FOREIGN KEY(doc_id) REFERENCES docs(id) ON DELETE CASCADE
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_uploaded_at ON docs(uploaded_at DESC)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_doc_views_user_time ON doc_views(user_id, last_viewed_at DESC)")
 
     # ------- HELP MENU: FAQ -------
     cur.execute("""
@@ -1375,7 +1437,12 @@ def db_docs_add_doc(category_id: int, title: str, description: str | None, file_
 def db_docs_delete_doc(doc_id: int) -> bool:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("DELETE FROM docs WHERE id=?", (doc_id,))
+    did = int(doc_id)
+    cur.execute("DELETE FROM doc_tag_links WHERE doc_id=?", (did,))
+    cur.execute("DELETE FROM doc_favorites WHERE doc_id=?", (did,))
+    cur.execute("DELETE FROM doc_views WHERE doc_id=?", (did,))
+    cur.execute("DELETE FROM doc_collection_items WHERE doc_id=?", (did,))
+    cur.execute("DELETE FROM docs WHERE id=?", (did,))
     deleted = cur.rowcount > 0
     con.commit()
     con.close()
@@ -1493,6 +1560,449 @@ def db_profiles_upsert(
     return int(pid)
 
 
+
+
+# ---------------- DOCUMENTS: KNOWLEDGE BASE DB ----------------
+
+def _db_doc_rows_to_dicts(rows) -> list[dict]:
+    return [
+        {
+            "id": int(r[0]),
+            "category_id": int(r[1]),
+            "title": r[2],
+            "description": r[3] or "",
+            "file_id": r[4],
+            "file_unique_id": r[5],
+            "mime": r[6],
+            "local_path": r[7],
+            "uploaded_at": r[8],
+            "updated_at": r[9] or r[8],
+            "category_title": r[10],
+        }
+        for r in rows
+    ]
+
+
+def db_docs_list_all(limit: int = 100) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT d.id, d.category_id, d.title, d.description, d.file_id,
+               d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
+               COALESCE(d.updated_at, d.uploaded_at), c.title
+        FROM docs d
+        JOIN doc_categories c ON c.id=d.category_id
+        ORDER BY d.title COLLATE NOCASE ASC
+        LIMIT ?
+        """,
+        (int(limit),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return _db_doc_rows_to_dicts(rows)
+
+
+def db_docs_search(query: str, limit: int = 40) -> list[dict]:
+    q = (query or "").strip()
+    if not q:
+        return []
+    like = f"%{q}%"
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT DISTINCT d.id, d.category_id, d.title, d.description, d.file_id,
+               d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
+               COALESCE(d.updated_at, d.uploaded_at), c.title
+        FROM docs d
+        JOIN doc_categories c ON c.id=d.category_id
+        LEFT JOIN doc_tag_links l ON l.doc_id=d.id
+        LEFT JOIN doc_tags t ON t.id=l.tag_id
+        WHERE d.title LIKE ? COLLATE NOCASE
+           OR COALESCE(d.description, '') LIKE ? COLLATE NOCASE
+           OR c.title LIKE ? COLLATE NOCASE
+           OR COALESCE(t.title, '') LIKE ? COLLATE NOCASE
+        ORDER BY d.title COLLATE NOCASE ASC
+        LIMIT ?
+        """,
+        (like, like, like, like, int(limit)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return _db_doc_rows_to_dicts(rows)
+
+
+def db_docs_new(days: int = 30, limit: int = 40) -> list[dict]:
+    threshold = (datetime.utcnow() - timedelta(days=max(1, int(days)))).isoformat()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT d.id, d.category_id, d.title, d.description, d.file_id,
+               d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
+               COALESCE(d.updated_at, d.uploaded_at), c.title
+        FROM docs d
+        JOIN doc_categories c ON c.id=d.category_id
+        WHERE d.uploaded_at>=?
+        ORDER BY d.uploaded_at DESC, d.id DESC
+        LIMIT ?
+        """,
+        (threshold, int(limit)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return _db_doc_rows_to_dicts(rows)
+
+
+def db_doc_record_view(user_id: int | None, doc_id: int):
+    if not user_id:
+        return
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO doc_views(user_id, doc_id, last_viewed_at, view_count)
+        VALUES(?, ?, ?, 1)
+        ON CONFLICT(user_id, doc_id) DO UPDATE SET
+            last_viewed_at=excluded.last_viewed_at,
+            view_count=doc_views.view_count+1
+        """,
+        (int(user_id), int(doc_id), datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    con.close()
+
+
+def db_docs_recent(user_id: int | None, limit: int = 40) -> list[dict]:
+    if not user_id:
+        return []
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT d.id, d.category_id, d.title, d.description, d.file_id,
+               d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
+               COALESCE(d.updated_at, d.uploaded_at), c.title
+        FROM doc_views v
+        JOIN docs d ON d.id=v.doc_id
+        JOIN doc_categories c ON c.id=d.category_id
+        WHERE v.user_id=?
+        ORDER BY v.last_viewed_at DESC
+        LIMIT ?
+        """,
+        (int(user_id), int(limit)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return _db_doc_rows_to_dicts(rows)
+
+
+def db_doc_is_favorite(user_id: int | None, doc_id: int) -> bool:
+    if not user_id:
+        return False
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT 1 FROM doc_favorites WHERE user_id=? AND doc_id=?", (int(user_id), int(doc_id)))
+    result = cur.fetchone() is not None
+    con.close()
+    return result
+
+
+def db_doc_toggle_favorite(user_id: int | None, doc_id: int) -> bool:
+    if not user_id:
+        return False
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT 1 FROM doc_favorites WHERE user_id=? AND doc_id=?", (int(user_id), int(doc_id)))
+    if cur.fetchone():
+        cur.execute("DELETE FROM doc_favorites WHERE user_id=? AND doc_id=?", (int(user_id), int(doc_id)))
+        enabled = False
+    else:
+        cur.execute(
+            "INSERT INTO doc_favorites(user_id, doc_id, created_at) VALUES(?, ?, ?)",
+            (int(user_id), int(doc_id), datetime.utcnow().isoformat()),
+        )
+        enabled = True
+    con.commit()
+    con.close()
+    return enabled
+
+
+def db_docs_favorites(user_id: int | None, limit: int = 40) -> list[dict]:
+    if not user_id:
+        return []
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT d.id, d.category_id, d.title, d.description, d.file_id,
+               d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
+               COALESCE(d.updated_at, d.uploaded_at), c.title
+        FROM doc_favorites f
+        JOIN docs d ON d.id=f.doc_id
+        JOIN doc_categories c ON c.id=d.category_id
+        WHERE f.user_id=?
+        ORDER BY f.created_at DESC
+        LIMIT ?
+        """,
+        (int(user_id), int(limit)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return _db_doc_rows_to_dicts(rows)
+
+
+def db_doc_tags_list() -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT t.id, t.title, COUNT(l.doc_id)
+        FROM doc_tags t
+        LEFT JOIN doc_tag_links l ON l.tag_id=t.id
+        GROUP BY t.id, t.title
+        ORDER BY t.title COLLATE NOCASE ASC
+        """
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [{"id": int(r[0]), "title": r[1], "count": int(r[2] or 0)} for r in rows]
+
+
+def db_doc_tag_add(title: str) -> int:
+    clean = re.sub(r"\s+", " ", (title or "").strip()).lstrip("#")
+    if len(clean) < 2:
+        raise ValueError("Название тега слишком короткое")
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO doc_tags(title, created_at) VALUES(?, ?)",
+        (clean[:50], datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    tag_id = int(cur.lastrowid)
+    con.close()
+    return tag_id
+
+
+def db_doc_tag_delete(tag_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM doc_tag_links WHERE tag_id=?", (int(tag_id),))
+    cur.execute("DELETE FROM doc_tags WHERE id=?", (int(tag_id),))
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+
+def db_doc_get_tags(doc_id: int) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT t.id, t.title
+        FROM doc_tag_links l
+        JOIN doc_tags t ON t.id=l.tag_id
+        WHERE l.doc_id=?
+        ORDER BY t.title COLLATE NOCASE ASC
+        """,
+        (int(doc_id),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [{"id": int(r[0]), "title": r[1]} for r in rows]
+
+
+def db_doc_toggle_tag(doc_id: int, tag_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT 1 FROM doc_tag_links WHERE doc_id=? AND tag_id=?", (int(doc_id), int(tag_id)))
+    if cur.fetchone():
+        cur.execute("DELETE FROM doc_tag_links WHERE doc_id=? AND tag_id=?", (int(doc_id), int(tag_id)))
+        enabled = False
+    else:
+        cur.execute("INSERT OR IGNORE INTO doc_tag_links(doc_id, tag_id) VALUES(?, ?)", (int(doc_id), int(tag_id)))
+        enabled = True
+    cur.execute("UPDATE docs SET updated_at=? WHERE id=?", (datetime.utcnow().isoformat(), int(doc_id)))
+    con.commit()
+    con.close()
+    return enabled
+
+
+def db_doc_update_title(doc_id: int, title: str) -> bool:
+    clean = re.sub(r"\s+", " ", (title or "").strip())[:120]
+    if len(clean) < 2:
+        return False
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("UPDATE docs SET title=?, updated_at=? WHERE id=?", (clean, datetime.utcnow().isoformat(), int(doc_id)))
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+
+def db_doc_update_description(doc_id: int, description: str | None) -> bool:
+    clean = (description or "").strip()[:1200] or None
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("UPDATE docs SET description=?, updated_at=? WHERE id=?", (clean, datetime.utcnow().isoformat(), int(doc_id)))
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+
+def db_doc_update_category(doc_id: int, category_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE docs SET category_id=?, updated_at=? WHERE id=?",
+        (int(category_id), datetime.utcnow().isoformat(), int(doc_id)),
+    )
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+
+def db_doc_replace_file(
+    doc_id: int,
+    file_id: str,
+    file_unique_id: str | None,
+    mime_type: str | None,
+    local_path: str | None,
+) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE docs
+        SET file_id=?, file_unique_id=?, mime_type=?, local_path=?, updated_at=?
+        WHERE id=?
+        """,
+        (
+            file_id,
+            file_unique_id,
+            mime_type,
+            local_path,
+            datetime.utcnow().isoformat(),
+            int(doc_id),
+        ),
+    )
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+
+def db_doc_collections_list() -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT c.id, c.title, c.description, COUNT(i.doc_id)
+        FROM doc_collections c
+        LEFT JOIN doc_collection_items i ON i.collection_id=c.id
+        GROUP BY c.id, c.title, c.description
+        ORDER BY c.title COLLATE NOCASE ASC
+        """
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {"id": int(r[0]), "title": r[1], "description": r[2] or "", "count": int(r[3] or 0)}
+        for r in rows
+    ]
+
+
+def db_doc_collection_get(collection_id: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id, title, description FROM doc_collections WHERE id=?", (int(collection_id),))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {"id": int(row[0]), "title": row[1], "description": row[2] or ""}
+
+
+def db_doc_collection_add(title: str, description: str | None = None) -> int:
+    clean = re.sub(r"\s+", " ", (title or "").strip())
+    if len(clean) < 2:
+        raise ValueError("Название подборки слишком короткое")
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO doc_collections(title, description, created_at) VALUES(?, ?, ?)",
+        (clean[:80], (description or "").strip()[:500] or None, datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    collection_id = int(cur.lastrowid)
+    con.close()
+    return collection_id
+
+
+def db_doc_collection_delete(collection_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM doc_collection_items WHERE collection_id=?", (int(collection_id),))
+    cur.execute("DELETE FROM doc_collections WHERE id=?", (int(collection_id),))
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+
+def db_doc_collection_items(collection_id: int) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT d.id, d.category_id, d.title, d.description, d.file_id,
+               d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
+               COALESCE(d.updated_at, d.uploaded_at), c.title
+        FROM doc_collection_items i
+        JOIN docs d ON d.id=i.doc_id
+        JOIN doc_categories c ON c.id=d.category_id
+        WHERE i.collection_id=?
+        ORDER BY i.position ASC, d.title COLLATE NOCASE ASC
+        """,
+        (int(collection_id),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return _db_doc_rows_to_dicts(rows)
+
+
+def db_doc_collection_add_item(collection_id: int, doc_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT COALESCE(MAX(position), -1)+1 FROM doc_collection_items WHERE collection_id=?", (int(collection_id),))
+    pos = int((cur.fetchone() or [0])[0] or 0)
+    cur.execute(
+        "INSERT OR IGNORE INTO doc_collection_items(collection_id, doc_id, position) VALUES(?, ?, ?)",
+        (int(collection_id), int(doc_id), pos),
+    )
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+
+def db_doc_collection_remove_item(collection_id: int, doc_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "DELETE FROM doc_collection_items WHERE collection_id=? AND doc_id=?",
+        (int(collection_id), int(doc_id)),
+    )
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
 
 # ---------------- HELP DB: FAQ ----------------
 
@@ -2744,6 +3254,15 @@ PENDING_DOC_INFO = "pending_doc_info"
 WAITING_NEW_CATEGORY_NAME = "waiting_new_category_name"
 WAITING_EDIT_CATEGORY_ID = "waiting_edit_category_id"
 
+# documents knowledge-base flows
+WAITING_DOC_SEARCH = "waiting_doc_search"
+WAITING_DOC_EDIT_TITLE_ID = "waiting_doc_edit_title_id"
+WAITING_DOC_EDIT_DESC_ID = "waiting_doc_edit_desc_id"
+WAITING_DOC_REPLACE_ID = "waiting_doc_replace_id"
+WAITING_DOC_TAG_NAME = "waiting_doc_tag_name"
+WAITING_DOC_COLLECTION_NAME = "waiting_doc_collection_name"
+DOCS_RETURN_CB = "docs_return_cb"
+
 
 # faq add flow
 WAITING_FAQ_Q = "waiting_faq_q"
@@ -2810,6 +3329,12 @@ def clear_docs_flow(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop(PENDING_DOC_INFO, None)
     context.chat_data[WAITING_NEW_CATEGORY_NAME] = False
     context.chat_data.pop(WAITING_EDIT_CATEGORY_ID, None)
+    context.chat_data[WAITING_DOC_SEARCH] = False
+    context.chat_data.pop(WAITING_DOC_EDIT_TITLE_ID, None)
+    context.chat_data.pop(WAITING_DOC_EDIT_DESC_ID, None)
+    context.chat_data.pop(WAITING_DOC_REPLACE_ID, None)
+    context.chat_data[WAITING_DOC_TAG_NAME] = False
+    context.chat_data[WAITING_DOC_COLLECTION_NAME] = False
 
 
 def clear_faq_flow(context: ContextTypes.DEFAULT_TYPE):
@@ -3625,7 +4150,7 @@ def kb_help_docs_categories():
     else:
         for cid, title in cats:
             rows.append([InlineKeyboardButton(title, callback_data=f"help:docs:cat:{cid}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:docs")])
     return InlineKeyboardMarkup(rows)
 
 def kb_help_faq_list():
@@ -3657,10 +4182,217 @@ def kb_help_docs_files(category_id: int):
         rows.append([InlineKeyboardButton("— файлов нет —", callback_data="noop")])
     else:
         for did, title in items[:40]:
-            rows.append([InlineKeyboardButton(title, callback_data=f"help:docs:file:{did}")])
+            rows.append([InlineKeyboardButton(title, callback_data=f"help:docs:open:{did}")])
     rows.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="help:docs")])
     rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
+
+
+
+def kb_help_docs_main(is_admin_user: bool):
+    rows = [
+        [InlineKeyboardButton("🔎 Найти документ", callback_data="help:docs:search")],
+        [
+            InlineKeyboardButton("⭐ Избранное", callback_data="help:docs:favorites"),
+            InlineKeyboardButton("🕘 Недавние", callback_data="help:docs:recent"),
+        ],
+        [InlineKeyboardButton("🆕 Новые документы", callback_data="help:docs:new")],
+        [InlineKeyboardButton("📂 Все категории", callback_data="help:docs:categories")],
+        [InlineKeyboardButton("🎓 Подборки", callback_data="help:docs:collections")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+    ]
+    if is_admin_user:
+        rows.extend([
+            [InlineKeyboardButton("➕ Добавить документ", callback_data="help:settings:add_doc")],
+            [InlineKeyboardButton("✏️ Редактировать документ", callback_data="help:docs:admin:edit")],
+            [InlineKeyboardButton("🔄 Заменить файл", callback_data="help:docs:admin:replace")],
+            [InlineKeyboardButton("➖ Удалить документ", callback_data="help:docs:admin:delete")],
+            [InlineKeyboardButton("🗂 Управление категориями", callback_data="help:settings:cats")],
+            [InlineKeyboardButton("🏷 Управление тегами", callback_data="help:docs:admin:tags")],
+            [InlineKeyboardButton("🎓 Управление подборками", callback_data="help:docs:admin:collections")],
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_docs_result_list(items: list[dict], empty_text: str = "— документов нет —", back_cb: str = "help:docs"):
+    rows = []
+    if not items:
+        rows.append([InlineKeyboardButton(empty_text, callback_data="noop")])
+    else:
+        for item in items[:40]:
+            title = str(item.get("title") or "Документ")
+            category = str(item.get("category_title") or "")
+            label = f"📄 {title}"
+            if category:
+                label += f" · {category}"
+            if len(label) > 60:
+                label = label[:57] + "…"
+            rows.append([InlineKeyboardButton(label, callback_data=f"help:docs:open:{int(item['id'])}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_cb)])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_doc_card(doc_id: int, user_id: int | None, back_cb: str = "help:docs"):
+    fav = db_doc_is_favorite(user_id, doc_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Получить файл", callback_data=f"help:docs:download:{doc_id}")],
+        [InlineKeyboardButton("★ Убрать из избранного" if fav else "⭐ В избранное", callback_data=f"help:docs:favorite:{doc_id}")],
+        [InlineKeyboardButton("⬅️ Назад к списку", callback_data=back_cb)],
+        [InlineKeyboardButton("🏠 Документы", callback_data="help:docs")],
+    ])
+
+
+def kb_doc_collections(back_cb: str = "help:docs"):
+    collections = db_doc_collections_list()
+    rows = []
+    for item in collections:
+        rows.append([
+            InlineKeyboardButton(
+                f"🎓 {item['title']} · {item['count']}",
+                callback_data=f"help:docs:collection:{item['id']}",
+            )
+        ])
+    if not rows:
+        rows.append([InlineKeyboardButton("— подборок пока нет —", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_cb)])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_doc_admin_picker(action: str, back_cb: str = "help:docs"):
+    items = db_docs_list_all(60)
+    rows = []
+    icons = {"edit": "✏️", "replace": "🔄", "delete": "🗑"}
+    icon = icons.get(action, "📄")
+    for item in items:
+        label = f"{icon} {item['title']} · {item['category_title']}"
+        if len(label) > 60:
+            label = label[:57] + "…"
+        rows.append([
+            InlineKeyboardButton(label, callback_data=f"help:docs:admin:{action}:{item['id']}")
+        ])
+    if not rows:
+        rows.append([InlineKeyboardButton("— документов нет —", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_cb)])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_doc_edit_menu(doc_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Название", callback_data=f"help:docs:admin:editfield:title:{doc_id}")],
+        [InlineKeyboardButton("📝 Описание", callback_data=f"help:docs:admin:editfield:description:{doc_id}")],
+        [InlineKeyboardButton("📂 Категория", callback_data=f"help:docs:admin:editfield:category:{doc_id}")],
+        [InlineKeyboardButton("🏷 Теги", callback_data=f"help:docs:admin:editfield:tags:{doc_id}")],
+        [InlineKeyboardButton("⬅️ К списку", callback_data="help:docs:admin:edit")],
+        [InlineKeyboardButton("🏠 Документы", callback_data="help:docs")],
+    ])
+
+
+def kb_doc_category_picker(doc_id: int):
+    rows = [
+        [InlineKeyboardButton(title, callback_data=f"help:docs:admin:setcat:{doc_id}:{cid}")]
+        for cid, title in db_docs_list_categories()
+    ]
+    if not rows:
+        rows.append([InlineKeyboardButton("— категорий нет —", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"help:docs:admin:edit:{doc_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_doc_tag_picker(doc_id: int):
+    assigned = {item["id"] for item in db_doc_get_tags(doc_id)}
+    rows = []
+    for tag in db_doc_tags_list():
+        mark = "✅" if tag["id"] in assigned else "▫️"
+        rows.append([
+            InlineKeyboardButton(
+                f"{mark} #{tag['title']}",
+                callback_data=f"help:docs:admin:tagtoggle:{doc_id}:{tag['id']}",
+            )
+        ])
+    if not rows:
+        rows.append([InlineKeyboardButton("— сначала создайте теги —", callback_data="noop")])
+    rows.append([InlineKeyboardButton("✅ Готово", callback_data=f"help:docs:admin:edit:{doc_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_doc_tags_manage():
+    rows = [[InlineKeyboardButton("➕ Создать тег", callback_data="help:docs:admin:tags:add")]]
+    for tag in db_doc_tags_list():
+        rows.append([
+            InlineKeyboardButton(
+                f"🗑 #{tag['title']} · {tag['count']}",
+                callback_data=f"help:docs:admin:tags:delete:{tag['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:docs")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_doc_collections_manage():
+    rows = [[InlineKeyboardButton("➕ Создать подборку", callback_data="help:docs:admin:collections:add")]]
+    for item in db_doc_collections_list():
+        rows.append([
+            InlineKeyboardButton(
+                f"🎓 {item['title']} · {item['count']}",
+                callback_data=f"help:docs:admin:collection:{item['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:docs")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_doc_collection_manage(collection_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить документы", callback_data=f"help:docs:admin:collection:addlist:{collection_id}")],
+        [InlineKeyboardButton("➖ Убрать документы", callback_data=f"help:docs:admin:collection:removelist:{collection_id}")],
+        [InlineKeyboardButton("🗑 Удалить подборку", callback_data=f"help:docs:admin:collection:delete:{collection_id}")],
+        [InlineKeyboardButton("⬅️ К подборкам", callback_data="help:docs:admin:collections")],
+    ])
+
+
+def kb_doc_collection_doc_picker(collection_id: int, mode: str):
+    current = {item["id"] for item in db_doc_collection_items(collection_id)}
+    source = db_docs_list_all(100)
+    if mode == "add":
+        source = [item for item in source if item["id"] not in current]
+        prefix = "➕"
+    else:
+        source = [item for item in source if item["id"] in current]
+        prefix = "➖"
+    rows = []
+    for item in source[:60]:
+        label = f"{prefix} {item['title']} · {item['category_title']}"
+        if len(label) > 60:
+            label = label[:57] + "…"
+        rows.append([
+            InlineKeyboardButton(
+                label,
+                callback_data=f"help:docs:admin:collection:{mode}:{collection_id}:{item['id']}",
+            )
+        ])
+    if not rows:
+        rows.append([InlineKeyboardButton("— подходящих документов нет —", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"help:docs:admin:collection:{collection_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_doc_card_text(doc: dict) -> str:
+    tags = db_doc_get_tags(int(doc["id"]))
+    tags_text = " ".join(f"#{escape(t['title'])}" for t in tags) if tags else "—"
+    description = (doc.get("description") or "").strip()
+    uploaded = _format_short_date(doc.get("uploaded_at"))
+    updated = _format_short_date(doc.get("updated_at"))
+    text = (
+        f"📄 <b>{escape(doc.get('title') or 'Документ')}</b>\n\n"
+        f"📂 Категория: <b>{escape(doc.get('category_title') or 'Без категории')}</b>\n"
+        f"🏷 Теги: {tags_text}\n"
+        f"📅 Добавлен: {escape(uploaded)}"
+    )
+    if updated != uploaded:
+        text += f"\n🔄 Обновлён: {escape(updated)}"
+    if description:
+        text += f"\n\n{escape(description)}"
+    return text
 
 # -------- LINKS (описание) --------
 
@@ -4325,11 +5057,7 @@ def kb_help_settings():
 
 def kb_settings_content():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("➕ Добавить файл", callback_data="help:settings:add_doc"),
-            InlineKeyboardButton("➖ Удалить файл", callback_data="help:settings:del_doc"),
-        ],
-        [InlineKeyboardButton("🗂️ Категории документов", callback_data="help:settings:cats")],
+        [InlineKeyboardButton("📚 Открыть раздел «Документы»", callback_data="help:docs")],
         [InlineKeyboardButton("❓ Управление FAQ", callback_data="help:settings:faq")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
     ])
@@ -5917,6 +6645,63 @@ def export_backup_zip_bytes() -> bytes:
         })
     files["docs.csv"] = buf.getvalue()
 
+    # doc_tags.csv — связи тегов с документами
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=[
+        "doc_title", "category_title", "doc_file_unique_id", "doc_file_id", "tag_title"
+    ])
+    w.writeheader()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT d.title, c.title, d.file_unique_id, d.file_id, t.title
+        FROM doc_tag_links l
+        JOIN docs d ON d.id=l.doc_id
+        JOIN doc_categories c ON c.id=d.category_id
+        JOIN doc_tags t ON t.id=l.tag_id
+        ORDER BY t.title COLLATE NOCASE, d.title COLLATE NOCASE
+    """)
+    for doc_title, cat_title, unique_id, file_id, tag_title in cur.fetchall():
+        w.writerow({
+            "doc_title": doc_title or "",
+            "category_title": cat_title or "",
+            "doc_file_unique_id": unique_id or "",
+            "doc_file_id": file_id or "",
+            "tag_title": tag_title or "",
+        })
+    con.close()
+    files["doc_tags.csv"] = buf.getvalue()
+
+    # doc_collections.csv — подборки и их состав
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=[
+        "collection_title", "collection_description", "position",
+        "doc_title", "category_title", "doc_file_unique_id", "doc_file_id"
+    ])
+    w.writeheader()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT col.title, col.description, i.position, d.title, cat.title, d.file_unique_id, d.file_id
+        FROM doc_collections col
+        LEFT JOIN doc_collection_items i ON i.collection_id=col.id
+        LEFT JOIN docs d ON d.id=i.doc_id
+        LEFT JOIN doc_categories cat ON cat.id=d.category_id
+        ORDER BY col.title COLLATE NOCASE, COALESCE(i.position, 0), d.title COLLATE NOCASE
+    """)
+    for collection_title, description, position, doc_title, cat_title, unique_id, file_id in cur.fetchall():
+        w.writerow({
+            "collection_title": collection_title or "",
+            "collection_description": description or "",
+            "position": position if position is not None else "",
+            "doc_title": doc_title or "",
+            "category_title": cat_title or "",
+            "doc_file_unique_id": unique_id or "",
+            "doc_file_id": file_id or "",
+        })
+    con.close()
+    files["doc_collections.csv"] = buf.getvalue()
+
     # profiles.csv
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=[
@@ -6011,7 +6796,7 @@ def export_backup_zip_bytes() -> bytes:
 
 def restore_backup_zip_bytes(data: bytes) -> dict:
     """Восстановление из ZIP бэкапа (CSV). Возвращает статистику по импортированным сущностям."""
-    stats = {"profiles": 0, "categories": 0, "docs": 0, "faq": 0, "notify_chats": 0, "achievements_awards": 0}
+    stats = {"profiles": 0, "categories": 0, "docs": 0, "doc_tags": 0, "doc_collections": 0, "faq": 0, "notify_chats": 0, "achievements_awards": 0}
     zbuf = io.BytesIO(data)
     with zipfile.ZipFile(zbuf, "r") as zf:
         names = set(zf.namelist())
@@ -6201,7 +6986,100 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
             con.commit()
             con.close()
 
-                # 4) faq.csv
+        def _find_restored_doc_id(row: dict) -> int | None:
+            unique_id = (row.get("doc_file_unique_id") or "").strip()
+            file_id = (row.get("doc_file_id") or "").strip()
+            doc_title = (row.get("doc_title") or "").strip()
+            cat_title = (row.get("category_title") or "").strip()
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            found = None
+            if unique_id:
+                cur.execute("SELECT id FROM docs WHERE file_unique_id=? ORDER BY id DESC LIMIT 1", (unique_id,))
+                r = cur.fetchone()
+                if r:
+                    found = int(r[0])
+            if found is None and file_id:
+                cur.execute("SELECT id FROM docs WHERE file_id=? ORDER BY id DESC LIMIT 1", (file_id,))
+                r = cur.fetchone()
+                if r:
+                    found = int(r[0])
+            if found is None and doc_title and cat_title:
+                cur.execute(
+                    """SELECT d.id FROM docs d JOIN doc_categories c ON c.id=d.category_id
+                       WHERE d.title=? AND c.title=? ORDER BY d.id DESC LIMIT 1""",
+                    (doc_title, cat_title),
+                )
+                r = cur.fetchone()
+                if r:
+                    found = int(r[0])
+            con.close()
+            return found
+
+        # 4) теги документов
+        if "doc_tags.csv" in names:
+            raw = zf.read("doc_tags.csv").decode("utf-8-sig", errors="ignore")
+            reader = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            for row in reader:
+                tag_title = (row.get("tag_title") or "").strip().lstrip("#")
+                doc_id = _find_restored_doc_id(row)
+                if not tag_title or not doc_id:
+                    continue
+                cur.execute(
+                    "INSERT INTO doc_tags(title, created_at) VALUES(?, ?) ON CONFLICT(title) DO NOTHING",
+                    (tag_title[:50], datetime.utcnow().isoformat()),
+                )
+                cur.execute("SELECT id FROM doc_tags WHERE title=? COLLATE NOCASE", (tag_title[:50],))
+                tag_row = cur.fetchone()
+                if tag_row:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO doc_tag_links(doc_id, tag_id) VALUES(?, ?)",
+                        (int(doc_id), int(tag_row[0])),
+                    )
+                    stats["doc_tags"] += 1
+            con.commit()
+            con.close()
+
+        # 5) подборки документов
+        if "doc_collections.csv" in names:
+            raw = zf.read("doc_collections.csv").decode("utf-8-sig", errors="ignore")
+            reader = csv.DictReader(io.StringIO(raw))
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            restored_collections = set()
+            for row in reader:
+                title = (row.get("collection_title") or "").strip()
+                description = (row.get("collection_description") or "").strip() or None
+                if not title:
+                    continue
+                cur.execute(
+                    """INSERT INTO doc_collections(title, description, created_at) VALUES(?, ?, ?)
+                       ON CONFLICT(title) DO UPDATE SET description=excluded.description""",
+                    (title[:80], description, datetime.utcnow().isoformat()),
+                )
+                cur.execute("SELECT id FROM doc_collections WHERE title=? COLLATE NOCASE", (title[:80],))
+                collection_row = cur.fetchone()
+                if not collection_row:
+                    continue
+                collection_id = int(collection_row[0])
+                restored_collections.add(collection_id)
+                doc_id = _find_restored_doc_id(row)
+                if doc_id:
+                    try:
+                        position = int(row.get("position") or 0)
+                    except Exception:
+                        position = 0
+                    cur.execute(
+                        "INSERT OR IGNORE INTO doc_collection_items(collection_id, doc_id, position) VALUES(?, ?, ?)",
+                        (collection_id, int(doc_id), position),
+                    )
+            stats["doc_collections"] += len(restored_collections)
+            con.commit()
+            con.close()
+
+                # 6) faq.csv
         if "faq.csv" in names:
             raw = zf.read("faq.csv").decode("utf-8-sig", errors="ignore")
             reader = csv.DictReader(io.StringIO(raw))
@@ -7363,42 +8241,429 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:docs":
+        clear_docs_flow(context)
+        context.user_data[DOCS_RETURN_CB] = "help:docs"
         text = (
-            "📄 <b>Документы</b>\n\n"
-            "Здесь собраны рабочие документы.\n"
-            "Выберите категорию, чтобы перейти к файлам."
+            "📚 <b>Документы</b>\n\n"
+            "Поиск, избранное, история просмотров, новые материалы, категории и подборки."
         )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_categories())
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_main(is_adm))
+        return
+
+    if data == "help:docs:categories":
+        context.user_data[DOCS_RETURN_CB] = "help:docs:categories"
+        await q.edit_message_text(
+            "📂 <b>Все категории</b>\n\nВыберите категорию:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_docs_categories(),
+        )
         return
 
     if data.startswith("help:docs:cat:"):
         cid = int(data.split(":")[-1])
         cats = dict(db_docs_list_categories())
         title = cats.get(cid, "Категория")
-        text = f"📄 <b>{title}</b>\n\nВыберите файл:"
+        context.user_data[DOCS_RETURN_CB] = f"help:docs:cat:{cid}"
+        text = f"📂 <b>{escape(title)}</b>\n\nВыберите документ:"
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_files(cid))
         return
 
-    if data.startswith("help:docs:file:"):
+    if data == "help:docs:search":
+        clear_docs_flow(context)
+        context.chat_data[WAITING_DOC_SEARCH] = True
+        context.chat_data[WAITING_USER_ID] = update.effective_user.id if update.effective_user else None
+        context.chat_data[WAITING_SINCE_TS] = int(time.time())
+        await q.edit_message_text(
+            "🔎 <b>Поиск документов</b>\n\n"
+            "Введите название, фразу из описания, категорию или тег.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="help:docs")]]),
+        )
+        return
+
+    if data == "help:docs:favorites":
+        items = db_docs_favorites(update.effective_user.id if update.effective_user else None)
+        context.user_data[DOCS_RETURN_CB] = "help:docs:favorites"
+        await q.edit_message_text(
+            "⭐ <b>Избранные документы</b>\n\nВаши сохранённые материалы:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_docs_result_list(items, "— в избранном пока пусто —"),
+        )
+        return
+
+    if data == "help:docs:recent":
+        items = db_docs_recent(update.effective_user.id if update.effective_user else None)
+        context.user_data[DOCS_RETURN_CB] = "help:docs:recent"
+        await q.edit_message_text(
+            "🕘 <b>Недавно открытые</b>\n\nПоследние просмотренные документы:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_docs_result_list(items, "— история просмотров пока пуста —"),
+        )
+        return
+
+    if data == "help:docs:new":
+        items = db_docs_new(30)
+        context.user_data[DOCS_RETURN_CB] = "help:docs:new"
+        await q.edit_message_text(
+            "🆕 <b>Новые документы</b>\n\nДобавленные за последние 30 дней:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_docs_result_list(items, "— за 30 дней новых документов нет —"),
+        )
+        return
+
+    if data == "help:docs:collections":
+        context.user_data[DOCS_RETURN_CB] = "help:docs:collections"
+        await q.edit_message_text(
+            "🎓 <b>Подборки</b>\n\nГотовые наборы документов по темам:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_doc_collections(),
+        )
+        return
+
+    if data.startswith("help:docs:collection:") and not data.startswith("help:docs:admin:"):
+        collection_id = int(data.split(":")[-1])
+        collection = db_doc_collection_get(collection_id)
+        if not collection:
+            await q.answer("Подборка не найдена.", show_alert=True)
+            return
+        items = db_doc_collection_items(collection_id)
+        context.user_data[DOCS_RETURN_CB] = f"help:docs:collection:{collection_id}"
+        description = f"\n\n{escape(collection['description'])}" if collection.get("description") else ""
+        await q.edit_message_text(
+            f"🎓 <b>{escape(collection['title'])}</b>{description}\n\nВыберите документ:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_docs_result_list(items, "— подборка пока пуста —", "help:docs:collections"),
+        )
+        return
+
+    if data.startswith("help:docs:open:") or data.startswith("help:docs:file:"):
         doc_id = int(data.split(":")[-1])
         doc = db_docs_get(doc_id)
         if not doc:
-            await q.edit_message_text("Файл не найден (возможно удалён).", reply_markup=kb_help_main(is_admin_user=is_adm))
+            await q.edit_message_text("Документ не найден или был удалён.", reply_markup=kb_help_docs_main(is_adm))
             return
+        category = db_docs_get_category(int(doc["category_id"])) or {"title": "Без категории"}
+        doc["category_title"] = category["title"]
         try:
-            caption = f"📄 <b>{doc['title']}</b>"
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute("SELECT uploaded_at, COALESCE(updated_at, uploaded_at) FROM docs WHERE id=?", (doc_id,))
+            date_row = cur.fetchone()
+            con.close()
+            doc["uploaded_at"] = date_row[0] if date_row else None
+            doc["updated_at"] = date_row[1] if date_row else None
+        except Exception:
+            doc["uploaded_at"] = None
+            doc["updated_at"] = None
+        db_doc_record_view(update.effective_user.id if update.effective_user else None, doc_id)
+        back_cb = context.user_data.get(DOCS_RETURN_CB) or "help:docs"
+        await q.edit_message_text(
+            build_doc_card_text(doc),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_doc_card(doc_id, update.effective_user.id if update.effective_user else None, back_cb),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:docs:download:"):
+        doc_id = int(data.split(":")[-1])
+        doc = db_docs_get(doc_id)
+        if not doc:
+            await q.answer("Документ не найден.", show_alert=True)
+            return
+        db_doc_record_view(update.effective_user.id if update.effective_user else None, doc_id)
+        try:
+            caption = f"📄 <b>{escape(doc['title'])}</b>"
             if doc.get("description"):
-                caption += f"\n\n{doc['description']}"
+                caption += f"\n\n{escape(doc['description'])}"
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
                 document=doc["file_id"],
-                caption=caption,
+                caption=caption[:1024],
                 parse_mode=ParseMode.HTML,
             )
+            await q.answer("Файл отправлен")
         except Exception as e:
             logger.exception("send_document failed: %s", e)
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="Не смог отправить файл 😕")
+            await q.answer("Не смог отправить файл.", show_alert=True)
         return
+
+    if data.startswith("help:docs:favorite:"):
+        doc_id = int(data.split(":")[-1])
+        enabled = db_doc_toggle_favorite(update.effective_user.id if update.effective_user else None, doc_id)
+        back_cb = context.user_data.get(DOCS_RETURN_CB) or "help:docs"
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=kb_doc_card(doc_id, update.effective_user.id if update.effective_user else None, back_cb)
+            )
+        except Exception:
+            pass
+        await q.answer("Добавлено в избранное" if enabled else "Удалено из избранного")
+        return
+
+    # -------- Администрирование документов --------
+    if data.startswith("help:docs:admin:"):
+        if not is_adm:
+            await q.answer("Доступно администраторам.", show_alert=True)
+            return
+
+        if data == "help:docs:admin:edit":
+            await q.edit_message_text(
+                "✏️ <b>Редактирование документа</b>\n\nВыберите документ:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_doc_admin_picker("edit"),
+            )
+            return
+
+        if data.startswith("help:docs:admin:edit:"):
+            doc_id = int(data.split(":")[-1])
+            doc = db_docs_get(doc_id)
+            if not doc:
+                await q.answer("Документ не найден.", show_alert=True)
+                return
+            await q.edit_message_text(
+                f"✏️ <b>{escape(doc['title'])}</b>\n\nЧто изменить?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_doc_edit_menu(doc_id),
+            )
+            return
+
+        if data.startswith("help:docs:admin:editfield:title:"):
+            doc_id = int(data.split(":")[-1])
+            clear_docs_flow(context)
+            context.chat_data[WAITING_DOC_EDIT_TITLE_ID] = doc_id
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "✏️ <b>Новое название</b>\n\nОтправьте название одним сообщением.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data=f"help:docs:admin:edit:{doc_id}")]]),
+            )
+            return
+
+        if data.startswith("help:docs:admin:editfield:description:"):
+            doc_id = int(data.split(":")[-1])
+            clear_docs_flow(context)
+            context.chat_data[WAITING_DOC_EDIT_DESC_ID] = doc_id
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "📝 <b>Новое описание</b>\n\nОтправьте описание или <code>-</code>, чтобы удалить его.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data=f"help:docs:admin:edit:{doc_id}")]]),
+            )
+            return
+
+        if data.startswith("help:docs:admin:editfield:category:"):
+            doc_id = int(data.split(":")[-1])
+            await q.edit_message_text(
+                "📂 <b>Категория документа</b>\n\nВыберите новую категорию:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_doc_category_picker(doc_id),
+            )
+            return
+
+        if data.startswith("help:docs:admin:setcat:"):
+            parts = data.split(":")
+            doc_id, category_id = int(parts[-2]), int(parts[-1])
+            db_doc_update_category(doc_id, category_id)
+            await q.edit_message_text(
+                "✅ Категория изменена.",
+                reply_markup=kb_doc_edit_menu(doc_id),
+            )
+            return
+
+        if data.startswith("help:docs:admin:editfield:tags:"):
+            doc_id = int(data.split(":")[-1])
+            await q.edit_message_text(
+                "🏷 <b>Теги документа</b>\n\nНажимайте теги, чтобы добавить или убрать их:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_doc_tag_picker(doc_id),
+            )
+            return
+
+        if data.startswith("help:docs:admin:tagtoggle:"):
+            parts = data.split(":")
+            doc_id, tag_id = int(parts[-2]), int(parts[-1])
+            db_doc_toggle_tag(doc_id, tag_id)
+            await q.edit_message_reply_markup(reply_markup=kb_doc_tag_picker(doc_id))
+            return
+
+        if data == "help:docs:admin:replace":
+            await q.edit_message_text(
+                "🔄 <b>Замена файла</b>\n\nВыберите документ. Название, описание, теги, избранное и подборки сохранятся:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_doc_admin_picker("replace"),
+            )
+            return
+
+        if data.startswith("help:docs:admin:replace:"):
+            doc_id = int(data.split(":")[-1])
+            doc = db_docs_get(doc_id)
+            if not doc:
+                await q.answer("Документ не найден.", show_alert=True)
+                return
+            clear_docs_flow(context)
+            context.chat_data[WAITING_DOC_REPLACE_ID] = doc_id
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                f"🔄 <b>Замена файла</b>\n\nДокумент: <b>{escape(doc['title'])}</b>\n\nОтправьте новый файл следующим сообщением.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="help:docs:admin:replace")]]),
+            )
+            return
+
+        if data == "help:docs:admin:delete":
+            await q.edit_message_text(
+                "➖ <b>Удаление документа</b>\n\nВыберите документ:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_doc_admin_picker("delete"),
+            )
+            return
+
+        if data.startswith("help:docs:admin:delete:") and not data.startswith("help:docs:admin:delete:confirm:"):
+            doc_id = int(data.split(":")[-1])
+            doc = db_docs_get(doc_id)
+            if not doc:
+                await q.answer("Документ не найден.", show_alert=True)
+                return
+            await q.edit_message_text(
+                f"⚠️ <b>Удалить документ?</b>\n\n<b>{escape(doc['title'])}</b>\n\n"
+                "Документ исчезнет из категорий, тегов, избранного и подборок.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_danger_confirm(
+                    f"help:docs:admin:delete:confirm:{doc_id}",
+                    "help:docs:admin:delete",
+                    "🗑 Да, удалить документ",
+                ),
+            )
+            return
+
+        if data.startswith("help:docs:admin:delete:confirm:"):
+            doc_id = int(data.split(":")[-1])
+            ok = db_docs_delete_doc(doc_id)
+            await q.edit_message_text(
+                "✅ Документ удалён." if ok else "⚠️ Документ уже отсутствует.",
+                reply_markup=kb_help_docs_main(True),
+            )
+            return
+
+        if data == "help:docs:admin:tags":
+            await q.edit_message_text(
+                "🏷 <b>Управление тегами</b>\n\nЧисло справа показывает количество документов с тегом.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_doc_tags_manage(),
+            )
+            return
+
+        if data == "help:docs:admin:tags:add":
+            clear_docs_flow(context)
+            context.chat_data[WAITING_DOC_TAG_NAME] = True
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "➕ <b>Новый тег</b>\n\nОтправьте название без символа #.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="help:docs:admin:tags")]]),
+            )
+            return
+
+        if data.startswith("help:docs:admin:tags:delete:"):
+            tag_id = int(data.split(":")[-1])
+            db_doc_tag_delete(tag_id)
+            await q.edit_message_text(
+                "✅ Тег удалён.",
+                reply_markup=kb_doc_tags_manage(),
+            )
+            return
+
+        if data == "help:docs:admin:collections":
+            await q.edit_message_text(
+                "🎓 <b>Управление подборками</b>\n\nСоздавайте тематические наборы документов.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_doc_collections_manage(),
+            )
+            return
+
+        if data == "help:docs:admin:collections:add":
+            clear_docs_flow(context)
+            context.chat_data[WAITING_DOC_COLLECTION_NAME] = True
+            context.chat_data[WAITING_USER_ID] = update.effective_user.id
+            context.chat_data[WAITING_SINCE_TS] = int(time.time())
+            await q.edit_message_text(
+                "➕ <b>Новая подборка</b>\n\nОтправьте название подборки.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="help:docs:admin:collections")]]),
+            )
+            return
+
+        if data.startswith("help:docs:admin:collection:"):
+            parts = data.split(":")
+            action = parts[4] if len(parts) > 4 else ""
+
+            if action.isdigit():
+                collection_id = int(action)
+                collection = db_doc_collection_get(collection_id)
+                if not collection:
+                    await q.answer("Подборка не найдена.", show_alert=True)
+                    return
+                await q.edit_message_text(
+                    f"🎓 <b>{escape(collection['title'])}</b>\n\nДокументов: {len(db_doc_collection_items(collection_id))}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_doc_collection_manage(collection_id),
+                )
+                return
+
+            if action == "addlist":
+                collection_id = int(parts[-1])
+                await q.edit_message_text(
+                    "➕ <b>Добавление документов</b>\n\nВыберите документ:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_doc_collection_doc_picker(collection_id, "add"),
+                )
+                return
+
+            if action == "removelist":
+                collection_id = int(parts[-1])
+                await q.edit_message_text(
+                    "➖ <b>Удаление из подборки</b>\n\nВыберите документ:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_doc_collection_doc_picker(collection_id, "remove"),
+                )
+                return
+
+            if action in ("add", "remove"):
+                collection_id, doc_id = int(parts[-2]), int(parts[-1])
+                if action == "add":
+                    db_doc_collection_add_item(collection_id, doc_id)
+                else:
+                    db_doc_collection_remove_item(collection_id, doc_id)
+                await q.edit_message_reply_markup(reply_markup=kb_doc_collection_doc_picker(collection_id, action))
+                return
+
+            if action == "delete":
+                collection_id = int(parts[-1])
+                collection = db_doc_collection_get(collection_id)
+                if not collection:
+                    await q.answer("Подборка не найдена.", show_alert=True)
+                    return
+                await q.edit_message_text(
+                    f"⚠️ Удалить подборку <b>{escape(collection['title'])}</b>?\n\nСами документы останутся в каталоге.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_danger_confirm(
+                        f"help:docs:admin:collection:deleteconfirm:{collection_id}",
+                        "help:docs:admin:collections",
+                        "🗑 Да, удалить подборку",
+                    ),
+                )
+                return
+
+            if action == "deleteconfirm":
+                collection_id = int(parts[-1])
+                db_doc_collection_delete(collection_id)
+                await q.edit_message_text("✅ Подборка удалена.", reply_markup=kb_doc_collections_manage())
+                return
 
     if data == "help:links":
         text = (
@@ -7791,7 +9056,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Доступно администраторам.", show_alert=True)
             return
         await q.edit_message_text(
-            "📄 <b>Контент</b>\n\nДокументы, категории и FAQ.",
+            "📄 <b>Контент</b>\n\nДокументы теперь управляются из единого раздела с поиском, тегами и подборками.",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_settings_content(),
         )
@@ -9425,9 +10690,16 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except (TimedOut, NetworkError):
                     pass
                 return
-            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
+            new_doc_id = db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
             clear_docs_flow(context)
-            await q.edit_message_text("✅ Файл добавлен в документы.", parse_mode=ParseMode.HTML, reply_markup=kb_help_settings())
+            await q.edit_message_text(
+                "✅ Документ добавлен. Теперь при необходимости назначьте ему теги или добавьте в подборку.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✏️ Настроить документ", callback_data=f"help:docs:admin:edit:{new_doc_id}")],
+                    [InlineKeyboardButton("🏠 Документы", callback_data="help:docs")],
+                ]),
+            )
             return
 
         if data == "help:settings:add_doc:newcat":
@@ -9979,6 +11251,46 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Категории: {ok_cats}\n"
             f"Документы: {ok_docs} (пропущено без файла: {skipped_docs})\n"
             f"Анкеты: {ok_profiles}"
+        )
+        return
+
+    # ---------------- DOC FILE REPLACEMENT ----------------
+    replace_doc_id = context.chat_data.get(WAITING_DOC_REPLACE_ID)
+    if replace_doc_id:
+        waiting_user = context.chat_data.get(WAITING_USER_ID)
+        current_user = update.effective_user.id if update.effective_user else None
+        if waiting_user and current_user != waiting_user:
+            return
+        if not await is_admin_scoped(update, context):
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут заменять документы.")
+            return
+        doc = update.message.document
+        if not doc:
+            return
+        local_path = None
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            safe_name = (doc.file_name or "document").replace("/", "_")
+            local_path = str(Path(STORAGE_DIR) / "docs" / f"{doc.file_unique_id}_{safe_name}")
+            await tg_file.download_to_drive(custom_path=local_path)
+        except Exception as e:
+            logger.exception("Failed to backup replacement doc locally: %s", e)
+        ok = db_doc_replace_file(
+            int(replace_doc_id),
+            doc.file_id,
+            doc.file_unique_id,
+            doc.mime_type,
+            local_path,
+        )
+        clear_docs_flow(context)
+        await update.message.reply_text(
+            "✅ Файл заменён. Название, описание, теги, избранное и подборки сохранены."
+            if ok else "❌ Документ не найден.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📄 Открыть документ", callback_data=f"help:docs:open:{int(replace_doc_id)}")],
+                [InlineKeyboardButton("🏠 Документы", callback_data="help:docs")],
+            ]),
         )
         return
 
@@ -10763,6 +12075,89 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ Ачивка выдана и опубликована в чате.", reply_markup=kb_help_settings())
             return
 
+    # ---------------- DOCUMENTS KNOWLEDGE-BASE TEXT FLOWS ----------------
+    if context.chat_data.get(WAITING_DOC_SEARCH):
+        context.chat_data[WAITING_DOC_SEARCH] = False
+        context.chat_data.pop(WAITING_USER_ID, None)
+        context.chat_data.pop(WAITING_SINCE_TS, None)
+        items = db_docs_search(text)
+        context.user_data[DOCS_RETURN_CB] = "help:docs"
+        await update.message.reply_text(
+            f"🔎 <b>Результаты поиска</b>\n\nЗапрос: <code>{escape(text[:80])}</code>\nНайдено: <b>{len(items)}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_docs_result_list(items, "— ничего не найдено —"),
+        )
+        return
+
+    edit_title_id = context.chat_data.get(WAITING_DOC_EDIT_TITLE_ID)
+    if edit_title_id:
+        if not await is_admin_scoped(update, context):
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут редактировать документы.")
+            return
+        if len(text.strip()) < 2:
+            await update.message.reply_text("Название слишком короткое. Отправьте другое.")
+            return
+        ok = db_doc_update_title(int(edit_title_id), text)
+        clear_docs_flow(context)
+        await update.message.reply_text(
+            "✅ Название обновлено." if ok else "❌ Документ не найден.",
+            reply_markup=kb_doc_edit_menu(int(edit_title_id)),
+        )
+        return
+
+    edit_desc_id = context.chat_data.get(WAITING_DOC_EDIT_DESC_ID)
+    if edit_desc_id:
+        if not await is_admin_scoped(update, context):
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут редактировать документы.")
+            return
+        description = None if text.strip() == "-" else text.strip()
+        ok = db_doc_update_description(int(edit_desc_id), description)
+        clear_docs_flow(context)
+        await update.message.reply_text(
+            "✅ Описание обновлено." if ok else "❌ Документ не найден.",
+            reply_markup=kb_doc_edit_menu(int(edit_desc_id)),
+        )
+        return
+
+    if context.chat_data.get(WAITING_DOC_TAG_NAME):
+        if not await is_admin_scoped(update, context):
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут создавать теги.")
+            return
+        try:
+            db_doc_tag_add(text)
+        except sqlite3.IntegrityError:
+            await update.message.reply_text("❌ Такой тег уже существует. Отправьте другое название.")
+            return
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}")
+            return
+        clear_docs_flow(context)
+        await update.message.reply_text("✅ Тег создан.", reply_markup=kb_doc_tags_manage())
+        return
+
+    if context.chat_data.get(WAITING_DOC_COLLECTION_NAME):
+        if not await is_admin_scoped(update, context):
+            clear_docs_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут создавать подборки.")
+            return
+        try:
+            collection_id = db_doc_collection_add(text)
+        except sqlite3.IntegrityError:
+            await update.message.reply_text("❌ Подборка с таким названием уже существует.")
+            return
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}")
+            return
+        clear_docs_flow(context)
+        await update.message.reply_text(
+            "✅ Подборка создана. Теперь добавьте в неё документы.",
+            reply_markup=kb_doc_collection_manage(collection_id),
+        )
+        return
+
     # описание документа
     if context.chat_data.get(WAITING_DOC_DESC):
         if not await is_admin_scoped(update, context):
@@ -10965,9 +12360,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending = context.chat_data.get(PENDING_DOC_INFO)
         if pending:
-            db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
+            new_doc_id = db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
             clear_docs_flow(context)
-            await update.message.reply_text("✅ Категория создана и файл добавлен.", reply_markup=kb_help_settings())
+            await update.message.reply_text(
+                "✅ Категория создана и документ добавлен.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✏️ Настроить документ", callback_data=f"help:docs:admin:edit:{new_doc_id}")],
+                    [InlineKeyboardButton("🏠 Документы", callback_data="help:docs")],
+                ]),
+            )
             return
 
         clear_docs_flow(context)
