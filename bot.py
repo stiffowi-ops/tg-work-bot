@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "DASHBOARD-FULL-NAME-SELF-EDIT-2026-07-20-V7"
+BUILD_VERSION = "TEAM-UPCOMING-BIRTHDAYS-2026-07-21-V8"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -762,6 +762,37 @@ def db_init():
 
 
 
+    # ------- COMMUNICATIONS: saved broadcast tags -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS broadcast_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # ------- COMMUNICATIONS: durable scheduled sends -------
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_communications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,                    -- meeting|broadcast
+            payload_json TEXT NOT NULL,
+            send_at_utc TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', -- pending|sending|sent|failed
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            result_json TEXT,
+            last_error TEXT
+        )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_communications_due "
+        "ON scheduled_communications(status, send_at_utc)"
+    )
+    # If the process stopped after reserving a task, retry it after restart.
+    cur.execute("UPDATE scheduled_communications SET status='pending' WHERE status='sending'")
+
     # ===================== TESTING (employees) DB =====================
     # templates
     cur.execute("""
@@ -850,6 +881,170 @@ def db_set_meta(key: str, value: str):
         VALUES(?, ?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
     """, (key, value))
+    con.commit()
+    con.close()
+
+
+def normalize_broadcast_tag_name(value: str) -> str:
+    """Returns a Telegram-friendly hashtag name without the leading #."""
+    clean = (value or "").strip().lstrip("#")
+    clean = re.sub(r"[^0-9A-Za-zА-Яа-яЁё_]+", "_", clean)
+    clean = re.sub(r"_+", "_", clean).strip("_")
+    return clean[:60]
+
+
+def db_broadcast_tags_list() -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id, name FROM broadcast_tags ORDER BY name COLLATE NOCASE ASC")
+    rows = cur.fetchall()
+    con.close()
+    return [{"id": int(r[0]), "name": r[1]} for r in rows]
+
+
+def db_broadcast_tag_get(tag_id: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id, name FROM broadcast_tags WHERE id=?", (int(tag_id),))
+    row = cur.fetchone()
+    con.close()
+    return {"id": int(row[0]), "name": row[1]} if row else None
+
+
+def db_broadcast_tag_add(name: str) -> dict | None:
+    clean = normalize_broadcast_tag_name(name)
+    if not clean:
+        return None
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO broadcast_tags(name, created_at) VALUES(?, ?) "
+        "ON CONFLICT(name) DO NOTHING",
+        (clean, datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    cur.execute("SELECT id, name FROM broadcast_tags WHERE name=?", (clean,))
+    row = cur.fetchone()
+    con.close()
+    return {"id": int(row[0]), "name": row[1]} if row else None
+
+
+def db_broadcast_tag_delete(tag_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM broadcast_tags WHERE id=?", (int(tag_id),))
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+
+def db_profiles_list_for_delivery() -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT id, full_name, tg_user_id FROM profiles "
+        "ORDER BY full_name COLLATE NOCASE ASC"
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {"id": int(r[0]), "full_name": r[1], "tg_user_id": r[2]}
+        for r in rows
+    ]
+
+
+def db_scheduled_communication_add(
+    kind: str,
+    payload: dict,
+    send_at_utc: str,
+    created_by: int | None,
+) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO scheduled_communications(
+            kind, payload_json, send_at_utc, status, created_by, created_at
+        ) VALUES(?, ?, ?, 'pending', ?, ?)
+        """,
+        (
+            kind,
+            json.dumps(payload, ensure_ascii=False),
+            send_at_utc,
+            int(created_by) if created_by else None,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    con.commit()
+    item_id = int(cur.lastrowid)
+    con.close()
+    return item_id
+
+
+def db_scheduled_communications_due(limit: int = 20) -> list[dict]:
+    now_utc = datetime.utcnow().isoformat()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, kind, payload_json, send_at_utc
+        FROM scheduled_communications
+        WHERE status='pending' AND send_at_utc<=?
+        ORDER BY send_at_utc ASC, id ASC
+        LIMIT ?
+        """,
+        (now_utc, int(limit)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {
+            "id": int(r[0]),
+            "kind": r[1],
+            "payload_json": r[2],
+            "send_at_utc": r[3],
+        }
+        for r in rows
+    ]
+
+
+def db_scheduled_communication_reserve(item_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE scheduled_communications SET status='sending' "
+        "WHERE id=? AND status='pending'",
+        (int(item_id),),
+    )
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
+
+
+def db_scheduled_communication_finish(
+    item_id: int,
+    status: str,
+    result: dict | None = None,
+    error: str | None = None,
+):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE scheduled_communications
+        SET status=?, sent_at=?, result_json=?, last_error=?
+        WHERE id=?
+        """,
+        (
+            status,
+            datetime.utcnow().isoformat(),
+            json.dumps(result or {}, ensure_ascii=False),
+            (error or None),
+            int(item_id),
+        ),
+    )
     con.commit()
     con.close()
 
@@ -1622,6 +1817,30 @@ def db_profiles_birthdays(ddmm: str) -> list[dict]:
             "birthday": r[3],
         })
     return res
+
+
+def db_profiles_with_birthdays() -> list[dict]:
+    """Возвращает сотрудников, у которых заполнена дата рождения ДД.ММ."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, full_name, birthday
+        FROM profiles
+        WHERE birthday IS NOT NULL AND TRIM(birthday) != ''
+        ORDER BY full_name COLLATE NOCASE ASC
+        """
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {
+            "id": int(row[0]),
+            "full_name": row[1],
+            "birthday": row[2],
+        }
+        for row in rows
+    ]
 
 
 # ---------------- ACHIEVEMENTS, NOMINATIONS, REACTIONS ----------------
@@ -2568,8 +2787,16 @@ SUGGESTION_MODE = "suggestion_mode"  # anon|named
 
 # broadcast flow
 BCAST_ACTIVE = "bcast_active"
-BCAST_STEP = "bcast_step"  # topic|text|files
+BCAST_STEP = "bcast_step"  # heading_choice|topic|text|files|schedule_time
 BCAST_DATA = "bcast_data"
+WAITING_BCAST_TAG_NAME = "waiting_bcast_tag_name"
+BCAST_TAG_MODE = "bcast_tag_mode"  # manage|wizard
+
+# custom meeting flow (Communications)
+COMM_MEETING_ACTIVE = "comm_meeting_active"
+COMM_MEETING_STEP = "comm_meeting_step"  # topic|description|link|recipients|schedule_time
+COMM_MEETING_DATA = "comm_meeting_data"
+COMM_MEETING_SELECTED_PIDS = "comm_meeting_selected_pids"
 
 def clear_waiting_date(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DATE_FLAG] = False
@@ -2626,10 +2853,23 @@ def clear_suggest_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data[WAITING_SUGGESTION_TEXT] = False
     context.user_data.pop(SUGGESTION_MODE, None)
 
+def clear_bcast_tag_waiting(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[WAITING_BCAST_TAG_NAME] = False
+    context.user_data.pop(BCAST_TAG_MODE, None)
+
+
 def clear_bcast_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data[BCAST_ACTIVE] = False
     context.user_data.pop(BCAST_STEP, None)
     context.user_data.pop(BCAST_DATA, None)
+    clear_bcast_tag_waiting(context)
+
+
+def clear_comm_meeting_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[COMM_MEETING_ACTIVE] = False
+    context.user_data.pop(COMM_MEETING_STEP, None)
+    context.user_data.pop(COMM_MEETING_DATA, None)
+    context.user_data.pop(COMM_MEETING_SELECTED_PIDS, None)
 
 
 def clear_bonus_calc_flow(context: ContextTypes.DEFAULT_TYPE):
@@ -2887,6 +3127,11 @@ async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_
 
 
 async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await process_due_communications(context)
+    except Exception as e:
+        logger.exception("Scheduled communications checker failed: %s", e)
+
     now_msk = datetime.now(MOSCOW_TZ)
     today_iso = now_msk.date().isoformat()
 
@@ -3272,13 +3517,105 @@ def kb_suggest_cancel():
     ])
 
 
+def kb_send_timing(prefix: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Отправить сейчас", callback_data=f"{prefix}:timing:now")],
+        [InlineKeyboardButton("🕒 Запланировать время", callback_data=f"{prefix}:timing:later")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"{prefix}:cancel")],
+    ])
+
+
+def kb_bcast_heading_choice():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Ввести тему", callback_data="help:settings:bcast:heading:topic")],
+        [InlineKeyboardButton("🏷 Выбрать сохранённый тег", callback_data="help:settings:bcast:heading:tag")],
+        [InlineKeyboardButton("➖ Без темы и тега", callback_data="help:settings:bcast:heading:none")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")],
+    ])
+
+
+def kb_bcast_tag_pick():
+    rows = []
+    for item in db_broadcast_tags_list()[:40]:
+        rows.append([
+            InlineKeyboardButton(
+                f"#{item['name']}",
+                callback_data=f"help:settings:bcast:tag:{item['id']}",
+            )
+        ])
+    if not rows:
+        rows.append([InlineKeyboardButton("— сохранённых тегов нет —", callback_data="noop")])
+    rows.append([InlineKeyboardButton("➕ Создать новый тег", callback_data="help:settings:bcast:tag_create")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:bcast")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_broadcast_tags_manage():
+    rows = [[InlineKeyboardButton("➕ Создать тег", callback_data="help:settings:bcast_tags:add")]]
+    tags = db_broadcast_tags_list()
+    for item in tags[:40]:
+        rows.append([
+            InlineKeyboardButton(
+                f"🗑 #{item['name']}",
+                callback_data=f"help:settings:bcast_tags:del:{item['id']}",
+            )
+        ])
+    if not tags:
+        rows.append([InlineKeyboardButton("— тегов пока нет —", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:communications")])
+    return InlineKeyboardMarkup(rows)
+
+
 def kb_bcast_files_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Отправить", callback_data="help:settings:bcast:send")],
+        [InlineKeyboardButton("✅ Продолжить", callback_data="help:settings:bcast:send")],
         [InlineKeyboardButton("🗑️ Очистить файлы", callback_data="help:settings:bcast:clear_files")],
         [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:communications")],
     ])
+
+
+def kb_meeting_recipient_mode():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Общий чат", callback_data="help:settings:meeting:recipients:chats")],
+        [InlineKeyboardButton("👥 Выбрать сотрудников", callback_data="help:settings:meeting:recipients:profiles:0")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:meeting:cancel")],
+    ])
+
+
+def kb_meeting_profile_picker(selected: set[int], page: int = 0):
+    people = db_profiles_list_for_delivery()
+    page_size = 8
+    pages = max(1, (len(people) + page_size - 1) // page_size)
+    page = max(0, min(int(page), pages - 1))
+    rows = []
+    for item in people[page * page_size:(page + 1) * page_size]:
+        pid = int(item["id"])
+        checked = "✅" if pid in selected else "▫️"
+        delivery = "" if item.get("tg_user_id") else " ⚠️"
+        rows.append([
+            InlineKeyboardButton(
+                f"{checked} {item['full_name'][:45]}{delivery}",
+                callback_data=f"help:settings:meeting:profile_toggle:{pid}:{page}",
+            )
+        ])
+    if not people:
+        rows.append([InlineKeyboardButton("— анкет сотрудников нет —", callback_data="noop")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"help:settings:meeting:recipients:profiles:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="noop"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"help:settings:meeting:recipients:profiles:{page+1}"))
+    rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(
+            f"✅ Готово ({len(selected)})",
+            callback_data="help:settings:meeting:profiles_done",
+        )
+    ])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:meeting:recipients_back")])
+    return InlineKeyboardMarkup(rows)
 
 def kb_help_docs_categories():
     cats = db_docs_list_categories()
@@ -3447,6 +3784,158 @@ def kb_help_link_card(url: str):
 
 TEAM_PAGE_SIZE = 8
 TEAM_COLUMNS = 2
+BIRTHDAY_PERIOD_DAYS = 60
+BIRTHDAY_COUNTER_DAYS = 30
+BIRTHDAY_MAX_OFFSET_DAYS = 300
+
+RU_MONTHS_GENITIVE = (
+    "",
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+)
+
+
+def _parse_birthday_ddmm(value: str | None) -> tuple[int, int] | None:
+    """Проверяет дату ДД.ММ; 29.02 считается корректной датой."""
+    text = (value or "").strip()
+    match = re.fullmatch(r"(\d{2})\.(\d{2})", text)
+    if not match:
+        return None
+    day = int(match.group(1))
+    month = int(match.group(2))
+    try:
+        # 2000 — високосный год, поэтому 29.02 проходит проверку.
+        date(2000, month, day)
+    except ValueError:
+        return None
+    return day, month
+
+
+def _birthday_occurrences(start_day: date, end_day: date) -> list[dict]:
+    """Собирает дни рождения сотрудников в заданном включительном периоде."""
+    events: list[dict] = []
+    for profile in db_profiles_with_birthdays():
+        parsed = _parse_birthday_ddmm(profile.get("birthday"))
+        if not parsed:
+            continue
+        day, month = parsed
+        for year in range(start_day.year, end_day.year + 1):
+            try:
+                event_day = date(year, month, day)
+            except ValueError:
+                # Например, 29 февраля в невисокосном году.
+                continue
+            if start_day <= event_day <= end_day:
+                events.append({
+                    "profile_id": int(profile["id"]),
+                    "full_name": profile["full_name"],
+                    "birthday": profile["birthday"],
+                    "event_date": event_day,
+                })
+    events.sort(key=lambda item: (item["event_date"], item["full_name"].casefold()))
+    return events
+
+
+def upcoming_birthdays(offset_days: int = 0, period_days: int = BIRTHDAY_PERIOD_DAYS) -> dict:
+    """Возвращает события и границы периода относительно текущей даты по Москве."""
+    offset = max(0, min(int(offset_days), BIRTHDAY_MAX_OFFSET_DAYS))
+    period = max(1, int(period_days))
+    today = datetime.now(MOSCOW_TZ).date()
+    start_day = today + timedelta(days=offset)
+    end_day = start_day + timedelta(days=period - 1)
+    return {
+        "today": today,
+        "offset": offset,
+        "start": start_day,
+        "end": end_day,
+        "events": _birthday_occurrences(start_day, end_day),
+    }
+
+
+def upcoming_birthdays_count(period_days: int = BIRTHDAY_COUNTER_DAYS) -> int:
+    return len(upcoming_birthdays(offset_days=0, period_days=period_days)["events"])
+
+
+def _birthday_date_text(value: date, include_year: bool = False) -> str:
+    text = f"{value.day} {RU_MONTHS_GENITIVE[value.month]}"
+    if include_year:
+        text += f" {value.year}"
+    return text
+
+
+def build_upcoming_birthdays_text(offset_days: int = 0) -> tuple[str, list[dict], int]:
+    data = upcoming_birthdays(offset_days=offset_days)
+    events = data["events"]
+    today = data["today"]
+    start_day = data["start"]
+    end_day = data["end"]
+    offset = int(data["offset"])
+
+    period_label = (
+        f"{_birthday_date_text(start_day, include_year=start_day.year != today.year)} — "
+        f"{_birthday_date_text(end_day, include_year=end_day.year != start_day.year)}"
+    )
+    lines = [
+        "🎂 <b>Ближайшие дни рождения</b>",
+        "",
+        "Здесь собраны дни рождения нашей команды.",
+        f"Период: <b>{escape(period_label)}</b>",
+    ]
+
+    if not events:
+        lines.extend(["", f"В ближайшие {BIRTHDAY_PERIOD_DAYS} дней дней рождения в команде нет."])
+        return "\n".join(lines), events, offset
+
+    groups: list[tuple[str, list[dict]]] = []
+    used_ids: set[int] = set()
+
+    def add_group(title: str, predicate):
+        matched_indexes = [
+            index
+            for index, item in enumerate(events)
+            if index not in used_ids and predicate(item)
+        ]
+        if matched_indexes:
+            used_ids.update(matched_indexes)
+            groups.append((title, [events[index] for index in matched_indexes]))
+
+    if offset == 0:
+        tomorrow = today + timedelta(days=1)
+        end_of_week = today + timedelta(days=6 - today.weekday())
+        add_group("🔥 <b>Сегодня</b>", lambda item: item["event_date"] == today)
+        add_group("⏰ <b>Завтра</b>", lambda item: item["event_date"] == tomorrow)
+        add_group(
+            "📆 <b>На этой неделе</b>",
+            lambda item: tomorrow < item["event_date"] <= end_of_week,
+        )
+
+    remaining = [item for index, item in enumerate(events) if index not in used_ids]
+    if remaining:
+        groups.append(("🗓 <b>Позже</b>" if offset == 0 else "🗓 <b>Дни рождения</b>", remaining))
+
+    for title, items in groups:
+        lines.extend(["", title, ""])
+        for item in items:
+            if item["event_date"] == today:
+                lines.append(f"🎉 {escape(item['full_name'])}")
+            elif item["event_date"] == today + timedelta(days=1):
+                lines.append(f"🎂 {escape(item['full_name'])}")
+            else:
+                lines.append(
+                    f"🎂 {_birthday_date_text(item['event_date'])} — {escape(item['full_name'])}"
+                )
+
+    return "\n".join(lines), events, offset
 
 
 def compact_team_name(name: str, limit: int = 22) -> str:
@@ -3533,11 +4022,67 @@ def kb_help_team(page: int = 0, can_create_profile: bool = False):
 
         rows.append(navigation_row)
 
+    birthday_count = upcoming_birthdays_count(BIRTHDAY_COUNTER_DAYS)
+    birthday_label = "🎂 Ближайшие дни рождения"
+    if birthday_count:
+        birthday_label += f" · {birthday_count}"
+    rows.append([
+        InlineKeyboardButton(
+            birthday_label,
+            callback_data="help:team:birthdays:0",
+        )
+    ])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_help_profile_card(profile: dict, page: int = 0):
+def kb_upcoming_birthdays(events: list[dict], offset_days: int = 0):
+    offset = max(0, min(int(offset_days), BIRTHDAY_MAX_OFFSET_DAYS))
+    rows = []
+
+    for event in events:
+        label = (
+            f"🎂 {event['event_date'].strftime('%d.%m')} · "
+            f"{compact_team_name(event['full_name'], 34)}"
+        )
+        rows.append([
+            InlineKeyboardButton(
+                label,
+                callback_data=f"help:team:birthday_person:{int(event['profile_id'])}:{offset}",
+            )
+        ])
+
+    navigation = []
+    if offset > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                "◀️ Предыдущие 60 дней",
+                callback_data=f"help:team:birthdays:{max(0, offset - BIRTHDAY_PERIOD_DAYS)}",
+            )
+        )
+    if offset + BIRTHDAY_PERIOD_DAYS <= BIRTHDAY_MAX_OFFSET_DAYS:
+        navigation.append(
+            InlineKeyboardButton(
+                "Следующие 60 дней ▶️",
+                callback_data=f"help:team:birthdays:{offset + BIRTHDAY_PERIOD_DAYS}",
+            )
+        )
+    if navigation:
+        # При двух длинных подписях каждая получает полную ширину строки.
+        for button in navigation:
+            rows.append([button])
+
+    rows.append([InlineKeyboardButton("⬅️ Наша команда", callback_data="help:team")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_help_profile_card(
+    profile: dict,
+    page: int = 0,
+    back_callback: str | None = None,
+    back_label: str = "⬅️ Назад к списку",
+    show_carousel: bool = True,
+):
     """Карточка сотрудника с переходами к предыдущему и следующему профилю."""
     rows = []
     people = db_profiles_list()
@@ -3554,7 +4099,7 @@ def kb_help_profile_card(profile: dict, page: int = 0):
         current_page = _team_clamp_page(page, len(people))
 
     # Циклическая карусель: после последнего сотрудника открывается первый.
-    if current_index is not None and len(people) > 1:
+    if show_carousel and current_index is not None and len(people) > 1:
         if len(people) == 2:
             # При двух сотрудниках предыдущий и следующий совпадают,
             # поэтому оставляем одну понятную кнопку.
@@ -3604,8 +4149,8 @@ def kb_help_profile_card(profile: dict, page: int = 0):
 
     rows.append([
         InlineKeyboardButton(
-            "⬅️ Назад к списку",
-            callback_data=f"help:team:page:{current_page}",
+            back_label,
+            callback_data=back_callback or f"help:team:page:{current_page}",
         )
     ])
     rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
@@ -3699,9 +4244,18 @@ async def render_profile_card(
     profile: dict,
     page: int,
     context: ContextTypes.DEFAULT_TYPE,
+    back_callback: str | None = None,
+    back_label: str = "⬅️ Назад к списку",
+    show_carousel: bool = True,
 ):
     """Показывает карточку текстом или фотографией и корректно переключает карусель."""
-    markup = kb_help_profile_card(profile, page=page)
+    markup = kb_help_profile_card(
+        profile,
+        page=page,
+        back_callback=back_callback,
+        back_label=back_label,
+        show_carousel=show_carousel,
+    )
     photo_file_id = (profile.get("photo_file_id") or "").strip()
     current_is_photo = bool(getattr(query.message, "photo", None))
 
@@ -3792,7 +4346,9 @@ def kb_settings_people():
 
 def kb_settings_communications():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Запланировать встречу", callback_data="help:settings:meeting")],
         [InlineKeyboardButton("📣 Создать рассылку", callback_data="help:settings:bcast")],
+        [InlineKeyboardButton("🏷 Теги рассылок", callback_data="help:settings:bcast_tags")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
     ])
 
@@ -5278,7 +5834,9 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_suggest_flow(context)
     clear_nomination_flow(context)
     clear_bcast_flow(context)
-    await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты/CSV/предложка/рассылка).")
+    clear_comm_meeting_flow(context)
+    clear_bcast_tag_waiting(context)
+    await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты/CSV/предложка/рассылка/встреча).")
 
 
 
@@ -6909,6 +7467,46 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data.startswith("help:team:birthdays:"):
+        try:
+            offset = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            offset = 0
+        offset = max(0, min(offset, BIRTHDAY_MAX_OFFSET_DAYS))
+        text, events, offset = build_upcoming_birthdays_text(offset)
+        await replace_callback_message_with_text(
+            q,
+            context,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_upcoming_birthdays(events, offset_days=offset),
+        )
+        return
+
+    if data.startswith("help:team:birthday_person:"):
+        parts = data.split(":")
+        try:
+            pid = int(parts[3])
+            offset = int(parts[4]) if len(parts) > 4 else 0
+        except (IndexError, TypeError, ValueError):
+            await q.answer("Не удалось открыть анкету.", show_alert=True)
+            return
+        profile = db_profiles_get(pid)
+        if not profile:
+            await q.answer("Анкета не найдена.", show_alert=True)
+            return
+        offset = max(0, min(offset, BIRTHDAY_MAX_OFFSET_DAYS))
+        await render_profile_card(
+            q,
+            profile,
+            page=_profile_team_page(pid),
+            context=context,
+            back_callback=f"help:team:birthdays:{offset}",
+            back_label="⬅️ К дням рождения",
+            show_carousel=False,
+        )
+        return
+
     if data == "help:team:create_profile":
         existing = get_profile_for_user(update)
         if existing:
@@ -7215,7 +7813,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Доступно администраторам.", show_alert=True)
             return
         await q.edit_message_text(
-            "📣 <b>Коммуникации</b>\n\nРассылки и сообщения для команды.",
+            "📣 <b>Коммуникации</b>\n\nВстречи, рассылки, теги и отложенная отправка.",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_settings_communications(),
         )
@@ -7320,22 +7918,241 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_nomination_flow(context)
             clear_ach_wiz(context)
             clear_bcast_flow(context)
+            clear_comm_meeting_flow(context)
+            clear_bcast_tag_waiting(context)
             await q.edit_message_text("✅ Действие отменено.", reply_markup=kb_help_settings(), parse_mode=ParseMode.HTML)
             return
 
 
-        if data == "help:settings:bcast":
-            clear_bcast_flow(context)
-            context.user_data[BCAST_ACTIVE] = True
-            context.user_data[BCAST_STEP] = "topic"
-            context.user_data[BCAST_DATA] = {"topic": None, "text": None, "files": []}
+        # ---------------- COMMUNICATIONS: saved broadcast tags ----------------
+        if data == "help:settings:bcast_tags":
+            clear_bcast_tag_waiting(context)
             await q.edit_message_text(
-                "📣 <b>Рассылка</b>\n\n"
-                "Шаг 1/3: <b>Тема</b> (будет выделена жирным)\n"
-                "Отправьте тему одним сообщением.\n"
-                "Если тема не нужна — отправьте <code>-</code>.",
+                "🏷 <b>Теги рассылок</b>\n\n"
+                "Сохранённый тег можно выбрать вместо темы при создании рассылки. "
+                "Нажатие на тег в этом списке удаляет его.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_broadcast_tags_manage(),
+            )
+            return
+
+        if data == "help:settings:bcast_tags:add":
+            clear_bcast_tag_waiting(context)
+            context.user_data[WAITING_BCAST_TAG_NAME] = True
+            context.user_data[BCAST_TAG_MODE] = "manage"
+            await q.edit_message_text(
+                "➕ <b>Новый тег рассылки</b>\n\n"
+                "Отправьте название одним сообщением. Символ <code>#</code> можно не вводить; "
+                "пробелы будут заменены на подчёркивания.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if data.startswith("help:settings:bcast_tags:del:"):
+            tag_id = int(data.split(":")[-1])
+            ok = db_broadcast_tag_delete(tag_id)
+            await q.answer("Тег удалён." if ok else "Тег уже не найден.")
+            await q.edit_message_reply_markup(reply_markup=kb_broadcast_tags_manage())
+            return
+
+        # ---------------- COMMUNICATIONS: custom meeting ----------------
+        if data == "help:settings:meeting":
+            clear_comm_meeting_flow(context)
+            clear_bcast_flow(context)
+            context.user_data[COMM_MEETING_ACTIVE] = True
+            context.user_data[COMM_MEETING_STEP] = "topic"
+            context.user_data[COMM_MEETING_DATA] = {
+                "topic": None,
+                "description_html": None,
+                "link": None,
+                "recipient_mode": None,
+                "profile_ids": [],
+            }
+            context.user_data[COMM_MEETING_SELECTED_PIDS] = []
+            await q.edit_message_text(
+                "📅 <b>Запланировать встречу</b>\n\n"
+                "Шаг 1/5: отправьте <b>тему встречи</b>.\n"
+                "В сообщении для получателей тема будет выделена жирным.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:meeting:cancel")]
+                ]),
+            )
+            return
+
+        if data == "help:settings:meeting:cancel":
+            clear_comm_meeting_flow(context)
+            await q.edit_message_text(
+                "✅ Создание встречи отменено.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_settings_communications(),
+            )
+            return
+
+        if data == "help:settings:meeting:recipients_back":
+            if not context.user_data.get(COMM_MEETING_ACTIVE):
+                await q.answer("Мастер встречи уже закрыт.", show_alert=True)
+                return
+            await q.edit_message_text(
+                "Шаг 4/5: выберите, куда отправить встречу:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_meeting_recipient_mode(),
+            )
+            return
+
+        if data == "help:settings:meeting:recipients:chats":
+            if not context.user_data.get(COMM_MEETING_ACTIVE):
+                await q.answer("Мастер встречи уже закрыт.", show_alert=True)
+                return
+            d = _meeting_get_data(context)
+            d["recipient_mode"] = "chats"
+            d["profile_ids"] = []
+            context.user_data[COMM_MEETING_DATA] = d
+            await q.edit_message_text(
+                "Шаг 5/5: отправить встречу сейчас или запланировать время?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_send_timing("help:settings:meeting"),
+            )
+            return
+
+        if data.startswith("help:settings:meeting:recipients:profiles:"):
+            if not context.user_data.get(COMM_MEETING_ACTIVE):
+                await q.answer("Мастер встречи уже закрыт.", show_alert=True)
+                return
+            page = int(data.split(":")[-1])
+            selected = set(context.user_data.get(COMM_MEETING_SELECTED_PIDS) or [])
+            await q.edit_message_text(
+                "👥 <b>Выберите одного или нескольких сотрудников</b>\n\n"
+                "⚠️ — сотрудник ещё не связал карточку со своим Telegram.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_meeting_profile_picker(selected, page),
+            )
+            return
+
+        if data.startswith("help:settings:meeting:profile_toggle:"):
+            if not context.user_data.get(COMM_MEETING_ACTIVE):
+                await q.answer("Мастер встречи уже закрыт.", show_alert=True)
+                return
+            parts = data.split(":")
+            pid = int(parts[-2])
+            page = int(parts[-1])
+            selected = set(context.user_data.get(COMM_MEETING_SELECTED_PIDS) or [])
+            if pid in selected:
+                selected.remove(pid)
+            else:
+                selected.add(pid)
+            context.user_data[COMM_MEETING_SELECTED_PIDS] = sorted(selected)
+            await q.edit_message_reply_markup(reply_markup=kb_meeting_profile_picker(selected, page))
+            await q.answer()
+            return
+
+        if data == "help:settings:meeting:profiles_done":
+            if not context.user_data.get(COMM_MEETING_ACTIVE):
+                await q.answer("Мастер встречи уже закрыт.", show_alert=True)
+                return
+            selected = sorted(set(context.user_data.get(COMM_MEETING_SELECTED_PIDS) or []))
+            if not selected:
+                await q.answer("Выберите хотя бы одного сотрудника.", show_alert=True)
+                return
+            d = _meeting_get_data(context)
+            d["recipient_mode"] = "profiles"
+            d["profile_ids"] = selected
+            context.user_data[COMM_MEETING_DATA] = d
+            await q.edit_message_text(
+                "Шаг 5/5: отправить встречу сейчас или запланировать время?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_send_timing("help:settings:meeting"),
+            )
+            return
+
+        if data == "help:settings:meeting:timing:later":
+            if not context.user_data.get(COMM_MEETING_ACTIVE):
+                await q.answer("Мастер встречи уже закрыт.", show_alert=True)
+                return
+            context.user_data[COMM_MEETING_STEP] = "schedule_time"
+            await q.edit_message_text(
+                "🕒 <b>Время отправки встречи</b>\n\n"
+                "Введите дату и время по Москве:\n"
+                "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
+                "Например: <code>24.07.2026 10:30</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:meeting:cancel")]
+                ]),
+            )
+            return
+
+        if data == "help:settings:meeting:timing:now":
+            if not context.user_data.get(COMM_MEETING_ACTIVE):
+                await q.answer("Мастер встречи уже закрыт.", show_alert=True)
+                return
+            d = _meeting_get_data(context)
+            d["send_mode"] = "now"
+            d.pop("send_at_utc", None)
+            d.pop("send_at_display", None)
+            context.user_data[COMM_MEETING_DATA] = d
+            await q.edit_message_text(
+                _meeting_confirmation_html(d),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Отправить встречу", callback_data="help:settings:meeting:confirm")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:meeting:cancel")],
+                ]),
+            )
+            return
+
+        if data == "help:settings:meeting:confirm":
+            if not context.user_data.get(COMM_MEETING_ACTIVE):
+                await q.answer("Данные встречи уже очищены.", show_alert=True)
+                return
+            d = _meeting_get_data(context)
+            payload = _meeting_payload_from_data(d)
+            if d.get("send_mode") == "schedule":
+                item_id = db_scheduled_communication_add(
+                    "meeting",
+                    payload,
+                    d["send_at_utc"],
+                    update.effective_user.id if update.effective_user else None,
+                )
+                display = d.get("send_at_display") or "указанное время"
+                clear_comm_meeting_flow(context)
+                await q.edit_message_text(
+                    f"✅ Встреча запланирована на <b>{escape(display)}</b>.\n"
+                    f"Номер задания: <code>{item_id}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_settings_communications(),
+                )
+                return
+
+            ok, fail = await send_custom_meeting(context, payload)
+            clear_comm_meeting_flow(context)
+            await q.edit_message_text(
+                "✅ Встреча отправлена.\n\n"
+                f"Успешно: <b>{ok}</b>\nОшибок: <b>{fail}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_settings_communications(),
+            )
+            return
+
+        # ---------------- COMMUNICATIONS: broadcast ----------------
+        if data == "help:settings:bcast":
+            clear_bcast_flow(context)
+            clear_comm_meeting_flow(context)
+            context.user_data[BCAST_ACTIVE] = True
+            context.user_data[BCAST_STEP] = "heading_choice"
+            context.user_data[BCAST_DATA] = {
+                "topic": None,
+                "tag": None,
+                "text_html": None,
+                "files": [],
+            }
+            await q.edit_message_text(
+                "📣 <b>Рассылка</b>\n\n"
+                "Шаг 1/4: выберите заголовок рассылки.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_bcast_heading_choice(),
                 disable_web_page_preview=True,
             )
             return
@@ -7343,6 +8160,77 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "help:settings:bcast:cancel":
             clear_bcast_flow(context)
             await q.edit_message_text("✅ Рассылка отменена.", parse_mode=ParseMode.HTML, reply_markup=kb_settings_communications())
+            return
+
+        if data == "help:settings:bcast:heading:topic":
+            context.user_data[BCAST_STEP] = "topic"
+            await q.edit_message_text(
+                "Шаг 1/4: <b>Тема</b> будет выделена жирным.\n"
+                "Отправьте тему одним сообщением.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")]
+                ]),
+            )
+            return
+
+        if data == "help:settings:bcast:heading:tag":
+            await q.edit_message_text(
+                "🏷 <b>Выберите тег рассылки</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_bcast_tag_pick(),
+            )
+            return
+
+        if data == "help:settings:bcast:heading:none":
+            d = _bcast_get_data(context)
+            d["topic"] = None
+            d["tag"] = None
+            context.user_data[BCAST_DATA] = d
+            context.user_data[BCAST_STEP] = "text"
+            await q.edit_message_text(
+                "Шаг 2/4: <b>Текст рассылки</b> 📝\n"
+                "Отправьте текст одним сообщением. Оформление Telegram сохранится.\n"
+                "Если текст не нужен — отправьте <code>-</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")]
+                ]),
+            )
+            return
+
+        if data == "help:settings:bcast:tag_create":
+            context.user_data[WAITING_BCAST_TAG_NAME] = True
+            context.user_data[BCAST_TAG_MODE] = "wizard"
+            await q.edit_message_text(
+                "➕ <b>Новый тег рассылки</b>\n\nОтправьте название одним сообщением.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")]
+                ]),
+            )
+            return
+
+        if data.startswith("help:settings:bcast:tag:"):
+            tag = db_broadcast_tag_get(int(data.split(":")[-1]))
+            if not tag:
+                await q.answer("Тег не найден.", show_alert=True)
+                return
+            d = _bcast_get_data(context)
+            d["topic"] = None
+            d["tag"] = tag["name"]
+            context.user_data[BCAST_DATA] = d
+            context.user_data[BCAST_STEP] = "text"
+            await q.edit_message_text(
+                f"Выбран тег: <b>#{escape(tag['name'])}</b>\n\n"
+                "Шаг 2/4: отправьте текст рассылки одним сообщением. "
+                "Жирный, курсив, подчёркивание, зачёркивание и скрытый текст сохранятся.\n"
+                "Если текст не нужен — отправьте <code>-</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")]
+                ]),
+            )
             return
 
         if data == "help:settings:bcast:clear_files":
@@ -7354,25 +8242,42 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "help:settings:bcast:send":
             d = _bcast_get_data(context)
-            topic = d.get("topic")
-            body = d.get("text")
+            message_html = _bcast_compose_message(d.get("topic"), d.get("text_html"), d.get("tag"))
             files = d.get("files") or []
-            message_html = _bcast_compose_message(topic, body)
-
             if not message_html and not files:
                 await q.answer("Нечего отправлять: добавьте текст или файлы.", show_alert=True)
                 return
-
-            chats_count = len(db_list_chats())
-            preview = re.sub(r"<[^>]+>", "", html_lib.unescape(message_html or ""))
-            preview = preview[:500] + ("…" if len(preview) > 500 else "")
             await q.edit_message_text(
-                "⚠️ <b>Подтверждение рассылки</b>\n\n"
-                f"Получателей-чатов: <b>{chats_count}</b>\n"
-                f"Вложений: <b>{len(files)}</b>\n\n"
-                f"Предпросмотр:\n{escape(preview or 'Только вложения')}\n\n"
-                "После подтверждения сообщение уйдёт во все подключённые чаты.",
+                "Шаг 4/4: отправить рассылку сейчас или запланировать время?",
                 parse_mode=ParseMode.HTML,
+                reply_markup=kb_send_timing("help:settings:bcast"),
+            )
+            return
+
+        if data == "help:settings:bcast:timing:later":
+            context.user_data[BCAST_STEP] = "schedule_time"
+            await q.edit_message_text(
+                "🕒 <b>Время отправки рассылки</b>\n\n"
+                "Введите дату и время по Москве:\n"
+                "<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
+                "Например: <code>24.07.2026 10:30</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")]
+                ]),
+            )
+            return
+
+        if data == "help:settings:bcast:timing:now":
+            d = _bcast_get_data(context)
+            d["send_mode"] = "now"
+            d.pop("send_at_utc", None)
+            d.pop("send_at_display", None)
+            context.user_data[BCAST_DATA] = d
+            await q.edit_message_text(
+                _bcast_confirmation_html(d),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
                 reply_markup=kb_danger_confirm(
                     "help:settings:bcast:send_confirm",
                     "help:settings:bcast:cancel",
@@ -7383,13 +8288,35 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "help:settings:bcast:send_confirm":
             d = _bcast_get_data(context)
-            topic = d.get("topic")
-            body = d.get("text")
+            message_html = _bcast_compose_message(d.get("topic"), d.get("text_html"), d.get("tag"))
             files = d.get("files") or []
-            message_html = _bcast_compose_message(topic, body)
             if not message_html and not files:
                 await q.answer("Данные рассылки уже очищены.", show_alert=True)
                 return
+
+            if d.get("send_mode") == "schedule":
+                payload = {
+                    "topic": d.get("topic"),
+                    "tag": d.get("tag"),
+                    "text_html": d.get("text_html"),
+                    "files": files,
+                }
+                item_id = db_scheduled_communication_add(
+                    "broadcast",
+                    payload,
+                    d["send_at_utc"],
+                    update.effective_user.id if update.effective_user else None,
+                )
+                display = d.get("send_at_display") or "указанное время"
+                clear_bcast_flow(context)
+                await q.edit_message_text(
+                    f"✅ Рассылка запланирована на <b>{escape(display)}</b>.\n"
+                    f"Номер задания: <code>{item_id}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_settings_communications(),
+                )
+                return
+
             ok, fail = await broadcast_to_chats(context, message_html, files)
             clear_bcast_flow(context)
             await q.edit_message_text(
@@ -7397,7 +8324,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Успешно: <b>{ok}</b>\n"
                 f"Ошибок: <b>{fail}</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb_help_settings(),
+                reply_markup=kb_settings_communications(),
             )
             return
 
@@ -8708,7 +9635,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d = _bcast_get_data(context)
             d["files"].append({"kind": "document", "file_id": doc.file_id, "file_unique_id": doc.file_unique_id})
             context.user_data[BCAST_DATA] = d
-            await update.message.reply_text("✅ Документ добавлен. Можешь добавить ещё или нажми «✅ Отправить».", reply_markup=kb_bcast_files_menu())
+            await update.message.reply_text("✅ Документ добавлен. Можешь добавить ещё или нажмите «✅ Продолжить».", reply_markup=kb_bcast_files_menu())
         return
 
 
@@ -9132,7 +10059,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d = _bcast_get_data(context)
             d["files"].append({"kind": "photo", "file_id": ph.file_id, "file_unique_id": ph.file_unique_id})
             context.user_data[BCAST_DATA] = d
-            await update.message.reply_text("✅ Фото добавлено. Можешь добавить ещё или нажми «✅ Отправить».", reply_markup=kb_bcast_files_menu())
+            await update.message.reply_text("✅ Фото добавлено. Можешь добавить ещё или нажмите «✅ Продолжить».", reply_markup=kb_bcast_files_menu())
         return
 
 async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9144,7 +10071,7 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d = _bcast_get_data(context)
             d["files"].append({"kind": "video", "file_id": vid.file_id, "file_unique_id": vid.file_unique_id})
             context.user_data[BCAST_DATA] = d
-            await update.message.reply_text("✅ Видео добавлено. Можешь добавить ещё или нажми «✅ Отправить».", reply_markup=kb_bcast_files_menu())
+            await update.message.reply_text("✅ Видео добавлено. Можешь добавить ещё или нажмите «✅ Продолжить».", reply_markup=kb_bcast_files_menu())
 
 
 
@@ -9500,56 +10427,216 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Спасибо! Передал тимлиду 🙌")
         return
 
-    # рассылка  # bcast attachment (в ЛС админа): шаги тема/текст/файлы
+    # сохранение нового тега рассылки
+    if context.user_data.get(WAITING_BCAST_TAG_NAME):
+        tag = db_broadcast_tag_add(text)
+        mode = context.user_data.get(BCAST_TAG_MODE) or "manage"
+        clear_bcast_tag_waiting(context)
+        if not tag:
+            await update.message.reply_text(
+                "❌ Не получилось создать тег. Используйте буквы, цифры или подчёркивание.",
+                reply_markup=kb_settings_communications(),
+            )
+            return
+        if mode == "wizard" and context.user_data.get(BCAST_ACTIVE):
+            d = _bcast_get_data(context)
+            d["topic"] = None
+            d["tag"] = tag["name"]
+            context.user_data[BCAST_DATA] = d
+            context.user_data[BCAST_STEP] = "text"
+            await update.message.reply_text(
+                f"✅ Тег <b>#{escape(tag['name'])}</b> сохранён и выбран.\n\n"
+                "Шаг 2/4: отправьте текст рассылки одним сообщением. "
+                "Оформление Telegram сохранится. Если текст не нужен — отправьте <code>-</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")]
+                ]),
+            )
+            return
+        await update.message.reply_text(
+            f"✅ Тег <b>#{escape(tag['name'])}</b> сохранён.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_broadcast_tags_manage(),
+        )
+        return
+
+    # запланированная встреча: тема / описание / ссылка / время
+    if context.user_data.get(COMM_MEETING_ACTIVE):
+        step = context.user_data.get(COMM_MEETING_STEP)
+        d = _meeting_get_data(context)
+
+        if step == "topic":
+            topic = text.strip()
+            if len(topic) < 2:
+                await update.message.reply_text("❌ Тема встречи слишком короткая.")
+                return
+            if len(topic) > 200:
+                await update.message.reply_text("❌ Тема встречи должна быть не длиннее 200 символов.")
+                return
+            d["topic"] = topic
+            context.user_data[COMM_MEETING_DATA] = d
+            context.user_data[COMM_MEETING_STEP] = "description"
+            await update.message.reply_text(
+                "Шаг 2/5: отправьте <b>описание встречи</b>.\n"
+                "Оформление текста сохранится. Если описания нет — отправьте <code>-</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:meeting:cancel")]
+                ]),
+            )
+            return
+
+        if step == "description":
+            if text == "-":
+                d["description_html"] = None
+            else:
+                if len(text) > 3000:
+                    await update.message.reply_text("❌ Описание слишком длинное. Максимум 3000 символов.")
+                    return
+                d["description_html"] = text_html
+            context.user_data[COMM_MEETING_DATA] = d
+            context.user_data[COMM_MEETING_STEP] = "link"
+            await update.message.reply_text(
+                "Шаг 3/5: отправьте <b>ссылку на встречу</b>.\n"
+                "Если ссылки нет — отправьте <code>-</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:meeting:cancel")]
+                ]),
+            )
+            return
+
+        if step == "link":
+            if text == "-":
+                d["link"] = None
+            else:
+                link = text.strip()
+                if not re.match(r"^https?://", link, flags=re.IGNORECASE):
+                    await update.message.reply_text(
+                        "❌ Ссылка должна начинаться с <code>http://</code> или <code>https://</code>.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+                if len(link) > 1000:
+                    await update.message.reply_text("❌ Ссылка слишком длинная.")
+                    return
+                d["link"] = link
+            context.user_data[COMM_MEETING_DATA] = d
+            context.user_data[COMM_MEETING_STEP] = "recipients"
+            await update.message.reply_text(
+                "Шаг 4/5: выберите, куда отправить встречу:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_meeting_recipient_mode(),
+            )
+            return
+
+        if step == "schedule_time":
+            parsed = parse_moscow_send_time(text)
+            if not parsed:
+                await update.message.reply_text(
+                    "❌ Не удалось распознать дату или время уже прошло.\n"
+                    "Используйте формат <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>, например "
+                    "<code>24.07.2026 10:30</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            send_at_utc, display = parsed
+            d["send_mode"] = "schedule"
+            d["send_at_utc"] = send_at_utc
+            d["send_at_display"] = display
+            context.user_data[COMM_MEETING_DATA] = d
+            await update.message.reply_text(
+                _meeting_confirmation_html(d),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Запланировать встречу", callback_data="help:settings:meeting:confirm")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:meeting:cancel")],
+                ]),
+            )
+            return
+
+        return
+
+    # рассылка: тема/тег, форматированный текст, файлы и планирование
     if context.user_data.get(BCAST_ACTIVE):
         step = context.user_data.get(BCAST_STEP)
         d = _bcast_get_data(context)
 
         if step == "topic":
-            if text != "-":
-                topic = text.strip()
-                if len(topic) < 2:
-                    await update.message.reply_text("❌ Тема слишком короткая. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
-                    return
-                d["topic"] = topic[:200]
-            else:
-                d["topic"] = None
-
+            topic = text.strip()
+            if len(topic) < 2:
+                await update.message.reply_text("❌ Тема слишком короткая.")
+                return
+            if len(topic) > 200:
+                await update.message.reply_text("❌ Тема должна быть не длиннее 200 символов.")
+                return
+            d["topic"] = topic
+            d["tag"] = None
             context.user_data[BCAST_DATA] = d
             context.user_data[BCAST_STEP] = "text"
             await update.message.reply_text(
-                "Шаг 2/3: <b>Текст рассылки</b> 📝\n"
-                "Отправьте текст одним сообщением.\n"
+                "Шаг 2/4: <b>Текст рассылки</b> 📝\n"
+                "Отправьте текст одним сообщением. Жирный, курсив, подчёркивание, "
+                "зачёркивание и скрытый текст сохранятся.\n"
                 "Если текст не нужен — отправьте <code>-</code>.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb_cancel_wizard_settings(),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:bcast:cancel")]
+                ]),
             )
             return
 
         if step == "text":
-            if text != "-":
-                body = text.strip()
-                if len(body) < 2:
-                    await update.message.reply_text("❌ Текст слишком короткий. Или отправьте <code>-</code> чтобы пропустить.", parse_mode=ParseMode.HTML)
-                    return
-                # лимит Telegram ~4096, оставим запас
-                d["text"] = body[:3500]
+            if text == "-":
+                d["text_html"] = None
             else:
-                d["text"] = None
-
+                # Telegram counts visible text, while text_html contains tags.
+                if len(text) > 3500:
+                    await update.message.reply_text("❌ Текст слишком длинный. Максимум 3500 символов.")
+                    return
+                d["text_html"] = text_html
             context.user_data[BCAST_DATA] = d
             context.user_data[BCAST_STEP] = "files"
             await update.message.reply_text(
-                "Шаг 3/3: <b>Файлы</b> 📎\n\n"
-                "Можешь прикрепить <b>документы / фото / видео</b> (сколько нужно).\n"
-                "Когда закончишь — нажми <b>✅ Отправить</b>.\n"
-                "Можно без файлов 🙂",
+                "Шаг 3/4: <b>Файлы</b> 📎\n\n"
+                "Можно прикрепить <b>документы, фото или видео</b>.\n"
+                "Когда закончите — нажмите <b>✅ Продолжить</b>.\n"
+                "Файлы необязательны.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_bcast_files_menu(),
             )
             return
 
-        # step == files -> ждём вложения или кнопку "Отправить"
+        if step == "schedule_time":
+            parsed = parse_moscow_send_time(text)
+            if not parsed:
+                await update.message.reply_text(
+                    "❌ Не удалось распознать дату или время уже прошло.\n"
+                    "Используйте формат <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>, например "
+                    "<code>24.07.2026 10:30</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            send_at_utc, display = parsed
+            d["send_mode"] = "schedule"
+            d["send_at_utc"] = send_at_utc
+            d["send_at_display"] = display
+            context.user_data[BCAST_DATA] = d
+            await update.message.reply_text(
+                _bcast_confirmation_html(d),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=kb_danger_confirm(
+                    "help:settings:bcast:send_confirm",
+                    "help:settings:bcast:cancel",
+                    "🕒 Да, запланировать рассылку",
+                ),
+            )
+            return
+
+        # files and heading_choice wait for buttons/media.
         return
 
     # ачивки — выдача
@@ -10149,53 +11236,217 @@ async def send_suggestion_to_admins(scope_chat_id: int, update: Update, context:
 
 
 
-# ---------------- BROADCAST ----------------
+# ---------------- COMMUNICATIONS / BROADCAST ----------------
+
+def parse_moscow_send_time(value: str) -> tuple[str, str] | None:
+    """Parses admin-entered Moscow time and returns (naive UTC ISO, display)."""
+    raw = (value or "").strip()
+    naive = None
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%y %H:%M"):
+        try:
+            naive = datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            continue
+    if naive is None:
+        return None
+    try:
+        aware_msk = MOSCOW_TZ.localize(naive)
+    except Exception:
+        return None
+    if aware_msk <= datetime.now(MOSCOW_TZ) + timedelta(seconds=20):
+        return None
+    utc_naive = aware_msk.astimezone(pytz.utc).replace(tzinfo=None)
+    return utc_naive.isoformat(), aware_msk.strftime("%d.%m.%Y %H:%M МСК")
+
+
+def _html_plain_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return html_lib.unescape(re.sub(r"<[^>]+>", "", value))
+
+
+def _communication_preview_html(message_html: str, max_visible: int = 800) -> str:
+    plain = _html_plain_text(message_html).strip()
+    if len(plain) > max_visible:
+        plain = plain[:max_visible].rstrip() + "…"
+    return escape(plain or "Только вложения")
+
+
+def _meeting_get_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    data = context.user_data.get(COMM_MEETING_DATA)
+    if not isinstance(data, dict):
+        data = {
+            "topic": None,
+            "description_html": None,
+            "link": None,
+            "recipient_mode": None,
+            "profile_ids": [],
+        }
+        context.user_data[COMM_MEETING_DATA] = data
+    return data
+
+
+def _meeting_compose_message(topic: str, description_html: str | None, link: str | None) -> str:
+    parts = [f"<b>{escape((topic or '').strip())}</b>"]
+    if description_html:
+        parts.append(description_html.strip())
+    if link:
+        safe_link = html_lib.escape(link.strip(), quote=True)
+        parts.append(f'<a href="{safe_link}">🔗 Ссылка на встречу</a>')
+    return "\n\n".join(part for part in parts if part)
+
+
+def _meeting_payload_from_data(data: dict) -> dict:
+    return {
+        "topic": data.get("topic"),
+        "description_html": data.get("description_html"),
+        "link": data.get("link"),
+        "recipient_mode": data.get("recipient_mode"),
+        "profile_ids": [int(x) for x in (data.get("profile_ids") or [])],
+    }
+
+
+def _meeting_recipient_summary(data: dict) -> str:
+    if data.get("recipient_mode") == "chats":
+        return f"Общий чат ({len(db_list_chats())})"
+    selected = [int(x) for x in (data.get("profile_ids") or [])]
+    names = []
+    for pid in selected[:8]:
+        profile = db_profiles_get(pid)
+        names.append(profile["full_name"] if profile else f"id={pid}")
+    text = ", ".join(names)
+    if len(selected) > 8:
+        text += f" и ещё {len(selected) - 8}"
+    return text or "Сотрудники не выбраны"
+
+
+def _meeting_confirmation_html(data: dict) -> str:
+    message_html = _meeting_compose_message(
+        data.get("topic") or "",
+        data.get("description_html"),
+        data.get("link"),
+    )
+    timing = "сразу" if data.get("send_mode") != "schedule" else data.get("send_at_display", "—")
+    return (
+        "📅 <b>Проверьте встречу</b>\n\n"
+        f"Получатели: <b>{escape(_meeting_recipient_summary(data))}</b>\n"
+        f"Отправка: <b>{escape(timing)}</b>\n\n"
+        "Предпросмотр:\n\n"
+        f"{message_html}"
+    )
+
+
+async def send_custom_meeting(context: ContextTypes.DEFAULT_TYPE, payload: dict) -> tuple[int, int]:
+    message_html = _meeting_compose_message(
+        payload.get("topic") or "",
+        payload.get("description_html"),
+        payload.get("link"),
+    )
+    ok = 0
+    fail = 0
+    if payload.get("recipient_mode") == "chats":
+        for chat_id in db_list_chats():
+            try:
+                sent = await context.bot.send_message(
+                    chat_id=int(chat_id),
+                    text=message_html,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                # Custom meeting notices follow the same clean-chat rule as regular meetings.
+                schedule_message_delete(context, sent)
+                ok += 1
+            except Exception as exc:
+                logger.exception("Custom meeting failed to chat %s: %s", chat_id, exc)
+                fail += 1
+        return ok, fail
+
+    seen_user_ids = set()
+    for pid in payload.get("profile_ids") or []:
+        profile = db_profiles_get(int(pid))
+        user_id = profile.get("tg_user_id") if profile else None
+        if not user_id or int(user_id) in seen_user_ids:
+            fail += 1
+            continue
+        seen_user_ids.add(int(user_id))
+        try:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=message_html,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            ok += 1
+        except Exception as exc:
+            logger.exception("Custom meeting failed to profile %s: %s", pid, exc)
+            fail += 1
+    return ok, fail
+
 
 def _bcast_get_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
     data = context.user_data.get(BCAST_DATA)
     if not isinstance(data, dict):
-        data = {"topic": None, "text": None, "files": []}
+        data = {"topic": None, "tag": None, "text_html": None, "files": []}
         context.user_data[BCAST_DATA] = data
     if "files" not in data or not isinstance(data.get("files"), list):
         data["files"] = []
+    # Migration of an unfinished wizard from the previous build.
+    if data.get("text_html") is None and data.get("text"):
+        data["text_html"] = escape(str(data.get("text")))
     return data
 
-def _bcast_compose_message(topic: str | None, body: str | None) -> str:
-    topic = (topic or "").strip()
-    body = (body or "").strip()
-    # Экрануем пользовательский ввод для HTML
-    topic_esc = escape(topic) if topic else ""
-    body_esc = escape(body) if body else ""
-    if topic_esc and body_esc:
-        return f"<b>{topic_esc}</b>\n\n{body_esc}"
-    if topic_esc:
-        return f"<b>{topic_esc}</b>"
-    return body_esc
 
-async def broadcast_to_chats(context: ContextTypes.DEFAULT_TYPE, message_html: str, files: list[dict]) -> tuple[int, int]:
-    """Рассылка в notify_chats. Возвращает (ok, fail).
+def _bcast_compose_message(
+    topic: str | None,
+    body_html: str | None,
+    tag: str | None = None,
+) -> str:
+    heading = ""
+    if topic and str(topic).strip():
+        heading = f"<b>{escape(str(topic).strip())}</b>"
+    elif tag and str(tag).strip():
+        clean_tag = normalize_broadcast_tag_name(str(tag))
+        if clean_tag:
+            heading = f"<b>#{escape(clean_tag)}</b>"
+    body = (body_html or "").strip()
+    if heading and body:
+        return f"{heading}\n\n{body}"
+    return heading or body
 
-    Формат отправки:
-      A) нет файлов -> одно текстовое сообщение
-      B) ровно 1 файл (document/photo/video) -> одно сообщение с caption
-      C) несколько файлов и ВСЕ photo/video -> media_group, caption у первого
-      D) иначе -> текст отдельным + файлы по одному (fallback)
-    """
+
+def _bcast_confirmation_html(data: dict) -> str:
+    message_html = _bcast_compose_message(
+        data.get("topic"), data.get("text_html"), data.get("tag")
+    )
+    timing = "сразу" if data.get("send_mode") != "schedule" else data.get("send_at_display", "—")
+    return (
+        "⚠️ <b>Подтверждение рассылки</b>\n\n"
+        f"Получателей-чатов: <b>{len(db_list_chats())}</b>\n"
+        f"Вложений: <b>{len(data.get('files') or [])}</b>\n"
+        f"Отправка: <b>{escape(timing)}</b>\n\n"
+        "Предпросмотр:\n"
+        f"{_communication_preview_html(message_html)}"
+    )
+
+
+async def broadcast_to_chats(
+    context: ContextTypes.DEFAULT_TYPE,
+    message_html: str,
+    files: list[dict],
+) -> tuple[int, int]:
+    """Broadcasts to notify_chats while preserving complete HTML entities."""
     ok = 0
     fail = 0
-
-    # caption лимиты у Telegram ~1024; оставим запас
-    def cap(text: str) -> str:
-        if not text:
-            return ""
-        return text[:900]
-
     chat_ids = db_list_chats()
     files = files or []
 
+    # Never cut HTML in the middle of an entity/tag. If the formatted text is too
+    # long for a caption, send it as a separate text message and keep files clean.
+    can_use_caption = len(_html_plain_text(message_html)) <= 900
+
     for cid in chat_ids:
         try:
-            # A) только текст
             if not files:
                 if message_html:
                     await context.bot.send_message(
@@ -10207,81 +11458,66 @@ async def broadcast_to_chats(context: ContextTypes.DEFAULT_TYPE, message_html: s
                 ok += 1
                 continue
 
-            # B) один файл -> caption в это же сообщение
             if len(files) == 1:
                 f0 = files[0]
                 kind = f0.get("kind")
                 file_id = f0.get("file_id")
-                caption = cap(message_html)
-
+                caption = message_html if message_html and can_use_caption else None
+                if message_html and not caption:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text=message_html,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
                 if kind == "document":
                     await context.bot.send_document(
-                        chat_id=cid,
-                        document=file_id,
-                        caption=caption or None,
+                        chat_id=cid, document=file_id, caption=caption,
                         parse_mode=ParseMode.HTML if caption else None,
                     )
                 elif kind == "photo":
                     await context.bot.send_photo(
-                        chat_id=cid,
-                        photo=file_id,
-                        caption=caption or None,
+                        chat_id=cid, photo=file_id, caption=caption,
                         parse_mode=ParseMode.HTML if caption else None,
                     )
                 elif kind == "video":
                     await context.bot.send_video(
-                        chat_id=cid,
-                        video=file_id,
-                        caption=caption or None,
+                        chat_id=cid, video=file_id, caption=caption,
                         parse_mode=ParseMode.HTML if caption else None,
                     )
                 else:
-                    # неизвестный тип -> fallback: текст + файл как документ
-                    if message_html:
-                        await context.bot.send_message(
-                            chat_id=cid,
-                            text=message_html,
-                            parse_mode=ParseMode.HTML,
-                            disable_web_page_preview=True,
-                        )
                     if file_id:
                         await context.bot.send_document(chat_id=cid, document=file_id)
                 ok += 1
                 continue
 
-            # C) несколько и все фото/видео -> media_group
             all_media = all((x.get("kind") in ("photo", "video")) for x in files)
             if all_media:
+                caption = message_html if message_html and can_use_caption else None
+                if message_html and not caption:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text=message_html,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
                 media = []
-                caption = cap(message_html)
-                for i, f0 in enumerate(files[:10]):  # лимит TG на альбом 10
+                for i, f0 in enumerate(files[:10]):
                     kind = f0.get("kind")
                     file_id = f0.get("file_id")
                     if not file_id:
                         continue
-                    if kind == "photo":
-                        media.append(
-                            InputMediaPhoto(
-                                media=file_id,
-                                caption=(caption if i == 0 and caption else None),
-                                parse_mode=(ParseMode.HTML if i == 0 and caption else None),
-                            )
-                        )
-                    else:
-                        media.append(
-                            InputMediaVideo(
-                                media=file_id,
-                                caption=(caption if i == 0 and caption else None),
-                                parse_mode=(ParseMode.HTML if i == 0 and caption else None),
-                            )
-                        )
-
+                    common = {
+                        "media": file_id,
+                        "caption": caption if i == 0 and caption else None,
+                        "parse_mode": ParseMode.HTML if i == 0 and caption else None,
+                    }
+                    media.append(InputMediaPhoto(**common) if kind == "photo" else InputMediaVideo(**common))
                 if media:
                     await context.bot.send_media_group(chat_id=cid, media=media)
                     ok += 1
                     continue
 
-            # D) fallback: текст отдельно + файлы по одному
             if message_html:
                 await context.bot.send_message(
                     chat_id=cid,
@@ -10301,11 +11537,40 @@ async def broadcast_to_chats(context: ContextTypes.DEFAULT_TYPE, message_html: s
                 elif kind == "video":
                     await context.bot.send_video(chat_id=cid, video=file_id)
             ok += 1
-        except Exception as e:
-            logger.exception("Broadcast failed to %s: %s", cid, e)
+        except Exception as exc:
+            logger.exception("Broadcast failed to %s: %s", cid, exc)
             fail += 1
-
     return ok, fail
+
+
+async def process_due_communications(context: ContextTypes.DEFAULT_TYPE):
+    """Sends durable scheduled meetings and broadcasts that have become due."""
+    for item in db_scheduled_communications_due(limit=20):
+        item_id = int(item["id"])
+        if not db_scheduled_communication_reserve(item_id):
+            continue
+        try:
+            payload = json.loads(item.get("payload_json") or "{}")
+            if item.get("kind") == "meeting":
+                ok, fail = await send_custom_meeting(context, payload)
+            elif item.get("kind") == "broadcast":
+                message_html = _bcast_compose_message(
+                    payload.get("topic"), payload.get("text_html"), payload.get("tag")
+                )
+                ok, fail = await broadcast_to_chats(context, message_html, payload.get("files") or [])
+            else:
+                raise RuntimeError(f"Unknown scheduled communication kind: {item.get('kind')}")
+
+            status = "sent" if ok > 0 or fail == 0 else "failed"
+            db_scheduled_communication_finish(
+                item_id,
+                status,
+                result={"ok": int(ok), "fail": int(fail)},
+                error=("No deliveries succeeded" if status == "failed" else None),
+            )
+        except Exception as exc:
+            logger.exception("Scheduled communication %s failed: %s", item_id, exc)
+            db_scheduled_communication_finish(item_id, "failed", error=str(exc)[:1000])
 
 
 # ---------------- ERROR HANDLER ----------------
