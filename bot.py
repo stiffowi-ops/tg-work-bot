@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "DASHBOARD-HOROSCOPE-REMINDERS-2026-07-21-V2"
+BUILD_VERSION = "DASHBOARD-HOROSCOPE-REMINDERS-EMPLOYEE-SYNC-2026-07-21-V3"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -679,6 +679,7 @@ def db_init():
             tg_user_id INTEGER,
             avg_test_score INTEGER,
             photo_file_id TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )
     """)
@@ -709,6 +710,16 @@ def db_init():
         cur.execute("ALTER TABLE profiles ADD COLUMN photo_file_id TEXT")
     except sqlite3.OperationalError:
         pass
+
+    # Мягкое удаление карточки: при выходе сотрудника из рабочего чата
+    # карточка скрывается, но связанные тесты, ачивки и история сохраняются.
+    try:
+        cur.execute("ALTER TABLE profiles ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass
+    cur.execute("UPDATE profiles SET is_active=1 WHERE is_active IS NULL")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_profiles_active_name ON profiles(is_active, full_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_profiles_tg_user_id ON profiles(tg_user_id)")
 
 
     # ------- ACHIEVEMENTS: выдачи ачивок -------
@@ -972,6 +983,7 @@ def db_profiles_list_for_delivery() -> list[dict]:
     cur = con.cursor()
     cur.execute(
         "SELECT id, full_name, tg_user_id FROM profiles "
+        "WHERE COALESCE(is_active, 1)=1 "
         "ORDER BY full_name COLLATE NOCASE ASC"
     )
     rows = cur.fetchall()
@@ -1434,7 +1446,8 @@ def db_profiles_upsert(
         cur.execute(
             """UPDATE profiles
                SET full_name=?, year_start=?, city=?, birthday=?, about=?, topics=?, tg_link=?,
-                   photo_file_id=COALESCE(?, photo_file_id)
+                   photo_file_id=COALESCE(?, photo_file_id),
+                   is_active=1
                WHERE id=?""",
             (
                 full_name.strip(), int(year_start), city.strip(), birthday, about.strip(),
@@ -1982,7 +1995,11 @@ def db_faq_upsert(question: str, answer: str) -> int:
 def db_profiles_list() -> list[tuple[int, str]]:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("SELECT id, full_name FROM profiles ORDER BY full_name COLLATE NOCASE ASC")
+    cur.execute(
+        "SELECT id, full_name FROM profiles "
+        "WHERE COALESCE(is_active, 1)=1 "
+        "ORDER BY full_name COLLATE NOCASE ASC"
+    )
     rows = cur.fetchall()
     con.close()
     return [(r[0], r[1]) for r in rows]
@@ -2107,6 +2124,107 @@ def _normalize_profile_tg_link(username: str | None) -> str | None:
     return "@" + u
 
 
+def db_profiles_ensure_from_tg_user(user) -> tuple[int, bool]:
+    """
+    Создаёт шаблон карточки Telegram-пользователя или активирует существующую.
+
+    Возвращает (profile_id, created), где created=True только для новой записи.
+    Сначала ищет по неизменяемому tg_user_id, затем по текущему @username,
+    чтобы связать ранее созданную вручную карточку и не делать дубль.
+    """
+    tg_user_id = int(user.id)
+    full_name = (
+        getattr(user, "full_name", None)
+        or getattr(user, "first_name", None)
+        or f"Сотрудник {tg_user_id}"
+    ).strip()
+    tg_link = _normalize_profile_tg_link(getattr(user, "username", None)) or ""
+
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute(
+            "SELECT id FROM profiles WHERE tg_user_id=? ORDER BY id ASC LIMIT 1",
+            (tg_user_id,),
+        )
+        row = cur.fetchone()
+
+        if not row and tg_link:
+            cur.execute(
+                "SELECT id FROM profiles WHERE tg_link=? ORDER BY id ASC LIMIT 1",
+                (tg_link,),
+            )
+            row = cur.fetchone()
+
+        if row:
+            profile_id = int(row[0])
+            cur.execute(
+                """
+                UPDATE profiles
+                SET full_name=?, tg_link=?, tg_user_id=?, is_active=1
+                WHERE id=?
+                """,
+                (full_name, tg_link, tg_user_id, profile_id),
+            )
+            created = False
+        else:
+            # Незаполненные поля отображаются в карточке как «—».
+            cur.execute(
+                """
+                INSERT INTO profiles(
+                    full_name, year_start, city, birthday, about, topics,
+                    tg_link, tg_user_id, is_active, created_at
+                ) VALUES (?, 0, '', NULL, '', '', ?, ?, 1, ?)
+                """,
+                (full_name, tg_link, tg_user_id, datetime.utcnow().isoformat()),
+            )
+            profile_id = int(cur.lastrowid)
+            created = True
+
+        con.commit()
+        return profile_id, created
+    finally:
+        con.close()
+
+
+def db_profiles_deactivate_by_tg_user(user) -> int | None:
+    """
+    Скрывает карточку покинувшего рабочий чат сотрудника без удаления истории.
+    Возвращает id карточки или None, если подходящая карточка не найдена.
+    """
+    tg_user_id = int(user.id)
+    tg_link = _normalize_profile_tg_link(getattr(user, "username", None))
+
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute(
+            "SELECT id FROM profiles WHERE tg_user_id=? ORDER BY id ASC LIMIT 1",
+            (tg_user_id,),
+        )
+        row = cur.fetchone()
+
+        if not row and tg_link:
+            cur.execute(
+                "SELECT id FROM profiles WHERE tg_link=? ORDER BY id ASC LIMIT 1",
+                (tg_link,),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return None
+
+        profile_id = int(row[0])
+        cur.execute(
+            "UPDATE profiles SET is_active=0 WHERE id=?",
+            (profile_id,),
+        )
+        con.commit()
+        return profile_id
+    finally:
+        con.close()
+
+
 async def sync_profile_user_id_from_update(update: Update):
     """
     Если у пользователя есть @username, и в profiles.tg_link есть такой же,
@@ -2213,6 +2331,7 @@ def db_profiles_birthdays(ddmm: str) -> list[dict]:
         SELECT id, full_name, tg_link, birthday
         FROM profiles
         WHERE birthday = ?
+          AND COALESCE(is_active, 1)=1
         ORDER BY full_name COLLATE NOCASE ASC
     """, (ddmm,))
     rows = cur.fetchall()
@@ -6570,6 +6689,8 @@ def export_backup_zip_bytes() -> bytes:
         "about",
         "topics",
         "tg_link",
+        "tg_user_id",
+        "is_active",
         "avg_test_score",
         "photo_file_id",
     ])
@@ -6577,7 +6698,8 @@ def export_backup_zip_bytes() -> bytes:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, photo_file_id
+        SELECT id, full_name, year_start, city, birthday, about, topics, tg_link,
+               tg_user_id, is_active, avg_test_score, photo_file_id
         FROM profiles
         ORDER BY id ASC
     """)
@@ -6591,8 +6713,10 @@ def export_backup_zip_bytes() -> bytes:
             "about": row[5] or "",
             "topics": row[6] or "",
             "tg_link": row[7] or "",
-            "avg_test_score": row[8] if row[8] is not None else "",
-            "photo_file_id": row[9] or "",
+            "tg_user_id": row[8] if row[8] is not None else "",
+            "is_active": int(row[9]) if row[9] is not None else 1,
+            "avg_test_score": row[10] if row[10] is not None else "",
+            "photo_file_id": row[11] or "",
         })
     con.close()
     files["profiles.csv"] = buf.getvalue()
@@ -6678,6 +6802,11 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
                 tg_link = (row.get("tg_link") or "").strip()
                 photo_file_id = (row.get("photo_file_id") or "").strip() or None
 
+                tg_user_id_raw = (row.get("tg_user_id") or "").strip()
+                tg_user_id = int(tg_user_id_raw) if tg_user_id_raw.lstrip("-").isdigit() else None
+                active_raw = (row.get("is_active") or "1").strip().lower()
+                is_active = 0 if active_raw in ("0", "false", "no", "нет") else 1
+
                 avg_raw = (row.get("avg_test_score") or "").strip()
                 avg_test_score = None
                 if avg_raw:
@@ -6691,8 +6820,10 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
                 # upsert by id if present, else by (tg_link, full_name) heuristic
                 if pid.isdigit():
                     cur.execute(
-                        """INSERT INTO profiles(id, full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, photo_file_id, created_at)
-                               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """INSERT INTO profiles(
+                               id, full_name, year_start, city, birthday, about, topics, tg_link,
+                               tg_user_id, is_active, avg_test_score, photo_file_id, created_at
+                           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                ON CONFLICT(id) DO UPDATE SET
                                  full_name=excluded.full_name,
                                  year_start=excluded.year_start,
@@ -6701,10 +6832,15 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
                                  about=excluded.about,
                                  topics=excluded.topics,
                                  tg_link=excluded.tg_link,
+                                 tg_user_id=COALESCE(excluded.tg_user_id, profiles.tg_user_id),
+                                 is_active=excluded.is_active,
                                  avg_test_score=excluded.avg_test_score,
                                  photo_file_id=COALESCE(excluded.photo_file_id, profiles.photo_file_id)
                         """,
-                        (int(pid), full_name, int(year_start), city, birthday, about, topics, tg_link, avg_test_score, photo_file_id, created_at),
+                        (
+                            int(pid), full_name, int(year_start), city, birthday, about, topics,
+                            tg_link, tg_user_id, is_active, avg_test_score, photo_file_id, created_at,
+                        ),
                     )
                     new_id = int(pid)
                 else:
@@ -6722,10 +6858,15 @@ def restore_backup_zip_bytes(data: bytes) -> dict:
                             new_id = int(r[0])
                     if new_id is None:
                         cur.execute(
-                            """INSERT INTO profiles(full_name, year_start, city, birthday, about, topics, tg_link, avg_test_score, photo_file_id, created_at)
-                                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """INSERT INTO profiles(
+                                   full_name, year_start, city, birthday, about, topics, tg_link,
+                                   tg_user_id, is_active, avg_test_score, photo_file_id, created_at
+                               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
-                            (full_name, int(year_start), city, birthday, about, topics, tg_link, avg_test_score, photo_file_id, created_at),
+                            (
+                                full_name, int(year_start), city, birthday, about, topics, tg_link,
+                                tg_user_id, is_active, avg_test_score, photo_file_id, created_at,
+                            ),
                         )
                         new_id = int(cur.lastrowid)
 
@@ -10680,33 +10821,94 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- HANDLERS: NEW MEMBERS ----------------
 
 async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    if not update.message or not update.effective_chat:
         return
 
     new_members = update.message.new_chat_members or []
     if not new_members:
         return
 
-    # если добавили самого бота — не приветствуем как человека
     bot_id = context.bot.id
-    for m in new_members:
-        if m.id == bot_id:
+    names: list[str] = []
+
+    for member in new_members:
+        # Добавление самого бота обрабатываем отдельно. При групповом добавлении
+        # остальных участников цикл продолжается, чтобы их карточки не потерялись.
+        if member.id == bot_id:
             await update.message.reply_text(
                 "Привет! Я в чате ✅\n"
                 "Чтобы включить уведомления, админ должен выполнить команду /setchat."
             )
+            continue
+
+        # Техническим ботам карточки сотрудников не создаём.
+        if member.is_bot:
+            continue
+
+        name = (member.full_name or member.first_name or "коллега").strip()
+        if name:
+            names.append(name)
+
+        # Автоматические карточки ведём только для основного рабочего чата.
+        if update.effective_chat.id == ACCESS_CHAT_ID:
+            try:
+                profile_id, created = db_profiles_ensure_from_tg_user(member)
+                logger.info(
+                    "Employee profile %s: chat_id=%s user_id=%s profile_id=%s",
+                    "created" if created else "activated",
+                    update.effective_chat.id,
+                    member.id,
+                    profile_id,
+                )
+            except Exception:
+                # Ошибка карточки не должна ломать приветственное сообщение.
+                logger.exception(
+                    "Could not create/activate employee profile: chat_id=%s user_id=%s",
+                    update.effective_chat.id,
+                    member.id,
+                )
+
+    if names:
+        joined = ", ".join(names)
+        text = WELCOME_TEXT.format(name=joined)
+        await update.message.reply_text(text, disable_web_page_preview=True)
+
+
+async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скрывает карточку сотрудника после выхода или удаления из рабочего чата."""
+    if not update.message or not update.effective_chat:
+        return
+    if update.effective_chat.id != ACCESS_CHAT_ID:
+        return
+
+    member = update.message.left_chat_member
+    if not member:
+        return
+    if member.id == context.bot.id or member.is_bot:
+        return
+
+    try:
+        profile_id = db_profiles_deactivate_by_tg_user(member)
+        if profile_id is None:
+            logger.warning(
+                "No employee profile found for departed member: chat_id=%s user_id=%s",
+                update.effective_chat.id,
+                member.id,
+            )
             return
 
-    names = []
-    for m in new_members:
-        nm = (m.full_name or m.first_name or "коллега").strip()
-        if nm:
-            names.append(nm)
-
-    joined = ", ".join(names) if names else "коллега"
-    text = WELCOME_TEXT.format(name=joined)
-
-    await update.message.reply_text(text, disable_web_page_preview=True)
+        logger.info(
+            "Employee profile deactivated: chat_id=%s user_id=%s profile_id=%s",
+            update.effective_chat.id,
+            member.id,
+            profile_id,
+        )
+    except Exception:
+        logger.exception(
+            "Could not deactivate employee profile: chat_id=%s user_id=%s",
+            update.effective_chat.id,
+            member.id,
+        )
 
 # ---------------- HANDLERS: DOCUMENT UPLOAD ----------------
 
@@ -13220,11 +13422,20 @@ def tv2_copy_bank_question(bank_id: int, tid: int) -> bool:
 def tv2_profile_ids_for_rule(rule: str, value: str | None = None, template_id: int | None = None) -> list[int]:
     with tv2_connect() as con:
         if rule == "all":
-            rows = con.execute("SELECT id FROM profiles ORDER BY full_name").fetchall()
+            rows = con.execute(
+                "SELECT id FROM profiles WHERE COALESCE(is_active, 1)=1 ORDER BY full_name"
+            ).fetchall()
         elif rule == "city":
-            rows = con.execute("SELECT id FROM profiles WHERE city=? ORDER BY full_name", (value or "",)).fetchall()
+            rows = con.execute(
+                "SELECT id FROM profiles WHERE city=? AND COALESCE(is_active, 1)=1 ORDER BY full_name",
+                (value or "",),
+            ).fetchall()
         elif rule == "department":
-            rows = con.execute("SELECT id FROM profiles WHERE COALESCE(department, '')=? ORDER BY full_name", (value or "",)).fetchall()
+            rows = con.execute(
+                "SELECT id FROM profiles WHERE COALESCE(department, '')=? "
+                "AND COALESCE(is_active, 1)=1 ORDER BY full_name",
+                (value or "",),
+            ).fetchall()
         elif rule == "failed" and template_id:
             root = tv2_get_template(template_id)
             root_id = int((root or {}).get("parent_template_id") or template_id)
@@ -13232,7 +13443,9 @@ def tv2_profile_ids_for_rule(rule: str, value: str | None = None, template_id: i
                 """SELECT DISTINCT p.id FROM profiles p
                    JOIN test_assignments a ON a.profile_id=p.id
                    JOIN test_templates t ON t.id=a.template_id
-                   WHERE (t.id=? OR t.parent_template_id=?) AND COALESCE(a.passed,0)=0""",
+                   WHERE (t.id=? OR t.parent_template_id=?)
+                     AND COALESCE(a.passed,0)=0
+                     AND COALESCE(p.is_active,1)=1""",
                 (root_id, root_id),
             ).fetchall()
         else:
@@ -14204,11 +14417,11 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if rule=="all": d["selected"]=tv2_profile_ids_for_rule("all"); context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Выбрано сотрудников: {len(d['selected'])}\n\nВведите срок в формате ДД.ММ.ГГГГ ЧЧ:ММ или «нет»:",reply_markup=tv2_kb_cancel()); return
         if rule=="failed": d["selected"]=tv2_profile_ids_for_rule("failed",template_id=tid); context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Выбрано сотрудников: {len(d['selected'])}\n\nВведите срок или «нет»:",reply_markup=tv2_kb_cancel()); return
         if rule=="department":
-            with tv2_connect() as con: deps=[str(r[0]) for r in con.execute("SELECT DISTINCT department FROM profiles WHERE COALESCE(department,'')!='' ORDER BY department").fetchall()]
+            with tv2_connect() as con: deps=[str(r[0]) for r in con.execute("SELECT DISTINCT department FROM profiles WHERE COALESCE(department,'')!='' AND COALESCE(is_active,1)=1 ORDER BY department").fetchall()]
             context.user_data["tv2_department_options"]=deps
             rows=[[InlineKeyboardButton(dep[:55],callback_data=f"help:testv2:deptpick:{i}")] for i,dep in enumerate(deps[:40])]; rows.append([InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:assign_template:{d.get('source_template_id',tid)}")]); await q.edit_message_text("Выберите отдел:",reply_markup=InlineKeyboardMarkup(rows)); return
         if rule=="city":
-            with tv2_connect() as con: cities=[str(r[0]) for r in con.execute("SELECT DISTINCT city FROM profiles WHERE city!='' ORDER BY city").fetchall()]
+            with tv2_connect() as con: cities=[str(r[0]) for r in con.execute("SELECT DISTINCT city FROM profiles WHERE city!='' AND COALESCE(is_active,1)=1 ORDER BY city").fetchall()]
             rows=[[InlineKeyboardButton(c,callback_data=f"help:testv2:citypick:{c}")] for c in cities[:40]]; rows.append([InlineKeyboardButton("⬅️ Назад",callback_data=f"help:testv2:assign_template:{d.get('source_template_id',tid)}")]); await q.edit_message_text("Выберите город:",reply_markup=InlineKeyboardMarkup(rows)); return
         if rule=="manual":
             page=int(parts[4]) if len(parts)>4 else 0; people=db_profiles_list(); selected=set(d.get("selected") or []); pages=max(1,(len(people)+7)//8); page=max(0,min(page,pages-1)); rows=[]
@@ -15773,8 +15986,9 @@ def main():
     # callbacks: help
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
 
-    # new members welcome
+    # employee chat membership sync + welcome
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
 
 
     # document upload
