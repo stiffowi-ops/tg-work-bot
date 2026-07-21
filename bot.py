@@ -15136,9 +15136,9 @@ def help_text_main(
             attention.append(f"⏰ ещё активных напоминаний: <b>{len(reminders) - 1}</b>")
 
     if attention:
-        attention_block = "• " + "\n• ".join(attention)
+        # Эмодзи уже выполняют роль визуальных маркеров — точки не нужны.
+        attention_block = "\n".join(attention)
     else:
-        # Без лишнего маркера перед единственной строкой.
         attention_block = "✅ срочных задач сейчас нет"
 
     admin_line = ""
@@ -15164,9 +15164,32 @@ def kb_help_main(is_admin_user: bool, unread_count: int = 0):
         unread_count=unread_count,
     )
     legacy_rows = [list(row) for row in legacy_markup.inline_keyboard]
-    reminder_row = [InlineKeyboardButton("⏰ Напоминалка", callback_data="help:reminder:list")]
-    # Длинная кнопка отдельной строкой сразу после «Моего кабинета».
-    rows = legacy_rows[:1] + [reminder_row] + legacy_rows[1:]
+    reminder_row = [
+        InlineKeyboardButton(
+            "⏰ Напоминалка",
+            callback_data="help:reminder:list",
+        )
+    ]
+
+    # Ставим длинную кнопку «Напоминалка» непосредственно перед
+    # администраторской кнопкой «Управление ботом». Для обычного сотрудника,
+    # у которого такой кнопки нет, «Напоминалка» будет последней строкой меню.
+    settings_row_index = next(
+        (
+            index
+            for index, row in enumerate(legacy_rows)
+            if any(
+                getattr(button, "callback_data", None) == "help:settings"
+                for button in row
+            )
+        ),
+        len(legacy_rows),
+    )
+    rows = (
+        legacy_rows[:settings_row_index]
+        + [reminder_row]
+        + legacy_rows[settings_row_index:]
+    )
     return InlineKeyboardMarkup(rows)
 
 
