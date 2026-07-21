@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "DASHBOARD-HOROSCOPE-ONLY-2026-07-21-V1"
+BUILD_VERSION = "DASHBOARD-HOROSCOPE-REMINDERS-2026-07-21-V2"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -14522,6 +14522,1191 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _tv2_legacy_on_text(update,context)
 
 # =================== END TESTING V2 ===================
+
+# ===================== EMPLOYEE REMINDERS V1 =====================
+# Личные напоминания сотрудников: создание, редактирование, удаление,
+# отображение на рабочей панели и надёжная отправка в ЛС.
+
+REMINDER_BUILD = "EMPLOYEE-REMINDERS-2026-07-21-V1"
+REMINDER_MAX_ACTIVE = 5
+REMINDER_TEXT_MAX_LENGTH = 160
+REMINDER_STATE = "employee_reminder_state"
+REMINDER_DATA = "employee_reminder_data"
+REMINDER_TIMEZONE_LABELS = {
+    0: "МСК",
+    1: "МСК+1",
+    2: "МСК+2",
+}
+
+# Сохраняем актуальные реализации, включая переопределения TESTING V2.
+_reminder_legacy_db_init = db_init
+_reminder_legacy_help_text_main = help_text_main
+_reminder_legacy_kb_help_main = kb_help_main
+_reminder_legacy_cb_help = cb_help
+_reminder_legacy_on_text = on_text
+_reminder_legacy_check_and_send_jobs = check_and_send_jobs
+
+
+def _reminder_utc_now() -> datetime:
+    return datetime.now(pytz.UTC)
+
+
+def _reminder_tz(timezone_delta: int):
+    delta = int(timezone_delta)
+    if delta not in REMINDER_TIMEZONE_LABELS:
+        raise ValueError("Недопустимый часовой пояс")
+    # Москва — UTC+3. Для регионов поддерживаем UTC+4 и UTC+5.
+    return pytz.FixedOffset((3 + delta) * 60)
+
+
+def _reminder_parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return pytz.UTC.localize(dt)
+    return dt.astimezone(pytz.UTC)
+
+
+def _reminder_local_to_utc(
+    reminder_date: date,
+    time_text: str,
+    timezone_delta: int,
+) -> datetime:
+    match = re.fullmatch(r"\s*(\d{1,2})[:.](\d{2})\s*", time_text or "")
+    if not match:
+        raise ValueError("Время нужно указать в формате ЧЧ:ММ, например 18:30")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("Укажите корректное время от 00:00 до 23:59")
+
+    tz = _reminder_tz(timezone_delta)
+    local_dt = datetime(
+        reminder_date.year,
+        reminder_date.month,
+        reminder_date.day,
+        hour,
+        minute,
+        tzinfo=tz,
+    )
+    return local_dt.astimezone(pytz.UTC)
+
+
+def _reminder_parse_date_text(value: str, timezone_delta: int) -> date:
+    clean = (value or "").strip()
+    tz = _reminder_tz(timezone_delta)
+    today_local = _reminder_utc_now().astimezone(tz).date()
+
+    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(clean, fmt).date()
+        except ValueError:
+            pass
+
+    try:
+        parsed = datetime.strptime(clean, "%d.%m").date().replace(year=today_local.year)
+        if parsed < today_local:
+            parsed = parsed.replace(year=today_local.year + 1)
+        return parsed
+    except ValueError:
+        raise ValueError("Введите дату в формате ДД.ММ или ДД.ММ.ГГГГ")
+
+
+def _reminder_format_when(item: dict, include_timezone: bool = True) -> str:
+    utc_dt = _reminder_parse_utc(item.get("remind_at_utc"))
+    if not utc_dt:
+        return "дата не определена"
+    delta = int(item.get("timezone_delta") or 0)
+    tz = _reminder_tz(delta)
+    local_dt = utc_dt.astimezone(tz)
+    today = _reminder_utc_now().astimezone(tz).date()
+    if local_dt.date() == today:
+        day_text = "Сегодня"
+    elif local_dt.date() == today + timedelta(days=1):
+        day_text = "Завтра"
+    else:
+        day_text = local_dt.strftime("%d.%m.%Y")
+    result = f"{day_text}, {local_dt:%H:%M}"
+    if include_timezone:
+        result += f" · {REMINDER_TIMEZONE_LABELS.get(delta, 'МСК')}"
+    return result
+
+
+def _reminder_short_text(value: str, limit: int = 42) -> str:
+    clean = re.sub(r"\s+", " ", (value or "").strip())
+    return clean if len(clean) <= limit else clean[: max(1, limit - 1)].rstrip() + "…"
+
+
+def db_init():
+    _reminder_legacy_db_init()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS employee_reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            reminder_text TEXT NOT NULL,
+            remind_at_utc TEXT NOT NULL,
+            timezone_delta INTEGER NOT NULL DEFAULT 0
+                CHECK(timezone_delta IN (0, 1, 2)),
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending', 'sending', 'sent', 'canceled', 'failed')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            sent_at TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_employee_reminders_due
+        ON employee_reminders(status, remind_at_utc)
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_employee_reminders_user
+        ON employee_reminders(user_id, status, remind_at_utc)
+        """
+    )
+    # После перезапуска безопасно возвращаем незавершённые отправки в очередь.
+    cur.execute(
+        """
+        UPDATE employee_reminders
+        SET status='pending', updated_at=?
+        WHERE status='sending'
+        """,
+        (_reminder_utc_now().isoformat(),),
+    )
+    con.commit()
+    con.close()
+
+
+def db_reminders_active(user_id: int, limit: int = REMINDER_MAX_ACTIVE) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, reminder_text, remind_at_utc, timezone_delta,
+               status, created_at, updated_at
+        FROM employee_reminders
+        WHERE user_id=? AND status IN ('pending', 'sending')
+        ORDER BY remind_at_utc ASC, id ASC
+        LIMIT ?
+        """,
+        (int(user_id), int(limit)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {
+            "id": int(r[0]),
+            "user_id": int(r[1]),
+            "reminder_text": r[2],
+            "remind_at_utc": r[3],
+            "timezone_delta": int(r[4] or 0),
+            "status": r[5],
+            "created_at": r[6],
+            "updated_at": r[7],
+        }
+        for r in rows
+    ]
+
+
+def db_reminders_active_count(user_id: int) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM employee_reminders
+        WHERE user_id=? AND status IN ('pending', 'sending')
+        """,
+        (int(user_id),),
+    )
+    count = int((cur.fetchone() or [0])[0] or 0)
+    con.close()
+    return count
+
+
+def db_reminder_get(reminder_id: int, user_id: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, reminder_text, remind_at_utc, timezone_delta,
+               status, created_at, updated_at, sent_at, last_error
+        FROM employee_reminders
+        WHERE id=? AND user_id=?
+        """,
+        (int(reminder_id), int(user_id)),
+    )
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "id": int(row[0]),
+        "user_id": int(row[1]),
+        "reminder_text": row[2],
+        "remind_at_utc": row[3],
+        "timezone_delta": int(row[4] or 0),
+        "status": row[5],
+        "created_at": row[6],
+        "updated_at": row[7],
+        "sent_at": row[8],
+        "last_error": row[9],
+    }
+
+
+def db_reminder_create(
+    user_id: int,
+    reminder_text: str,
+    remind_at_utc: datetime,
+    timezone_delta: int,
+) -> int:
+    clean = re.sub(r"\s+", " ", (reminder_text or "").strip())
+    if not clean:
+        raise ValueError("Описание не может быть пустым")
+    if len(clean) > REMINDER_TEXT_MAX_LENGTH:
+        raise ValueError(f"Описание должно быть не длиннее {REMINDER_TEXT_MAX_LENGTH} символов")
+    if int(timezone_delta) not in REMINDER_TIMEZONE_LABELS:
+        raise ValueError("Недопустимый часовой пояс")
+    when_utc = remind_at_utc.astimezone(pytz.UTC)
+    if when_utc <= _reminder_utc_now() + timedelta(seconds=30):
+        raise ValueError("Время напоминания должно быть в будущем")
+
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM employee_reminders
+            WHERE user_id=? AND status IN ('pending', 'sending')
+            """,
+            (int(user_id),),
+        )
+        active_count = int((cur.fetchone() or [0])[0] or 0)
+        if active_count >= REMINDER_MAX_ACTIVE:
+            raise ValueError(
+                "У тебя уже 5 активных напоминаний. Удали одно из них "
+                "или дождись его отправки."
+            )
+        now_iso = _reminder_utc_now().isoformat()
+        cur.execute(
+            """
+            INSERT INTO employee_reminders(
+                user_id, reminder_text, remind_at_utc, timezone_delta,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                int(user_id),
+                clean,
+                when_utc.isoformat(),
+                int(timezone_delta),
+                now_iso,
+                now_iso,
+            ),
+        )
+        reminder_id = int(cur.lastrowid)
+        con.commit()
+        return reminder_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def db_reminder_update_text(reminder_id: int, user_id: int, new_text: str) -> bool:
+    clean = re.sub(r"\s+", " ", (new_text or "").strip())
+    if not clean:
+        raise ValueError("Описание не может быть пустым")
+    if len(clean) > REMINDER_TEXT_MAX_LENGTH:
+        raise ValueError(f"Описание должно быть не длиннее {REMINDER_TEXT_MAX_LENGTH} символов")
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE employee_reminders
+        SET reminder_text=?, updated_at=?, last_error=NULL
+        WHERE id=? AND user_id=? AND status='pending'
+        """,
+        (clean, _reminder_utc_now().isoformat(), int(reminder_id), int(user_id)),
+    )
+    changed = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return changed
+
+
+def db_reminder_update_schedule(
+    reminder_id: int,
+    user_id: int,
+    remind_at_utc: datetime,
+    timezone_delta: int,
+) -> bool:
+    if int(timezone_delta) not in REMINDER_TIMEZONE_LABELS:
+        raise ValueError("Недопустимый часовой пояс")
+    when_utc = remind_at_utc.astimezone(pytz.UTC)
+    if when_utc <= _reminder_utc_now() + timedelta(seconds=30):
+        raise ValueError("Время напоминания должно быть в будущем")
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE employee_reminders
+        SET remind_at_utc=?, timezone_delta=?, updated_at=?, last_error=NULL
+        WHERE id=? AND user_id=? AND status='pending'
+        """,
+        (
+            when_utc.isoformat(),
+            int(timezone_delta),
+            _reminder_utc_now().isoformat(),
+            int(reminder_id),
+            int(user_id),
+        ),
+    )
+    changed = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return changed
+
+
+def db_reminder_cancel(reminder_id: int, user_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE employee_reminders
+        SET status='canceled', updated_at=?
+        WHERE id=? AND user_id=? AND status='pending'
+        """,
+        (_reminder_utc_now().isoformat(), int(reminder_id), int(user_id)),
+    )
+    changed = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return changed
+
+
+def db_reminders_due(limit: int = 50) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, reminder_text, remind_at_utc, timezone_delta
+        FROM employee_reminders
+        WHERE status='pending' AND remind_at_utc<=?
+        ORDER BY remind_at_utc ASC, id ASC
+        LIMIT ?
+        """,
+        (_reminder_utc_now().isoformat(), int(limit)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {
+            "id": int(r[0]),
+            "user_id": int(r[1]),
+            "reminder_text": r[2],
+            "remind_at_utc": r[3],
+            "timezone_delta": int(r[4] or 0),
+        }
+        for r in rows
+    ]
+
+
+def db_reminder_reserve(reminder_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE employee_reminders
+        SET status='sending', updated_at=?, attempt_count=attempt_count+1
+        WHERE id=? AND status='pending'
+        """,
+        (_reminder_utc_now().isoformat(), int(reminder_id)),
+    )
+    reserved = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return reserved
+
+
+def db_reminder_mark_sent(reminder_id: int):
+    now_iso = _reminder_utc_now().isoformat()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE employee_reminders
+        SET status='sent', sent_at=?, updated_at=?, last_error=NULL
+        WHERE id=? AND status='sending'
+        """,
+        (now_iso, now_iso, int(reminder_id)),
+    )
+    con.commit()
+    con.close()
+
+
+def db_reminder_return_pending(reminder_id: int, error: str | None = None):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE employee_reminders
+        SET status='pending', updated_at=?, last_error=?
+        WHERE id=? AND status='sending'
+        """,
+        (_reminder_utc_now().isoformat(), (error or "")[:1000] or None, int(reminder_id)),
+    )
+    con.commit()
+    con.close()
+
+
+def db_reminder_mark_failed(reminder_id: int, error: str | None = None):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE employee_reminders
+        SET status='failed', updated_at=?, last_error=?
+        WHERE id=? AND status='sending'
+        """,
+        (_reminder_utc_now().isoformat(), (error or "")[:1000] or None, int(reminder_id)),
+    )
+    con.commit()
+    con.close()
+
+
+def clear_reminder_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(REMINDER_STATE, None)
+    context.user_data.pop(REMINDER_DATA, None)
+
+
+def _reminder_set_flow(context: ContextTypes.DEFAULT_TYPE, state: str, **data):
+    context.user_data[REMINDER_STATE] = state
+    context.user_data[REMINDER_DATA] = dict(data)
+
+
+def _reminder_intro_text(user_id: int) -> str:
+    count = db_reminders_active_count(user_id)
+    return (
+        "⏰ <b>Напоминалка</b>\n\n"
+        "Здесь ты можешь создать личное уведомление. Придумай краткое описание, "
+        "выбери дату, время и свой часовой пояс — в нужный момент я вернусь "
+        "к тебе в личные сообщения.\n\n"
+        "Доступные часовые пояса: <b>МСК, МСК+1 и МСК+2</b>.\n"
+        f"Активных напоминаний: <b>{count} из {REMINDER_MAX_ACTIVE}</b>"
+    )
+
+
+def kb_reminders_list(user_id: int) -> InlineKeyboardMarkup:
+    items = db_reminders_active(user_id, limit=REMINDER_MAX_ACTIVE)
+    rows = []
+    if len(items) < REMINDER_MAX_ACTIVE:
+        rows.append([InlineKeyboardButton("➕ Создать напоминание", callback_data="help:reminder:new")])
+    for item in items:
+        when = _reminder_format_when(item, include_timezone=False)
+        label = f"⏰ {when} · {_reminder_short_text(item['reminder_text'], 28)}"
+        rows.append([
+            InlineKeyboardButton(label[:64], callback_data=f"help:reminder:open:{item['id']}")
+        ])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_reminder_timezone(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("МСК", callback_data=f"{prefix}:0"),
+            InlineKeyboardButton("МСК+1", callback_data=f"{prefix}:1"),
+            InlineKeyboardButton("МСК+2", callback_data=f"{prefix}:2"),
+        ],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:reminder:cancel")],
+    ])
+
+
+def kb_reminder_date(timezone_delta: int) -> InlineKeyboardMarkup:
+    today = _reminder_utc_now().astimezone(_reminder_tz(timezone_delta)).date()
+    tomorrow = today + timedelta(days=1)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Сегодня", callback_data=f"help:reminder:date:{today.isoformat()}"),
+            InlineKeyboardButton("Завтра", callback_data=f"help:reminder:date:{tomorrow.isoformat()}"),
+        ],
+        [InlineKeyboardButton("📅 Ввести дату", callback_data="help:reminder:date:custom")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:reminder:cancel")],
+    ])
+
+
+def _reminder_item_text(item: dict) -> str:
+    status_labels = {
+        "pending": "активно",
+        "sending": "отправляется",
+        "sent": "отправлено",
+        "canceled": "удалено",
+        "failed": "ошибка отправки",
+    }
+    return (
+        "⏰ <b>Напоминание</b>\n\n"
+        f"📝 {escape(item['reminder_text'])}\n\n"
+        f"🕒 <b>{escape(_reminder_format_when(item))}</b>\n"
+        f"Статус: <b>{escape(status_labels.get(item.get('status'), item.get('status') or '—'))}</b>"
+    )
+
+
+def kb_reminder_item(item: dict) -> InlineKeyboardMarkup:
+    rid = int(item["id"])
+    rows = []
+    if item.get("status") == "pending":
+        rows.extend([
+            [InlineKeyboardButton("✏️ Изменить описание", callback_data=f"help:reminder:edittext:{rid}")],
+            [InlineKeyboardButton("📅 Изменить дату и время", callback_data=f"help:reminder:editwhen:{rid}")],
+            [InlineKeyboardButton("🌍 Изменить часовой пояс", callback_data=f"help:reminder:edittz:{rid}")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"help:reminder:delete:{rid}")],
+        ])
+    rows.append([InlineKeyboardButton("⬅️ К напоминаниям", callback_data="help:reminder:list")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _reminder_confirm_text(data: dict) -> str:
+    item = {
+        "remind_at_utc": data.get("remind_at_utc"),
+        "timezone_delta": int(data.get("timezone_delta") or 0),
+    }
+    return (
+        "✅ <b>Проверь напоминание</b>\n\n"
+        f"📝 {escape(data.get('reminder_text') or '')}\n"
+        f"🕒 <b>{escape(_reminder_format_when(item))}</b>\n\n"
+        "Сохранить?"
+    )
+
+
+def help_text_main(
+    bot_username: str,
+    profile: dict | None = None,
+    unread_count: int = 0,
+    is_admin_user: bool = False,
+    user_full_name: str | None = None,
+) -> str:
+    if not profile:
+        return _reminder_legacy_help_text_main(
+            bot_username,
+            profile=profile,
+            unread_count=unread_count,
+            is_admin_user=is_admin_user,
+            user_full_name=user_full_name,
+        )
+
+    profile_full_name = (profile.get("full_name") or "Коллега").strip()
+    display_name = (user_full_name or "").strip() or profile_full_name
+    tests = db_profile_test_summary(int(profile["id"]))
+    achievements_count = db_achievements_count(int(profile["id"]))
+    attention: list[str] = []
+
+    if tests.get("assigned"):
+        attention.append(f"📝 новых тестов: <b>{tests['assigned']}</b>")
+    if tests.get("in_progress"):
+        attention.append(f"⏳ тестов в процессе: <b>{tests['in_progress']}</b>")
+    if unread_count:
+        attention.append(f"🔔 непрочитанных уведомлений: <b>{unread_count}</b>")
+
+    user_id = profile.get("tg_user_id")
+    reminders = db_reminders_active(int(user_id), REMINDER_MAX_ACTIVE) if user_id else []
+    if reminders:
+        nearest = reminders[0]
+        attention.append(
+            "⏰ ближайшее: "
+            f"<b>{escape(_reminder_format_when(nearest, include_timezone=False))}</b> — "
+            f"{escape(_reminder_short_text(nearest['reminder_text'], 58))}"
+        )
+        if len(reminders) > 1:
+            attention.append(f"⏰ ещё активных напоминаний: <b>{len(reminders) - 1}</b>")
+
+    if attention:
+        attention_block = "• " + "\n• ".join(attention)
+    else:
+        # Без лишнего маркера перед единственной строкой.
+        attention_block = "✅ срочных задач сейчас нет"
+
+    admin_line = ""
+    if is_admin_user:
+        pending = len(db_nominations_pending(100))
+        if pending:
+            admin_line = f"\n⚙️ Ожидают решения номинации: <b>{pending}</b>\n"
+
+    return (
+        f"👋 <b>Привет, {escape(display_name)}!</b>\n\n"
+        "Это твоя рабочая панель. Здесь видно, что требует внимания, "
+        "и доступны основные разделы команды.\n\n"
+        f"📌 <b>Сейчас:</b>\n{attention_block}\n"
+        f"🏆 Всего достижений: <b>{achievements_count}</b>"
+        f"{admin_line}\n\n"
+        "Выберите нужный раздел 👇"
+    )
+
+
+def kb_help_main(is_admin_user: bool, unread_count: int = 0):
+    legacy_markup = _reminder_legacy_kb_help_main(
+        is_admin_user=is_admin_user,
+        unread_count=unread_count,
+    )
+    legacy_rows = [list(row) for row in legacy_markup.inline_keyboard]
+    reminder_row = [InlineKeyboardButton("⏰ Напоминалка", callback_data="help:reminder:list")]
+    # Длинная кнопка отдельной строкой сразу после «Моего кабинета».
+    rows = legacy_rows[:1] + [reminder_row] + legacy_rows[1:]
+    return InlineKeyboardMarkup(rows)
+
+
+async def _render_reminders_list(query, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    clear_reminder_flow(context)
+    await replace_callback_message_with_text(
+        query,
+        context,
+        _reminder_intro_text(user_id),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_reminders_list(user_id),
+    )
+
+
+async def _render_reminder_item(query, context: ContextTypes.DEFAULT_TYPE, item: dict):
+    clear_reminder_flow(context)
+    await replace_callback_message_with_text(
+        query,
+        context,
+        _reminder_item_text(item),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_reminder_item(item),
+    )
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = (update.callback_query.data or "") if update.callback_query else ""
+    if not data.startswith("help:reminder"):
+        # Выход в любой другой раздел отменяет незавершённый мастер напоминания.
+        if data.startswith("help:") and context.user_data.get(REMINDER_STATE):
+            clear_reminder_flow(context)
+        return await _reminder_legacy_cb_help(update, context)
+
+    if await deny_no_access(update, context):
+        return
+    await sync_profile_user_id_from_update(update)
+
+    q = update.callback_query
+    try:
+        await q.answer()
+    except (TimedOut, NetworkError):
+        pass
+
+    user = update.effective_user
+    if not user:
+        return
+    user_id = int(user.id)
+
+    if not update.effective_chat or update.effective_chat.type != "private":
+        try:
+            await q.answer("Напоминалка работает в личных сообщениях с ботом.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    if data in ("help:reminder", "help:reminder:list"):
+        await _render_reminders_list(q, context, user_id)
+        return
+
+    if data == "help:reminder:cancel":
+        clear_reminder_flow(context)
+        await _render_reminders_list(q, context, user_id)
+        return
+
+    if data == "help:reminder:new":
+        if db_reminders_active_count(user_id) >= REMINDER_MAX_ACTIVE:
+            await q.answer(
+                "У тебя уже 5 активных напоминаний. Удали одно или дождись отправки.",
+                show_alert=True,
+            )
+            return
+        _reminder_set_flow(context, "create_text", mode="create")
+        await replace_callback_message_with_text(
+            q,
+            context,
+            "➕ <b>Новое напоминание</b>\n\n"
+            "Напиши коротко, о чём тебе напомнить.\n"
+            f"Не более {REMINDER_TEXT_MAX_LENGTH} символов.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data="help:reminder:cancel")]
+            ]),
+        )
+        return
+
+    if data.startswith("help:reminder:create:tz:"):
+        try:
+            delta = int(data.rsplit(":", 1)[-1])
+            if delta not in REMINDER_TIMEZONE_LABELS:
+                raise ValueError
+        except ValueError:
+            await q.answer("Неизвестный часовой пояс.", show_alert=True)
+            return
+        draft = context.user_data.get(REMINDER_DATA) or {}
+        if draft.get("mode") != "create" or not draft.get("reminder_text"):
+            clear_reminder_flow(context)
+            await q.answer("Создание напоминания уже завершено. Начни заново.", show_alert=True)
+            await _render_reminders_list(q, context, user_id)
+            return
+        draft["timezone_delta"] = delta
+        context.user_data[REMINDER_DATA] = draft
+        context.user_data[REMINDER_STATE] = "create_date"
+        await replace_callback_message_with_text(
+            q,
+            context,
+            "📅 <b>Когда напомнить?</b>\n\nВыбери дату.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_reminder_date(delta),
+        )
+        return
+
+    if data.startswith("help:reminder:date:"):
+        draft = context.user_data.get(REMINDER_DATA) or {}
+        state = context.user_data.get(REMINDER_STATE)
+        if state not in ("create_date", "edit_date"):
+            clear_reminder_flow(context)
+            await q.answer("Этот шаг уже неактуален. Начни заново.", show_alert=True)
+            await _render_reminders_list(q, context, user_id)
+            return
+        value = data[len("help:reminder:date:"):]
+        if value == "custom":
+            context.user_data[REMINDER_STATE] = (
+                "create_date_text" if state == "create_date" else "edit_date_text"
+            )
+            await replace_callback_message_with_text(
+                q,
+                context,
+                "📅 <b>Введи дату</b>\n\n"
+                "Формат: <code>ДД.ММ</code> или <code>ДД.ММ.ГГГГ</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:reminder:cancel")]
+                ]),
+            )
+            return
+        try:
+            selected_date = date.fromisoformat(value)
+        except ValueError:
+            await q.answer("Не удалось распознать дату.", show_alert=True)
+            return
+        draft["date"] = selected_date.isoformat()
+        context.user_data[REMINDER_DATA] = draft
+        context.user_data[REMINDER_STATE] = (
+            "create_time" if state == "create_date" else "edit_time"
+        )
+        await replace_callback_message_with_text(
+            q,
+            context,
+            "🕒 <b>Во сколько напомнить?</b>\n\n"
+            "Введи время в формате <code>ЧЧ:ММ</code>, например <code>18:30</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data="help:reminder:cancel")]
+            ]),
+        )
+        return
+
+    if data == "help:reminder:save":
+        draft = context.user_data.get(REMINDER_DATA) or {}
+        if draft.get("mode") != "create" or not draft.get("remind_at_utc"):
+            clear_reminder_flow(context)
+            await q.answer("Черновик не найден. Начни создание заново.", show_alert=True)
+            await _render_reminders_list(q, context, user_id)
+            return
+        when_utc = _reminder_parse_utc(draft.get("remind_at_utc"))
+        if not when_utc:
+            await q.answer("Не удалось определить время.", show_alert=True)
+            return
+        try:
+            db_reminder_create(
+                user_id=user_id,
+                reminder_text=draft.get("reminder_text") or "",
+                remind_at_utc=when_utc,
+                timezone_delta=int(draft.get("timezone_delta") or 0),
+            )
+        except ValueError as exc:
+            await q.answer(str(exc), show_alert=True)
+            return
+        clear_reminder_flow(context)
+        await replace_callback_message_with_text(
+            q,
+            context,
+            "✅ <b>Напоминание создано</b>\n\n" + _reminder_intro_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_reminders_list(user_id),
+        )
+        return
+
+    if data.startswith("help:reminder:open:"):
+        try:
+            reminder_id = int(data.rsplit(":", 1)[-1])
+        except ValueError:
+            return
+        item = db_reminder_get(reminder_id, user_id)
+        if not item or item.get("status") not in ("pending", "sending"):
+            await q.answer("Напоминание уже не активно.", show_alert=True)
+            await _render_reminders_list(q, context, user_id)
+            return
+        await _render_reminder_item(q, context, item)
+        return
+
+    if data.startswith("help:reminder:edittext:"):
+        try:
+            reminder_id = int(data.rsplit(":", 1)[-1])
+        except ValueError:
+            return
+        item = db_reminder_get(reminder_id, user_id)
+        if not item or item.get("status") != "pending":
+            await q.answer("Это напоминание уже нельзя редактировать.", show_alert=True)
+            return
+        _reminder_set_flow(context, "edit_text", mode="edit", reminder_id=reminder_id)
+        await replace_callback_message_with_text(
+            q,
+            context,
+            "✏️ <b>Новое описание</b>\n\n"
+            f"Сейчас: {escape(item['reminder_text'])}\n\n"
+            "Отправь новый текст напоминания.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data="help:reminder:cancel")]
+            ]),
+        )
+        return
+
+    if data.startswith("help:reminder:editwhen:"):
+        try:
+            reminder_id = int(data.rsplit(":", 1)[-1])
+        except ValueError:
+            return
+        item = db_reminder_get(reminder_id, user_id)
+        if not item or item.get("status") != "pending":
+            await q.answer("Это напоминание уже нельзя редактировать.", show_alert=True)
+            return
+        delta = int(item.get("timezone_delta") or 0)
+        _reminder_set_flow(
+            context,
+            "edit_date",
+            mode="edit_when",
+            reminder_id=reminder_id,
+            timezone_delta=delta,
+        )
+        await replace_callback_message_with_text(
+            q,
+            context,
+            "📅 <b>Новая дата</b>\n\nВыбери дату напоминания.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_reminder_date(delta),
+        )
+        return
+
+    if data.startswith("help:reminder:edittzsave:"):
+        parts = data.split(":")
+        try:
+            reminder_id = int(parts[-2])
+            new_delta = int(parts[-1])
+            if new_delta not in REMINDER_TIMEZONE_LABELS:
+                raise ValueError
+        except ValueError:
+            await q.answer("Некорректные данные.", show_alert=True)
+            return
+        item = db_reminder_get(reminder_id, user_id)
+        if not item or item.get("status") != "pending":
+            await q.answer("Это напоминание уже нельзя редактировать.", show_alert=True)
+            return
+        old_utc = _reminder_parse_utc(item.get("remind_at_utc"))
+        if not old_utc:
+            await q.answer("Не удалось определить время напоминания.", show_alert=True)
+            return
+        old_local = old_utc.astimezone(_reminder_tz(int(item.get("timezone_delta") or 0)))
+        new_local = datetime(
+            old_local.year,
+            old_local.month,
+            old_local.day,
+            old_local.hour,
+            old_local.minute,
+            tzinfo=_reminder_tz(new_delta),
+        )
+        try:
+            changed = db_reminder_update_schedule(
+                reminder_id,
+                user_id,
+                new_local.astimezone(pytz.UTC),
+                new_delta,
+            )
+        except ValueError as exc:
+            await q.answer(str(exc), show_alert=True)
+            return
+        if not changed:
+            await q.answer("Не удалось изменить часовой пояс.", show_alert=True)
+            return
+        updated = db_reminder_get(reminder_id, user_id)
+        await _render_reminder_item(q, context, updated)
+        return
+
+    if data.startswith("help:reminder:edittz:"):
+        try:
+            reminder_id = int(data.rsplit(":", 1)[-1])
+        except ValueError:
+            return
+        item = db_reminder_get(reminder_id, user_id)
+        if not item or item.get("status") != "pending":
+            await q.answer("Это напоминание уже нельзя редактировать.", show_alert=True)
+            return
+        await replace_callback_message_with_text(
+            q,
+            context,
+            "🌍 <b>Выбери новый часовой пояс</b>\n\n"
+            "Дата и время на часах останутся прежними, изменится только часовой пояс.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("МСК", callback_data=f"help:reminder:edittzsave:{reminder_id}:0"),
+                    InlineKeyboardButton("МСК+1", callback_data=f"help:reminder:edittzsave:{reminder_id}:1"),
+                    InlineKeyboardButton("МСК+2", callback_data=f"help:reminder:edittzsave:{reminder_id}:2"),
+                ],
+                [InlineKeyboardButton("⬅️ Назад", callback_data=f"help:reminder:open:{reminder_id}")],
+            ]),
+        )
+        return
+
+    if data.startswith("help:reminder:deleteconfirm:"):
+        try:
+            reminder_id = int(data.rsplit(":", 1)[-1])
+        except ValueError:
+            return
+        if not db_reminder_cancel(reminder_id, user_id):
+            await q.answer("Напоминание уже не активно.", show_alert=True)
+        await _render_reminders_list(q, context, user_id)
+        return
+
+    if data.startswith("help:reminder:delete:"):
+        try:
+            reminder_id = int(data.rsplit(":", 1)[-1])
+        except ValueError:
+            return
+        item = db_reminder_get(reminder_id, user_id)
+        if not item or item.get("status") != "pending":
+            await q.answer("Напоминание уже не активно.", show_alert=True)
+            return
+        await replace_callback_message_with_text(
+            q,
+            context,
+            "🗑 <b>Удалить напоминание?</b>\n\n"
+            f"{escape(item['reminder_text'])}\n"
+            f"🕒 {_reminder_format_when(item)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"help:reminder:deleteconfirm:{reminder_id}")],
+                [InlineKeyboardButton("⬅️ Не удалять", callback_data=f"help:reminder:open:{reminder_id}")],
+            ]),
+        )
+        return
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get(REMINDER_STATE)
+    if not state:
+        return await _reminder_legacy_on_text(update, context)
+
+    if await deny_no_access(update, context):
+        return
+    await sync_profile_user_id_from_update(update)
+
+    if not update.effective_user or not update.message:
+        return
+    if not update.effective_chat or update.effective_chat.type != "private":
+        clear_reminder_flow(context)
+        await update.message.reply_text("Напоминалка работает только в личных сообщениях с ботом.")
+        return
+
+    user_id = int(update.effective_user.id)
+    text = (update.message.text or "").strip()
+    draft = context.user_data.get(REMINDER_DATA) or {}
+
+    if state == "create_text":
+        clean = re.sub(r"\s+", " ", text)
+        if not clean:
+            await update.message.reply_text("Описание не может быть пустым.")
+            return
+        if len(clean) > REMINDER_TEXT_MAX_LENGTH:
+            await update.message.reply_text(
+                f"Слишком длинно. Максимум {REMINDER_TEXT_MAX_LENGTH} символов."
+            )
+            return
+        draft["reminder_text"] = clean
+        draft["mode"] = "create"
+        context.user_data[REMINDER_DATA] = draft
+        context.user_data[REMINDER_STATE] = "create_timezone"
+        await update.message.reply_text(
+            "🌍 <b>Выбери свой часовой пояс</b>\n\n"
+            "В нём будут указаны дата и время напоминания.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_reminder_timezone("help:reminder:create:tz"),
+        )
+        return
+
+    if state == "edit_text":
+        clean = re.sub(r"\s+", " ", text)
+        try:
+            changed = db_reminder_update_text(
+                int(draft.get("reminder_id")),
+                user_id,
+                clean,
+            )
+        except (TypeError, ValueError) as exc:
+            await update.message.reply_text(str(exc))
+            return
+        clear_reminder_flow(context)
+        if not changed:
+            await update.message.reply_text(
+                "Не удалось изменить напоминание: возможно, оно уже отправлено.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏰ Мои напоминания", callback_data="help:reminder:list")]
+                ]),
+            )
+            return
+        await update.message.reply_text(
+            "✅ Описание обновлено.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Открыть напоминание", callback_data=f"help:reminder:open:{int(draft['reminder_id'])}")]
+            ]),
+        )
+        return
+
+    if state in ("create_date_text", "edit_date_text"):
+        delta = int(draft.get("timezone_delta") or 0)
+        try:
+            selected_date = _reminder_parse_date_text(text, delta)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        draft["date"] = selected_date.isoformat()
+        context.user_data[REMINDER_DATA] = draft
+        context.user_data[REMINDER_STATE] = (
+            "create_time" if state == "create_date_text" else "edit_time"
+        )
+        await update.message.reply_text(
+            "🕒 <b>Во сколько напомнить?</b>\n\n"
+            "Введи время в формате <code>ЧЧ:ММ</code>, например <code>18:30</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data="help:reminder:cancel")]
+            ]),
+        )
+        return
+
+    if state in ("create_time", "edit_time"):
+        try:
+            selected_date = date.fromisoformat(str(draft.get("date") or ""))
+            delta = int(draft.get("timezone_delta") or 0)
+            when_utc = _reminder_local_to_utc(selected_date, text, delta)
+            if when_utc <= _reminder_utc_now() + timedelta(seconds=30):
+                raise ValueError("Это время уже прошло. Выбери время в будущем.")
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+
+        if state == "edit_time":
+            try:
+                changed = db_reminder_update_schedule(
+                    int(draft.get("reminder_id")),
+                    user_id,
+                    when_utc,
+                    delta,
+                )
+            except (TypeError, ValueError) as exc:
+                await update.message.reply_text(str(exc))
+                return
+            reminder_id = int(draft.get("reminder_id"))
+            clear_reminder_flow(context)
+            if not changed:
+                await update.message.reply_text(
+                    "Не удалось изменить время: возможно, напоминание уже отправлено.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⏰ Мои напоминания", callback_data="help:reminder:list")]
+                    ]),
+                )
+                return
+            await update.message.reply_text(
+                "✅ Дата и время обновлены.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Открыть напоминание", callback_data=f"help:reminder:open:{reminder_id}")]
+                ]),
+            )
+            return
+
+        draft["remind_at_utc"] = when_utc.isoformat()
+        draft["time"] = text
+        context.user_data[REMINDER_DATA] = draft
+        context.user_data[REMINDER_STATE] = "create_confirm"
+        await update.message.reply_text(
+            _reminder_confirm_text(draft),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Сохранить", callback_data="help:reminder:save")],
+                [InlineKeyboardButton("❌ Отмена", callback_data="help:reminder:cancel")],
+            ]),
+        )
+        return
+
+    # На шагах, где ожидается нажатие кнопки, подсказываем пользователю.
+    await update.message.reply_text("Выбери один из вариантов кнопкой под сообщением.")
+
+
+async def send_due_employee_reminders(context: ContextTypes.DEFAULT_TYPE):
+    for item in db_reminders_due(limit=50):
+        reminder_id = int(item["id"])
+        if not db_reminder_reserve(reminder_id):
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=int(item["user_id"]),
+                text=(
+                    "⏰ <b>Напоминание</b>\n\n"
+                    f"{escape(item['reminder_text'])}\n\n"
+                    f"🕒 {escape(_reminder_format_when(item))}"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Мои напоминания", callback_data="help:reminder:list")]
+                ]),
+            )
+            db_reminder_mark_sent(reminder_id)
+        except Forbidden as exc:
+            db_reminder_mark_failed(reminder_id, f"Forbidden: {exc}")
+        except (TimedOut, NetworkError) as exc:
+            db_reminder_return_pending(reminder_id, str(exc))
+        except Exception as exc:
+            logger.exception("Employee reminder %s failed: %s", reminder_id, exc)
+            db_reminder_return_pending(reminder_id, str(exc))
+
+
+async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
+    await _reminder_legacy_check_and_send_jobs(context)
+    try:
+        await send_due_employee_reminders(context)
+    except Exception as exc:
+        logger.exception("Employee reminders checker failed: %s", exc)
+
+# =================== END EMPLOYEE REMINDERS V1 ===================
 
 # ---------------- APP ----------------
 
