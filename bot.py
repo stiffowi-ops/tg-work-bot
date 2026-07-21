@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "DOCUMENTS-KNOWLEDGE-BASE-2026-07-21-V9"
+BUILD_VERSION = "DASHBOARD-HOROSCOPE-ONLY-2026-07-21-V1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -165,8 +165,6 @@ DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH", "bot.db")
 
 STORAGE_DIR = os.getenv("STORAGE_DIR", "storage")
 
-# ------- MEMES (channel source) -------
-MEME_CHANNEL_ID = int(os.getenv("MEME_CHANNEL_ID", "-1003761916249"))
 
 # -------- ACCESS CONTROL --------
 ACCESS_CHAT_ID = -1003399576556
@@ -242,11 +240,6 @@ def kb_horo_signs():
     return InlineKeyboardMarkup(rows)
 
 
-
-def kb_horo_after():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Твой персональный мем 😂", callback_data="horo:meme")]
-    ])
 
 def zodiac_from_ddmm(ddmm: str) -> str | None:
     # ddmm = "ДД.ММ"
@@ -797,33 +790,6 @@ def db_init():
         )
     """)
 
-    # ------- MEMES: пул мемов из канала -------
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS memes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL,           -- photo|video|document
-            file_id TEXT NOT NULL,
-            unique_key TEXT UNIQUE,       -- чтобы не дублировать
-            created_at TEXT NOT NULL
-        )
-    """)
-
-
-    # ------- MEME SENDS: выдача мемов без повторов в день -------
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS meme_sends (
-            day TEXT NOT NULL,            -- YYYY-MM-DD (по MOSCOW_TZ)
-            user_id INTEGER NOT NULL,
-            meme_id INTEGER NOT NULL,
-            sent_at TEXT NOT NULL,
-            PRIMARY KEY (day, user_id),
-            UNIQUE (day, meme_id),
-            FOREIGN KEY(meme_id) REFERENCES memes(id) ON DELETE CASCADE
-        )
-    """)
-
-
-
     # ------- COMMUNICATIONS: saved broadcast tags -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS broadcast_tags (
@@ -1151,72 +1117,6 @@ def db_set_horo_last_date(user_id: int, date_iso: str):
     con.close()
 
 
-
-# ---------------- MEMES DB ----------------
-
-def db_meme_add(kind: str, file_id: str, unique_key: str):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """INSERT INTO memes(kind, file_id, unique_key, created_at)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(unique_key) DO NOTHING""",
-        (kind, file_id, unique_key, datetime.utcnow().isoformat()),
-    )
-    con.commit()
-    con.close()
-
-
-def db_meme_user_has_today(user_id: int, day_iso: str) -> bool:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM meme_sends WHERE day=? AND user_id=? LIMIT 1", (day_iso, user_id))
-    row = cur.fetchone()
-    con.close()
-    return bool(row)
-
-
-def db_meme_pick_for_day(day_iso: str) -> dict | None:
-    """
-    Выбираем случайный мем, который ещё НЕ выдавался никому в этот день.
-    """
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("""
-        SELECT m.id, m.kind, m.file_id
-        FROM memes m
-        LEFT JOIN meme_sends s
-            ON s.meme_id = m.id AND s.day = ?
-        WHERE s.meme_id IS NULL
-        ORDER BY RANDOM()
-        LIMIT 1
-    """, (day_iso,))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
-    return {"id": row[0], "kind": row[1], "file_id": row[2]}
-
-
-def db_meme_mark_sent(day_iso: str, user_id: int, meme_id: int) -> bool:
-    """
-    Пишем факт выдачи. Возвращает True если успешно (без конфликтов),
-    False если уже есть выдача пользователю сегодня или мем уже занят сегодня.
-    """
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO meme_sends(day, user_id, meme_id, sent_at)
-            VALUES (?, ?, ?, ?)
-        """, (day_iso, user_id, meme_id, datetime.utcnow().isoformat()))
-        con.commit()
-        ok = True
-    except sqlite3.IntegrityError:
-        ok = False
-    finally:
-        con.close()
-    return ok
 
 
 def db_horo_get_user_sign(user_id: int) -> str | None:
@@ -6252,7 +6152,6 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
         text=msg,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
-        reply_markup=kb_horo_after(),
     )
 
     db_set_horo_last_date(user_id, today_iso)
@@ -6359,48 +6258,6 @@ async def cb_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
     except (TimedOut, NetworkError):
         pass
-
-    # кнопка мема после гороскопа
-    if q.data == "horo:meme":
-        day_iso = datetime.now(MOSCOW_TZ).date().isoformat()
-        uid = update.effective_user.id
-
-        # 1 раз в день на пользователя
-        if db_meme_user_has_today(uid, day_iso):
-            await context.bot.send_message(
-                chat_id=uid,
-                text="Звёзды любят работать, но поработай и ты. Давай завтра 😂",
-            )
-            return
-
-        # без повторов: один и тот же мем нельзя выдать двум людям в этот день
-        meme = None
-        for _ in range(5):  # на всякий случай, если одновременно нажали несколько людей
-            candidate = db_meme_pick_for_day(day_iso)
-            if not candidate:
-                meme = None
-                break
-            if db_meme_mark_sent(day_iso, uid, candidate["id"]):
-                meme = candidate
-                break
-
-        if not meme:
-            await context.bot.send_message(
-                chat_id=uid,
-                text="Сегодня мемы уже разобрали 😅\nДавай завтра 😂",
-            )
-            return
-
-        kind = meme["kind"]
-        file_id = meme["file_id"]
-
-        if kind == "photo":
-            await context.bot.send_photo(chat_id=uid, photo=file_id)
-        elif kind == "video":
-            await context.bot.send_video(chat_id=uid, video=file_id)
-        else:
-            await context.bot.send_document(chat_id=uid, document=file_id)
-        return
 
     parts = q.data.split(":")
     if len(parts) != 3 or parts[0] != "horo" or parts[1] != "sign":
@@ -11387,41 +11244,6 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# ---------------- HANDLERS: MEME CHANNEL (collect memes) ----------------
-
-async def on_meme_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not msg or not msg.chat:
-        return
-
-    # только нужный канал
-    if int(msg.chat_id) != int(MEME_CHANNEL_ID):
-        return
-
-    # PHOTO (берём самый большой размер)
-    if getattr(msg, "photo", None):
-        ph = msg.photo[-1]
-        unique_key = f"photo:{ph.file_unique_id}"
-        db_meme_add("photo", ph.file_id, unique_key)
-        return
-
-    # VIDEO
-    if getattr(msg, "video", None):
-        vd = msg.video
-        unique_key = f"video:{vd.file_unique_id}"
-        db_meme_add("video", vd.file_id, unique_key)
-        return
-
-    # DOCUMENT (например gif/видео/картинка документом)
-    if getattr(msg, "document", None):
-        doc = msg.document
-        unique_key = f"document:{doc.file_unique_id}"
-        db_meme_add("document", doc.file_id, unique_key)
-        return
-
-
-
-
 # ---------------- HANDLERS: TEXT INPUT (dates / categories / profiles) ----------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -14746,11 +14568,6 @@ def main():
     # new members welcome
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
 
-    # meme channel collector
-    app.add_handler(MessageHandler(
-        filters.Chat(MEME_CHANNEL_ID) & (filters.PHOTO | filters.VIDEO | filters.Document.ALL),
-        on_meme_channel_post
-    ))
 
     # document upload
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
