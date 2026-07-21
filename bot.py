@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "DASHBOARD-HOROSCOPE-REMINDERS-PROFILE-CARD-LAYOUT-2026-07-21-V4"
+BUILD_VERSION = "DASHBOARD-HOROSCOPE-REMINDERS-PROFILE-CARD-SYMMETRIC-2026-07-21-V5"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -4914,44 +4914,120 @@ def _truncate_profile_field(value: str | None, limit: int) -> str:
     return text[: max(1, limit - 1)].rstrip() + "…"
 
 
-def build_profile_card_text(profile: dict, compact: bool = False) -> str:
-    """Формирует единый полный текст карточки — одинаковый с фото и без фото."""
-    bday = (profile.get("birthday") or "").strip() or "—"
+def _build_profile_card_text(
+    profile: dict,
+    *,
+    about_limit: int = 1200,
+    topics_limit: int = 1200,
+    progress_limit: int = 8,
+    achievements_limit: int = 5,
+    name_limit: int = 180,
+    city_limit: int = 120,
+    tg_limit: int = 120,
+) -> str:
+    """Собирает карточку в едином формате с настраиваемыми лимитами полей."""
+    full_name = _truncate_profile_field(profile.get("full_name"), name_limit)
+    year_start = str(profile.get("year_start") or "—")
+    city = _truncate_profile_field(profile.get("city"), city_limit)
+    bday = _truncate_profile_field(profile.get("birthday"), 30)
+    tg_link = _truncate_profile_field(profile.get("tg_link"), tg_limit)
+
     avg = profile.get("avg_test_score")
     avg_text = f"{avg}%" if avg is not None and str(avg).strip() else "—"
-    about = _truncate_profile_field(profile.get("about"), 1200)
-    topics = _truncate_profile_field(profile.get("topics"), 1200)
+    about = _truncate_profile_field(profile.get("about"), about_limit)
+    topics = _truncate_profile_field(profile.get("topics"), topics_limit)
+
     progress_items = db_achievement_progress_summary(int(profile["id"]))
     progress_lines = []
-    for item in progress_items[:8]:
-        level = achievement_level_label(item["level"])
-        if item["next_threshold"] is None:
-            progress_text = "максимальный уровень"
-        else:
-            progress_text = item["label"]
-        progress_lines.append(
-            f"{escape(item['emoji'])} {escape(item['title'])} · {level} — {escape(progress_text)}"
-        )
+    if progress_limit > 0:
+        for item in progress_items[:int(progress_limit)]:
+            level = achievement_level_label(item["level"])
+            if item["next_threshold"] is None:
+                progress_text_item = "максимальный уровень"
+            else:
+                progress_text_item = item["label"]
+            progress_lines.append(
+                f"{escape(item['emoji'])} {escape(item['title'])} · "
+                f"{level} — {escape(progress_text_item)}"
+            )
     progress_text = "\n".join(progress_lines) if progress_lines else "— Всё ещё впереди —"
 
+    if achievements_limit > 0:
+        achievements_text = format_achievements_for_profile(
+            int(profile["id"]),
+            limit=int(achievements_limit),
+        )
+    else:
+        achievements_text = "— Всё ещё впереди —"
+
     return (
-        f"👤 <b>{escape(profile['full_name'])}</b>\n\n"
-        f"📅 Работает с: <b>{escape(str(profile.get('year_start') or '—'))}</b>\n"
-        f"🏙️ Город: <b>{escape(profile.get('city') or '—')}</b>\n"
+        f"👤 <b>{escape(full_name)}</b>\n\n"
+        f"📅 Работает с: <b>{escape(year_start)}</b>\n"
+        f"🏙️ Город: <b>{escape(city)}</b>\n"
         f"🎂 День рождения: <b>{escape(bday)}</b>\n\n"
         f"📝 <b>Кратко о себе</b>\n{escape(about)}\n\n"
         f"❓ <b>По каким вопросам обращаться</b>\n{escape(topics)}\n\n"
-        f"🔗 <b>TG:</b> {escape(profile.get('tg_link') or '—')}\n"
+        f"🔗 <b>TG:</b> {escape(tg_link)}\n"
         f"📈 <b>Средний балл тестирования:</b> <b>{escape(avg_text)}</b>\n\n"
         f"━━━━━━━━━━━━━━\n\n"
         f"🏆 <b>Прогресс уровней</b>\n{progress_text}\n\n"
-        f"🏅 <b>Последние ачивки</b>\n\n{format_achievements_for_profile(int(profile['id']), limit=5)}"
+        f"🏅 <b>Последние ачивки</b>\n\n{achievements_text}"
     )
 
 
-# Фото карточки отправляется отдельным сообщением, а кнопки находятся
-# на полном текстовом сообщении. Здесь храним связь, чтобы удалять фото
-# при переходе между карточками и при возврате в меню.
+def build_profile_card_text(profile: dict, compact: bool = False) -> str:
+    """Полная текстовая карточка для профилей без фотографии."""
+    return _build_profile_card_text(profile)
+
+
+def build_profile_card_caption(profile: dict) -> str:
+    """
+    Полная карточка для подписи к фотографии.
+
+    Сначала сохраняем исходный полный вид. Если карточка длиннее лимита
+    Telegram-caption, постепенно сокращаем только значения полей и число
+    элементов ачивок, не удаляя заголовки и не меняя порядок разделов.
+    """
+    variants = [
+        # Обычная карточка: визуально совпадает с текстовой версией.
+        dict(about_limit=1200, topics_limit=1200, progress_limit=8, achievements_limit=5),
+        # Мягкое сокращение для насыщенных карточек.
+        dict(about_limit=360, topics_limit=360, progress_limit=5, achievements_limit=3),
+        dict(about_limit=240, topics_limit=240, progress_limit=4, achievements_limit=2),
+        dict(about_limit=160, topics_limit=160, progress_limit=3, achievements_limit=1),
+        # Гарантированный компактный вариант с сохранением всех разделов.
+        dict(
+            about_limit=90,
+            topics_limit=90,
+            progress_limit=1,
+            achievements_limit=0,
+            name_limit=90,
+            city_limit=60,
+            tg_limit=70,
+        ),
+    ]
+
+    for params in variants:
+        caption = _build_profile_card_text(profile, **params)
+        if len(_html_plain_text(caption)) <= 1024:
+            return caption
+
+    # Практически недостижимый резервный вариант.
+    return _build_profile_card_text(
+        profile,
+        about_limit=40,
+        topics_limit=40,
+        progress_limit=0,
+        achievements_limit=0,
+        name_limit=50,
+        city_limit=35,
+        tg_limit=40,
+    )
+
+
+# Совместимость с предыдущей версией, где фото и текст карточки
+# отправлялись раздельно. После перехода на симметричную карточку
+# эта связь используется только для удаления старых отдельных фото.
 PROFILE_CARD_PHOTO_MESSAGES = "profile_card_photo_messages"
 
 
@@ -5034,11 +5110,11 @@ async def render_profile_card(
     show_carousel: bool = True,
 ):
     """
-    Показывает карточку всегда в одном формате:
-    1. фотография отдельным сообщением без подписи, если она есть;
-    2. полный текст карточки отдельным сообщением с кнопками.
+    Показывает симметричную карточку:
+    - с фотографией: фото и полный текст находятся в одном медиасообщении;
+    - без фотографии: используется обычное текстовое сообщение.
 
-    При переключении старая фотография и старое текстовое сообщение удаляются.
+    За счёт caption ширина описания всегда совпадает с шириной фотографии.
     """
     markup = kb_help_profile_card(
         profile,
@@ -5048,61 +5124,74 @@ async def render_profile_card(
         show_carousel=show_carousel,
     )
     chat_id = int(query.message.chat_id)
-    old_text_message_id = int(query.message.message_id)
+    current_message_id = int(query.message.message_id)
     photo_file_id = (profile.get("photo_file_id") or "").strip()
-    card_text = build_profile_card_text(profile, compact=False)
+    current_is_photo = bool(getattr(query.message, "photo", None))
 
-    # Убираем фото предыдущей карточки, которое было связано с её текстом.
+    # Удаляем отдельное фото, если карточка была открыта старой версией кода.
     await delete_profile_card_photo_for_message(
         context,
         chat_id=chat_id,
-        text_message_id=old_text_message_id,
+        text_message_id=current_message_id,
     )
 
-    new_photo_message = None
     if photo_file_id:
-        new_photo_message = await context.bot.send_photo(
+        caption = build_profile_card_caption(profile)
+
+        if current_is_photo:
+            await query.edit_message_media(
+                media=InputMediaPhoto(
+                    media=photo_file_id,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                ),
+                reply_markup=markup,
+            )
+            return
+
+        sent = await context.bot.send_photo(
             chat_id=chat_id,
             photo=photo_file_id,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
         )
+        if sent:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=current_message_id,
+                )
+            except Exception:
+                pass
+        return
 
-    try:
-        new_text_message = await context.bot.send_message(
+    text = build_profile_card_text(profile, compact=False)
+
+    if current_is_photo:
+        sent = await context.bot.send_message(
             chat_id=chat_id,
-            text=card_text,
+            text=text,
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
             disable_web_page_preview=True,
         )
-    except Exception:
-        # Не оставляем одинокое фото, если текст карточки отправить не удалось.
-        if new_photo_message:
+        if sent:
             try:
                 await context.bot.delete_message(
                     chat_id=chat_id,
-                    message_id=new_photo_message.message_id,
+                    message_id=current_message_id,
                 )
             except Exception:
                 pass
-        raise
+        return
 
-    if new_photo_message:
-        photo_messages = context.chat_data.setdefault(
-            PROFILE_CARD_PHOTO_MESSAGES,
-            {},
-        )
-        photo_messages[
-            _profile_card_message_key(chat_id, new_text_message.message_id)
-        ] = int(new_photo_message.message_id)
-
-    # Старую карточку удаляем только после успешной отправки новой.
-    try:
-        await context.bot.delete_message(
-            chat_id=chat_id,
-            message_id=old_text_message_id,
-        )
-    except Exception:
-        pass
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    )
 
 
 def kb_help_settings():
