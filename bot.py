@@ -4420,6 +4420,26 @@ FAQ_PAGE_TEXT_LIMIT = 3300
 FAQ_SINGLE_CARD_TEXT_LIMIT = 3050
 
 
+def ru_word_form(number: int, one: str, few: str, many: str) -> str:
+    """Return the correct Russian noun form for an integer count."""
+    number = abs(int(number))
+    last_two = number % 100
+    if 11 <= last_two <= 14:
+        return many
+
+    last = number % 10
+    if last == 1:
+        return one
+    if 2 <= last <= 4:
+        return few
+    return many
+
+
+def faq_question_count(count: int) -> str:
+    """Examples: 1 вопрос, 2 вопроса, 5 вопросов, 21 вопрос."""
+    return f"{int(count)} {ru_word_form(count, 'вопрос', 'вопроса', 'вопросов')}"
+
+
 def faq_plain_text(value: str | None) -> str:
     """Telegram HTML -> readable plain text for search and safe length checks."""
     value = value or ""
@@ -4562,7 +4582,8 @@ def build_help_faq_menu() -> tuple[str, InlineKeyboardMarkup]:
     """Main FAQ screen without a separate button for every question."""
     count = len(db_faq_list_full())
     count_line = (
-        f"В базе знаний: <b>{count}</b> вопросов"
+        f"В базе знаний: <b>{count}</b> "
+        f"{ru_word_form(count, 'вопрос', 'вопроса', 'вопросов')}"
         if count
         else "Пока вопросов и ответов нет."
     )
@@ -4607,7 +4628,8 @@ def build_help_faq_cards_page(
         text_lines.extend([
             "",
             f"Страница <b>{page + 1}</b> из <b>{total_pages}</b> · "
-            f"всего вопросов: <b>{len(items)}</b>",
+            f"всего: <b>{len(items)}</b> "
+            f"{ru_word_form(len(items), 'вопрос', 'вопроса', 'вопросов')}",
             "",
         ])
         text_lines.append("\n\n━━━━━━━━━━━━━━\n\n".join(page_blocks))
