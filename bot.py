@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "FAQ-DYNAMIC-CARDS-SEARCH-2026-07-22-V1"
+BUILD_VERSION = "FAQ-CLICKABLE-SHORT-ANSWERS-2026-07-22-V2"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -4418,26 +4418,8 @@ def kb_help_docs_categories():
 FAQ_CARDS_PER_PAGE = 5
 FAQ_PAGE_TEXT_LIMIT = 3300
 FAQ_SINGLE_CARD_TEXT_LIMIT = 3050
-
-
-def ru_word_form(number: int, one: str, few: str, many: str) -> str:
-    """Return the correct Russian noun form for an integer count."""
-    number = abs(int(number))
-    last_two = number % 100
-    if 11 <= last_two <= 14:
-        return many
-
-    last = number % 10
-    if last == 1:
-        return one
-    if 2 <= last <= 4:
-        return few
-    return many
-
-
-def faq_question_count(count: int) -> str:
-    """Examples: 1 вопрос, 2 вопроса, 5 вопросов, 21 вопрос."""
-    return f"{int(count)} {ru_word_form(count, 'вопрос', 'вопроса', 'вопросов')}"
+FAQ_SHORT_ANSWER_LIMIT = 58
+FAQ_QUESTION_PREVIEW_LIMIT = 360
 
 
 def faq_plain_text(value: str | None) -> str:
@@ -4466,6 +4448,57 @@ def faq_search_items(query: str) -> list[dict]:
         if all(token in haystack for token in tokens):
             result.append(item)
     return result
+
+
+def faq_compact_preview(value: str | None, limit: int) -> str:
+    """Build a single-line preview suitable for a compact FAQ row/button."""
+    plain = faq_plain_text(value)
+    compact = re.sub(r"\s+", " ", plain).strip()
+    if not compact:
+        return "Текст пока не указан"
+    if len(compact) <= limit:
+        return compact
+
+    # Prefer a complete first sentence when it is informative but still short.
+    first_sentence = re.split(r"(?<=[.!?…])\s+", compact, maxsplit=1)[0]
+    if 12 <= len(first_sentence) <= limit:
+        return first_sentence
+
+    cut = compact.rfind(" ", 0, max(1, limit - 1))
+    if cut < max(12, limit // 2):
+        cut = max(1, limit - 1)
+    return compact[:cut].rstrip(" ,;:—-") + "…"
+
+
+def faq_item_pages(items: list[dict]) -> list[list[dict]]:
+    """Paginate FAQ rows while keeping the text message comfortably below its limit."""
+    if not items:
+        return [[]]
+
+    pages: list[list[dict]] = []
+    current: list[dict] = []
+    current_length = 0
+    for item in items:
+        question_preview = faq_compact_preview(
+            item.get("question"),
+            FAQ_QUESTION_PREVIEW_LIMIT,
+        )
+        row_length = len(question_preview) + 16
+        should_break = bool(current) and (
+            len(current) >= FAQ_CARDS_PER_PAGE
+            or current_length + row_length > FAQ_PAGE_TEXT_LIMIT
+        )
+        if should_break:
+            pages.append(current)
+            current = []
+            current_length = 0
+
+        current.append(item)
+        current_length += row_length
+
+    if current:
+        pages.append(current)
+    return pages or [[]]
 
 
 def faq_split_plain_text(value: str, limit: int) -> list[str]:
@@ -4582,8 +4615,7 @@ def build_help_faq_menu() -> tuple[str, InlineKeyboardMarkup]:
     """Main FAQ screen without a separate button for every question."""
     count = len(db_faq_list_full())
     count_line = (
-        f"В базе знаний: <b>{count}</b> "
-        f"{ru_word_form(count, 'вопрос', 'вопроса', 'вопросов')}"
+        f"В базе знаний: <b>{count}</b> вопросов"
         if count
         else "Пока вопросов и ответов нет."
     )
@@ -4616,10 +4648,11 @@ def build_help_faq_cards_page(
     callback_prefix: str = "help:faq:answers",
     show_search: bool = True,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    pages = faq_pack_pages(items)
+    pages = faq_item_pages(items)
     total_pages = max(1, len(pages))
     page = max(0, min(int(page), total_pages - 1))
-    page_blocks = pages[page]
+    page_items = pages[page]
+    first_number = sum(len(previous_page) for previous_page in pages[:page]) + 1
 
     text_lines = [f"<b>{title}</b>"]
     if subtitle:
@@ -4628,15 +4661,39 @@ def build_help_faq_cards_page(
         text_lines.extend([
             "",
             f"Страница <b>{page + 1}</b> из <b>{total_pages}</b> · "
-            f"всего: <b>{len(items)}</b> "
-            f"{ru_word_form(len(items), 'вопрос', 'вопроса', 'вопросов')}",
+            f"всего вопросов: <b>{len(items)}</b>",
+            "",
+            "Нажмите на краткий ответ под списком, чтобы открыть полный текст.",
             "",
         ])
-        text_lines.append("\n\n━━━━━━━━━━━━━━\n\n".join(page_blocks))
+        for offset, item in enumerate(page_items):
+            number = first_number + offset
+            question = faq_compact_preview(
+                item.get("question"),
+                FAQ_QUESTION_PREVIEW_LIMIT,
+            )
+            text_lines.append(
+                f"<b>{number}.</b> {html_lib.escape(question)}"
+            )
     else:
         text_lines.extend(["", "Ничего не найдено."])
 
     rows: list[list[InlineKeyboardButton]] = []
+    return_to_search = callback_prefix == "help:faq:search_results"
+    for offset, item in enumerate(page_items):
+        number = first_number + offset
+        short_answer = faq_compact_preview(
+            item.get("answer"),
+            FAQ_SHORT_ANSWER_LIMIT,
+        )
+        callback_data = f"help:faq:item:{int(item['id'])}:{page}"
+        if return_to_search:
+            callback_data += ":search"
+        rows.append([InlineKeyboardButton(
+            f"{number}. {short_answer}",
+            callback_data=callback_data,
+        )])
+
     if total_pages > 1:
         nav_row: list[InlineKeyboardButton] = []
         if page > 0:
@@ -4710,12 +4767,22 @@ def kb_help_faq_list(page: int = 0):
     return keyboard
 
 
-def kb_help_faq_item(page: int = 0):
+def kb_help_faq_item(page: int = 0, *, return_to_search: bool = False):
     """Keyboard for old messages where a question opened separately."""
+    back_callback = (
+        f"help:faq:search_results:{max(0, int(page))}"
+        if return_to_search
+        else f"help:faq:answers:{max(0, int(page))}"
+    )
+    back_label = (
+        "⬅️ К результатам поиска"
+        if return_to_search
+        else "⬅️ К ответам на вопросы"
+    )
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            "⬅️ К ответам на вопросы",
-            callback_data=f"help:faq:answers:{max(0, int(page))}",
+            back_label,
+            callback_data=back_callback,
         )],
         [InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")],
     ])
@@ -8914,6 +8981,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             faq_page = max(0, int(parts[4]))
         except (IndexError, TypeError, ValueError):
             faq_page = 0
+        return_to_search = len(parts) > 5 and parts[5] == "search"
 
         item = db_faq_get(fid)
         if not item:
@@ -8930,7 +8998,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_faq_item(faq_page),
+            reply_markup=kb_help_faq_item(
+                faq_page,
+                return_to_search=return_to_search,
+            ),
             disable_web_page_preview=True,
         )
         return
