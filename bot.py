@@ -3230,19 +3230,96 @@ def format_regular_meeting_date(value: date) -> str:
     return value.strftime("%d.%m.%Y")
 
 
-def kb_regular_meetings_root():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Планёрка", callback_data="help:settings:regular_meeting:type:standup")],
-        [InlineKeyboardButton("🔵 Отраслевая встреча", callback_data="help:settings:regular_meeting:type:industry")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:communications")],
-    ])
+def regular_meeting_week_bounds(reference_date: date | None = None) -> tuple[date, date]:
+    """Возвращает понедельник и воскресенье недели по московской дате."""
+    current = reference_date or datetime.now(MOSCOW_TZ).date()
+    monday = current - timedelta(days=current.weekday())
+    return monday, monday + timedelta(days=6)
 
 
-def kb_regular_meeting_actions(meeting_type: str):
+def regular_meetings_for_current_week(reference_date: date | None = None) -> list[dict]:
+    """
+    Список регулярных встреч текущей недели, которые ещё можно изменить.
+    Встречи до текущей московской даты не показываются.
+    """
+    today_d = reference_date or datetime.now(MOSCOW_TZ).date()
+    week_start, week_end = regular_meeting_week_bounds(today_d)
+    items: list[dict] = []
+
+    cursor = week_start
+    while cursor <= week_end:
+        if cursor >= today_d:
+            if regular_meeting_is_due(MEETING_STANDUP, cursor):
+                items.append({"meeting_type": MEETING_STANDUP, "meeting_date": cursor})
+            if regular_meeting_is_due(MEETING_INDUSTRY, cursor):
+                items.append({"meeting_type": MEETING_INDUSTRY, "meeting_date": cursor})
+        cursor += timedelta(days=1)
+
+    return items
+
+
+def regular_meeting_week_text(reference_date: date | None = None) -> str:
+    today_d = reference_date or datetime.now(MOSCOW_TZ).date()
+    week_start, week_end = regular_meeting_week_bounds(today_d)
+    return (
+        "🗓 <b>Управление встречами текущей недели</b>\n\n"
+        f"Неделя: <b>{week_start.strftime('%d.%m')}–{week_end.strftime('%d.%m.%Y')}</b>\n"
+        "Выберите конкретную встречу, которую нужно отменить или перенести. "
+        "Показываются только сегодняшние и будущие встречи этой недели."
+    )
+
+
+def kb_regular_meetings_root(reference_date: date | None = None):
+    rows = []
+    for item in regular_meetings_for_current_week(reference_date):
+        meeting_type = item["meeting_type"]
+        meeting_date = item["meeting_date"]
+        state = db_get_state(meeting_type, meeting_date)
+
+        if state.get("canceled") and state.get("reschedule_date"):
+            try:
+                moved_to = date.fromisoformat(state["reschedule_date"]).strftime("%d.%m")
+            except (TypeError, ValueError):
+                moved_to = "другая дата"
+            icon = "🔄"
+            suffix = f" → {moved_to}"
+        elif state.get("canceled"):
+            icon = "❌"
+            suffix = " — отменена"
+        else:
+            icon = "🟢" if meeting_type == MEETING_STANDUP else "🔵"
+            suffix = ""
+
+        day_name = DAY_RU_UPPER.get(meeting_date.weekday(), "")
+        label = (
+            f"{icon} {day_name} {meeting_date.strftime('%d.%m')} — "
+            f"{regular_meeting_title(meeting_type)}{suffix}"
+        )
+        callback = (
+            "help:settings:regular_meeting:pick:"
+            f"{meeting_type}:{meeting_date.isoformat()}"
+        )
+        rows.append([InlineKeyboardButton(label, callback_data=callback)])
+
+    if not rows:
+        rows.append([InlineKeyboardButton("— На этой неделе встреч больше нет —", callback_data="noop")])
+
+    rows.append([InlineKeyboardButton("🔄 Обновить список", callback_data="help:settings:regular_meetings")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:communications")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_regular_meeting_actions(meeting_type: str, original_date: date):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Отменить встречу", callback_data=f"help:settings:regular_meeting:action:{meeting_type}:cancel")],
-        [InlineKeyboardButton("🔄 Перенести на другой день", callback_data=f"help:settings:regular_meeting:action:{meeting_type}:move")],
-        [InlineKeyboardButton("⬅️ К выбору встречи", callback_data="help:settings:regular_meetings")],
+        [InlineKeyboardButton(
+            "❌ Отменить / удалить встречу",
+            callback_data="help:settings:regular_meeting:selected_action:cancel",
+        )],
+        [InlineKeyboardButton(
+            "🔄 Перенести на другой день",
+            callback_data="help:settings:regular_meeting:selected_action:move",
+        )],
+        [InlineKeyboardButton("⬅️ К встречам недели", callback_data="help:settings:regular_meetings")],
     ])
 
 
@@ -9481,52 +9558,132 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_comm_meeting_flow(context)
             clear_bcast_flow(context)
             await q.edit_message_text(
-                "🗓 <b>Управление регулярными встречами</b>\n\n"
-                "Здесь можно заранее отменить или перенести планёрку и отраслевую встречу. "
-                "После изменения можно выбрать, уведомлять ли сотрудников в подключённых чатах.",
+                regular_meeting_week_text(),
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_regular_meetings_root(),
             )
             return
 
-        if data.startswith("help:settings:regular_meeting:type:"):
-            meeting_type = data.rsplit(":", 1)[-1]
-            if meeting_type not in (MEETING_STANDUP, MEETING_INDUSTRY):
-                await q.answer("Неизвестный тип встречи.", show_alert=True)
+        if data.startswith("help:settings:regular_meeting:pick:"):
+            parts = data.split(":")
+            if len(parts) != 6:
+                await q.answer("Не удалось определить встречу.", show_alert=True)
                 return
+            meeting_type = parts[4]
+            try:
+                original_d = date.fromisoformat(parts[5])
+            except ValueError:
+                await q.answer("Некорректная дата встречи.", show_alert=True)
+                return
+
+            today_d = datetime.now(MOSCOW_TZ).date()
+            week_start, week_end = regular_meeting_week_bounds(today_d)
+            if (
+                meeting_type not in (MEETING_STANDUP, MEETING_INDUSTRY)
+                or original_d < today_d
+                or not (week_start <= original_d <= week_end)
+                or not regular_meeting_is_due(meeting_type, original_d)
+            ):
+                await q.answer("Эта встреча уже недоступна для изменения.", show_alert=True)
+                await q.edit_message_text(
+                    regular_meeting_week_text(),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_regular_meetings_root(),
+                )
+                return
+
             clear_regular_meeting_flow(context)
-            context.user_data[REGULAR_MEETING_DATA] = {"meeting_type": meeting_type}
+            context.user_data[REGULAR_MEETING_DATA] = {
+                "meeting_type": meeting_type,
+                "original_date": format_regular_meeting_date(original_d),
+            }
+            state = db_get_state(meeting_type, original_d)
+            status_lines = []
+            if state.get("canceled") and state.get("reschedule_date"):
+                try:
+                    moved_to = date.fromisoformat(state["reschedule_date"])
+                    status_lines.append(
+                        f"Текущий статус: <b>перенесена на {format_regular_meeting_date(moved_to)}</b>"
+                    )
+                except ValueError:
+                    status_lines.append("Текущий статус: <b>перенесена</b>")
+            elif state.get("canceled"):
+                status_lines.append("Текущий статус: <b>отменена</b>")
+            else:
+                status_lines.append("Текущий статус: <b>запланирована</b>")
+
             await q.edit_message_text(
-                f"🗓 <b>{escape(regular_meeting_title(meeting_type))}</b>\n\nЧто нужно сделать?",
+                f"🗓 <b>{escape(regular_meeting_title(meeting_type))}</b>\n\n"
+                f"Дата: <b>{format_regular_meeting_date(original_d)}</b>\n"
+                + "\n".join(status_lines)
+                + "\n\nЧто нужно сделать с этой встречей?",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb_regular_meeting_actions(meeting_type),
+                reply_markup=kb_regular_meeting_actions(meeting_type, original_d),
             )
             return
 
-        if data.startswith("help:settings:regular_meeting:action:"):
-            parts = data.split(":")
-            if len(parts) != 6:
+        if data.startswith("help:settings:regular_meeting:selected_action:"):
+            action = data.rsplit(":", 1)[-1]
+            d = context.user_data.get(REGULAR_MEETING_DATA) or {}
+            meeting_type = d.get("meeting_type")
+            original_d = parse_regular_meeting_date(d.get("original_date") or "")
+            today_d = datetime.now(MOSCOW_TZ).date()
+            week_start, week_end = regular_meeting_week_bounds(today_d)
+
+            if (
+                action not in ("cancel", "move")
+                or meeting_type not in (MEETING_STANDUP, MEETING_INDUSTRY)
+                or not original_d
+                or original_d < today_d
+                or not (week_start <= original_d <= week_end)
+                or not regular_meeting_is_due(meeting_type, original_d)
+            ):
+                clear_regular_meeting_flow(context)
+                await q.answer("Сначала выберите встречу из списка недели.", show_alert=True)
+                await q.edit_message_text(
+                    regular_meeting_week_text(),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_regular_meetings_root(),
+                )
                 return
-            meeting_type = parts[4]
-            action = parts[5]
-            if meeting_type not in (MEETING_STANDUP, MEETING_INDUSTRY) or action not in ("cancel", "move"):
-                await q.answer("Не удалось определить действие.", show_alert=True)
-                return
+
+            d["action"] = action
+            d.pop("new_date", None)
             context.user_data[REGULAR_MEETING_ACTIVE] = True
-            context.user_data[REGULAR_MEETING_STEP] = "original_date"
-            context.user_data[REGULAR_MEETING_DATA] = {
-                "meeting_type": meeting_type,
-                "action": action,
-            }
+            context.user_data[REGULAR_MEETING_DATA] = d
+
+            if action == "move":
+                context.user_data[REGULAR_MEETING_STEP] = "new_date"
+                await q.edit_message_text(
+                    f"🔄 <b>Перенос: {escape(regular_meeting_title(meeting_type))}</b>\n\n"
+                    f"Исходная дата: <b>{format_regular_meeting_date(original_d)}</b>\n\n"
+                    "Отправьте новую дату в формате <code>ДД.ММ.ГГГГ</code>.\n"
+                    "Новая дата должна быть позже исходной.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:regular_meeting:cancel")]
+                    ]),
+                )
+            else:
+                context.user_data[REGULAR_MEETING_STEP] = "reason"
+                await q.edit_message_text(
+                    f"❌ <b>Отмена: {escape(regular_meeting_title(meeting_type))}</b>\n\n"
+                    f"Дата: <b>{format_regular_meeting_date(original_d)}</b>\n\n"
+                    "Укажите причину отмены одним сообщением.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:regular_meeting:cancel")]
+                    ]),
+                )
+            return
+
+        # Старые кнопки из ранее отправленных сообщений перенаправляем к новому списку недели.
+        if data.startswith("help:settings:regular_meeting:type:") or data.startswith("help:settings:regular_meeting:action:"):
+            clear_regular_meeting_flow(context)
             await q.edit_message_text(
-                f"📅 <b>{'Отмена' if action == 'cancel' else 'Перенос'}: "
-                f"{escape(regular_meeting_title(meeting_type))}</b>\n\n"
-                "Отправьте дату встречи в формате <code>ДД.ММ.ГГГГ</code>.\n"
-                "Можно указать сегодняшнюю или будущую дату.",
+                regular_meeting_week_text(),
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:regular_meeting:cancel")]
-                ]),
+                reply_markup=kb_regular_meetings_root(),
             )
             return
 
@@ -14668,7 +14825,7 @@ async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
 
 async def tv2_admin_guard(update, context) -> bool:
     if not await is_admin_scoped(update,context):
-        try: await update.callback_query.answer("Только для администратора",show_alert=True)
+        try: await update.callback_query.answer("Недостаточно прав.",show_alert=True)
         except Exception: pass
         return False
     return True
@@ -16473,6 +16630,1381 @@ async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Employee reminders checker failed: %s", exc)
 
 # =================== END EMPLOYEE REMINDERS V1 ===================
+
+# ===================== TESTING MODES V3 =====================
+# Два варианта прохождения:
+# 1) результат публикуется только после проверки;
+# 2) правильный ответ и пояснение показываются сразу.
+# Сохраняются одиночный/множественный выбор, открытые вопросы,
+# версии, банк вопросов, попытки, аналитика, сроки и карточки сотрудников.
+
+TEST_MODES_V3_BUILD = "TESTING-MODES-V3-2026-07-22"
+
+_test_modes_legacy_db_init = db_init
+_test_modes_legacy_cb_help = cb_help
+_test_modes_legacy_cb_test = cb_test
+_test_modes_legacy_on_text = on_text
+_test_modes_legacy_get_assignment = tv2_get_assignment
+_test_modes_legacy_add_question = tv2_add_question
+_test_modes_legacy_bank_add = tv2_bank_add
+_test_modes_legacy_copy_bank_question = tv2_copy_bank_question
+_test_modes_legacy_publish_template = tv2_publish_template
+_test_modes_legacy_update_question = tv2_update_question
+
+
+def db_init():
+    _test_modes_legacy_db_init()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    _tv2_add_column(cur, "test_templates", "grading_mode TEXT NOT NULL DEFAULT 'review'")
+    _tv2_add_column(cur, "test_questions", "correct_text TEXT")
+    _tv2_add_column(cur, "test_question_bank", "correct_text TEXT")
+    _tv2_add_column(cur, "test_assignments", "result_released INTEGER NOT NULL DEFAULT 0")
+    _tv2_add_column(cur, "test_assignments", "verified_at TEXT")
+    _tv2_add_column(cur, "test_assignments", "completion_notified INTEGER NOT NULL DEFAULT 0")
+
+    # Старые обучающие тесты становятся мгновенными, остальные — с проверкой.
+    cur.execute(
+        """
+        UPDATE test_templates
+        SET grading_mode=CASE
+            WHEN COALESCE(immediate_feedback,0)=1 OR test_mode='learning' THEN 'instant'
+            ELSE 'review'
+        END
+        WHERE grading_mode IS NULL OR grading_mode NOT IN ('review','instant')
+        """
+    )
+    cur.execute(
+        "UPDATE test_templates SET immediate_feedback=CASE WHEN grading_mode='instant' THEN 1 ELSE 0 END"
+    )
+    cur.execute(
+        "UPDATE test_assignments SET result_released=1 "
+        "WHERE status='finished' AND COALESCE(result_released,0)=0"
+    )
+    con.commit()
+    con.close()
+    logger.warning("=== %s ===", TEST_MODES_V3_BUILD)
+
+
+def tv2_get_assignment(aid: int) -> dict | None:
+    item = _test_modes_legacy_get_assignment(aid)
+    if not item:
+        return None
+    template = tv2_get_template(int(item["template_id"])) or {}
+    item["grading_mode"] = template.get("grading_mode") or (
+        "instant" if int(template.get("immediate_feedback") or 0) else "review"
+    )
+    return item
+
+
+def tv3_grading_mode(value) -> str:
+    if isinstance(value, dict):
+        mode = value.get("grading_mode")
+        if not mode and value.get("template_id"):
+            template = tv2_get_template(int(value["template_id"])) or {}
+            mode = template.get("grading_mode")
+    else:
+        template = tv2_get_template(int(value)) or {}
+        mode = template.get("grading_mode")
+    return "instant" if mode == "instant" else "review"
+
+
+def tv3_mode_title(mode: str) -> str:
+    return "⚡ Мгновенный результат" if mode == "instant" else "🕓 Результат после проверки"
+
+
+def tv3_time_label(seconds: int | None) -> str:
+    return "без времени" if not seconds else f"{int(seconds) // 60} минут"
+
+
+def tv3_time_keyboard(callback_prefix: str, back_callback: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("Без времени", callback_data=f"{callback_prefix}:0")],
+        [
+            InlineKeyboardButton("5 минут", callback_data=f"{callback_prefix}:300"),
+            InlineKeyboardButton("10 минут", callback_data=f"{callback_prefix}:600"),
+        ],
+        [
+            InlineKeyboardButton("15 минут", callback_data=f"{callback_prefix}:900"),
+            InlineKeyboardButton("20 минут", callback_data=f"{callback_prefix}:1200"),
+        ],
+        [
+            InlineKeyboardButton("25 минут", callback_data=f"{callback_prefix}:1500"),
+            InlineKeyboardButton("30 минут", callback_data=f"{callback_prefix}:1800"),
+        ],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def tv2_add_question(
+    tid: int,
+    q_type: str,
+    text: str,
+    options: list[str] | None,
+    correct: list[int] | None,
+    points: float = 1,
+    explanation: str = "",
+    category: str = "",
+    difficulty: int = 1,
+    tags: str = "",
+    correct_text: str = "",
+) -> int:
+    with tv2_connect() as con:
+        idx = int(
+            con.execute(
+                "SELECT COALESCE(MAX(idx),0)+1 FROM test_questions WHERE template_id=?",
+                (int(tid),),
+            ).fetchone()[0]
+        )
+        cur = con.execute(
+            """
+            INSERT INTO test_questions(
+                template_id, idx, q_type, question_text, options_json, correct_json,
+                created_at, points, explanation, category, difficulty, tags, correct_text
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(tid), idx, q_type, text.strip(), _safe_json_dumps(options or []),
+                _safe_json_dumps(correct or []), datetime.utcnow().isoformat(), float(points),
+                (explanation or "").strip() or None, (category or "").strip() or None,
+                max(1, min(int(difficulty or 1), 5)), (tags or "").strip() or None,
+                (correct_text or "").strip() or None,
+            ),
+        )
+        con.execute(
+            "UPDATE test_templates SET updated_at=? WHERE id=?",
+            (datetime.utcnow().isoformat(), int(tid)),
+        )
+        return int(cur.lastrowid)
+
+
+def tv2_bank_add(
+    q_type: str,
+    text: str,
+    options: list[str],
+    correct: list[int],
+    points: float,
+    explanation: str,
+    category: str,
+    difficulty: int,
+    tags: str,
+    created_by: int | None,
+    correct_text: str = "",
+) -> int:
+    with tv2_connect() as con:
+        cur = con.execute(
+            """
+            INSERT INTO test_question_bank(
+                q_type, question_text, options_json, correct_json, points,
+                explanation, category, difficulty, tags, created_by, created_at,
+                correct_text
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                q_type, text.strip(), _safe_json_dumps(options), _safe_json_dumps(correct),
+                float(points), explanation.strip() or None, category.strip() or "Без категории",
+                max(1, min(int(difficulty), 5)), tags.strip() or None, created_by,
+                datetime.utcnow().isoformat(), (correct_text or "").strip() or None,
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def tv2_copy_bank_question(bank_id: int, tid: int) -> bool:
+    with tv2_connect() as con:
+        row = con.execute(
+            "SELECT * FROM test_question_bank WHERE id=? AND is_active=1",
+            (int(bank_id),),
+        ).fetchone()
+    if not row:
+        return False
+    item = dict(row)
+    tv2_add_question(
+        tid,
+        item["q_type"],
+        item["question_text"],
+        _safe_json_loads(item.get("options_json"), []),
+        _safe_json_loads(item.get("correct_json"), []),
+        item.get("points") or 1,
+        item.get("explanation") or "",
+        item.get("category") or "",
+        item.get("difficulty") or 1,
+        item.get("tags") or "",
+        item.get("correct_text") or "",
+    )
+    return True
+
+
+def tv2_update_question(qid: int, field: str, value):
+    if field == "correct_text":
+        with tv2_connect() as con:
+            con.execute(
+                "UPDATE test_questions SET correct_text=? WHERE id=?",
+                ((value or "").strip() or None, int(qid)),
+            )
+        return
+    return _test_modes_legacy_update_question(qid, field, value)
+
+
+def tv2_publish_template(tid: int, user_id: int | None = None) -> int:
+    src = tv2_get_template(tid)
+    if not src:
+        raise ValueError("template not found")
+    if int(src.get("is_published") or 0) == 1:
+        return int(tid)
+    root_id = int(src.get("parent_template_id") or src["id"])
+    with tv2_connect() as con:
+        max_ver = int(
+            con.execute(
+                "SELECT COALESCE(MAX(version),0) FROM test_templates WHERE id=? OR parent_template_id=?",
+                (root_id, root_id),
+            ).fetchone()[0] or 0
+        )
+        version = max(1, max_ver + 1)
+        fields = [
+            "title", "created_by", "created_at", "is_draft_visible", "passing_score",
+            "max_attempts", "scoring_policy", "result_mode", "test_mode",
+            "shuffle_questions", "shuffle_options", "allow_back", "allow_skip",
+            "immediate_feedback", "default_time_limit_sec", "version",
+            "parent_template_id", "is_published", "published_at", "updated_at",
+            "grading_mode",
+        ]
+        now = datetime.utcnow().isoformat()
+        vals = [
+            src.get("title"), user_id or src.get("created_by"), now, 1,
+            src.get("passing_score", 70), src.get("max_attempts", 1),
+            src.get("scoring_policy", "best"), src.get("result_mode", "errors"),
+            src.get("test_mode", "exam"), src.get("shuffle_questions", 0),
+            src.get("shuffle_options", 0), src.get("allow_back", 0),
+            src.get("allow_skip", 1), src.get("immediate_feedback", 0),
+            src.get("default_time_limit_sec"), version, root_id, 1, now, now,
+            tv3_grading_mode(src),
+        ]
+        placeholders = ",".join("?" for _ in fields)
+        cur = con.execute(
+            f"INSERT INTO test_templates({','.join(fields)}) VALUES({placeholders})",
+            vals,
+        )
+        pub_id = int(cur.lastrowid)
+        for question in tv2_questions(tid):
+            con.execute(
+                """
+                INSERT INTO test_questions(
+                    template_id, idx, q_type, question_text, options_json, correct_json,
+                    created_at, points, explanation, category, difficulty, tags, correct_text
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    pub_id, question["idx"], question["q_type"], question["question_text"],
+                    question.get("options_json"), question.get("correct_json"), now,
+                    question.get("points", 1), question.get("explanation"),
+                    question.get("category"), question.get("difficulty", 1),
+                    question.get("tags"), question.get("correct_text"),
+                ),
+            )
+        return pub_id
+
+
+def tv3_normalize_open_answer(value: str) -> str:
+    value = (value or "").strip().lower().replace("ё", "е")
+    value = re.sub(r"[^0-9a-zа-я\s]+", " ", value, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def tv3_open_answer_is_correct(answer: str, correct_text: str | None) -> bool:
+    actual = tv3_normalize_open_answer(answer)
+    accepted = [
+        tv3_normalize_open_answer(item)
+        for item in (correct_text or "").split("|")
+        if tv3_normalize_open_answer(item)
+    ]
+    return bool(actual and accepted and actual in accepted)
+
+
+def tv3_correct_answer_text(question: dict) -> str:
+    if question.get("q_type") == "open":
+        raw = (question.get("correct_text") or "").strip()
+        return " / ".join(x.strip() for x in raw.split("|") if x.strip()) or "—"
+    options = question.get("options") or []
+    indexes = [int(x) for x in (question.get("correct") or [])]
+    values = [options[i] for i in indexes if 0 <= i < len(options)]
+    return ", ".join(values) or "—"
+
+
+def tv3_employee_answer_text(question: dict, answer: dict | None) -> str:
+    if not answer:
+        return "—"
+    payload = answer.get("answer") or {}
+    if question.get("q_type") == "open":
+        return str(payload.get("text") or "—")
+    options = question.get("options") or []
+    selected = [int(x) for x in (payload.get("selected") or [])]
+    values = [options[i] for i in selected if 0 <= i < len(options)]
+    return ", ".join(values) or "—"
+
+
+def tv3_feedback_text(question: dict, correct: bool) -> str:
+    lines = ["✅ <b>Верно</b>" if correct else "❌ <b>Неверно</b>"]
+    lines.extend(["", "Правильный ответ:", f"<b>{escape(tv3_correct_answer_text(question))}</b>"])
+    if question.get("explanation"):
+        lines.extend(["", "💡 <b>Пояснение</b>", escape(str(question["explanation"]))])
+    return "\n".join(lines)
+
+
+def tv3_answer_marker(answer: dict | None) -> str:
+    if not answer:
+        return "⚪"
+    status = str(answer.get("review_status") or "")
+    if status == "pending":
+        return "⏳"
+    if status == "partial":
+        return "🟡"
+    return "✅" if answer.get("is_correct") == 1 else "❌"
+
+
+def tv3_calculation(aid: int) -> dict:
+    return tv2_calculate(aid, finalize=False)
+
+
+def tv3_submit_for_review(aid: int):
+    calc = tv3_calculation(aid)
+    with tv2_connect() as con:
+        con.execute(
+            """
+            UPDATE test_assignments
+            SET status='needs_review', review_status='pending', finished_at=?,
+                score_percent=?, points_earned=?, points_total=?, passed=0,
+                result_released=0
+            WHERE id=?
+            """,
+            (
+                datetime.utcnow().isoformat(), calc["percent"], calc["earned"],
+                calc["total"], int(aid),
+            ),
+        )
+    return calc
+
+
+def tv3_pending_review_count(aid: int) -> int:
+    with tv2_connect() as con:
+        row = con.execute(
+            """
+            SELECT COUNT(*)
+            FROM test_answers
+            WHERE assignment_id=? AND review_status='pending'
+            """,
+            (int(aid),),
+        ).fetchone()
+    return int(row[0] or 0)
+
+
+def tv3_release_result(aid: int) -> tuple[bool, dict]:
+    assignment = tv2_get_assignment(aid)
+    if not assignment:
+        return False, {}
+    if int(assignment.get("result_released") or 0) == 1 and assignment.get("status") == "finished":
+        return False, tv3_calculation(aid)
+    if tv3_pending_review_count(aid) > 0:
+        return False, tv3_calculation(aid)
+    calc = tv3_calculation(aid)
+    now = datetime.utcnow().isoformat()
+    with tv2_connect() as con:
+        con.execute(
+            """
+            UPDATE test_assignments
+            SET status='finished', review_status='reviewed', verified_at=?,
+                result_released=1, finished_at=COALESCE(finished_at,?),
+                score_percent=?, points_earned=?, points_total=?, passed=?
+            WHERE id=?
+            """,
+            (
+                now, now, calc["percent"], calc["earned"], calc["total"],
+                1 if calc["passed"] else 0, int(aid),
+            ),
+        )
+    tv2_update_profile_average(int(assignment["profile_id"]))
+    tv2_award_test_achievements(
+        int(assignment["profile_id"]), aid, calc["percent"], calc["passed"]
+    )
+    return True, calc
+
+
+def tv2_result_text(aid: int) -> str:
+    assignment = tv2_get_assignment(aid)
+    if not assignment:
+        return "Тест не найден."
+    lines = [f"📝 <b>{escape(assignment['title'])}</b>", ""]
+    if assignment.get("status") == "needs_review" or not int(assignment.get("result_released") or 0):
+        lines.append("⏳ <b>Результат появится после проверки.</b>")
+    else:
+        calc = tv3_calculation(aid)
+        lines.append(f"Результат: <b>{calc['percent']:.0f}%</b>")
+        lines.append(f"Баллы: <b>{calc['earned']:.1f} из {calc['total']:.1f}</b>")
+        lines.append(f"Проходной балл: <b>{int(assignment.get('passing_score') or 70)}%</b>")
+        lines.append("Статус: " + ("✅ успешно пройден" if calc["passed"] else "❌ не пройден"))
+    summary = tv2_attempts_summary(assignment)
+    lines.append(
+        f"Попытка: <b>{int(assignment.get('attempt_no') or 1)} "
+        f"из {int(assignment.get('max_attempts') or 1)}</b>"
+    )
+    if assignment.get("status") == "finished" and summary.get("final") is not None:
+        names = {"best": "лучший", "last": "последний", "average": "средний"}
+        lines.append(
+            f"Зачётный результат ({names.get(assignment.get('scoring_policy'), 'лучший')}): "
+            f"<b>{summary['final']:.0f}%</b>"
+        )
+    if assignment.get("reviewer_comment") and assignment.get("status") == "finished":
+        lines.extend(["", "💬 <b>Комментарий</b>", escape(assignment["reviewer_comment"])])
+    return "\n".join(lines)
+
+
+def tv2_render_result_details(aid: int) -> str:
+    assignment = tv2_get_assignment(aid)
+    if not assignment:
+        return "Тест не найден."
+    if assignment.get("status") != "finished" or not int(assignment.get("result_released") or 0):
+        return tv2_result_text(aid)
+
+    mode = assignment.get("result_mode") or "errors"
+    # После проверки всегда показываем полный разбор.
+    if tv3_grading_mode(assignment) == "review":
+        mode = "all"
+    base = tv2_result_text(aid)
+    if mode in ("score", "hidden"):
+        return base
+
+    lines = [base, "", "<b>Разбор ответов</b>"]
+    for question in tv2_questions(int(assignment["template_id"])):
+        answer = tv2_answer(aid, int(question["id"]))
+        if mode == "errors" and answer and answer.get("is_correct") == 1:
+            continue
+        marker = tv3_answer_marker(answer)
+        lines.extend([
+            "",
+            f"{marker} <b>{int(question['idx'])}. {escape(question['question_text'])}</b>",
+            "Ваш ответ: " + escape(tv3_employee_answer_text(question, answer)),
+            "Правильный ответ: " + escape(tv3_correct_answer_text(question)),
+        ])
+        if question.get("explanation"):
+            lines.append("💡 " + escape(str(question["explanation"])))
+        if answer and answer.get("reviewer_comment"):
+            lines.append("💬 " + escape(str(answer["reviewer_comment"])))
+    return "\n".join(lines)[:4000]
+
+
+def tv2_template_text(tid: int) -> str:
+    template = tv2_get_template(tid)
+    if not template:
+        return "Шаблон не найден."
+    questions = tv2_questions(tid)
+    result_mode = {
+        "score": "только балл", "errors": "ошибки", "all": "все ответы", "hidden": "скрыто"
+    }.get(template.get("result_mode"), template.get("result_mode"))
+    type_counts = {
+        "single": sum(1 for item in questions if item.get("q_type") == "single"),
+        "multi": sum(1 for item in questions if item.get("q_type") == "multi"),
+        "open": sum(1 for item in questions if item.get("q_type") == "open"),
+    }
+    return (
+        f"📝 <b>{escape(template['title'])}</b>\n"
+        f"Версия: <b>{int(template.get('version') or 1)}</b> · "
+        f"{'опубликована' if int(template.get('is_published') or 0) else 'черновик'}\n\n"
+        f"Вариант: <b>{escape(tv3_mode_title(tv3_grading_mode(template)))}</b>\n"
+        f"Вопросов: <b>{len(questions)}</b> "
+        f"(1 ответ: {type_counts['single']}, несколько: {type_counts['multi']}, открытые: {type_counts['open']})\n"
+        f"Время: <b>{escape(tv3_time_label(template.get('default_time_limit_sec')))}</b>\n"
+        f"Проходной балл: <b>{int(template.get('passing_score') or 70)}%</b>\n"
+        f"Попыток: <b>{int(template.get('max_attempts') or 1)}</b>\n"
+        f"Зачёт: <b>{escape(str(template.get('scoring_policy') or 'best'))}</b>\n"
+        f"Показывать результат: <b>{escape(str(result_mode))}</b>\n"
+        f"Перемешивать вопросы: <b>{'да' if int(template.get('shuffle_questions') or 0) else 'нет'}</b>\n"
+        f"Перемешивать варианты: <b>{'да' if int(template.get('shuffle_options') or 0) else 'нет'}</b>\n"
+        f"Назад/пропуск: <b>{'да' if int(template.get('allow_back') or 0) else 'нет'} / "
+        f"{'да' if int(template.get('allow_skip') or 0) else 'нет'}</b>"
+    )
+
+
+def tv2_kb_admin_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Создать тест", callback_data="help:testv2:create")],
+        [InlineKeyboardButton("🗂 Черновики и версии", callback_data="help:testv2:drafts:0")],
+        [InlineKeyboardButton("📚 Банк вопросов", callback_data="help:testv2:bank")],
+        [InlineKeyboardButton("👥 Назначить тест", callback_data="help:testv2:assign")],
+        [InlineKeyboardButton("✅ Проверить результаты", callback_data="help:testv2:review")],
+        [InlineKeyboardButton("📊 Результаты и аналитика", callback_data="help:testv2:analytics")],
+        [InlineKeyboardButton("⌛ Просроченные", callback_data="help:testv2:overdue")],
+        [InlineKeyboardButton("🏢 Отделы сотрудников", callback_data="help:testv2:departments:0")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
+    ])
+
+
+def tv2_kb_settings(tid: int):
+    template = tv2_get_template(tid) or {}
+    def yn(value):
+        return "✅" if int(value or 0) else "❌"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"Вариант: {'сразу' if tv3_grading_mode(template) == 'instant' else 'после проверки'}",
+            callback_data=f"help:testv2:set:mode:{tid}",
+        )],
+        [InlineKeyboardButton(
+            f"⏱ Время: {tv3_time_label(template.get('default_time_limit_sec'))}",
+            callback_data=f"help:testv2:set:time:{tid}",
+        )],
+        [InlineKeyboardButton(
+            f"Проходной: {int(template.get('passing_score') or 70)}%",
+            callback_data=f"help:testv2:set:passing:{tid}",
+        )],
+        [InlineKeyboardButton(
+            f"Попыток: {int(template.get('max_attempts') or 1)}",
+            callback_data=f"help:testv2:set:attempts:{tid}",
+        )],
+        [InlineKeyboardButton(
+            f"Зачёт: {template.get('scoring_policy','best')}",
+            callback_data=f"help:testv2:set:policy:{tid}",
+        )],
+        [InlineKeyboardButton(
+            f"Результаты: {template.get('result_mode','errors')}",
+            callback_data=f"help:testv2:set:result:{tid}",
+        )],
+        [InlineKeyboardButton(
+            f"{yn(template.get('shuffle_questions'))} Перемешивать вопросы",
+            callback_data=f"help:testv2:toggle:shuffleq:{tid}",
+        )],
+        [InlineKeyboardButton(
+            f"{yn(template.get('shuffle_options'))} Перемешивать варианты",
+            callback_data=f"help:testv2:toggle:shuffleo:{tid}",
+        )],
+        [InlineKeyboardButton(
+            f"{yn(template.get('allow_back'))} Разрешить назад",
+            callback_data=f"help:testv2:toggle:back:{tid}",
+        )],
+        [InlineKeyboardButton(
+            f"{yn(template.get('allow_skip'))} Разрешить пропуск",
+            callback_data=f"help:testv2:toggle:skip:{tid}",
+        )],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"help:testv2:template:{tid}")],
+    ])
+
+
+def tv2_question_text(question: dict) -> str:
+    options = question.get("options") or []
+    correct = set(int(x) for x in (question.get("correct") or []))
+    type_name = {"single": "один ответ", "multi": "несколько ответов", "open": "открытый"}.get(
+        question.get("q_type"), question.get("q_type")
+    )
+    lines = [
+        f"❓ <b>{int(question['idx'])}. {escape(question['question_text'])}</b>",
+        f"Тип: <b>{escape(str(type_name))}</b> · Баллы: <b>{float(question.get('points') or 1):g}</b>",
+    ]
+    if question.get("q_type") == "open":
+        lines.append("✅ Эталон: " + escape(tv3_correct_answer_text(question)))
+    else:
+        for index, option in enumerate(options):
+            lines.append(f"{'✅' if index in correct else '▫️'} {index + 1}. {escape(option)}")
+    if question.get("explanation"):
+        lines.extend(["", "💡 " + escape(str(question["explanation"]))])
+    return "\n".join(lines)
+
+
+def tv2_kb_question_edit(question: dict):
+    qid = int(question["id"])
+    tid = int(question["template_id"])
+    rows = [
+        [
+            InlineKeyboardButton("✏️ Текст", callback_data=f"help:testv2:qfield:text:{qid}"),
+            InlineKeyboardButton("⭐ Баллы", callback_data=f"help:testv2:qfield:points:{qid}"),
+        ],
+    ]
+    if question.get("q_type") != "open":
+        rows.append([
+            InlineKeyboardButton("📋 Варианты", callback_data=f"help:testv2:qfield:options:{qid}"),
+            InlineKeyboardButton("✅ Правильный", callback_data=f"help:testv2:qfield:correct:{qid}"),
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton("✅ Эталон ответа", callback_data=f"help:testv2:qfield:correct:{qid}")
+        ])
+    rows.extend([
+        [InlineKeyboardButton("💡 Пояснение", callback_data=f"help:testv2:qfield:explanation:{qid}")],
+        [
+            InlineKeyboardButton("⬆️", callback_data=f"help:testv2:qmove:{qid}:-1"),
+            InlineKeyboardButton("⬇️", callback_data=f"help:testv2:qmove:{qid}:1"),
+        ],
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f"help:testv2:qdeleteconfirm:{qid}")],
+        [InlineKeyboardButton("⬅️ К вопросам", callback_data=f"help:testv2:qeditlist:{tid}:0")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def tv2_admin_guard(update, context) -> bool:
+    if not await is_admin_scoped(update, context):
+        try:
+            await update.callback_query.answer("Недостаточно прав.", show_alert=True)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def tv3_review_keyboard(aid: int) -> InlineKeyboardMarkup:
+    assignment = tv2_get_assignment(aid)
+    rows = []
+    for question in tv2_questions(int(assignment["template_id"])):
+        answer = tv2_answer(aid, int(question["id"]))
+        rows.append([
+            InlineKeyboardButton(
+                f"{tv3_answer_marker(answer)} {int(question['idx'])}. {question['question_text'][:43]}",
+                callback_data=f"help:testv2:reviewanswer:{aid}:{int(question['id'])}",
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton("💬 Общий комментарий", callback_data=f"help:testv2:reviewcomment:{aid}")
+    ])
+    pending = tv3_pending_review_count(aid)
+    if pending == 0:
+        rows.append([
+            InlineKeyboardButton(
+                "✅ Проверено — отправить результат",
+                callback_data=f"help:testv2:reviewfinish:{aid}",
+            )
+        ])
+    else:
+        rows.append([InlineKeyboardButton(f"⏳ Осталось проверить: {pending}", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ К списку", callback_data="help:testv2:review")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tv3_review_answer_text(aid: int, qid: int) -> tuple[str, InlineKeyboardMarkup]:
+    question = tv2_question_by_id(qid) or {}
+    answer = tv2_answer(aid, qid)
+    max_points = float(question.get("points") or 1)
+    lines = [
+        f"❓ <b>{escape(str(question.get('question_text') or ''))}</b>",
+        "",
+        "Ответ:",
+        escape(tv3_employee_answer_text(question, answer)),
+        "",
+        "Правильный ответ:",
+        f"<b>{escape(tv3_correct_answer_text(question))}</b>",
+        "",
+        f"Максимум: <b>{max_points:g}</b> балла",
+    ]
+    if question.get("explanation"):
+        lines.extend(["", "💡 <b>Пояснение</b>", escape(str(question["explanation"]))])
+    if answer and answer.get("reviewer_comment"):
+        lines.extend(["", "💬 <b>Комментарий</b>", escape(str(answer["reviewer_comment"]))])
+    rows = []
+    if answer:
+        rows.append([
+            InlineKeyboardButton("✅ Верно", callback_data=f"help:testv2:grade:{aid}:{qid}:100"),
+            InlineKeyboardButton("🟡 Частично", callback_data=f"help:testv2:grade:{aid}:{qid}:50"),
+            InlineKeyboardButton("❌ Неверно", callback_data=f"help:testv2:grade:{aid}:{qid}:0"),
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "💬 Комментарий к ответу",
+                callback_data=f"help:testv2:answercomment:{aid}:{qid}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"help:testv2:reviewopen:{aid}")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def tv3_notify_result_ready(context, aid: int):
+    assignment = tv2_get_assignment(aid)
+    if not assignment or not assignment.get("tg_user_id"):
+        return
+    try:
+        await context.bot.send_message(
+            int(assignment["tg_user_id"]),
+            tv2_render_result_details(aid),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Открыть результат", callback_data=f"help:testv2:result:{aid}")]
+            ]),
+        )
+        with tv2_connect() as con:
+            con.execute(
+                "UPDATE test_assignments SET completion_notified=1 WHERE id=?",
+                (int(aid),),
+            )
+    except Exception:
+        pass
+
+
+async def tv3_notify_assigned_by(context, aid: int, event: str):
+    assignment = tv2_get_assignment(aid)
+    if not assignment or not assignment.get("assigned_by"):
+        return
+    if int(assignment.get("assigned_by") or 0) == int(assignment.get("tg_user_id") or -1):
+        return
+    if event == "review":
+        text = (
+            f"📝 Тест завершён и ожидает проверки.\n\n"
+            f"Сотрудник: <b>{escape(assignment['full_name'])}</b>\n"
+            f"Тест: <b>{escape(assignment['title'])}</b>"
+        )
+        callback = f"help:testv2:reviewopen:{aid}"
+        button = "Открыть проверку"
+    else:
+        calc = tv3_calculation(aid)
+        text = (
+            f"📊 Тест завершён.\n\n"
+            f"Сотрудник: <b>{escape(assignment['full_name'])}</b>\n"
+            f"Тест: <b>{escape(assignment['title'])}</b>\n"
+            f"Результат: <b>{calc['percent']:.0f}%</b>\n"
+            f"Баллы: <b>{calc['earned']:.1f} из {calc['total']:.1f}</b>"
+        )
+        callback = f"help:testv2:result:{aid}"
+        button = "Открыть результат"
+    try:
+        await context.bot.send_message(
+            int(assignment["assigned_by"]),
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(button, callback_data=callback)]]),
+        )
+    except Exception:
+        pass
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = (update.callback_query.data or "") if update.callback_query else ""
+    if not data.startswith("help:testv2:"):
+        return await _test_modes_legacy_cb_help(update, context)
+
+    query = update.callback_query
+
+    if data == "help:testv2:admin":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        tv2_clear(context)
+        await query.edit_message_text(
+            "📝 <b>Тестирование</b>\n\nСоздание, назначение, проверка, результаты и аналитика.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv2_kb_admin_menu(),
+        )
+        return
+
+    if data.startswith("help:testv2:creategrading:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        mode = data.rsplit(":", 1)[-1]
+        draft = context.user_data.get(TV2_DATA) or {}
+        title = draft.get("title") or "Новый тест"
+        base_mode = "learning" if mode == "instant" else "exam"
+        tid = tv2_create_template(title, update.effective_user.id, base_mode)
+        with tv2_connect() as con:
+            con.execute(
+                """
+                UPDATE test_templates
+                SET grading_mode=?, immediate_feedback=?, test_mode=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    "instant" if mode == "instant" else "review",
+                    1 if mode == "instant" else 0,
+                    base_mode,
+                    datetime.utcnow().isoformat(),
+                    int(tid),
+                ),
+            )
+        tv2_clear(context)
+        await query.edit_message_text(
+            tv2_template_text(tid),
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv2_kb_template(tid),
+        )
+        return
+
+    if data.startswith("help:testv2:set:mode:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        tid = int(data.rsplit(":", 1)[-1])
+        await query.edit_message_text(
+            "Выберите вариант теста:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🕓 Результат после проверки",
+                    callback_data=f"help:testv2:gradingvalue:{tid}:review",
+                )],
+                [InlineKeyboardButton(
+                    "⚡ Мгновенный результат",
+                    callback_data=f"help:testv2:gradingvalue:{tid}:instant",
+                )],
+                [InlineKeyboardButton("⬅️ Назад", callback_data=f"help:testv2:settings:{tid}")],
+            ]),
+        )
+        return
+
+    if data.startswith("help:testv2:gradingvalue:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        parts = data.split(":")
+        tid = int(parts[-2])
+        mode = parts[-1]
+        with tv2_connect() as con:
+            con.execute(
+                """
+                UPDATE test_templates
+                SET grading_mode=?, immediate_feedback=?, test_mode=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    mode,
+                    1 if mode == "instant" else 0,
+                    "learning" if mode == "instant" else "exam",
+                    datetime.utcnow().isoformat(),
+                    tid,
+                ),
+            )
+        await query.edit_message_text(
+            "⚙️ <b>Настройки теста</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv2_kb_settings(tid),
+        )
+        return
+
+    if data.startswith("help:testv2:set:time:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        tid = int(data.rsplit(":", 1)[-1])
+        await query.edit_message_text(
+            "Выберите время на прохождение:",
+            reply_markup=tv3_time_keyboard(
+                f"help:testv2:timevalue:{tid}",
+                f"help:testv2:settings:{tid}",
+            ),
+        )
+        return
+
+    if data.startswith("help:testv2:timevalue:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        parts = data.split(":")
+        tid = int(parts[-2])
+        seconds = int(parts[-1])
+        with tv2_connect() as con:
+            con.execute(
+                "UPDATE test_templates SET default_time_limit_sec=?, updated_at=? WHERE id=?",
+                (None if seconds == 0 else seconds, datetime.utcnow().isoformat(), tid),
+            )
+        await query.edit_message_text(
+            "⚙️ <b>Настройки теста</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv2_kb_settings(tid),
+        )
+        return
+
+    if data.startswith("help:testv2:assigntime:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        seconds = int(data.rsplit(":", 1)[-1])
+        draft = context.user_data.get(TV2_DATA) or {}
+        draft["time_limit_sec"] = None if seconds == 0 else seconds
+        context.user_data[TV2_DATA] = draft
+        context.user_data[TV2_STATE] = "assign_ready"
+        await query.edit_message_text(
+            f"Время на прохождение: <b>{escape(tv3_time_label(draft['time_limit_sec']))}</b>\n\n"
+            "Настройки назначения готовы.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 Проверить", callback_data="help:testv2:assignconfirm")],
+                [InlineKeyboardButton("❌ Отмена", callback_data="help:testv2:admin")],
+            ]),
+        )
+        return
+
+    if data.startswith("help:testv2:qfield:correct:"):
+        qid = int(data.rsplit(":", 1)[-1])
+        question = tv2_question_by_id(qid)
+        if question and question.get("q_type") == "open":
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            if not await tv2_admin_guard(update, context):
+                return
+            tv2_set_state(
+                context,
+                "edit_q_correct_text",
+                question_id=qid,
+                template_id=int(question["template_id"]),
+            )
+            await query.edit_message_text(
+                "Введите эталонный ответ. Несколько допустимых формулировок разделите символом <code>|</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=tv2_kb_cancel(f"help:testv2:qedit:{qid}"),
+            )
+            return
+
+    if data == "help:testv2:review":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        items = tv2_admin_review_list()
+        rows = [
+            [InlineKeyboardButton(
+                f"{item['full_name']} · {item['title']}",
+                callback_data=f"help:testv2:reviewopen:{int(item['id'])}",
+            )]
+            for item in items[:40]
+        ]
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:testv2:admin")])
+        await query.edit_message_text(
+            f"✅ <b>Ожидают проверки: {len(items)}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("help:testv2:reviewopen:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        aid = int(data.rsplit(":", 1)[-1])
+        assignment = tv2_get_assignment(aid)
+        if not assignment:
+            await query.edit_message_text("Результат не найден.")
+            return
+        await query.edit_message_text(
+            f"✅ <b>{escape(assignment['full_name'])}</b> · {escape(assignment['title'])}\n\n"
+            "Откройте вопросы, проверьте ответы и нажмите «Проверено». ",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv3_review_keyboard(aid),
+        )
+        return
+
+    if data.startswith("help:testv2:reviewanswer:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        parts = data.split(":")
+        aid = int(parts[-2])
+        qid = int(parts[-1])
+        text, keyboard = tv3_review_answer_text(aid, qid)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
+    if data.startswith("help:testv2:grade:"):
+        try:
+            await query.answer("Оценка сохранена", show_alert=False)
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        parts = data.split(":")
+        aid = int(parts[-3])
+        qid = int(parts[-2])
+        percent = int(parts[-1])
+        question = tv2_question_by_id(qid) or {}
+        awarded = float(question.get("points") or 1) * percent / 100
+        status = {100: "full", 50: "partial", 0: "wrong"}[percent]
+        with tv2_connect() as con:
+            con.execute(
+                """
+                UPDATE test_answers
+                SET awarded_points=?, is_correct=?, review_status=?
+                WHERE assignment_id=? AND question_id=?
+                """,
+                (awarded, 1 if percent == 100 else 0, status, aid, qid),
+            )
+        assignment = tv2_get_assignment(aid)
+        await query.edit_message_text(
+            f"✅ <b>{escape(assignment['full_name'])}</b> · {escape(assignment['title'])}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv3_review_keyboard(aid),
+        )
+        return
+
+    if data.startswith("help:testv2:reviewfinish:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        aid = int(data.rsplit(":", 1)[-1])
+        if tv3_pending_review_count(aid) > 0:
+            await query.answer("Сначала проверьте все открытые ответы.", show_alert=True)
+            return
+        released, calc = tv3_release_result(aid)
+        if released:
+            await tv3_notify_result_ready(context, aid)
+            await query.edit_message_text(
+                f"✅ Проверено. Результат отправлен.\n\n"
+                f"Итог: <b>{calc['percent']:.0f}%</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Открыть результат", callback_data=f"help:testv2:result:{aid}")],
+                    [InlineKeyboardButton("⬅️ К проверкам", callback_data="help:testv2:review")],
+                ]),
+            )
+        else:
+            await query.edit_message_text(
+                "Результат уже отправлен.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 Открыть результат", callback_data=f"help:testv2:result:{aid}")]
+                ]),
+            )
+        return
+
+    return await _test_modes_legacy_cb_help(update, context)
+
+
+async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = (update.callback_query.data or "") if update.callback_query else ""
+    if not data.startswith("test:v2:"):
+        return await _test_modes_legacy_cb_test(update, context)
+
+    parts = data.split(":")
+    action = parts[2]
+    aid = int(parts[3]) if len(parts) > 3 else 0
+    assignment = tv2_get_assignment(aid)
+    profile = get_profile_for_user(update)
+    if not assignment or not profile or int(assignment["profile_id"]) != int(profile["id"]):
+        try:
+            await update.callback_query.answer("Тест назначен другому сотруднику", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    mode = tv3_grading_mode(assignment)
+    query = update.callback_query
+
+    if action == "single":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if tv2_is_expired(assignment):
+            tv2_mark_expired(aid)
+            await query.edit_message_text("⌛ Время теста истекло.")
+            return
+        qid = int(parts[4])
+        option = int(parts[5])
+        question = tv2_question_by_id(qid) or {}
+        correct_options = set(int(x) for x in question.get("correct") or [])
+        correct = {option} == correct_options
+        points = float(question.get("points") or 1) if correct else 0
+        tv2_save_answer(aid, qid, {"selected": [option]}, 1 if correct else 0, points, "auto")
+        if mode == "instant":
+            await query.edit_message_text(
+                tv3_feedback_text(question, correct),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Далее ▶️", callback_data=f"test:v2:next:{aid}")]
+                ]),
+            )
+            return
+        return await cb_test_goto_next(update, context, aid)
+
+    if action == "multisubmit":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if tv2_is_expired(assignment):
+            tv2_mark_expired(aid)
+            await query.edit_message_text("⌛ Время теста истекло.")
+            return
+        qid = int(parts[4])
+        question = tv2_question_by_id(qid) or {}
+        selected = set((context.user_data.get(TV2_MULTI) or {}).get(str(qid), []))
+        correct_options = set(int(x) for x in question.get("correct") or [])
+        correct = selected == correct_options
+        points = float(question.get("points") or 1) if correct else 0
+        tv2_save_answer(
+            aid, qid, {"selected": sorted(selected)}, 1 if correct else 0, points, "auto"
+        )
+        if mode == "instant":
+            await query.edit_message_text(
+                tv3_feedback_text(question, correct),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Далее ▶️", callback_data=f"test:v2:next:{aid}")]
+                ]),
+            )
+            return
+        return await cb_test_goto_next(update, context, aid)
+
+    if action == "finish":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        tv2_clear(context)
+        if mode == "review":
+            tv3_submit_for_review(aid)
+            await tv3_notify_assigned_by(context, aid, "review")
+            await query.edit_message_text(
+                "✅ Ответы отправлены.\n\n⏳ <b>Результат появится после проверки.</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Мои тесты", callback_data="help:testv2:my:all:0")]
+                ]),
+            )
+            return
+
+        calc = tv2_calculate(aid, finalize=True)
+        if calc.get("pending"):
+            with tv2_connect() as con:
+                con.execute(
+                    "UPDATE test_assignments SET result_released=0 WHERE id=?",
+                    (int(aid),),
+                )
+            await tv3_notify_assigned_by(context, aid, "review")
+            await query.edit_message_text(
+                "✅ Ответы отправлены.\n\n⏳ <b>Результат появится после проверки.</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Мои тесты", callback_data="help:testv2:my:all:0")]
+                ]),
+            )
+            return
+        with tv2_connect() as con:
+            con.execute(
+                """
+                UPDATE test_assignments
+                SET result_released=1, verified_at=COALESCE(verified_at,?)
+                WHERE id=?
+                """,
+                (datetime.utcnow().isoformat(), int(aid)),
+            )
+        await tv3_notify_assigned_by(context, aid, "instant")
+        await query.edit_message_text(
+            tv2_result_text(aid),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 Подробнее", callback_data=f"help:testv2:result:{aid}")],
+                [InlineKeyboardButton("⬅️ Мои тесты", callback_data="help:testv2:my:all:0")],
+            ]),
+        )
+        return
+
+    return await _test_modes_legacy_cb_test(update, context)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get(TV2_STATE)
+    if not state:
+        return await _test_modes_legacy_on_text(update, context)
+    if await deny_no_access(update, context):
+        return
+    await sync_profile_user_id_from_update(update)
+    text = (update.message.text or "").strip()
+    draft = context.user_data.get(TV2_DATA) or {}
+
+    if state == "create_title":
+        if len(text) < 3:
+            await update.message.reply_text("Название слишком короткое.")
+            return
+        context.user_data[TV2_DATA] = {"title": text}
+        context.user_data[TV2_STATE] = "create_mode"
+        await update.message.reply_text(
+            "Выберите вариант теста:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🕓 Результат после проверки",
+                    callback_data="help:testv2:creategrading:review",
+                )],
+                [InlineKeyboardButton(
+                    "⚡ Мгновенный результат",
+                    callback_data="help:testv2:creategrading:instant",
+                )],
+                [InlineKeyboardButton("❌ Отмена", callback_data="help:testv2:admin")],
+            ]),
+        )
+        return
+
+    if state == "q_text":
+        draft["question_text"] = text
+        context.user_data[TV2_DATA] = draft
+        if draft.get("q_type") == "open":
+            context.user_data[TV2_STATE] = "q_open_correct"
+            await update.message.reply_text(
+                "Введите эталонный ответ. Несколько допустимых формулировок разделите символом |."
+            )
+            return
+        context.user_data[TV2_STATE] = "q_options"
+        await update.message.reply_text(
+            "Введите варианты ответа, каждый с новой строки (минимум 2):"
+        )
+        return
+
+    if state == "q_open_correct":
+        if not text or text == "-":
+            await update.message.reply_text("Укажите хотя бы один эталонный ответ.")
+            return
+        draft["correct_text"] = text
+        context.user_data[TV2_DATA] = draft
+        context.user_data[TV2_STATE] = "q_points"
+        await update.message.reply_text("Сколько баллов даёт вопрос?")
+        return
+
+    if state == "q_explanation":
+        draft["explanation"] = "" if text == "-" else text
+        context.user_data[TV2_DATA] = draft
+        if draft.get("target") == "bank":
+            context.user_data[TV2_STATE] = "q_bank_meta"
+            await update.message.reply_text(
+                "Введите: категория | сложность 1-5 | теги через запятую\n"
+                "Например: CRM | 2 | лиды, синхронизация"
+            )
+            return
+        tv2_add_question(
+            int(draft["template_id"]), draft["q_type"], draft["question_text"],
+            draft.get("options", []), draft.get("correct", []), draft["points"],
+            draft["explanation"], correct_text=draft.get("correct_text", ""),
+        )
+        tid = int(draft["template_id"])
+        tv2_clear(context)
+        await update.message.reply_text(
+            "✅ Вопрос добавлен.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Открыть тест", callback_data=f"help:testv2:template:{tid}")]
+            ]),
+        )
+        return
+
+    if state == "q_bank_meta":
+        parts = [item.strip() for item in text.split("|")]
+        category = parts[0] if parts else "Без категории"
+        try:
+            difficulty = int(parts[1]) if len(parts) > 1 else 1
+        except Exception:
+            difficulty = 1
+        tags = parts[2] if len(parts) > 2 else ""
+        bank_id = tv2_bank_add(
+            draft["q_type"], draft["question_text"], draft.get("options", []),
+            draft.get("correct", []), draft["points"], draft.get("explanation", ""),
+            category, difficulty, tags, update.effective_user.id,
+            correct_text=draft.get("correct_text", ""),
+        )
+        tv2_clear(context)
+        await update.message.reply_text(
+            f"✅ Вопрос добавлен в банк (ID {bank_id}).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Банк вопросов", callback_data="help:testv2:bank")]
+            ]),
+        )
+        return
+
+    if state == "edit_q_correct_text":
+        if not text or text == "-":
+            await update.message.reply_text("Укажите хотя бы один эталонный ответ.")
+            return
+        qid = int(draft["question_id"])
+        tv2_update_question(qid, "correct_text", text)
+        tv2_clear(context)
+        await update.message.reply_text(
+            "✅ Изменение сохранено.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Открыть вопрос", callback_data=f"help:testv2:qedit:{qid}")]
+            ]),
+        )
+        return
+
+    if state == "assign_due":
+        due = tv2_parse_dt(text)
+        if due == "INVALID":
+            await update.message.reply_text("Формат: ДД.ММ.ГГГГ ЧЧ:ММ или «нет».")
+            return
+        draft["due_at"] = due
+        context.user_data[TV2_DATA] = draft
+        context.user_data[TV2_STATE] = "assign_time_buttons"
+        await update.message.reply_text(
+            "Выберите время на прохождение:",
+            reply_markup=tv3_time_keyboard(
+                "help:testv2:assigntime",
+                "help:testv2:admin",
+            ),
+        )
+        return
+
+    if state == "assign_time_buttons":
+        await update.message.reply_text("Выберите время кнопкой под сообщением.")
+        return
+
+    if state == "open_answer":
+        aid = int(draft["assignment_id"])
+        qid = int(draft["question_id"])
+        question = tv2_question_by_id(qid) or {}
+        assignment = tv2_get_assignment(aid) or {}
+        mode = tv3_grading_mode(assignment)
+        has_reference = bool((question.get("correct_text") or "").strip())
+        if mode == "instant" and has_reference:
+            correct = tv3_open_answer_is_correct(text, question.get("correct_text"))
+            points = float(question.get("points") or 1) if correct else 0
+            tv2_save_answer(
+                aid, qid, {"text": text}, 1 if correct else 0, points, "auto"
+            )
+        else:
+            tv2_save_answer(aid, qid, {"text": text}, None, None, "pending")
+        tv2_clear(context)
+        if mode == "instant" and has_reference:
+            await update.message.reply_text(
+                tv3_feedback_text(question, correct),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Далее ▶️", callback_data=f"test:v2:next:{aid}")]
+                ]),
+            )
+            return
+        position = int(draft.get("position") or 0) + 1
+        order = tv2_assignment_order(assignment)
+        if position >= len(order):
+            review_text, keyboard = tv2_review_page_text(aid)
+            await update.message.reply_text(
+                review_text, parse_mode=ParseMode.HTML, reply_markup=keyboard
+            )
+        else:
+            await tv2_send_question(update, context, aid, position)
+        return
+
+    return await _test_modes_legacy_on_text(update, context)
+
+# =================== END TESTING MODES V3 ===================
+
 
 # ---------------- APP ----------------
 
