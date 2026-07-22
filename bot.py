@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "FAQ-CLICKABLE-SHORT-ANSWERS-2026-07-22-V2"
+BUILD_VERSION = "FAQ-DYNAMIC-CARDS-SEARCH-2026-07-22-V1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -508,6 +508,7 @@ def db_init():
             canceled INTEGER NOT NULL DEFAULT 0,
             reason TEXT,
             reschedule_date TEXT,
+            reschedule_time TEXT,
             PRIMARY KEY (meeting_type, meeting_date)
         )
     """)
@@ -518,11 +519,44 @@ def db_init():
             meeting_type TEXT NOT NULL,
             original_date TEXT NOT NULL,
             new_date TEXT NOT NULL,
+            new_time TEXT,
             created_at TEXT NOT NULL,
             sent INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (meeting_type, original_date)
         )
     """)
+
+    # Миграции времени перенесённых регулярных встреч для старых баз.
+    try:
+        cur.execute("ALTER TABLE meeting_state ADD COLUMN reschedule_time TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE meeting_reschedules ADD COLUMN new_time TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # Старые переносы продолжают работать в прежнее стандартное время.
+    cur.execute(
+        """UPDATE meeting_reschedules
+           SET new_time=CASE
+               WHEN meeting_type='standup' THEN '09:15'
+               WHEN meeting_type='industry' THEN '11:30'
+               ELSE '09:15'
+           END
+           WHERE new_time IS NULL OR new_time=''"""
+    )
+    cur.execute(
+        """UPDATE meeting_state
+           SET reschedule_time=CASE
+               WHEN meeting_type='standup' THEN '09:15'
+               WHEN meeting_type='industry' THEN '11:30'
+               ELSE '09:15'
+           END
+           WHERE reschedule_date IS NOT NULL
+             AND reschedule_date<>''
+             AND (reschedule_time IS NULL OR reschedule_time='')"""
+    )
 
     # мета
     cur.execute("""
@@ -1185,42 +1219,89 @@ def db_get_state(meeting_type: str, d: date):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
-        "SELECT canceled, reason, reschedule_date FROM meeting_state WHERE meeting_type=? AND meeting_date=?",
+        "SELECT canceled, reason, reschedule_date, reschedule_time "
+        "FROM meeting_state WHERE meeting_type=? AND meeting_date=?",
         (meeting_type, d.isoformat()),
     )
     row = cur.fetchone()
     con.close()
     if not row:
-        return {"canceled": 0, "reason": None, "reschedule_date": None}
-    return {"canceled": row[0], "reason": row[1], "reschedule_date": row[2]}
+        return {
+            "canceled": 0,
+            "reason": None,
+            "reschedule_date": None,
+            "reschedule_time": None,
+        }
+    return {
+        "canceled": row[0],
+        "reason": row[1],
+        "reschedule_date": row[2],
+        "reschedule_time": row[3],
+    }
 
 
-def db_set_canceled(meeting_type: str, d: date, reason: str, reschedule_date: str | None = None):
+def db_set_canceled(
+    meeting_type: str,
+    d: date,
+    reason: str,
+    reschedule_date: str | None = None,
+    reschedule_time: str | None = None,
+):
+    if reschedule_date:
+        reschedule_time = (
+            parse_regular_meeting_time(reschedule_time)
+            or regular_meeting_default_time(meeting_type)
+        )
+    else:
+        reschedule_time = None
+
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        INSERT INTO meeting_state (meeting_type, meeting_date, canceled, reason, reschedule_date)
-        VALUES (?, ?, 1, ?, ?)
+        INSERT INTO meeting_state (
+            meeting_type, meeting_date, canceled, reason,
+            reschedule_date, reschedule_time
+        )
+        VALUES (?, ?, 1, ?, ?, ?)
         ON CONFLICT(meeting_type, meeting_date) DO UPDATE SET
             canceled=1,
             reason=excluded.reason,
-            reschedule_date=excluded.reschedule_date
-    """, (meeting_type, d.isoformat(), reason, reschedule_date))
+            reschedule_date=excluded.reschedule_date,
+            reschedule_time=excluded.reschedule_time
+    """, (
+        meeting_type, d.isoformat(), reason,
+        reschedule_date, reschedule_time,
+    ))
     con.commit()
     con.close()
 
 
-def db_upsert_reschedule(meeting_type: str, original_d: date, new_d: date):
+def db_upsert_reschedule(
+    meeting_type: str,
+    original_d: date,
+    new_d: date,
+    new_time: str | None = None,
+):
+    clean_time = (
+        parse_regular_meeting_time(new_time)
+        or regular_meeting_default_time(meeting_type)
+    )
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        INSERT INTO meeting_reschedules(meeting_type, original_date, new_date, created_at, sent)
-        VALUES (?, ?, ?, ?, 0)
+        INSERT INTO meeting_reschedules(
+            meeting_type, original_date, new_date, new_time, created_at, sent
+        )
+        VALUES (?, ?, ?, ?, ?, 0)
         ON CONFLICT(meeting_type, original_date) DO UPDATE SET
             new_date=excluded.new_date,
+            new_time=excluded.new_time,
             created_at=excluded.created_at,
             sent=0
-    """, (meeting_type, original_d.isoformat(), new_d.isoformat(), datetime.utcnow().isoformat()))
+    """, (
+        meeting_type, original_d.isoformat(), new_d.isoformat(),
+        clean_time, datetime.utcnow().isoformat(),
+    ))
     con.commit()
     con.close()
 
@@ -1239,15 +1320,42 @@ def db_delete_reschedule(meeting_type: str, original_d: date) -> bool:
     return ok
 
 
-def db_get_due_reschedules(meeting_type: str, target_day: date) -> list[str]:
+def db_get_due_reschedules(
+    meeting_type: str,
+    target_day: date,
+    as_of_time: str | None = None,
+) -> list[str]:
+    """
+    Возвращает ожидающие переносы на указанную дату.
+
+    Если передано as_of_time в формате ЧЧ:ММ, выбираются только переносы,
+    время уведомления которых уже наступило. Это позволяет безопасно
+    догнать уведомление после краткого перезапуска бота.
+    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("""
-        SELECT original_date
-        FROM meeting_reschedules
-        WHERE meeting_type=? AND sent=0 AND new_date = ?
-        ORDER BY original_date ASC
-    """, (meeting_type, target_day.isoformat()))
+    if as_of_time is None:
+        cur.execute("""
+            SELECT original_date
+            FROM meeting_reschedules
+            WHERE meeting_type=? AND sent=0 AND new_date=?
+            ORDER BY COALESCE(new_time, ''), original_date ASC
+        """, (meeting_type, target_day.isoformat()))
+    else:
+        clean_time = parse_regular_meeting_time(as_of_time) or "00:00"
+        default_time = regular_meeting_default_time(meeting_type)
+        cur.execute("""
+            SELECT original_date
+            FROM meeting_reschedules
+            WHERE meeting_type=?
+              AND sent=0
+              AND new_date=?
+              AND COALESCE(NULLIF(new_time, ''), ?)<=?
+            ORDER BY COALESCE(NULLIF(new_time, ''), ?), original_date ASC
+        """, (
+            meeting_type, target_day.isoformat(), default_time, clean_time,
+            default_time,
+        ))
     rows = cur.fetchall()
     con.close()
     return [r[0] for r in rows]
@@ -3223,6 +3331,28 @@ def regular_meeting_title(meeting_type: str) -> str:
     return "Планёрка" if meeting_type == MEETING_STANDUP else "Отраслевая встреча"
 
 
+def regular_meeting_default_time(meeting_type: str) -> str:
+    return "09:15" if meeting_type == MEETING_STANDUP else "11:30"
+
+
+def parse_regular_meeting_time(value: str | None) -> str | None:
+    clean = (value or "").strip()
+    if re.fullmatch(r"\d{4}", clean):
+        clean = f"{clean[:2]}:{clean[2:]}"
+    if not re.fullmatch(r"\d{1,2}:\d{2}", clean):
+        return None
+    try:
+        parsed = datetime.strptime(clean, "%H:%M")
+    except ValueError:
+        return None
+    return parsed.strftime("%H:%M")
+
+
+def format_regular_meeting_datetime(value: date, time_value: str | None) -> str:
+    clean_time = parse_regular_meeting_time(time_value) or "—"
+    return f"{format_regular_meeting_date(value)} в {clean_time} МСК"
+
+
 def regular_meeting_is_due(meeting_type: str, meeting_date: date) -> bool:
     if meeting_type == MEETING_STANDUP:
         return standup_due_on_weekday(meeting_date)
@@ -3296,8 +3426,12 @@ def kb_regular_meetings_root(reference_date: date | None = None):
                 moved_to = date.fromisoformat(state["reschedule_date"]).strftime("%d.%m")
             except (TypeError, ValueError):
                 moved_to = "другая дата"
+            moved_time = (
+                parse_regular_meeting_time(state.get("reschedule_time"))
+                or regular_meeting_default_time(meeting_type)
+            )
             icon = "🔄"
-            suffix = f" → {moved_to}"
+            suffix = f" → {moved_to} {moved_time}"
         elif state.get("canceled"):
             icon = "❌"
             suffix = " — отменена"
@@ -3331,11 +3465,51 @@ def kb_regular_meeting_actions(meeting_type: str, original_date: date):
             callback_data="help:settings:regular_meeting:selected_action:cancel",
         )],
         [InlineKeyboardButton(
-            "🔄 Перенести на другой день",
+            "🔄 Перенести дату и время уведомления",
             callback_data="help:settings:regular_meeting:selected_action:move",
         )],
         [InlineKeyboardButton("⬅️ К встречам недели", callback_data="help:settings:regular_meetings")],
     ])
+
+
+def kb_regular_meeting_time_picker(meeting_type: str):
+    """Кнопки времени уведомления о перенесённой встрече."""
+    rows = [[InlineKeyboardButton(
+        f"⭐ Обычное время — {regular_meeting_default_time(meeting_type)}",
+        callback_data=(
+            "help:settings:regular_meeting:new_time:"
+            + regular_meeting_default_time(meeting_type).replace(":", "")
+        ),
+    )]]
+
+    options: list[str] = []
+    current = datetime(2000, 1, 1, 8, 0)
+    finish = datetime(2000, 1, 1, 20, 0)
+    while current <= finish:
+        options.append(current.strftime("%H:%M"))
+        current += timedelta(minutes=30)
+
+    for idx in range(0, len(options), 3):
+        rows.append([
+            InlineKeyboardButton(
+                value,
+                callback_data=(
+                    "help:settings:regular_meeting:new_time:"
+                    + value.replace(":", "")
+                ),
+            )
+            for value in options[idx:idx + 3]
+        ])
+
+    rows.append([InlineKeyboardButton(
+        "✍️ Указать другое время",
+        callback_data="help:settings:regular_meeting:new_time_manual",
+    )])
+    rows.append([InlineKeyboardButton(
+        "❌ Отмена",
+        callback_data="help:settings:regular_meeting:cancel",
+    )])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_regular_meeting_notify():
@@ -3358,6 +3532,7 @@ def regular_meeting_confirmation_html(data: dict) -> str:
     action = data.get("action")
     original_d = parse_regular_meeting_date(data.get("original_date") or "")
     new_d = parse_regular_meeting_date(data.get("new_date") or "") if data.get("new_date") else None
+    new_time = parse_regular_meeting_time(data.get("new_time"))
     reason = escape((data.get("reason") or "").strip())
     notify_text = "да" if data.get("notify") else "нет"
     action_text = "Отмена" if action == "cancel" else "Перенос"
@@ -3369,7 +3544,10 @@ def regular_meeting_confirmation_html(data: dict) -> str:
         f"Дата встречи: <b>{format_regular_meeting_date(original_d) if original_d else '—'}</b>",
     ]
     if new_d:
-        lines.append(f"Новая дата: <b>{format_regular_meeting_date(new_d)}</b>")
+        lines.append(
+            "Новая дата и время уведомления: "
+            f"<b>{format_regular_meeting_datetime(new_d, new_time)}</b>"
+        )
     lines.extend([
         f"Причина: {reason}",
         f"Уведомить сотрудников в чатах: <b>{notify_text}</b>",
@@ -3382,6 +3560,7 @@ async def notify_regular_meeting_change(context: ContextTypes.DEFAULT_TYPE, data
     action = data.get("action")
     original_d = parse_regular_meeting_date(data.get("original_date") or "")
     new_d = parse_regular_meeting_date(data.get("new_date") or "") if data.get("new_date") else None
+    new_time = parse_regular_meeting_time(data.get("new_time"))
     reason = escape((data.get("reason") or "").strip())
     title = escape(regular_meeting_title(meeting_type))
 
@@ -3389,7 +3568,8 @@ async def notify_regular_meeting_change(context: ContextTypes.DEFAULT_TYPE, data
         message_text = (
             f"🔄 <b>{title} перенесена</b>\n\n"
             f"Было: <b>{format_regular_meeting_date(original_d)}</b>\n"
-            f"Стало: <b>{format_regular_meeting_date(new_d)}</b>\n"
+            "Новое уведомление: "
+            f"<b>{format_regular_meeting_datetime(new_d, new_time)}</b>\n"
             f"Причина: {reason}"
         )
     else:
@@ -3565,7 +3745,7 @@ COMM_MEETING_SELECTED_PIDS = "comm_meeting_selected_pids"
 
 # management of recurring stand-up / industry meetings (Communications)
 REGULAR_MEETING_ACTIVE = "regular_meeting_active"
-REGULAR_MEETING_STEP = "regular_meeting_step"  # original_date|new_date|reason|notify
+REGULAR_MEETING_STEP = "regular_meeting_step"  # original_date|new_date|new_time|new_time_manual|reason|notify
 REGULAR_MEETING_DATA = "regular_meeting_data"
 
 def clear_waiting_date(context: ContextTypes.DEFAULT_TYPE):
@@ -3859,8 +4039,17 @@ async def send_birthday_congrats(context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 # ---------------- CORE SENDERS ----------------
 
-async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_TYPE, force: bool = False) -> bool:
-    today_d = datetime.now(MOSCOW_TZ).date()
+async def send_meeting_message(
+    meeting_type: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    force: bool = False,
+    *,
+    include_standard: bool = True,
+    due_time: str | None = None,
+) -> bool:
+    now_msk = datetime.now(MOSCOW_TZ)
+    today_d = now_msk.date()
+    due_time = parse_regular_meeting_time(due_time) or now_msk.strftime("%H:%M")
 
     chat_ids = db_list_chats()
     if not chat_ids:
@@ -3876,9 +4065,9 @@ async def send_meeting_message(meeting_type: str, context: ContextTypes.DEFAULT_
         return False
 
     state = db_get_state(meeting_type, today_d)
-    standard_due = weekday_due and state["canceled"] != 1
+    standard_due = include_standard and weekday_due and state["canceled"] != 1
 
-    due_orig_isos = db_get_due_reschedules(meeting_type, today_d)
+    due_orig_isos = db_get_due_reschedules(meeting_type, today_d, due_time)
     reschedule_due = len(due_orig_isos) > 0
 
     if meeting_type == MEETING_INDUSTRY and standard_due and reschedule_due:
@@ -3932,14 +4121,30 @@ async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
     if now_msk.hour == 9 and now_msk.minute == 15:
         key = "last_auto_sent_date:standup"
         if db_get_meta(key) != today_iso:
-            await send_meeting_message(MEETING_STANDUP, context, force=False)
+            await send_meeting_message(
+                MEETING_STANDUP, context, force=False,
+                include_standard=True, due_time=now_msk.strftime("%H:%M"),
+            )
             db_set_meta(key, today_iso)
 
     if now_msk.hour == 11 and now_msk.minute == 30:
         key = "last_auto_sent_date:industry"
         if db_get_meta(key) != today_iso:
-            await send_meeting_message(MEETING_INDUSTRY, context, force=False)
+            await send_meeting_message(
+                MEETING_INDUSTRY, context, force=False,
+                include_standard=True, due_time=now_msk.strftime("%H:%M"),
+            )
             db_set_meta(key, today_iso)
+
+    # Перенесённые встречи могут иметь собственное время уведомления.
+    # Проверяем их каждую минуту; sent=1 защищает от повторной отправки.
+    current_hhmm = now_msk.strftime("%H:%M")
+    for meeting_type in (MEETING_STANDUP, MEETING_INDUSTRY):
+        if db_get_due_reschedules(meeting_type, now_msk.date(), current_hhmm):
+            await send_meeting_message(
+                meeting_type, context, force=False,
+                include_standard=False, due_time=current_hhmm,
+            )
 
 # ---------------- HELP MENUS ----------------
 
@@ -4418,8 +4623,26 @@ def kb_help_docs_categories():
 FAQ_CARDS_PER_PAGE = 5
 FAQ_PAGE_TEXT_LIMIT = 3300
 FAQ_SINGLE_CARD_TEXT_LIMIT = 3050
-FAQ_SHORT_ANSWER_LIMIT = 58
-FAQ_QUESTION_PREVIEW_LIMIT = 360
+
+
+def ru_word_form(number: int, one: str, few: str, many: str) -> str:
+    """Return the correct Russian noun form for an integer count."""
+    number = abs(int(number))
+    last_two = number % 100
+    if 11 <= last_two <= 14:
+        return many
+
+    last = number % 10
+    if last == 1:
+        return one
+    if 2 <= last <= 4:
+        return few
+    return many
+
+
+def faq_question_count(count: int) -> str:
+    """Examples: 1 вопрос, 2 вопроса, 5 вопросов, 21 вопрос."""
+    return f"{int(count)} {ru_word_form(count, 'вопрос', 'вопроса', 'вопросов')}"
 
 
 def faq_plain_text(value: str | None) -> str:
@@ -4448,57 +4671,6 @@ def faq_search_items(query: str) -> list[dict]:
         if all(token in haystack for token in tokens):
             result.append(item)
     return result
-
-
-def faq_compact_preview(value: str | None, limit: int) -> str:
-    """Build a single-line preview suitable for a compact FAQ row/button."""
-    plain = faq_plain_text(value)
-    compact = re.sub(r"\s+", " ", plain).strip()
-    if not compact:
-        return "Текст пока не указан"
-    if len(compact) <= limit:
-        return compact
-
-    # Prefer a complete first sentence when it is informative but still short.
-    first_sentence = re.split(r"(?<=[.!?…])\s+", compact, maxsplit=1)[0]
-    if 12 <= len(first_sentence) <= limit:
-        return first_sentence
-
-    cut = compact.rfind(" ", 0, max(1, limit - 1))
-    if cut < max(12, limit // 2):
-        cut = max(1, limit - 1)
-    return compact[:cut].rstrip(" ,;:—-") + "…"
-
-
-def faq_item_pages(items: list[dict]) -> list[list[dict]]:
-    """Paginate FAQ rows while keeping the text message comfortably below its limit."""
-    if not items:
-        return [[]]
-
-    pages: list[list[dict]] = []
-    current: list[dict] = []
-    current_length = 0
-    for item in items:
-        question_preview = faq_compact_preview(
-            item.get("question"),
-            FAQ_QUESTION_PREVIEW_LIMIT,
-        )
-        row_length = len(question_preview) + 16
-        should_break = bool(current) and (
-            len(current) >= FAQ_CARDS_PER_PAGE
-            or current_length + row_length > FAQ_PAGE_TEXT_LIMIT
-        )
-        if should_break:
-            pages.append(current)
-            current = []
-            current_length = 0
-
-        current.append(item)
-        current_length += row_length
-
-    if current:
-        pages.append(current)
-    return pages or [[]]
 
 
 def faq_split_plain_text(value: str, limit: int) -> list[str]:
@@ -4615,7 +4787,8 @@ def build_help_faq_menu() -> tuple[str, InlineKeyboardMarkup]:
     """Main FAQ screen without a separate button for every question."""
     count = len(db_faq_list_full())
     count_line = (
-        f"В базе знаний: <b>{count}</b> вопросов"
+        f"В базе знаний: <b>{count}</b> "
+        f"{ru_word_form(count, 'вопрос', 'вопроса', 'вопросов')}"
         if count
         else "Пока вопросов и ответов нет."
     )
@@ -4648,11 +4821,10 @@ def build_help_faq_cards_page(
     callback_prefix: str = "help:faq:answers",
     show_search: bool = True,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    pages = faq_item_pages(items)
+    pages = faq_pack_pages(items)
     total_pages = max(1, len(pages))
     page = max(0, min(int(page), total_pages - 1))
-    page_items = pages[page]
-    first_number = sum(len(previous_page) for previous_page in pages[:page]) + 1
+    page_blocks = pages[page]
 
     text_lines = [f"<b>{title}</b>"]
     if subtitle:
@@ -4661,39 +4833,15 @@ def build_help_faq_cards_page(
         text_lines.extend([
             "",
             f"Страница <b>{page + 1}</b> из <b>{total_pages}</b> · "
-            f"всего вопросов: <b>{len(items)}</b>",
-            "",
-            "Нажмите на краткий ответ под списком, чтобы открыть полный текст.",
+            f"всего: <b>{len(items)}</b> "
+            f"{ru_word_form(len(items), 'вопрос', 'вопроса', 'вопросов')}",
             "",
         ])
-        for offset, item in enumerate(page_items):
-            number = first_number + offset
-            question = faq_compact_preview(
-                item.get("question"),
-                FAQ_QUESTION_PREVIEW_LIMIT,
-            )
-            text_lines.append(
-                f"<b>{number}.</b> {html_lib.escape(question)}"
-            )
+        text_lines.append("\n\n━━━━━━━━━━━━━━\n\n".join(page_blocks))
     else:
         text_lines.extend(["", "Ничего не найдено."])
 
     rows: list[list[InlineKeyboardButton]] = []
-    return_to_search = callback_prefix == "help:faq:search_results"
-    for offset, item in enumerate(page_items):
-        number = first_number + offset
-        short_answer = faq_compact_preview(
-            item.get("answer"),
-            FAQ_SHORT_ANSWER_LIMIT,
-        )
-        callback_data = f"help:faq:item:{int(item['id'])}:{page}"
-        if return_to_search:
-            callback_data += ":search"
-        rows.append([InlineKeyboardButton(
-            f"{number}. {short_answer}",
-            callback_data=callback_data,
-        )])
-
     if total_pages > 1:
         nav_row: list[InlineKeyboardButton] = []
         if page > 0:
@@ -4767,22 +4915,12 @@ def kb_help_faq_list(page: int = 0):
     return keyboard
 
 
-def kb_help_faq_item(page: int = 0, *, return_to_search: bool = False):
+def kb_help_faq_item(page: int = 0):
     """Keyboard for old messages where a question opened separately."""
-    back_callback = (
-        f"help:faq:search_results:{max(0, int(page))}"
-        if return_to_search
-        else f"help:faq:answers:{max(0, int(page))}"
-    )
-    back_label = (
-        "⬅️ К результатам поиска"
-        if return_to_search
-        else "⬅️ К ответам на вопросы"
-    )
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            back_label,
-            callback_data=back_callback,
+            "⬅️ К ответам на вопросы",
+            callback_data=f"help:faq:answers:{max(0, int(page))}",
         )],
         [InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")],
     ])
@@ -7233,7 +7371,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reason = state["reason"] or "—"
             rs = state["reschedule_date"]
             if rs:
-                return f"• <b>{title}</b>: ❌ отменено/перенесено сегодня\n  Причина: {reason}\n  Новая дата: {rs}"
+                rs_time = state.get("reschedule_time") or "—"
+                return (
+                    f"• <b>{title}</b>: ❌ отменено/перенесено сегодня\n"
+                    f"  Причина: {reason}\n"
+                    f"  Новое уведомление: {rs} в {rs_time} МСК"
+                )
             return f"• <b>{title}</b>: ❌ отменено сегодня\n  Причина: {reason}"
         else:
             extra = ""
@@ -8981,7 +9124,6 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             faq_page = max(0, int(parts[4]))
         except (IndexError, TypeError, ValueError):
             faq_page = 0
-        return_to_search = len(parts) > 5 and parts[5] == "search"
 
         item = db_faq_get(fid)
         if not item:
@@ -8998,10 +9140,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_faq_item(
-                faq_page,
-                return_to_search=return_to_search,
-            ),
+            reply_markup=kb_help_faq_item(faq_page),
             disable_web_page_preview=True,
         )
         return
@@ -10044,8 +10183,13 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if state.get("canceled") and state.get("reschedule_date"):
                 try:
                     moved_to = date.fromisoformat(state["reschedule_date"])
+                    moved_time = (
+                        parse_regular_meeting_time(state.get("reschedule_time"))
+                        or regular_meeting_default_time(meeting_type)
+                    )
                     status_lines.append(
-                        f"Текущий статус: <b>перенесена на {format_regular_meeting_date(moved_to)}</b>"
+                        "Текущий статус: <b>перенесена на "
+                        f"{format_regular_meeting_datetime(moved_to, moved_time)}</b>"
                     )
                 except ValueError:
                     status_lines.append("Текущий статус: <b>перенесена</b>")
@@ -10091,6 +10235,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             d["action"] = action
             d.pop("new_date", None)
+            d.pop("new_time", None)
             context.user_data[REGULAR_MEETING_ACTIVE] = True
             context.user_data[REGULAR_MEETING_DATA] = d
 
@@ -10100,6 +10245,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🔄 <b>Перенос: {escape(regular_meeting_title(meeting_type))}</b>\n\n"
                     f"Исходная дата: <b>{format_regular_meeting_date(original_d)}</b>\n\n"
                     "Отправьте новую дату в формате <code>ДД.ММ.ГГГГ</code>.\n"
+                    "После даты бот предложит выбрать новое время уведомления.\n"
                     "Новая дата должна быть позже исходной.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([
@@ -10129,6 +10275,57 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if data.startswith("help:settings:regular_meeting:new_time:"):
+            if not context.user_data.get(REGULAR_MEETING_ACTIVE):
+                await q.answer("Мастер уже закрыт.", show_alert=True)
+                return
+            raw_time = data.rsplit(":", 1)[-1]
+            new_time = parse_regular_meeting_time(raw_time)
+            d = context.user_data.get(REGULAR_MEETING_DATA) or {}
+            new_d = parse_regular_meeting_date(d.get("new_date") or "")
+            if not new_time or not new_d or d.get("action") != "move":
+                await q.answer("Сначала выберите новую дату.", show_alert=True)
+                return
+            d["new_time"] = new_time
+            context.user_data[REGULAR_MEETING_DATA] = d
+            context.user_data[REGULAR_MEETING_STEP] = "reason"
+            await q.edit_message_text(
+                "🔄 <b>Новое уведомление</b>\n\n"
+                f"Дата и время: <b>{format_regular_meeting_datetime(new_d, new_time)}</b>\n\n"
+                "Укажите <b>причину переноса</b> одним сообщением.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "❌ Отмена",
+                        callback_data="help:settings:regular_meeting:cancel",
+                    )
+                ]]),
+            )
+            return
+
+        if data == "help:settings:regular_meeting:new_time_manual":
+            if not context.user_data.get(REGULAR_MEETING_ACTIVE):
+                await q.answer("Мастер уже закрыт.", show_alert=True)
+                return
+            d = context.user_data.get(REGULAR_MEETING_DATA) or {}
+            if d.get("action") != "move" or not d.get("new_date"):
+                await q.answer("Сначала выберите новую дату.", show_alert=True)
+                return
+            context.user_data[REGULAR_MEETING_STEP] = "new_time_manual"
+            await q.edit_message_text(
+                "🕒 <b>Другое время уведомления</b>\n\n"
+                "Отправьте время по Москве в формате <code>ЧЧ:ММ</code>.\n"
+                "Например: <code>14:45</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "❌ Отмена",
+                        callback_data="help:settings:regular_meeting:cancel",
+                    )
+                ]]),
+            )
+            return
+
         if data.startswith("help:settings:regular_meeting:notify:"):
             if not context.user_data.get(REGULAR_MEETING_ACTIVE):
                 await q.answer("Мастер уже закрыт.", show_alert=True)
@@ -10152,6 +10349,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d = context.user_data.get(REGULAR_MEETING_DATA) or {}
             original_d = parse_regular_meeting_date(d.get("original_date") or "")
             new_d = parse_regular_meeting_date(d.get("new_date") or "") if d.get("new_date") else None
+            new_time = parse_regular_meeting_time(d.get("new_time"))
             meeting_type = d.get("meeting_type")
             action = d.get("action")
             reason = (d.get("reason") or "").strip()
@@ -10174,13 +10372,19 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not new_d or new_d <= original_d:
                     await q.answer("Новая дата должна быть позже исходной.", show_alert=True)
                     return
+                if not new_time:
+                    await q.answer("Выберите время нового уведомления.", show_alert=True)
+                    return
                 db_set_canceled(
                     meeting_type,
                     original_d,
                     reason,
                     reschedule_date=new_d.isoformat(),
+                    reschedule_time=new_time,
                 )
-                db_upsert_reschedule(meeting_type, original_d, new_d)
+                db_upsert_reschedule(
+                    meeting_type, original_d, new_d, new_time
+                )
             else:
                 db_set_canceled(meeting_type, original_d, reason)
                 db_delete_reschedule(meeting_type, original_d)
@@ -10197,7 +10401,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"отменена на дату {format_regular_meeting_date(original_d)}"
                     if action == "cancel"
                     else f"перенесена с {format_regular_meeting_date(original_d)} "
-                         f"на {format_regular_meeting_date(new_d)}"
+                         f"на {format_regular_meeting_datetime(new_d, new_time)}"
                 ),
             ]
             if d.get("notify"):
@@ -12530,6 +12734,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data[REGULAR_MEETING_STEP] = "new_date"
                 await update.message.reply_text(
                     "📅 Теперь отправьте <b>новую дату</b> в формате <code>ДД.ММ.ГГГГ</code>.\n"
+                    "После даты бот предложит выбрать время уведомления.\n"
                     "Новая дата должна быть позже исходной.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([
@@ -12559,14 +12764,55 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Новая дата должна быть позже исходной даты встречи.")
                 return
             d["new_date"] = format_regular_meeting_date(new_d)
+            d.pop("new_time", None)
+            context.user_data[REGULAR_MEETING_DATA] = d
+            context.user_data[REGULAR_MEETING_STEP] = "new_time"
+            await update.message.reply_text(
+                "🕒 <b>Выберите время нового уведомления</b>\n\n"
+                f"Новая дата: <b>{format_regular_meeting_date(new_d)}</b>\n"
+                "Время указывается по Москве.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_regular_meeting_time_picker(meeting_type),
+            )
+            return
+
+        if step == "new_time":
+            await update.message.reply_text(
+                "Выберите время кнопкой под сообщением или нажмите "
+                "«Указать другое время».",
+                reply_markup=kb_regular_meeting_time_picker(meeting_type),
+            )
+            return
+
+        if step == "new_time_manual":
+            new_time = parse_regular_meeting_time(text)
+            new_d = parse_regular_meeting_date(d.get("new_date") or "")
+            if not new_time:
+                await update.message.reply_text(
+                    "❌ Не удалось распознать время. Используйте формат ЧЧ:ММ, "
+                    "например 14:45."
+                )
+                return
+            if not new_d:
+                clear_regular_meeting_flow(context)
+                await update.message.reply_text(
+                    "❌ Данные переноса устарели. Начните заново из раздела «Коммуникации»."
+                )
+                return
+            d["new_time"] = new_time
             context.user_data[REGULAR_MEETING_DATA] = d
             context.user_data[REGULAR_MEETING_STEP] = "reason"
             await update.message.reply_text(
-                "📝 Укажите <b>причину переноса</b> одним сообщением.",
+                "🔄 <b>Новое уведомление</b>\n\n"
+                f"Дата и время: <b>{format_regular_meeting_datetime(new_d, new_time)}</b>\n\n"
+                "Укажите <b>причину переноса</b> одним сообщением.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:regular_meeting:cancel")]
-                ]),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "❌ Отмена",
+                        callback_data="help:settings:regular_meeting:cancel",
+                    )
+                ]]),
             )
             return
 
@@ -14950,7 +15196,7 @@ def tv2_kb_settings(tid: int):
         [InlineKeyboardButton(f"{yn(t.get('allow_back'))} Разрешить назад", callback_data=f"help:testv2:toggle:back:{tid}")],
         [InlineKeyboardButton(f"{yn(t.get('allow_skip'))} Разрешить пропуск", callback_data=f"help:testv2:toggle:skip:{tid}")],
         [InlineKeyboardButton(f"{yn(t.get('immediate_feedback'))} Мгновенная обратная связь", callback_data=f"help:testv2:toggle:feedback:{tid}")],
-        [InlineKeyboardButton("⏱ Время после запуска", callback_data=f"help:testv2:set:time:{tid}")],
+        [InlineKeyboardButton("⏱ Время на сам тест", callback_data=f"help:testv2:set:time:{tid}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data=f"help:testv2:template:{tid}")],
     ])
 
@@ -15021,7 +15267,7 @@ def tv2_my_open_text(a: dict) -> str:
     text=(f"📝 <b>{escape(a['title'])}</b>\n\n"
           f"Статус: <b>{status_names.get(a['status'],a['status'])}</b>\n"
           f"Вопросов: <b>{qcount}</b>\n"
-          f"Время после запуска: <b>{duration}</b>\n"
+          f"Время на сам тест: <b>{duration}</b>\n"
           f"Пройти до: <b>{escape(tv2_fmt_dt(a.get('due_at')))}</b>\n"
           f"Проходной балл: <b>{int(a.get('passing_score') or 70)}%</b>\n"
           f"Попытка: <b>{int(a.get('attempt_no') or 1)} из {int(a.get('max_attempts') or 1)}</b>")
@@ -15490,8 +15736,24 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("help:testv2:recipients:"):
         parts=data.split(":"); rule=parts[3]; d=context.user_data.get(TV2_DATA) or {}; tid=int(d.get("template_id"))
-        if rule=="all": d["selected"]=tv2_profile_ids_for_rule("all"); context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Выбрано сотрудников: {len(d['selected'])}\n\nВведите срок в формате ДД.ММ.ГГГГ ЧЧ:ММ или «нет»:",reply_markup=tv2_kb_cancel()); return
-        if rule=="failed": d["selected"]=tv2_profile_ids_for_rule("failed",template_id=tid); context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Выбрано сотрудников: {len(d['selected'])}\n\nВведите срок или «нет»:",reply_markup=tv2_kb_cancel()); return
+        if rule=="all":
+            d["selected"] = tv2_profile_ids_for_rule("all")
+            context.user_data[TV2_DATA] = d
+            context.user_data[TV2_STATE] = "assign_due_buttons"
+            await q.edit_message_text(
+                tv3_due_selection_text(f"Выбрано сотрудников: {len(d['selected'])}"),
+                reply_markup=tv3_assignment_due_main_keyboard(),
+            )
+            return
+        if rule=="failed":
+            d["selected"] = tv2_profile_ids_for_rule("failed", template_id=tid)
+            context.user_data[TV2_DATA] = d
+            context.user_data[TV2_STATE] = "assign_due_buttons"
+            await q.edit_message_text(
+                tv3_due_selection_text(f"Выбрано сотрудников: {len(d['selected'])}"),
+                reply_markup=tv3_assignment_due_main_keyboard(),
+            )
+            return
         if rule=="department":
             with tv2_connect() as con: deps=[str(r[0]) for r in con.execute("SELECT DISTINCT department FROM profiles WHERE COALESCE(department,'')!='' AND COALESCE(is_active,1)=1 ORDER BY department").fetchall()]
             context.user_data["tv2_department_options"]=deps
@@ -15509,10 +15771,36 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows.append(nav); rows.append([InlineKeyboardButton(f"Готово ({len(selected)})",callback_data="help:testv2:manualdone")]); await q.edit_message_text("Выберите сотрудников:",reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data.startswith("help:testv2:deptpick:"):
-        idx=int(data.rsplit(":",1)[-1]); deps=context.user_data.get("tv2_department_options") or []; dep=deps[idx] if 0<=idx<len(deps) else ""; d=context.user_data.get(TV2_DATA) or {}; d["selected"]=tv2_profile_ids_for_rule("department",dep); context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Отдел: {escape(dep)}\nВыбрано: {len(d['selected'])}\n\nВведите срок или «нет»:",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_cancel()); return
+        idx = int(data.rsplit(":", 1)[-1])
+        deps = context.user_data.get("tv2_department_options") or []
+        dep = deps[idx] if 0 <= idx < len(deps) else ""
+        d = context.user_data.get(TV2_DATA) or {}
+        d["selected"] = tv2_profile_ids_for_rule("department", dep)
+        context.user_data[TV2_DATA] = d
+        context.user_data[TV2_STATE] = "assign_due_buttons"
+        await q.edit_message_text(
+            tv3_due_selection_text(
+                f"Отдел: {escape(dep)}\nВыбрано: {len(d['selected'])}"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv3_assignment_due_main_keyboard(),
+        )
+        return
 
     if data.startswith("help:testv2:citypick:"):
-        city=data.split(":",3)[-1]; d=context.user_data.get(TV2_DATA) or {}; d["selected"]=tv2_profile_ids_for_rule("city",city); context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Город: {escape(city)}\nВыбрано: {len(d['selected'])}\n\nВведите срок или «нет»:",parse_mode=ParseMode.HTML,reply_markup=tv2_kb_cancel()); return
+        city = data.split(":", 3)[-1]
+        d = context.user_data.get(TV2_DATA) or {}
+        d["selected"] = tv2_profile_ids_for_rule("city", city)
+        context.user_data[TV2_DATA] = d
+        context.user_data[TV2_STATE] = "assign_due_buttons"
+        await q.edit_message_text(
+            tv3_due_selection_text(
+                f"Город: {escape(city)}\nВыбрано: {len(d['selected'])}"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv3_assignment_due_main_keyboard(),
+        )
+        return
 
     if data.startswith("help:testv2:manualtoggle:"):
         parts=data.split(":"); pid=int(parts[-2]); page=int(parts[-1]); d=context.user_data.get(TV2_DATA) or {}; s=set(d.get("selected") or [])
@@ -15530,11 +15818,19 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Выберите сотрудников:",reply_markup=InlineKeyboardMarkup(rows)); return
 
     if data=="help:testv2:manualdone":
-        d=context.user_data.get(TV2_DATA) or {}; context.user_data[TV2_STATE]="assign_due"; await q.edit_message_text(f"Выбрано сотрудников: {len(d.get('selected') or [])}\n\nВведите срок или «нет»:",reply_markup=tv2_kb_cancel()); return
+        d = context.user_data.get(TV2_DATA) or {}
+        context.user_data[TV2_STATE] = "assign_due_buttons"
+        await q.edit_message_text(
+            tv3_due_selection_text(
+                f"Выбрано сотрудников: {len(d.get('selected') or [])}"
+            ),
+            reply_markup=tv3_assignment_due_main_keyboard(),
+        )
+        return
 
     if data=="help:testv2:assignconfirm":
         d=context.user_data.get(TV2_DATA) or {}; tid=int(d["template_id"]); selected=d.get("selected") or []; t=tv2_get_template(tid) or {}; duration=d.get("time_limit_sec",t.get("default_time_limit_sec"))
-        lines=["📋 <b>Проверка назначения</b>","",f"Тест: <b>{escape(t.get('title',''))}</b>",f"Получателей: <b>{len(selected)}</b>",f"Срок: <b>{escape(tv2_fmt_dt(d.get('due_at')))}</b>",f"Время после запуска: <b>{int(duration)//60 if duration else 'без ограничения'}</b>"]
+        lines=["📋 <b>Проверка назначения</b>","",f"Тест: <b>{escape(t.get('title',''))}</b>",f"Получателей: <b>{len(selected)}</b>",f"Срок: <b>{escape(tv2_fmt_dt(d.get('due_at')))}</b>",f"Время на сам тест: <b>{int(duration)//60 if duration else 'без ограничения'}</b>"]
         await q.edit_message_text("\n".join(lines),parse_mode=ParseMode.HTML,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Назначить",callback_data="help:testv2:assignsend")],[InlineKeyboardButton("❌ Отмена",callback_data="help:testv2:admin")]])); return
 
     if data=="help:testv2:assignsend":
@@ -15775,10 +16071,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with tv2_connect() as con: con.execute(f"UPDATE test_templates SET {col}=? WHERE id=?",(value,tid))
         tv2_clear(context); await update.message.reply_text("✅ Настройка сохранена.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Настройки",callback_data=f"help:testv2:settings:{tid}")]])); return
 
-    if state=="assign_due":
-        due=tv2_parse_dt(text)
-        if due=="INVALID": await update.message.reply_text("Формат: ДД.ММ.ГГГГ ЧЧ:ММ или «нет»."); return
-        d["due_at"]=due; context.user_data[TV2_DATA]=d; context.user_data[TV2_STATE]="assign_time"; t=tv2_get_template(int(d["template_id"])) or {}; current=t.get("default_time_limit_sec"); await update.message.reply_text(f"Введите время после запуска в минутах или «по умолчанию» ({int(current)//60 if current else 'без ограничения'}):"); return
+    if state in ("assign_due", "assign_due_buttons"):
+        await update.message.reply_text(
+            "Выберите срок кнопкой под сообщением.",
+            reply_markup=tv3_assignment_due_main_keyboard(),
+        )
+        return
 
     if state=="assign_time":
         t=tv2_get_template(int(d["template_id"])) or {}
@@ -17126,6 +17424,109 @@ def tv3_time_keyboard(callback_prefix: str, back_callback: str) -> InlineKeyboar
     return InlineKeyboardMarkup(rows)
 
 
+TV3_RU_WEEKDAYS_SHORT = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+TV3_DUE_TIME_VALUES = tuple([f"{hour:02d}:00" for hour in range(8, 24)] + ["23:59"])
+
+
+def tv3_assignment_due_main_keyboard() -> InlineKeyboardMarkup:
+    """Первый шаг выбора предельного срока прохождения теста."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Без срока", callback_data="help:testv2:assigndue:none")],
+        [InlineKeyboardButton("Сегодня", callback_data="help:testv2:assigndue:today")],
+        [InlineKeyboardButton("Другие даты", callback_data="help:testv2:assignduedates")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:testv2:admin")],
+    ])
+
+
+def tv3_assignment_due_dates_keyboard() -> InlineKeyboardMarkup:
+    """Даты на неделю вперёд; сегодняшний день вынесен отдельной кнопкой."""
+    today = datetime.now(MOSCOW_TZ).date()
+    date_buttons = []
+    for offset in range(1, 8):
+        selected = today + timedelta(days=offset)
+        weekday = TV3_RU_WEEKDAYS_SHORT[selected.weekday()]
+        label = f"{weekday}, {selected.strftime('%d.%m.%Y')}"
+        date_buttons.append(InlineKeyboardButton(
+            label,
+            callback_data=f"help:testv2:assigndue:{selected.isoformat()}",
+        ))
+
+    rows = []
+    for index in range(0, len(date_buttons), 2):
+        rows.append(date_buttons[index:index + 2])
+    rows.extend([
+        [InlineKeyboardButton("⬅️ К выбору срока", callback_data="help:testv2:assigndueback")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:testv2:admin")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def tv3_due_time_is_available(selected_date: date, time_text: str) -> bool:
+    """Для сегодняшнего дня не показывает уже прошедшее пограничное время."""
+    try:
+        hour, minute = [int(part) for part in time_text.split(":", 1)]
+        local_dt = MOSCOW_TZ.localize(datetime.combine(
+            selected_date,
+            datetime.min.time().replace(hour=hour, minute=minute),
+        ))
+    except Exception:
+        return False
+    return local_dt > datetime.now(MOSCOW_TZ) + timedelta(minutes=1)
+
+
+def tv3_assignment_due_time_keyboard(
+    selected_date: date,
+    back_callback: str,
+) -> InlineKeyboardMarkup:
+    """Пограничное время срока: кнопки с 08:00 до 23:00 и 23:59 МСК."""
+    values = [
+        value for value in TV3_DUE_TIME_VALUES
+        if tv3_due_time_is_available(selected_date, value)
+    ]
+    rows = []
+    for index in range(0, len(values), 3):
+        rows.append([
+            InlineKeyboardButton(
+                value,
+                callback_data=(
+                    f"help:testv2:assignduetime:"
+                    f"{selected_date.isoformat()}:{value.replace(':', '')}"
+                ),
+            )
+            for value in values[index:index + 3]
+        ])
+    if not values:
+        rows.append([InlineKeyboardButton(
+            "На сегодня доступного времени нет",
+            callback_data="noop",
+        )])
+    rows.extend([
+        [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:testv2:admin")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def tv3_due_at_for_date_time(selected_date: date, time_text: str) -> str:
+    """Преобразует выбранные дату и время МСК в naive UTC ISO для базы."""
+    hour, minute = [int(part) for part in time_text.split(":", 1)]
+    local_deadline = MOSCOW_TZ.localize(datetime.combine(
+        selected_date,
+        datetime.min.time().replace(hour=hour, minute=minute),
+    ))
+    return local_deadline.astimezone(pytz.UTC).replace(tzinfo=None).isoformat()
+
+
+def tv3_due_date_label(selected_date: date) -> str:
+    weekday = TV3_RU_WEEKDAYS_SHORT[selected_date.weekday()]
+    return f"{weekday}, {selected_date.strftime('%d.%m.%Y')}"
+
+
+def tv3_due_selection_text(prefix: str = "") -> str:
+    head = (prefix or "").strip()
+    body = "Выберите предельный срок прохождения теста:"
+    return f"{head}\n\n{body}" if head else body
+
 def tv2_add_question(
     tid: int,
     q_type: str,
@@ -17911,6 +18312,175 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "help:testv2:assignduedates":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        context.user_data[TV2_STATE] = "assign_due_buttons"
+        await query.edit_message_text(
+            "Выберите дату завершения теста. После даты нужно будет выбрать пограничное время:",
+            reply_markup=tv3_assignment_due_dates_keyboard(),
+        )
+        return
+
+    if data == "help:testv2:assigndueback":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        draft = context.user_data.get(TV2_DATA) or {}
+        draft.pop("due_at", None)
+        draft.pop("due_date", None)
+        draft.pop("due_time", None)
+        draft.pop("due_source", None)
+        context.user_data[TV2_DATA] = draft
+        context.user_data[TV2_STATE] = "assign_due_buttons"
+        await query.edit_message_text(
+            tv3_due_selection_text(),
+            reply_markup=tv3_assignment_due_main_keyboard(),
+        )
+        return
+
+    if data == "help:testv2:assignduetimeback":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        draft = context.user_data.get(TV2_DATA) or {}
+        try:
+            selected_date = date.fromisoformat(str(draft.get("due_date") or ""))
+        except ValueError:
+            context.user_data[TV2_STATE] = "assign_due_buttons"
+            await query.edit_message_text(
+                tv3_due_selection_text(),
+                reply_markup=tv3_assignment_due_main_keyboard(),
+            )
+            return
+        context.user_data[TV2_STATE] = "assign_due_time_buttons"
+        back_callback = (
+            "help:testv2:assigndueback"
+            if draft.get("due_source") == "today"
+            else "help:testv2:assignduedates"
+        )
+        await query.edit_message_text(
+            f"Дата завершения: <b>{escape(tv3_due_date_label(selected_date))}</b>\n\n"
+            "Выберите пограничное время прохождения теста:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv3_assignment_due_time_keyboard(selected_date, back_callback),
+        )
+        return
+
+    if data.startswith("help:testv2:assigndue:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+
+        token = data.rsplit(":", 1)[-1]
+        draft = context.user_data.get(TV2_DATA) or {}
+        today = datetime.now(MOSCOW_TZ).date()
+
+        if token == "none":
+            draft["due_at"] = None
+            draft.pop("due_date", None)
+            draft.pop("due_time", None)
+            draft.pop("due_source", None)
+            context.user_data[TV2_DATA] = draft
+            context.user_data[TV2_STATE] = "assign_time_buttons"
+            await query.edit_message_text(
+                "Предельный срок: <b>без срока</b>\n\n"
+                "Выберите время на сам тест:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=tv3_time_keyboard(
+                    "help:testv2:assigntime",
+                    "help:testv2:assigndueback",
+                ),
+            )
+            return
+
+        if token == "today":
+            selected_date = today
+            due_source = "today"
+            back_callback = "help:testv2:assigndueback"
+        else:
+            try:
+                selected_date = date.fromisoformat(token)
+            except ValueError:
+                await query.answer("Некорректная дата.", show_alert=True)
+                return
+            if selected_date <= today or selected_date > today + timedelta(days=7):
+                await query.answer("Эта дата недоступна для выбора.", show_alert=True)
+                return
+            due_source = "other"
+            back_callback = "help:testv2:assignduedates"
+
+        draft["due_date"] = selected_date.isoformat()
+        draft["due_source"] = due_source
+        draft.pop("due_at", None)
+        draft.pop("due_time", None)
+        context.user_data[TV2_DATA] = draft
+        context.user_data[TV2_STATE] = "assign_due_time_buttons"
+        await query.edit_message_text(
+            f"Дата завершения: <b>{escape(tv3_due_date_label(selected_date))}</b>\n\n"
+            "Выберите пограничное время прохождения теста:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv3_assignment_due_time_keyboard(selected_date, back_callback),
+        )
+        return
+
+    if data.startswith("help:testv2:assignduetime:"):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        if not await tv2_admin_guard(update, context):
+            return
+        parts = data.split(":")
+        if len(parts) < 5:
+            await query.answer("Некорректные дата или время.", show_alert=True)
+            return
+        try:
+            selected_date = date.fromisoformat(parts[-2])
+            compact_time = parts[-1]
+            if len(compact_time) != 4 or not compact_time.isdigit():
+                raise ValueError
+            time_text = f"{compact_time[:2]}:{compact_time[2:]}"
+            if time_text not in TV3_DUE_TIME_VALUES:
+                raise ValueError
+            due_at = tv3_due_at_for_date_time(selected_date, time_text)
+            if datetime.fromisoformat(due_at) <= datetime.utcnow() + timedelta(minutes=1):
+                raise ValueError
+        except ValueError:
+            await query.answer("Это время уже прошло или недоступно.", show_alert=True)
+            return
+
+        draft = context.user_data.get(TV2_DATA) or {}
+        draft["due_date"] = selected_date.isoformat()
+        draft["due_time"] = time_text
+        draft["due_at"] = due_at
+        context.user_data[TV2_DATA] = draft
+        context.user_data[TV2_STATE] = "assign_time_buttons"
+        await query.edit_message_text(
+            f"Предельный срок: <b>{escape(tv3_due_date_label(selected_date))}, "
+            f"{escape(time_text)} МСК</b>\n\n"
+            "Теперь выберите время на сам тест:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv3_time_keyboard(
+                "help:testv2:assigntime",
+                "help:testv2:assignduetimeback",
+            ),
+        )
+        return
+
     if data.startswith("help:testv2:assigntime:"):
         try:
             await query.answer()
@@ -17924,7 +18494,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data[TV2_DATA] = draft
         context.user_data[TV2_STATE] = "assign_ready"
         await query.edit_message_text(
-            f"Время на прохождение: <b>{escape(tv3_time_label(draft['time_limit_sec']))}</b>\n\n"
+            f"Предельный срок: <b>{escape(tv2_fmt_dt(draft.get('due_at')))}</b>\n"
+            f"Время на сам тест: <b>{escape(tv3_time_label(draft['time_limit_sec']))}</b>\n\n"
             "Настройки назначения готовы.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -18333,25 +18904,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if state == "assign_due":
-        due = tv2_parse_dt(text)
-        if due == "INVALID":
-            await update.message.reply_text("Формат: ДД.ММ.ГГГГ ЧЧ:ММ или «нет».")
-            return
-        draft["due_at"] = due
-        context.user_data[TV2_DATA] = draft
-        context.user_data[TV2_STATE] = "assign_time_buttons"
+    if state in ("assign_due", "assign_due_buttons"):
         await update.message.reply_text(
-            "Выберите время на прохождение:",
-            reply_markup=tv3_time_keyboard(
-                "help:testv2:assigntime",
-                "help:testv2:admin",
-            ),
+            "Выберите срок кнопкой под сообщением.",
+            reply_markup=tv3_assignment_due_main_keyboard(),
         )
         return
 
+    if state == "assign_due_time_buttons":
+        await update.message.reply_text("Выберите пограничное время кнопкой под сообщением.")
+        return
+
     if state == "assign_time_buttons":
-        await update.message.reply_text("Выберите время кнопкой под сообщением.")
+        await update.message.reply_text("Выберите время на сам тест кнопкой под сообщением.")
         return
 
     if state == "open_answer":
