@@ -19946,6 +19946,413 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== END TEST HISTORY + QUESTION BANK V4 ===================
 
+# ===================== FAQ PERSONAL FAVORITES V5 =====================
+# Избранное FAQ хранится отдельно для каждого Telegram-пользователя. Оно не
+# меняет общую базу вопросов и переживает обновление текста ответа.
+
+FAQ_FAVORITES_V5_BUILD = "FAQ-PERSONAL-FAVORITES-V5-2026-07-22"
+
+_faq_favorites_legacy_db_init = db_init
+_faq_favorites_legacy_cb_help = cb_help
+
+
+def db_init():
+    _faq_favorites_legacy_db_init()
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS faq_favorites (
+            user_id INTEGER NOT NULL,
+            faq_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, faq_id),
+            FOREIGN KEY(faq_id) REFERENCES faq_items(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_faq_favorites_user "
+        "ON faq_favorites(user_id, created_at DESC)"
+    )
+    con.commit()
+    con.close()
+    logger.warning("=== %s ===", FAQ_FAVORITES_V5_BUILD)
+
+
+def db_faq_is_favorite(user_id: int | None, faq_id: int) -> bool:
+    if user_id is None:
+        return False
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT 1 FROM faq_favorites WHERE user_id=? AND faq_id=?",
+            (int(user_id), int(faq_id)),
+        ).fetchone()
+    return row is not None
+
+
+def db_faq_toggle_favorite(user_id: int | None, faq_id: int) -> bool:
+    if user_id is None:
+        return False
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT 1 FROM faq_favorites WHERE user_id=? AND faq_id=?",
+            (int(user_id), int(faq_id)),
+        ).fetchone()
+        if row:
+            con.execute(
+                "DELETE FROM faq_favorites WHERE user_id=? AND faq_id=?",
+                (int(user_id), int(faq_id)),
+            )
+            return False
+        con.execute(
+            "INSERT INTO faq_favorites(user_id, faq_id, created_at) VALUES(?,?,?)",
+            (int(user_id), int(faq_id), datetime.utcnow().isoformat()),
+        )
+        return True
+
+
+def db_faq_favorites(user_id: int | None, limit: int = 100) -> list[dict]:
+    if user_id is None:
+        return []
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            """
+            SELECT f.id, f.question, f.answer
+            FROM faq_items f
+            JOIN faq_favorites fav ON fav.faq_id=f.id
+            WHERE fav.user_id=?
+            ORDER BY fav.created_at DESC, f.id DESC
+            LIMIT ?
+            """,
+            (int(user_id), max(1, min(int(limit), 500))),
+        ).fetchall()
+    return [
+        {"id": int(row[0]), "question": row[1], "answer": row[2]}
+        for row in rows
+    ]
+
+
+def db_faq_delete(fid: int) -> bool:
+    """Удаляет FAQ и явно чистит закладки для БД без включённых FK."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM faq_favorites WHERE faq_id=?", (int(fid),))
+        cur = con.execute("DELETE FROM faq_items WHERE id=?", (int(fid),))
+        return cur.rowcount > 0
+
+
+def _faq_favorites_pack_pages(items: list[dict]) -> list[list[tuple[dict, str]]]:
+    """Версия faq_pack_pages, которая сохраняет вопрос для кнопки избранного."""
+    pages: list[list[tuple[dict, str]]] = []
+    current: list[tuple[dict, str]] = []
+    current_length = 0
+    for number, item in enumerate(items, start=1):
+        for block in faq_card_html(number, item):
+            block_length = len(faq_plain_text(block))
+            separator_length = 24 if current else 0
+            if current and (
+                len(current) >= FAQ_CARDS_PER_PAGE
+                or current_length + separator_length + block_length > FAQ_PAGE_TEXT_LIMIT
+            ):
+                pages.append(current)
+                current = []
+                current_length = 0
+            current.append((item, block))
+            current_length += (24 if len(current) > 1 else 0) + block_length
+    if current:
+        pages.append(current)
+    return pages or [[]]
+
+
+def build_help_faq_menu(user_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    count = len(db_faq_list_full())
+    count_line = (
+        f"В базе знаний: <b>{count}</b> "
+        f"{ru_word_form(count, 'вопрос', 'вопроса', 'вопросов')}"
+        if count else "Пока вопросов и ответов нет."
+    )
+    text = (
+        "❓ <b>FAQ</b>\n\n"
+        f"{count_line}\n\n"
+        "Откройте ответы, воспользуйтесь поиском или сохраните важные вопросы в избранное."
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 Ответы на вопросы", callback_data="help:faq:answers:0")],
+        [InlineKeyboardButton("⭐ Избранное", callback_data="help:faq:favorites:0")],
+        [InlineKeyboardButton("🔎 Найти ответ", callback_data="help:faq:search")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+    ])
+    return text, keyboard
+
+
+def build_help_faq_cards_page(
+    items: list[dict],
+    page: int = 0,
+    *,
+    title: str = "📚 Ответы на вопросы",
+    subtitle: str | None = None,
+    callback_prefix: str = "help:faq:answers",
+    show_search: bool = True,
+    user_id: int | None = None,
+    item_source: str = "all",
+) -> tuple[str, InlineKeyboardMarkup]:
+    pages = _faq_favorites_pack_pages(items)
+    total_pages = max(1, len(pages))
+    page = max(0, min(int(page), total_pages - 1))
+    page_entries = pages[page]
+    page_blocks = [entry[1] for entry in page_entries]
+
+    text_lines = [f"<b>{title}</b>"]
+    if subtitle:
+        text_lines.extend(["", subtitle])
+    if items:
+        text_lines.extend([
+            "",
+            f"Страница <b>{page + 1}</b> из <b>{total_pages}</b> · "
+            f"всего: <b>{len(items)}</b> "
+            f"{ru_word_form(len(items), 'вопрос', 'вопроса', 'вопросов')}",
+            "",
+        ])
+        text_lines.append("\n\n━━━━━━━━━━━━━━\n\n".join(page_blocks))
+    else:
+        text_lines.extend(["", "Ничего не найдено."])
+
+    rows: list[list[InlineKeyboardButton]] = []
+    seen_ids: set[int] = set()
+    for item, _block in page_entries:
+        faq_id = int(item["id"])
+        if faq_id in seen_ids:
+            continue
+        seen_ids.add(faq_id)
+        question_plain = faq_plain_text(item.get("question")) or "Вопрос"
+        label = question_plain if len(question_plain) <= 42 else question_plain[:39] + "…"
+        marked = db_faq_is_favorite(user_id, faq_id)
+        rows.append([InlineKeyboardButton(
+            ("★ " if marked else "☆ ") + label,
+            callback_data=f"help:faq:item:{faq_id}:{page}:{item_source}",
+        )])
+
+    if total_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(
+                "⬅️ Предыдущая", callback_data=f"{callback_prefix}:{page - 1}"
+            ))
+        nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(
+                "Следующая ➡️", callback_data=f"{callback_prefix}:{page + 1}"
+            ))
+        rows.append(nav_row)
+
+    if show_search:
+        rows.append([InlineKeyboardButton("🔎 Найти ответ", callback_data="help:faq:search")])
+    else:
+        rows.append([InlineKeyboardButton("📚 Все вопросы", callback_data="help:faq:answers:0")])
+        rows.append([InlineKeyboardButton("🔎 Новый поиск", callback_data="help:faq:search")])
+    rows.append([InlineKeyboardButton("⭐ Избранное", callback_data="help:faq:favorites:0")])
+    rows.append([InlineKeyboardButton("⬅️ В FAQ", callback_data="help:faq")])
+    rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
+    return "\n".join(text_lines).rstrip(), InlineKeyboardMarkup(rows)
+
+
+def build_help_faq_answers_page(
+    page: int = 0, user_id: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    return build_help_faq_cards_page(
+        db_faq_list_full(), page, callback_prefix="help:faq:answers",
+        show_search=True, user_id=user_id, item_source="all",
+    )
+
+
+def build_help_faq_search_page(
+    query: str, page: int = 0, user_id: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    items = faq_search_items(query)
+    return build_help_faq_cards_page(
+        items, page, title="🔎 Результаты поиска",
+        subtitle=f"Запрос: <b>{html_lib.escape(query)}</b>",
+        callback_prefix="help:faq:search_results", show_search=False,
+        user_id=user_id, item_source="search",
+    )
+
+
+def kb_faq_item(
+    faq_id: int,
+    page: int,
+    user_id: int | None,
+    back_callback: str,
+    source: str = "all",
+):
+    marked = db_faq_is_favorite(user_id, int(faq_id))
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "★ Убрать из избранного" if marked else "☆ Добавить в избранное",
+            callback_data=f"help:faq:favorite:{int(faq_id)}:{int(page)}:{source}",
+        )],
+        [InlineKeyboardButton("⬅️ К списку вопросов", callback_data=back_callback)],
+        [InlineKeyboardButton("⭐ Избранное", callback_data="help:faq:favorites:0")],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")],
+    ])
+
+
+def _faq_favorites_back_callback(source: str, page: int) -> str:
+    if source == "favorites":
+        return f"help:faq:favorites:{max(0, int(page))}"
+    if source == "search":
+        return f"help:faq:search_results:{max(0, int(page))}"
+    return f"help:faq:answers:{max(0, int(page))}"
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = (update.callback_query.data or "") if update.callback_query else ""
+    if not data.startswith("help:faq"):
+        return await _faq_favorites_legacy_cb_help(update, context)
+
+    query = update.callback_query
+    user_id = update.effective_user.id if update.effective_user else None
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    if data == "help:faq":
+        clear_faq_search_flow(context)
+        text, keyboard = build_help_faq_menu(user_id)
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:faq:favorites" or data.startswith("help:faq:favorites:"):
+        clear_faq_search_flow(context)
+        try:
+            page = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            page = 0
+        text, keyboard = build_help_faq_cards_page(
+            db_faq_favorites(user_id), page,
+            title="⭐ Избранные вопросы",
+            callback_prefix="help:faq:favorites",
+            show_search=False, user_id=user_id, item_source="favorites",
+        )
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:faq:answers" or data.startswith("help:faq:answers:") \
+            or data.startswith("help:faq:page:"):
+        clear_faq_search_flow(context)
+        try:
+            page = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            page = 0
+        text, keyboard = build_help_faq_answers_page(page, user_id)
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:faq:search":
+        clear_faq_search_flow(context)
+        context.chat_data[WAITING_FAQ_SEARCH] = True
+        await query.edit_message_text(
+            "🔎 <b>Поиск по FAQ</b>\n\n"
+            "Напишите слово или фразу. Поиск выполняется одновременно по вопросам и ответам.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data="help:faq")]
+            ]),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:faq:search_results" or data.startswith("help:faq:search_results:"):
+        clear_faq_search_flow(context, drop_query=False)
+        query_text = (context.chat_data.get(FAQ_SEARCH_QUERY) or "").strip()
+        if not query_text:
+            context.chat_data[WAITING_FAQ_SEARCH] = True
+            await query.edit_message_text(
+                "🔎 Напишите запрос для поиска по FAQ.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:faq")]
+                ]),
+            )
+            return
+        try:
+            page = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            page = 0
+        text, keyboard = build_help_faq_search_page(query_text, page, user_id)
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:faq:item:"):
+        parts = data.split(":")
+        try:
+            faq_id = int(parts[3])
+            page = max(0, int(parts[4]))
+        except (IndexError, TypeError, ValueError):
+            await query.answer("Некорректный вопрос", show_alert=True)
+            return
+        source = parts[5] if len(parts) > 5 else (
+            "search" if context.chat_data.get(FAQ_SEARCH_QUERY) else "all"
+        )
+        if source not in ("all", "search", "favorites"):
+            source = "all"
+        item = db_faq_get(faq_id)
+        if not item:
+            await query.edit_message_text(
+                "Вопрос не найден (возможно, его удалил администратор).",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ В FAQ", callback_data="help:faq")
+                ]]),
+            )
+            return
+        back_callback = _faq_favorites_back_callback(source, page)
+        await query.edit_message_text(
+            f"❓ {item['question']}\n\n{item['answer']}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_faq_item(faq_id, page, user_id, back_callback, source),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:faq:favorite:"):
+        parts = data.split(":")
+        try:
+            faq_id = int(parts[3])
+            page = max(0, int(parts[4]))
+            source = parts[5] if len(parts) > 5 else "all"
+        except (IndexError, TypeError, ValueError):
+            await query.answer("Некорректный вопрос", show_alert=True)
+            return
+        item = db_faq_get(faq_id)
+        if not item:
+            await query.answer("Вопрос уже удалён", show_alert=True)
+            return
+        enabled = db_faq_toggle_favorite(user_id, faq_id)
+        back_callback = _faq_favorites_back_callback(source, page)
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=kb_faq_item(faq_id, page, user_id, back_callback, source)
+            )
+        except Exception:
+            pass
+        await query.answer("Добавлено в избранное" if enabled else "Удалено из избранного")
+        return
+
+    return await _faq_favorites_legacy_cb_help(update, context)
+
+# =================== END FAQ PERSONAL FAVORITES V5 ===================
+
 
 # ---------------- APP ----------------
 
