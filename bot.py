@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "DASHBOARD-HOROSCOPE-REMINDERS-PROFILE-CARD-SYMMETRIC-2026-07-21-V5"
+BUILD_VERSION = "COMMUNICATIONS-REGULAR-MEETINGS-2026-07-22-V1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -1223,6 +1223,20 @@ def db_upsert_reschedule(meeting_type: str, original_d: date, new_d: date):
     """, (meeting_type, original_d.isoformat(), new_d.isoformat(), datetime.utcnow().isoformat()))
     con.commit()
     con.close()
+
+
+def db_delete_reschedule(meeting_type: str, original_d: date) -> bool:
+    """Удаляет ранее созданный перенос регулярной встречи."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "DELETE FROM meeting_reschedules WHERE meeting_type=? AND original_date=?",
+        (meeting_type, original_d.isoformat()),
+    )
+    ok = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return ok
 
 
 def db_get_due_reschedules(meeting_type: str, target_day: date) -> list[str]:
@@ -3189,6 +3203,128 @@ def kb_manual_input_controls(meeting_type: str):
         [InlineKeyboardButton("Отмена ввода даты ❌", callback_data=f"reschedule:cancel_manual:{meeting_type}")]
     ])
 
+
+def regular_meeting_title(meeting_type: str) -> str:
+    return "Планёрка" if meeting_type == MEETING_STANDUP else "Отраслевая встреча"
+
+
+def regular_meeting_is_due(meeting_type: str, meeting_date: date) -> bool:
+    if meeting_type == MEETING_STANDUP:
+        return standup_due_on_weekday(meeting_date)
+    if meeting_type == MEETING_INDUSTRY:
+        return industry_due_on_weekday(meeting_date)
+    return False
+
+
+def parse_regular_meeting_date(value: str) -> date | None:
+    clean = (value or "").strip()
+    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(clean, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def format_regular_meeting_date(value: date) -> str:
+    return value.strftime("%d.%m.%Y")
+
+
+def kb_regular_meetings_root():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Планёрка", callback_data="help:settings:regular_meeting:type:standup")],
+        [InlineKeyboardButton("🔵 Отраслевая встреча", callback_data="help:settings:regular_meeting:type:industry")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:communications")],
+    ])
+
+
+def kb_regular_meeting_actions(meeting_type: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отменить встречу", callback_data=f"help:settings:regular_meeting:action:{meeting_type}:cancel")],
+        [InlineKeyboardButton("🔄 Перенести на другой день", callback_data=f"help:settings:regular_meeting:action:{meeting_type}:move")],
+        [InlineKeyboardButton("⬅️ К выбору встречи", callback_data="help:settings:regular_meetings")],
+    ])
+
+
+def kb_regular_meeting_notify():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔔 Да, уведомить в чате", callback_data="help:settings:regular_meeting:notify:yes")],
+        [InlineKeyboardButton("🔕 Нет, не уведомлять", callback_data="help:settings:regular_meeting:notify:no")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:regular_meeting:cancel")],
+    ])
+
+
+def kb_regular_meeting_confirm():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подтвердить", callback_data="help:settings:regular_meeting:confirm")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:regular_meeting:cancel")],
+    ])
+
+
+def regular_meeting_confirmation_html(data: dict) -> str:
+    meeting_type = data.get("meeting_type")
+    action = data.get("action")
+    original_d = parse_regular_meeting_date(data.get("original_date") or "")
+    new_d = parse_regular_meeting_date(data.get("new_date") or "") if data.get("new_date") else None
+    reason = escape((data.get("reason") or "").strip())
+    notify_text = "да" if data.get("notify") else "нет"
+    action_text = "Отмена" if action == "cancel" else "Перенос"
+    lines = [
+        "📋 <b>Проверьте изменение</b>",
+        "",
+        f"Встреча: <b>{escape(regular_meeting_title(meeting_type))}</b>",
+        f"Действие: <b>{action_text}</b>",
+        f"Дата встречи: <b>{format_regular_meeting_date(original_d) if original_d else '—'}</b>",
+    ]
+    if new_d:
+        lines.append(f"Новая дата: <b>{format_regular_meeting_date(new_d)}</b>")
+    lines.extend([
+        f"Причина: {reason}",
+        f"Уведомить сотрудников в чатах: <b>{notify_text}</b>",
+    ])
+    return "\n".join(lines)
+
+
+async def notify_regular_meeting_change(context: ContextTypes.DEFAULT_TYPE, data: dict) -> tuple[int, int]:
+    meeting_type = data.get("meeting_type")
+    action = data.get("action")
+    original_d = parse_regular_meeting_date(data.get("original_date") or "")
+    new_d = parse_regular_meeting_date(data.get("new_date") or "") if data.get("new_date") else None
+    reason = escape((data.get("reason") or "").strip())
+    title = escape(regular_meeting_title(meeting_type))
+
+    if action == "move":
+        message_text = (
+            f"🔄 <b>{title} перенесена</b>\n\n"
+            f"Было: <b>{format_regular_meeting_date(original_d)}</b>\n"
+            f"Стало: <b>{format_regular_meeting_date(new_d)}</b>\n"
+            f"Причина: {reason}"
+        )
+    else:
+        message_text = (
+            f"❌ <b>{title} отменена</b>\n\n"
+            f"Дата: <b>{format_regular_meeting_date(original_d)}</b>\n"
+            f"Причина: {reason}"
+        )
+
+    ok = 0
+    fail = 0
+    for chat_id in db_list_chats():
+        try:
+            sent = await context.bot.send_message(
+                chat_id=chat_id,
+                text=message_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            schedule_message_delete(context, sent)
+            ok += 1
+        except Exception as exc:
+            logger.exception("Cannot notify meeting change to %s: %s", chat_id, exc)
+            fail += 1
+    return ok, fail
+
+
 # ---------------- ADMIN CHECK (scoped) ----------------
 
 async def is_admin_in_chat(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -3336,6 +3472,11 @@ COMM_MEETING_STEP = "comm_meeting_step"  # topic|description|link|recipients|sch
 COMM_MEETING_DATA = "comm_meeting_data"
 COMM_MEETING_SELECTED_PIDS = "comm_meeting_selected_pids"
 
+# management of recurring stand-up / industry meetings (Communications)
+REGULAR_MEETING_ACTIVE = "regular_meeting_active"
+REGULAR_MEETING_STEP = "regular_meeting_step"  # original_date|new_date|reason|notify
+REGULAR_MEETING_DATA = "regular_meeting_data"
+
 def clear_waiting_date(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_DATE_FLAG] = False
     context.chat_data.pop(WAITING_USER_ID, None)
@@ -3414,6 +3555,12 @@ def clear_comm_meeting_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(COMM_MEETING_STEP, None)
     context.user_data.pop(COMM_MEETING_DATA, None)
     context.user_data.pop(COMM_MEETING_SELECTED_PIDS, None)
+
+
+def clear_regular_meeting_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[REGULAR_MEETING_ACTIVE] = False
+    context.user_data.pop(REGULAR_MEETING_STEP, None)
+    context.user_data.pop(REGULAR_MEETING_DATA, None)
 
 
 def clear_bonus_calc_flow(context: ContextTypes.DEFAULT_TYPE):
@@ -5231,7 +5378,8 @@ def kb_settings_people():
 
 def kb_settings_communications():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Запланировать встречу", callback_data="help:settings:meeting")],
+        [InlineKeyboardButton("🗓 Управление планёркой и отраслевой", callback_data="help:settings:regular_meetings")],
+        [InlineKeyboardButton("📅 Запланировать другую встречу", callback_data="help:settings:meeting")],
         [InlineKeyboardButton("📣 Создать рассылку", callback_data="help:settings:bcast")],
         [InlineKeyboardButton("🏷 Теги рассылок", callback_data="help:settings:bcast_tags")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:settings")],
@@ -6677,6 +6825,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_nomination_flow(context)
     clear_bcast_flow(context)
     clear_comm_meeting_flow(context)
+    clear_regular_meeting_flow(context)
     clear_bcast_tag_waiting(context)
     await update.message.reply_text("✅ Сбросил состояния ожидания (дата/документы/анкеты/CSV/предложка/рассылка/встреча).")
 
@@ -9320,10 +9469,158 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clear_ach_wiz(context)
             clear_bcast_flow(context)
             clear_comm_meeting_flow(context)
+            clear_regular_meeting_flow(context)
             clear_bcast_tag_waiting(context)
             await q.edit_message_text("✅ Действие отменено.", reply_markup=kb_help_settings(), parse_mode=ParseMode.HTML)
             return
 
+
+        # ---------------- COMMUNICATIONS: recurring meetings ----------------
+        if data == "help:settings:regular_meetings":
+            clear_regular_meeting_flow(context)
+            clear_comm_meeting_flow(context)
+            clear_bcast_flow(context)
+            await q.edit_message_text(
+                "🗓 <b>Управление регулярными встречами</b>\n\n"
+                "Здесь можно заранее отменить или перенести планёрку и отраслевую встречу. "
+                "После изменения можно выбрать, уведомлять ли сотрудников в подключённых чатах.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_regular_meetings_root(),
+            )
+            return
+
+        if data.startswith("help:settings:regular_meeting:type:"):
+            meeting_type = data.rsplit(":", 1)[-1]
+            if meeting_type not in (MEETING_STANDUP, MEETING_INDUSTRY):
+                await q.answer("Неизвестный тип встречи.", show_alert=True)
+                return
+            clear_regular_meeting_flow(context)
+            context.user_data[REGULAR_MEETING_DATA] = {"meeting_type": meeting_type}
+            await q.edit_message_text(
+                f"🗓 <b>{escape(regular_meeting_title(meeting_type))}</b>\n\nЧто нужно сделать?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_regular_meeting_actions(meeting_type),
+            )
+            return
+
+        if data.startswith("help:settings:regular_meeting:action:"):
+            parts = data.split(":")
+            if len(parts) != 6:
+                return
+            meeting_type = parts[4]
+            action = parts[5]
+            if meeting_type not in (MEETING_STANDUP, MEETING_INDUSTRY) or action not in ("cancel", "move"):
+                await q.answer("Не удалось определить действие.", show_alert=True)
+                return
+            context.user_data[REGULAR_MEETING_ACTIVE] = True
+            context.user_data[REGULAR_MEETING_STEP] = "original_date"
+            context.user_data[REGULAR_MEETING_DATA] = {
+                "meeting_type": meeting_type,
+                "action": action,
+            }
+            await q.edit_message_text(
+                f"📅 <b>{'Отмена' if action == 'cancel' else 'Перенос'}: "
+                f"{escape(regular_meeting_title(meeting_type))}</b>\n\n"
+                "Отправьте дату встречи в формате <code>ДД.ММ.ГГГГ</code>.\n"
+                "Можно указать сегодняшнюю или будущую дату.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:regular_meeting:cancel")]
+                ]),
+            )
+            return
+
+        if data.startswith("help:settings:regular_meeting:notify:"):
+            if not context.user_data.get(REGULAR_MEETING_ACTIVE):
+                await q.answer("Мастер уже закрыт.", show_alert=True)
+                return
+            notify = data.endswith(":yes")
+            d = context.user_data.get(REGULAR_MEETING_DATA) or {}
+            d["notify"] = notify
+            context.user_data[REGULAR_MEETING_DATA] = d
+            context.user_data[REGULAR_MEETING_STEP] = "confirm"
+            await q.edit_message_text(
+                regular_meeting_confirmation_html(d),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_regular_meeting_confirm(),
+            )
+            return
+
+        if data == "help:settings:regular_meeting:confirm":
+            if not context.user_data.get(REGULAR_MEETING_ACTIVE):
+                await q.answer("Мастер уже закрыт.", show_alert=True)
+                return
+            d = context.user_data.get(REGULAR_MEETING_DATA) or {}
+            original_d = parse_regular_meeting_date(d.get("original_date") or "")
+            new_d = parse_regular_meeting_date(d.get("new_date") or "") if d.get("new_date") else None
+            meeting_type = d.get("meeting_type")
+            action = d.get("action")
+            reason = (d.get("reason") or "").strip()
+            if (
+                not original_d
+                or original_d < datetime.now(MOSCOW_TZ).date()
+                or meeting_type not in (MEETING_STANDUP, MEETING_INDUSTRY)
+                or not regular_meeting_is_due(meeting_type, original_d)
+                or action not in ("cancel", "move")
+                or not reason
+            ):
+                clear_regular_meeting_flow(context)
+                await q.edit_message_text(
+                    "❌ Не удалось применить изменение: данные мастера устарели.",
+                    reply_markup=kb_settings_communications(),
+                )
+                return
+
+            if action == "move":
+                if not new_d or new_d <= original_d:
+                    await q.answer("Новая дата должна быть позже исходной.", show_alert=True)
+                    return
+                db_set_canceled(
+                    meeting_type,
+                    original_d,
+                    reason,
+                    reschedule_date=new_d.isoformat(),
+                )
+                db_upsert_reschedule(meeting_type, original_d, new_d)
+            else:
+                db_set_canceled(meeting_type, original_d, reason)
+                db_delete_reschedule(meeting_type, original_d)
+
+            sent_ok = sent_fail = 0
+            if d.get("notify"):
+                sent_ok, sent_fail = await notify_regular_meeting_change(context, d)
+
+            result_lines = [
+                "✅ <b>Изменение сохранено</b>",
+                "",
+                f"{escape(regular_meeting_title(meeting_type))}: "
+                + (
+                    f"отменена на дату {format_regular_meeting_date(original_d)}"
+                    if action == "cancel"
+                    else f"перенесена с {format_regular_meeting_date(original_d)} "
+                         f"на {format_regular_meeting_date(new_d)}"
+                ),
+            ]
+            if d.get("notify"):
+                result_lines.append(f"Уведомления в чатах: отправлено {sent_ok}, ошибок {sent_fail}.")
+            else:
+                result_lines.append("Сотрудники в чатах не уведомлялись.")
+            clear_regular_meeting_flow(context)
+            await q.edit_message_text(
+                "\n".join(result_lines),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_settings_communications(),
+            )
+            return
+
+        if data == "help:settings:regular_meeting:cancel":
+            clear_regular_meeting_flow(context)
+            await q.edit_message_text(
+                "✅ Управление встречей отменено.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_settings_communications(),
+            )
+            return
 
         # ---------------- COMMUNICATIONS: saved broadcast tags ----------------
         if data == "help:settings:bcast_tags":
@@ -11598,6 +11895,101 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     text_html = (message_to_html(update.message) or "").strip()
+
+    # recurring stand-up / industry meeting management
+    if context.user_data.get(REGULAR_MEETING_ACTIVE):
+        if not await is_admin_scoped(update, context):
+            clear_regular_meeting_flow(context)
+            await update.message.reply_text("❌ Только администраторы могут управлять регулярными встречами.")
+            return
+
+        step = context.user_data.get(REGULAR_MEETING_STEP)
+        d = context.user_data.get(REGULAR_MEETING_DATA) or {}
+        meeting_type = d.get("meeting_type")
+
+        if step == "original_date":
+            original_d = parse_regular_meeting_date(text)
+            if not original_d:
+                await update.message.reply_text(
+                    "❌ Не удалось распознать дату. Используйте формат ДД.ММ.ГГГГ, например 24.07.2026."
+                )
+                return
+            today_d = datetime.now(MOSCOW_TZ).date()
+            if original_d < today_d:
+                await update.message.reply_text("❌ Нельзя изменить встречу задним числом.")
+                return
+            if not regular_meeting_is_due(meeting_type, original_d):
+                schedule_hint = "понедельник, среду или пятницу" if meeting_type == MEETING_STANDUP else "среду"
+                await update.message.reply_text(
+                    f"❌ На эту дату регулярная встреча не запланирована. "
+                    f"Для выбранного типа укажите {schedule_hint}."
+                )
+                return
+            d["original_date"] = format_regular_meeting_date(original_d)
+            context.user_data[REGULAR_MEETING_DATA] = d
+            if d.get("action") == "move":
+                context.user_data[REGULAR_MEETING_STEP] = "new_date"
+                await update.message.reply_text(
+                    "📅 Теперь отправьте <b>новую дату</b> в формате <code>ДД.ММ.ГГГГ</code>.\n"
+                    "Новая дата должна быть позже исходной.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:regular_meeting:cancel")]
+                    ]),
+                )
+            else:
+                context.user_data[REGULAR_MEETING_STEP] = "reason"
+                await update.message.reply_text(
+                    "📝 Укажите <b>причину отмены</b> одним сообщением.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:regular_meeting:cancel")]
+                    ]),
+                )
+            return
+
+        if step == "new_date":
+            new_d = parse_regular_meeting_date(text)
+            original_d = parse_regular_meeting_date(d.get("original_date") or "")
+            if not new_d:
+                await update.message.reply_text(
+                    "❌ Не удалось распознать дату. Используйте формат ДД.ММ.ГГГГ."
+                )
+                return
+            if not original_d or new_d <= original_d:
+                await update.message.reply_text("❌ Новая дата должна быть позже исходной даты встречи.")
+                return
+            d["new_date"] = format_regular_meeting_date(new_d)
+            context.user_data[REGULAR_MEETING_DATA] = d
+            context.user_data[REGULAR_MEETING_STEP] = "reason"
+            await update.message.reply_text(
+                "📝 Укажите <b>причину переноса</b> одним сообщением.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:regular_meeting:cancel")]
+                ]),
+            )
+            return
+
+        if step == "reason":
+            reason = re.sub(r"\s+", " ", text).strip()
+            if len(reason) < 2:
+                await update.message.reply_text("❌ Причина слишком короткая.")
+                return
+            if len(reason) > 500:
+                await update.message.reply_text("❌ Причина должна быть не длиннее 500 символов.")
+                return
+            d["reason"] = reason
+            context.user_data[REGULAR_MEETING_DATA] = d
+            context.user_data[REGULAR_MEETING_STEP] = "notify"
+            await update.message.reply_text(
+                "🔔 <b>Уведомить сотрудников об изменении в подключённых чатах?</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_regular_meeting_notify(),
+            )
+            return
+
+        return
 
 
     # ===================== TESTING (employees) on_text routing =====================
