@@ -2839,6 +2839,42 @@ def db_notification_add(
     return nid
 
 
+def db_notification_add_once(
+    user_id: int | None,
+    notification_type: str,
+    title: str,
+    body: str = "",
+    callback_data: str | None = None,
+) -> int | None:
+    """Добавляет внутреннее уведомление один раз для одного события."""
+    if not user_id:
+        return None
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id
+        FROM notifications
+        WHERE user_id=? AND notification_type=?
+          AND COALESCE(callback_data, '')=COALESCE(?, '')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (int(user_id), (notification_type or "info")[:40], callback_data or None),
+    )
+    row = cur.fetchone()
+    con.close()
+    if row:
+        return int(row[0])
+    return db_notification_add(
+        user_id,
+        notification_type,
+        title,
+        body,
+        callback_data=callback_data,
+    )
+
+
 def db_notifications_unread_count(user_id: int | None) -> int:
     if not user_id:
         return 0
@@ -15407,47 +15443,199 @@ def tv2_analytics(tid: int) -> dict:
 
 
 async def tv2_notify_assignment(context, aid: int):
-    a=tv2_get_assignment(aid)
-    if not a or not a.get("tg_user_id"): return False
-    text=(f"📝 Вам назначен тест: <b>{escape(a['title'])}</b>\n"
-          f"⏱ После запуска: <b>{int(a['time_limit_sec'])//60 if a.get('time_limit_sec') else 'без ограничения'}"
-          f"{' минут' if a.get('time_limit_sec') else ''}</b>\n"
-          f"📅 Пройти до: <b>{escape(tv2_fmt_dt(a.get('due_at')))}</b>\n"
-          f"🎯 Проходной балл: <b>{int(a.get('passing_score') or 70)}%</b>")
+    assignment = tv2_get_assignment(aid)
+    if not assignment or not assignment.get("tg_user_id"):
+        return False
+
+    user_id = int(assignment["tg_user_id"])
+    callback = f"help:testv2:myopen:{aid}"
+    duration = (
+        f"{int(assignment['time_limit_sec']) // 60} минут"
+        if assignment.get("time_limit_sec")
+        else "без ограничения"
+    )
+    due_text = tv2_fmt_dt(assignment.get("due_at"))
+
+    # Назначение сразу появляется в личном центре уведомлений.
+    db_notification_add_once(
+        user_id,
+        "test_assigned_v2",
+        f"Назначен новый тест: {assignment['title']}",
+        (
+            f"Пройти до: {due_text}. "
+            f"Время после запуска: {duration}. "
+            "Тест ещё не начат."
+        ),
+        callback_data=callback,
+    )
+
+    text = (
+        f"📝 Вам назначен новый тест: <b>{escape(assignment['title'])}</b>\n"
+        f"⏱ После запуска: <b>{escape(duration)}</b>\n"
+        f"📅 Пройти до: <b>{escape(due_text)}</b>\n"
+        f"🎯 Проходной балл: <b>{int(assignment.get('passing_score') or 70)}%</b>"
+    )
     try:
-        await context.bot.send_message(int(a["tg_user_id"]),text,parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Открыть тест",callback_data=f"help:testv2:myopen:{aid}")]]))
+        await context.bot.send_message(
+            user_id,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ Открыть тест", callback_data=callback)
+            ]]),
+        )
         return True
-    except Exception:
+    except Exception as exc:
+        logger.warning("Cannot notify employee about test assignment %s: %s", aid, exc)
         return False
 
 
 async def tv2_send_reminders(context):
-    now=datetime.utcnow(); soon24=(now+timedelta(hours=24)).isoformat(); soon2=(now+timedelta(hours=2)).isoformat()
+    """Напоминает о сроке и отдельно сигнализирует, если тест ещё не начат."""
+    now = datetime.utcnow()
     with tv2_connect() as con:
-        rows=con.execute("""SELECT a.id,a.due_at,a.reminder_24_sent,a.reminder_2_sent,a.overdue_notice_sent,
-                                   p.tg_user_id,t.title,a.status
-                            FROM test_assignments a JOIN profiles p ON p.id=a.profile_id
-                            JOIN test_templates t ON t.id=a.template_id
-                            WHERE a.status IN ('assigned','in_progress','saved') AND a.due_at IS NOT NULL""").fetchall()
-    for r in rows:
-        aid=int(r[0]); due=r[1]; uid=r[5]
-        if not uid: continue
-        try: due_dt=datetime.fromisoformat(due)
-        except Exception: continue
-        remaining=(due_dt-now).total_seconds()
-        flag=None; text=None
-        if remaining<=0 and not int(r[4] or 0):
-            tv2_mark_expired(aid); flag="overdue_notice_sent"; text=f"⌛ Срок теста «{r[6]}» истёк."
-        elif remaining<=7200 and not int(r[3] or 0):
-            flag="reminder_2_sent"; text=f"⏰ До срока теста «{r[6]}» осталось менее 2 часов."
-        elif remaining<=86400 and not int(r[2] or 0):
-            flag="reminder_24_sent"; text=f"⏰ До срока теста «{r[6]}» осталось менее суток."
-        if text and flag:
-            try:
-                await context.bot.send_message(int(uid),text,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Открыть",callback_data=f"help:testv2:myopen:{aid}")]]))
-                with tv2_connect() as con: con.execute(f"UPDATE test_assignments SET {flag}=1 WHERE id=?",(aid,))
-            except Exception: pass
+        rows = con.execute(
+            """
+            SELECT a.id, a.due_at, a.reminder_24_sent, a.reminder_2_sent,
+                   a.overdue_notice_sent, p.tg_user_id, t.title, a.status
+            FROM test_assignments a
+            JOIN profiles p ON p.id=a.profile_id
+            JOIN test_templates t ON t.id=a.template_id
+            WHERE a.status IN ('assigned','in_progress','saved')
+              AND a.due_at IS NOT NULL
+            """
+        ).fetchall()
+
+    for row in rows:
+        aid = int(row[0])
+        due_iso = row[1]
+        user_id = row[5]
+        title = str(row[6] or "Тест")
+        status = str(row[7] or "assigned")
+        if not user_id:
+            continue
+
+        try:
+            due_dt = datetime.fromisoformat(due_iso)
+        except Exception:
+            continue
+
+        remaining = (due_dt - now).total_seconds()
+        callback = f"help:testv2:myopen:{aid}"
+        due_text = tv2_fmt_dt(due_iso)
+        flag = None
+        extra_flag = None
+        message_text = None
+        notification_type = None
+        notification_title = None
+        notification_body = None
+        button_text = "Открыть тест"
+
+        if remaining <= 0 and not int(row[4] or 0):
+            was_not_started = status == "assigned"
+            tv2_mark_expired(aid)
+            flag = "overdue_notice_sent"
+            notification_type = "test_not_started_expired" if was_not_started else "test_expired"
+            if was_not_started:
+                message_text = (
+                    f"⌛ Срок теста «{escape(title)}» истёк. "
+                    "Вы не успели приступить к тестированию."
+                )
+                notification_title = f"Срок теста истёк: {title}"
+                notification_body = (
+                    f"Тест не был начат. Предельный срок: {due_text}."
+                )
+            else:
+                message_text = f"⌛ Срок теста «{escape(title)}» истёк."
+                notification_title = f"Срок теста истёк: {title}"
+                notification_body = f"Предельный срок: {due_text}."
+
+        elif remaining <= 7200 and not int(row[3] or 0):
+            flag = "reminder_2_sent"
+            # Не отправляем вслед за срочным alarm более слабое уведомление «за сутки».
+            extra_flag = "reminder_24_sent"
+            if status == "assigned":
+                notification_type = "test_not_started_2h"
+                notification_title = f"Срочно начните тест: {title}"
+                notification_body = (
+                    f"До предельного срока осталось менее 2 часов. "
+                    f"Пройти до: {due_text}. Тест ещё не начат."
+                )
+                message_text = (
+                    f"🚨 <b>Вы ещё не приступили к тесту</b>\n\n"
+                    f"Тест: <b>{escape(title)}</b>\n"
+                    f"До предельного срока осталось <b>менее 2 часов</b>.\n"
+                    f"Пройти до: <b>{escape(due_text)}</b>"
+                )
+                button_text = "▶️ Начать тест"
+            else:
+                notification_type = "test_due_2h"
+                notification_title = f"До срока теста менее 2 часов: {title}"
+                notification_body = f"Пройти до: {due_text}."
+                message_text = (
+                    f"⏰ До срока теста «{escape(title)}» осталось менее 2 часов."
+                )
+
+        elif 7200 < remaining <= 86400 and not int(row[2] or 0):
+            flag = "reminder_24_sent"
+            if status == "assigned":
+                notification_type = "test_not_started_24h"
+                notification_title = f"Пора начать тест: {title}"
+                notification_body = (
+                    f"До предельного срока осталось менее суток. "
+                    f"Пройти до: {due_text}. Тест ещё не начат."
+                )
+                message_text = (
+                    f"⏰ <b>Вы ещё не приступили к тесту</b>\n\n"
+                    f"Тест: <b>{escape(title)}</b>\n"
+                    f"До предельного срока осталось <b>менее суток</b>.\n"
+                    f"Пройти до: <b>{escape(due_text)}</b>"
+                )
+                button_text = "▶️ Начать тест"
+            else:
+                notification_type = "test_due_24h"
+                notification_title = f"До срока теста менее суток: {title}"
+                notification_body = f"Пройти до: {due_text}."
+                message_text = (
+                    f"⏰ До срока теста «{escape(title)}» осталось менее суток."
+                )
+
+        if not flag or not message_text:
+            continue
+
+        db_notification_add_once(
+            int(user_id),
+            notification_type or "test_reminder",
+            notification_title or "Напоминание о тесте",
+            notification_body or "",
+            callback_data=callback,
+        )
+
+        try:
+            await context.bot.send_message(
+                int(user_id),
+                message_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(button_text, callback_data=callback)
+                ]]),
+            )
+        except Exception as exc:
+            logger.warning("Cannot send test reminder %s to %s: %s", aid, user_id, exc)
+
+        # Фиксируем событие один раз, даже если Telegram временно не доставил push:
+        # запись остаётся доступной в разделе «Уведомления».
+        with tv2_connect() as con:
+            if extra_flag:
+                con.execute(
+                    f"UPDATE test_assignments SET {flag}=1, {extra_flag}=1 WHERE id=?",
+                    (aid,),
+                )
+            else:
+                con.execute(
+                    f"UPDATE test_assignments SET {flag}=1 WHERE id=?",
+                    (aid,),
+                )
 
 
 async def check_and_send_jobs(context: ContextTypes.DEFAULT_TYPE):
@@ -18958,6 +19146,805 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _test_modes_legacy_on_text(update, context)
 
 # =================== END TESTING MODES V3 ===================
+
+# ===================== TEST HISTORY + QUESTION BANK V4 =====================
+# Администратор может убрать ненужные шаблоны, опубликованные версии и
+# тестирования из рабочих списков, но история сотрудника, ответы и средний балл
+# сохраняются. Каждый вопрос теста имеет независимую копию в банке вопросов.
+
+TEST_HISTORY_V4_BUILD = "TEST-HISTORY-BANK-V4-2026-07-22"
+
+_test_history_legacy_db_init = db_init
+_test_history_legacy_cb_help = cb_help
+_test_history_legacy_publish_template = tv2_publish_template
+_test_history_legacy_update_question = tv2_update_question
+
+
+def _tv4_question_payload(
+    q_type: str,
+    text: str,
+    options: list[str] | None,
+    correct: list[int] | None,
+    points: float = 1,
+    explanation: str = "",
+    category: str = "",
+    difficulty: int = 1,
+    tags: str = "",
+    correct_text: str = "",
+) -> dict:
+    return {
+        "q_type": (q_type or "open").strip(),
+        "question_text": (text or "").strip(),
+        "options_json": _safe_json_dumps(options or []),
+        "correct_json": _safe_json_dumps(correct or []),
+        "points": float(points or 1),
+        "explanation": (explanation or "").strip(),
+        "category": (category or "").strip() or "Без категории",
+        "difficulty": max(1, min(int(difficulty or 1), 5)),
+        "tags": (tags or "").strip(),
+        "correct_text": (correct_text or "").strip(),
+    }
+
+
+def _tv4_ensure_bank_question(
+    con: sqlite3.Connection,
+    question: dict,
+    created_by: int | None = None,
+    preferred_bank_id: int | None = None,
+) -> int:
+    """Возвращает постоянный ID вопроса в банке, создавая запись при необходимости."""
+    if preferred_bank_id:
+        row = con.execute(
+            "SELECT id FROM test_question_bank WHERE id=?",
+            (int(preferred_bank_id),),
+        ).fetchone()
+        if row:
+            return int(row[0])
+
+    payload = _tv4_question_payload(
+        question.get("q_type") or "open",
+        question.get("question_text") or "",
+        _safe_json_loads(question.get("options_json"), question.get("options") or []),
+        _safe_json_loads(question.get("correct_json"), question.get("correct") or []),
+        question.get("points") or 1,
+        question.get("explanation") or "",
+        question.get("category") or "",
+        question.get("difficulty") or 1,
+        question.get("tags") or "",
+        question.get("correct_text") or "",
+    )
+    row = con.execute(
+        """
+        SELECT id
+        FROM test_question_bank
+        WHERE is_active=1
+          AND q_type=?
+          AND question_text=?
+          AND COALESCE(options_json,'[]')=?
+          AND COALESCE(correct_json,'[]')=?
+          AND COALESCE(points,1)=?
+          AND COALESCE(explanation,'')=?
+          AND COALESCE(category,'Без категории')=?
+          AND COALESCE(difficulty,1)=?
+          AND COALESCE(tags,'')=?
+          AND COALESCE(correct_text,'')=?
+        ORDER BY id
+        LIMIT 1
+        """,
+        (
+            payload["q_type"], payload["question_text"], payload["options_json"],
+            payload["correct_json"], payload["points"], payload["explanation"],
+            payload["category"], payload["difficulty"], payload["tags"],
+            payload["correct_text"],
+        ),
+    ).fetchone()
+    if row:
+        return int(row[0])
+
+    now = datetime.utcnow().isoformat()
+    cur = con.execute(
+        """
+        INSERT INTO test_question_bank(
+            q_type, question_text, options_json, correct_json, points,
+            explanation, category, difficulty, tags, is_active,
+            created_by, created_at, updated_at, correct_text
+        ) VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?,?)
+        """,
+        (
+            payload["q_type"], payload["question_text"], payload["options_json"],
+            payload["correct_json"], payload["points"],
+            payload["explanation"] or None, payload["category"],
+            payload["difficulty"], payload["tags"] or None,
+            created_by, now, now, payload["correct_text"] or None,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def db_init():
+    _test_history_legacy_db_init()
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+
+    _tv2_add_column(cur, "test_templates", "deleted_at TEXT")
+    _tv2_add_column(cur, "test_assignments", "admin_deleted_at TEXT")
+    _tv2_add_column(cur, "test_questions", "bank_question_id INTEGER")
+    _tv2_add_column(cur, "test_question_bank", "deleted_at TEXT")
+
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_test_assign_admin_visible "
+        "ON test_assignments(admin_deleted_at, status)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_test_questions_bank "
+        "ON test_questions(bank_question_id)"
+    )
+    cur.execute(
+        "UPDATE test_templates SET deleted_at=COALESCE(deleted_at, updated_at, created_at) "
+        "WHERE COALESCE(is_draft_visible,1)=0 AND deleted_at IS NULL"
+    )
+
+    # Однократная миграция: все ранее созданные вопросы также становятся
+    # независимыми записями банка. Опубликованные копии одинаковых вопросов
+    # связываются с одной активной записью банка.
+    questions = cur.execute(
+        """
+        SELECT q.*, t.created_by AS template_created_by
+        FROM test_questions q
+        LEFT JOIN test_templates t ON t.id=q.template_id
+        WHERE q.bank_question_id IS NULL
+        ORDER BY q.id
+        """
+    ).fetchall()
+    for row in questions:
+        item = dict(row)
+        bank_id = _tv4_ensure_bank_question(
+            con,
+            item,
+            item.get("template_created_by"),
+        )
+        cur.execute(
+            "UPDATE test_questions SET bank_question_id=? WHERE id=?",
+            (bank_id, int(item["id"])),
+        )
+
+    con.commit()
+    con.close()
+    logger.warning("=== %s ===", TEST_HISTORY_V4_BUILD)
+
+
+def tv2_add_question(
+    tid: int,
+    q_type: str,
+    text: str,
+    options: list[str] | None,
+    correct: list[int] | None,
+    points: float = 1,
+    explanation: str = "",
+    category: str = "",
+    difficulty: int = 1,
+    tags: str = "",
+    correct_text: str = "",
+    bank_question_id: int | None = None,
+) -> int:
+    payload = _tv4_question_payload(
+        q_type, text, options, correct, points, explanation,
+        category, difficulty, tags, correct_text,
+    )
+    now = datetime.utcnow().isoformat()
+    with tv2_connect() as con:
+        template = con.execute(
+            "SELECT created_by FROM test_templates WHERE id=?",
+            (int(tid),),
+        ).fetchone()
+        persistent_bank_id = _tv4_ensure_bank_question(
+            con,
+            payload,
+            int(template[0]) if template and template[0] is not None else None,
+            bank_question_id,
+        )
+        idx = int(con.execute(
+            "SELECT COALESCE(MAX(idx),0)+1 FROM test_questions WHERE template_id=?",
+            (int(tid),),
+        ).fetchone()[0])
+        cur = con.execute(
+            """
+            INSERT INTO test_questions(
+                template_id, idx, q_type, question_text, options_json, correct_json,
+                created_at, points, explanation, category, difficulty, tags,
+                correct_text, bank_question_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(tid), idx, payload["q_type"], payload["question_text"],
+                payload["options_json"], payload["correct_json"], now,
+                payload["points"], payload["explanation"] or None,
+                None if payload["category"] == "Без категории" else payload["category"],
+                payload["difficulty"], payload["tags"] or None,
+                payload["correct_text"] or None, persistent_bank_id,
+            ),
+        )
+        con.execute(
+            "UPDATE test_templates SET updated_at=? WHERE id=?",
+            (now, int(tid)),
+        )
+        return int(cur.lastrowid)
+
+
+def tv2_copy_bank_question(bank_id: int, tid: int) -> bool:
+    with tv2_connect() as con:
+        row = con.execute(
+            "SELECT * FROM test_question_bank WHERE id=? AND is_active=1",
+            (int(bank_id),),
+        ).fetchone()
+    if not row:
+        return False
+    item = dict(row)
+    tv2_add_question(
+        tid,
+        item["q_type"],
+        item["question_text"],
+        _safe_json_loads(item.get("options_json"), []),
+        _safe_json_loads(item.get("correct_json"), []),
+        item.get("points") or 1,
+        item.get("explanation") or "",
+        item.get("category") or "",
+        item.get("difficulty") or 1,
+        item.get("tags") or "",
+        item.get("correct_text") or "",
+        bank_question_id=int(bank_id),
+    )
+    return True
+
+
+def tv2_update_question(qid: int, field: str, value):
+    _test_history_legacy_update_question(qid, field, value)
+    # Редактирование создаёт/выбирает самостоятельную актуальную запись банка,
+    # не меняя вопрос в других тестах.
+    with tv2_connect() as con:
+        row = con.execute(
+            """
+            SELECT q.*, t.created_by AS template_created_by
+            FROM test_questions q
+            LEFT JOIN test_templates t ON t.id=q.template_id
+            WHERE q.id=?
+            """,
+            (int(qid),),
+        ).fetchone()
+        if row:
+            item = dict(row)
+            bank_id = _tv4_ensure_bank_question(
+                con, item, item.get("template_created_by")
+            )
+            con.execute(
+                "UPDATE test_questions SET bank_question_id=? WHERE id=?",
+                (bank_id, int(qid)),
+            )
+
+
+def tv2_publish_template(tid: int, user_id: int | None = None) -> int:
+    published_id = _test_history_legacy_publish_template(tid, user_id)
+    if int(published_id) == int(tid):
+        return int(published_id)
+    source_questions = {int(q["idx"]): q for q in tv2_questions(tid)}
+    with tv2_connect() as con:
+        for idx, question in source_questions.items():
+            bank_id = question.get("bank_question_id")
+            if not bank_id:
+                bank_id = _tv4_ensure_bank_question(con, question, user_id)
+                con.execute(
+                    "UPDATE test_questions SET bank_question_id=? WHERE id=?",
+                    (int(bank_id), int(question["id"])),
+                )
+            con.execute(
+                "UPDATE test_questions SET bank_question_id=? "
+                "WHERE template_id=? AND idx=?",
+                (int(bank_id), int(published_id), idx),
+            )
+    return int(published_id)
+
+
+def tv2_kb_template(tid: int):
+    template = tv2_get_template(tid) or {}
+    visible = bool(template) and int(template.get("is_draft_visible") or 0) == 1 \
+        and not template.get("deleted_at")
+    rows = [[InlineKeyboardButton(
+        "👁 Предпросмотр", callback_data=f"help:testv2:preview:{tid}"
+    )]]
+    if visible and not int(template.get("is_published") or 0):
+        rows.extend([
+            [InlineKeyboardButton("➕ Добавить вопрос", callback_data=f"help:testv2:qadd:{tid}")],
+            [InlineKeyboardButton("📚 Добавить из банка", callback_data=f"help:testv2:bankpick:{tid}:0")],
+            [InlineKeyboardButton("🎲 Добавить 10 случайных", callback_data=f"help:testv2:bankrandom:{tid}")],
+            [InlineKeyboardButton("✏️ Редактор вопросов", callback_data=f"help:testv2:qeditlist:{tid}:0")],
+            [InlineKeyboardButton("⚙️ Настройки теста", callback_data=f"help:testv2:settings:{tid}")],
+            [InlineKeyboardButton("🔒 Опубликовать версию", callback_data=f"help:testv2:publishconfirm:{tid}")],
+        ])
+    if visible:
+        rows.extend([
+            [InlineKeyboardButton("👥 Назначить", callback_data=f"help:testv2:assign_template:{tid}")],
+            [InlineKeyboardButton("📊 Аналитика", callback_data=f"help:testv2:analytic:{tid}")],
+            [InlineKeyboardButton(
+                "🗑 Удалить опубликованную версию"
+                if int(template.get("is_published") or 0)
+                else "🗑 Удалить шаблон",
+                callback_data=f"help:testv2:templatedeleteconfirm:{tid}",
+            )],
+        ])
+    rows.append([InlineKeyboardButton("⬅️ К шаблонам", callback_data="help:testv2:drafts:0")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _tv4_bank_question(bank_id: int) -> dict | None:
+    with tv2_connect() as con:
+        row = con.execute(
+            "SELECT * FROM test_question_bank WHERE id=? AND is_active=1",
+            (int(bank_id),),
+        ).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["options"] = _safe_json_loads(item.get("options_json"), [])
+    item["correct"] = _safe_json_loads(item.get("correct_json"), [])
+    return item
+
+
+def _tv4_bank_question_text(item: dict) -> str:
+    type_name = {
+        "single": "один ответ", "multi": "несколько ответов", "open": "открытый",
+    }.get(item.get("q_type"), item.get("q_type") or "—")
+    lines = [
+        f"📚 <b>{escape(item.get('question_text') or 'Без текста')}</b>",
+        "",
+        f"Категория: <b>{escape(item.get('category') or 'Без категории')}</b>",
+        f"Тип: <b>{escape(type_name)}</b>",
+        f"Сложность: <b>{int(item.get('difficulty') or 1)}</b>",
+        f"Баллы: <b>{float(item.get('points') or 1):g}</b>",
+    ]
+    if item.get("q_type") == "open":
+        lines.append("Эталон: " + escape(tv3_correct_answer_text(item)))
+    else:
+        correct = set(int(x) for x in (item.get("correct") or []))
+        for index, option in enumerate(item.get("options") or []):
+            lines.append(
+                f"{'✅' if index in correct else '▫️'} {index + 1}. {escape(str(option))}"
+            )
+    if item.get("explanation"):
+        lines.extend(["", "💡 " + escape(str(item["explanation"]))])
+    return "\n".join(lines)[:4000]
+
+
+def tv2_analytics(tid: int) -> dict:
+    template = tv2_get_template(tid) or {}
+    root = int(template.get("parent_template_id") or tid)
+    with tv2_connect() as con:
+        row = con.execute(
+            """
+            SELECT COUNT(*),
+                   SUM(CASE WHEN a.status!='assigned' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN a.status IN ('finished','needs_review') THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN a.status='expired' THEN 1 ELSE 0 END),
+                   AVG(CASE WHEN a.status='finished' THEN a.score_percent END),
+                   SUM(CASE WHEN a.passed=1 THEN 1 ELSE 0 END)
+            FROM test_assignments a
+            JOIN test_templates t ON t.id=a.template_id
+            WHERE (t.id=? OR t.parent_template_id=?)
+              AND a.admin_deleted_at IS NULL
+            """,
+            (root, root),
+        ).fetchone()
+        hard = con.execute(
+            """
+            SELECT q.question_text,
+                   AVG(CASE WHEN ans.is_correct=1 THEN 1.0 ELSE 0.0 END) rate,
+                   COUNT(ans.id) cnt
+            FROM test_questions q
+            JOIN test_templates t ON t.id=q.template_id
+            JOIN test_answers ans ON ans.question_id=q.id
+            JOIN test_assignments a ON a.id=ans.assignment_id
+            WHERE (t.id=? OR t.parent_template_id=?)
+              AND q.q_type!='open'
+              AND a.admin_deleted_at IS NULL
+            GROUP BY q.id
+            HAVING cnt>0
+            ORDER BY rate ASC
+            LIMIT 5
+            """,
+            (root, root),
+        ).fetchall()
+    return {
+        "assigned": int(row[0] or 0), "started": int(row[1] or 0),
+        "completed": int(row[2] or 0), "expired": int(row[3] or 0),
+        "avg": float(row[4] or 0), "passed": int(row[5] or 0),
+        "hard": [(str(r[0]), float(r[1] or 0), int(r[2] or 0)) for r in hard],
+    }
+
+
+async def _tv4_answer_callback(query):
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = (update.callback_query.data or "") if update.callback_query else ""
+    intercepted = (
+        data.startswith("help:testv2:drafts:")
+        or data.startswith("help:testv2:templatedelete")
+        or data.startswith("help:testv2:resultdelete")
+        or data.startswith("help:testv2:qdelete")
+        or data == "help:testv2:bank"
+        or data.startswith("help:testv2:bankcat:")
+        or data.startswith("help:testv2:bankquestion:")
+        or data.startswith("help:testv2:bankdelete")
+        or data == "help:testv2:resultspeople"
+        or data.startswith("help:testv2:resultsperson:")
+        or data.startswith("help:testv2:resultsperiod:")
+        or data.startswith("help:testv2:results:")
+        or data == "help:testv2:overdue"
+    )
+    if not intercepted:
+        return await _test_history_legacy_cb_help(update, context)
+
+    query = update.callback_query
+    await _tv4_answer_callback(query)
+    if not await tv2_admin_guard(update, context):
+        return
+
+    if data.startswith("help:testv2:drafts:"):
+        page = int(data.rsplit(":", 1)[-1])
+        await query.edit_message_text(
+            "🗂 <b>Шаблоны и опубликованные версии</b>\n\n"
+            "Удаление убирает тест из рабочих списков. Назначения, ответы и "
+            "результаты сотрудников сохраняются в «Моём кабинете», а вопросы — в банке.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tv2_kb_drafts(page),
+        )
+        return
+
+    if data.startswith("help:testv2:templatedeleteconfirm:"):
+        tid = int(data.rsplit(":", 1)[-1])
+        template = tv2_get_template(tid)
+        if not template:
+            await query.edit_message_text(
+                "Тест не найден.", reply_markup=tv2_kb_drafts(0)
+            )
+            return
+        kind = "опубликованную версию" if int(template.get("is_published") or 0) else "шаблон"
+        await query.edit_message_text(
+            f"⚠️ Удалить {kind} «{escape(template.get('title') or '')}» из рабочих списков?\n\n"
+            "История сотрудников, ответы, результаты и средний балл сохранятся. "
+            "Вопросы останутся в банке вопросов.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🗑 Да, удалить", callback_data=f"help:testv2:templatedelete:{tid}"
+                )],
+                [InlineKeyboardButton(
+                    "Отмена", callback_data=f"help:testv2:template:{tid}"
+                )],
+            ]),
+        )
+        return
+
+    if data.startswith("help:testv2:templatedelete:"):
+        tid = int(data.rsplit(":", 1)[-1])
+        with tv2_connect() as con:
+            con.execute(
+                "UPDATE test_templates "
+                "SET is_draft_visible=0, deleted_at=COALESCE(deleted_at,?), updated_at=? "
+                "WHERE id=?",
+                (datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), tid),
+            )
+        await query.edit_message_text(
+            "✅ Тест удалён из рабочих списков. История сотрудников и банк вопросов сохранены.",
+            reply_markup=tv2_kb_drafts(0),
+        )
+        return
+
+    if data.startswith("help:testv2:resultdeleteconfirm:"):
+        aid = int(data.rsplit(":", 1)[-1])
+        await query.edit_message_text(
+            "⚠️ Удалить тестирование из административных отчётов?\n\n"
+            "Для сотрудника тест, ответы и результат останутся в «Моём кабинете» "
+            "и продолжат учитываться в среднем балле.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🗑 Да, убрать из отчётов", callback_data=f"help:testv2:resultdelete:{aid}"
+                )],
+                [InlineKeyboardButton(
+                    "Отмена", callback_data=f"help:testv2:result:{aid}"
+                )],
+            ]),
+        )
+        return
+
+    if data.startswith("help:testv2:resultdelete:"):
+        aid = int(data.rsplit(":", 1)[-1])
+        with tv2_connect() as con:
+            con.execute(
+                "UPDATE test_assignments SET admin_deleted_at=COALESCE(admin_deleted_at,?) "
+                "WHERE id=?",
+                (datetime.utcnow().isoformat(), aid),
+            )
+        await query.edit_message_text(
+            "✅ Тестирование убрано из административных отчётов. "
+            "История и средний балл сотрудника сохранены.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ К аналитике", callback_data="help:testv2:analytics")
+            ]]),
+        )
+        return
+
+    if data.startswith("help:testv2:qdeleteconfirm:"):
+        question_id = int(data.rsplit(":", 1)[-1])
+        question = tv2_question_by_id(question_id)
+        if not question:
+            await query.edit_message_text(
+                "Вопрос не найден.", reply_markup=tv2_kb_drafts(0)
+            )
+            return
+        await query.edit_message_text(
+            "⚠️ Удалить вопрос только из текущего теста?\n\n"
+            "Сам вопрос останется в банке и его можно будет добавить в любой новый тест.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🗑 Удалить из теста", callback_data=f"help:testv2:qdelete:{question_id}"
+                )],
+                [InlineKeyboardButton(
+                    "Отмена", callback_data=f"help:testv2:qedit:{question_id}"
+                )],
+            ]),
+        )
+        return
+
+    if data.startswith("help:testv2:qdelete:"):
+        question_id = int(data.rsplit(":", 1)[-1])
+        question = tv2_question_by_id(question_id)
+        if not question:
+            await query.edit_message_text(
+                "Вопрос уже удалён из теста.", reply_markup=tv2_kb_drafts(0)
+            )
+            return
+        template_id = int(question["template_id"])
+        tv2_delete_question(question_id)
+        await query.edit_message_text(
+            "✅ Вопрос удалён из текущего теста и сохранён в банке вопросов.",
+            reply_markup=tv2_kb_question_list(template_id, 0),
+        )
+        return
+
+    if data == "help:testv2:bank":
+        categories = tv2_bank_categories()
+        rows = [[InlineKeyboardButton(
+            category, callback_data=f"help:testv2:bankcat:{category}"
+        )] for category in categories[:30]]
+        rows.extend([
+            [InlineKeyboardButton("➕ Добавить вопрос в банк", callback_data="help:testv2:bankadd")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="help:testv2:admin")],
+        ])
+        await query.edit_message_text(
+            "📚 <b>Банк вопросов</b>\n\n"
+            "Все вопросы из тестов сохраняются здесь. Удалить вопрос можно только из его карточки в банке.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("help:testv2:bankcat:"):
+        category = data.split(":", 3)[-1]
+        items = tv2_bank_list(category, limit=100)
+        rows = [[InlineKeyboardButton(
+            item["question_text"][:55],
+            callback_data=f"help:testv2:bankquestion:{int(item['id'])}",
+        )] for item in items[:50]]
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:testv2:bank")])
+        await query.edit_message_text(
+            f"📚 <b>{escape(category)}</b>\nВопросов: {len(items)}\n\n"
+            "Откройте вопрос, чтобы посмотреть или удалить его из банка.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("help:testv2:bankquestion:"):
+        bank_id = int(data.rsplit(":", 1)[-1])
+        item = _tv4_bank_question(bank_id)
+        if not item:
+            await query.edit_message_text(
+                "Вопрос уже удалён из банка.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ В банк", callback_data="help:testv2:bank")
+                ]]),
+            )
+            return
+        await query.edit_message_text(
+            _tv4_bank_question_text(item),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🗑 Удалить из банка", callback_data=f"help:testv2:bankdeleteconfirm:{bank_id}"
+                )],
+                [InlineKeyboardButton("⬅️ К категориям", callback_data="help:testv2:bank")],
+            ]),
+        )
+        return
+
+    if data.startswith("help:testv2:bankdeleteconfirm:"):
+        bank_id = int(data.rsplit(":", 1)[-1])
+        await query.edit_message_text(
+            "⚠️ Удалить вопрос из банка?\n\n"
+            "Копии вопроса в существующих тестах и исторических результатах сотрудников сохранятся.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🗑 Да, удалить из банка", callback_data=f"help:testv2:bankdelete:{bank_id}"
+                )],
+                [InlineKeyboardButton(
+                    "Отмена", callback_data=f"help:testv2:bankquestion:{bank_id}"
+                )],
+            ]),
+        )
+        return
+
+    if data.startswith("help:testv2:bankdelete:"):
+        bank_id = int(data.rsplit(":", 1)[-1])
+        now = datetime.utcnow().isoformat()
+        with tv2_connect() as con:
+            con.execute(
+                "UPDATE test_question_bank "
+                "SET is_active=0, deleted_at=COALESCE(deleted_at,?), updated_at=? "
+                "WHERE id=?",
+                (now, now, bank_id),
+            )
+        await query.edit_message_text(
+            "✅ Вопрос удалён из банка. Существующие тесты и результаты не изменены.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ В банк", callback_data="help:testv2:bank")
+            ]]),
+        )
+        return
+
+    if data == "help:testv2:resultspeople":
+        with tv2_connect() as con:
+            people = con.execute(
+                """
+                SELECT p.id, p.full_name, COUNT(a.id) cnt
+                FROM profiles p
+                JOIN test_assignments a ON a.profile_id=p.id
+                WHERE a.admin_deleted_at IS NULL
+                GROUP BY p.id
+                ORDER BY p.full_name
+                """
+            ).fetchall()
+        rows = [[InlineKeyboardButton(
+            f"{row[1]} · {int(row[2])}",
+            callback_data=f"help:testv2:resultsperson:{int(row[0])}",
+        )] for row in people[:60]]
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:testv2:resultsfilters")])
+        await query.edit_message_text(
+            "👤 Выберите сотрудника:", reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    if data.startswith("help:testv2:resultsperson:"):
+        profile_id = int(data.rsplit(":", 1)[-1])
+        with tv2_connect() as con:
+            rows = con.execute(
+                """
+                SELECT a.id, t.title, a.status, a.score_percent
+                FROM test_assignments a
+                JOIN test_templates t ON t.id=a.template_id
+                WHERE a.profile_id=? AND a.admin_deleted_at IS NULL
+                ORDER BY a.assigned_at DESC
+                LIMIT 50
+                """,
+                (profile_id,),
+            ).fetchall()
+            person = con.execute(
+                "SELECT full_name FROM profiles WHERE id=?", (profile_id,)
+            ).fetchone()
+        keyboard = [[InlineKeyboardButton(
+            f"{row[1]} · {row[2]}{(' · '+str(round(row[3]))+'%') if row[3] is not None else ''}"[:60],
+            callback_data=f"help:testv2:result:{int(row[0])}",
+        )] for row in rows]
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:testv2:resultspeople")])
+        await query.edit_message_text(
+            f"Результаты: {escape(person[0] if person else str(profile_id))}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if data.startswith("help:testv2:resultsperiod:"):
+        days = int(data.rsplit(":", 1)[-1])
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        with tv2_connect() as con:
+            rows = con.execute(
+                """
+                SELECT a.id, p.full_name, t.title, a.status, a.score_percent
+                FROM test_assignments a
+                JOIN profiles p ON p.id=a.profile_id
+                JOIN test_templates t ON t.id=a.template_id
+                WHERE COALESCE(a.finished_at,a.assigned_at)>=?
+                  AND a.admin_deleted_at IS NULL
+                ORDER BY COALESCE(a.finished_at,a.assigned_at) DESC
+                LIMIT 60
+                """,
+                (cutoff,),
+            ).fetchall()
+        keyboard = [[InlineKeyboardButton(
+            f"{row[1]} · {row[2]}{(' · '+str(round(row[4]))+'%') if row[4] is not None else ''}"[:60],
+            callback_data=f"help:testv2:result:{int(row[0])}",
+        )] for row in rows]
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:testv2:resultsfilters")])
+        await query.edit_message_text(
+            f"📅 Результаты за {days} дней: {len(rows)}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if data.startswith("help:testv2:results:"):
+        result_filter = data.rsplit(":", 1)[-1]
+        conditions = {
+            "failed": "a.status='finished' AND COALESCE(a.passed,0)=0",
+            "review": "a.status='needs_review'",
+            "expired": "a.status='expired'",
+            "passed": "a.status='finished' AND a.passed=1",
+        }
+        condition = conditions.get(result_filter)
+        if condition is None:
+            return await _test_history_legacy_cb_help(update, context)
+        with tv2_connect() as con:
+            rows = con.execute(
+                f"""
+                SELECT a.id, p.full_name, t.title, a.score_percent
+                FROM test_assignments a
+                JOIN profiles p ON p.id=a.profile_id
+                JOIN test_templates t ON t.id=a.template_id
+                WHERE {condition} AND a.admin_deleted_at IS NULL
+                ORDER BY COALESCE(a.finished_at,a.assigned_at) DESC
+                LIMIT 50
+                """
+            ).fetchall()
+        keyboard = [[InlineKeyboardButton(
+            f"{row[1]} · {row[2]}{(' · '+str(round(row[3]))+'%') if row[3] is not None else ''}"[:60],
+            callback_data=f"help:testv2:result:{int(row[0])}",
+        )] for row in rows]
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:testv2:resultsfilters")])
+        await query.edit_message_text(
+            f"Найдено: {len(rows)}", reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if data == "help:testv2:overdue":
+        with tv2_connect() as con:
+            rows = con.execute(
+                """
+                SELECT a.id, p.full_name, t.title, a.due_at
+                FROM test_assignments a
+                JOIN profiles p ON p.id=a.profile_id
+                JOIN test_templates t ON t.id=a.template_id
+                WHERE a.status='expired' AND a.admin_deleted_at IS NULL
+                ORDER BY a.due_at DESC
+                LIMIT 50
+                """
+            ).fetchall()
+        keyboard = [[InlineKeyboardButton(
+            f"⌛ {row[1]} · {row[2]}"[:60],
+            callback_data=f"help:testv2:result:{int(row[0])}",
+        )] for row in rows]
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:testv2:admin")])
+        await query.edit_message_text(
+            f"⌛ Просроченные тесты: {len(rows)}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    return await _test_history_legacy_cb_help(update, context)
+
+# =================== END TEST HISTORY + QUESTION BANK V4 ===================
 
 
 # ---------------- APP ----------------
