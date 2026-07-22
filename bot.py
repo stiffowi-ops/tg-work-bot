@@ -4396,24 +4396,106 @@ def kb_help_docs_categories():
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:docs")])
     return InlineKeyboardMarkup(rows)
 
-def kb_help_faq_list():
+FAQ_PAGE_SIZE = 10
+
+
+def _faq_plain_question(question: str) -> str:
+    """Возвращает вопрос без HTML-тегов для безопасного вывода в списке FAQ."""
+    plain = re.sub(r"<[^>]+>", "", question or "")
+    plain = html_lib.unescape(plain)
+    return re.sub(r"\s+", " ", plain).strip()
+
+
+def build_help_faq_page(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Формирует страницу FAQ по 10 вопросов.
+
+    Полный текст вопроса выводится в сообщении, а не на inline-кнопке,
+    поэтому Telegram-клиент не обрезает вопрос многоточием.
+    """
     items = db_faq_list()
-    rows = []
-    rows.append([InlineKeyboardButton("🧮 Калькулятор премии", callback_data="help:faq:bonus")])
-    if not items:
-        rows.append([InlineKeyboardButton("— пока пусто —", callback_data="noop")])
+    total_items = len(items)
+    total_pages = max(1, (total_items + FAQ_PAGE_SIZE - 1) // FAQ_PAGE_SIZE)
+    page = max(0, min(int(page), total_pages - 1))
+
+    start = page * FAQ_PAGE_SIZE
+    page_items = items[start:start + FAQ_PAGE_SIZE]
+
+    text_lines = [
+        "❓ <b>Часто задаваемые вопросы</b>",
+        "",
+    ]
+
+    if not page_items:
+        text_lines.append("Пока вопросов нет.")
     else:
-        for fid, q in items[:40]:
-            plain = html_lib.unescape(re.sub(r"<[^>]+>", "", q or ""))
-            label = plain if len(plain) <= 60 else (plain[:57] + "…")
-            rows.append([InlineKeyboardButton(label, callback_data=f"help:faq:item:{fid}")])
+        text_lines.append(
+            f"Страница <b>{page + 1}</b> из <b>{total_pages}</b>. "
+            "Нажмите кнопку с номером нужного вопроса."
+        )
+        text_lines.append("")
+
+        for offset, (_fid, question) in enumerate(page_items, start=1):
+            number = start + offset
+            plain = _faq_plain_question(question) or "Без названия"
+            text_lines.append(f"<b>{number}.</b> {html_lib.escape(plain)}")
+            text_lines.append("")
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("🧮 Калькулятор премии", callback_data="help:faq:bonus")]
+    ]
+
+    # Кнопки короткие, а полный вопрос всегда остаётся видимым в тексте сообщения.
+    for offset, (fid, _question) in enumerate(page_items, start=1):
+        number = start + offset
+        rows.append([
+            InlineKeyboardButton(
+                f"❓ Вопрос №{number}",
+                callback_data=f"help:faq:item:{fid}:{page}",
+            )
+        ])
+
+    if total_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(
+                InlineKeyboardButton(
+                    "⬅️ Предыдущая",
+                    callback_data=f"help:faq:page:{page - 1}",
+                )
+            )
+
+        nav_row.append(
+            InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop")
+        )
+
+        if page < total_pages - 1:
+            nav_row.append(
+                InlineKeyboardButton(
+                    "Следующая ➡️",
+                    callback_data=f"help:faq:page:{page + 1}",
+                )
+            )
+        rows.append(nav_row)
+
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
-    return InlineKeyboardMarkup(rows)
+    return "\n".join(text_lines).rstrip(), InlineKeyboardMarkup(rows)
 
 
-def kb_help_faq_item():
+def kb_help_faq_list(page: int = 0):
+    """Обратная совместимость: возвращает только клавиатуру страницы FAQ."""
+    _text, keyboard = build_help_faq_page(page)
+    return keyboard
+
+
+def kb_help_faq_item(page: int = 0):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
+        [
+            InlineKeyboardButton(
+                "⬅️ Назад к FAQ",
+                callback_data=f"help:faq:page:{max(0, int(page))}",
+            )
+        ],
         [InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")],
     ])
 
@@ -8525,13 +8607,23 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "help:faq":
+    if data == "help:faq" or data.startswith("help:faq:page:"):
         clear_bonus_calc_flow(context)
-        text = (
-            "❓ <b>Часто задаваемые вопросы</b>\n\n"
-            "Выберите вопрос из списка ниже 👇"
+
+        page = 0
+        if data.startswith("help:faq:page:"):
+            try:
+                page = int(data.rsplit(":", 1)[-1])
+            except (TypeError, ValueError):
+                page = 0
+
+        text, keyboard = build_help_faq_page(page)
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
         )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_faq_list(), disable_web_page_preview=True)
         return
 
 
@@ -8552,16 +8644,38 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("help:faq:item:"):
-        fid = int(data.split(":")[-1])
+        parts = data.split(":")
+        try:
+            fid = int(parts[3])
+        except (IndexError, TypeError, ValueError):
+            await q.answer("Некорректный вопрос", show_alert=True)
+            return
+
+        # В новых callback хранится номер страницы. Старые callback без страницы
+        # продолжают работать и возвращают пользователя на первую страницу.
+        try:
+            faq_page = max(0, int(parts[4]))
+        except (IndexError, TypeError, ValueError):
+            faq_page = 0
+
         item = db_faq_get(fid)
         if not item:
-            await q.edit_message_text("Вопрос не найден (возможно удалён).", reply_markup=kb_help_main(is_admin_user=is_adm))
+            await q.edit_message_text(
+                "Вопрос не найден (возможно удалён).",
+                reply_markup=kb_help_main(is_admin_user=is_adm),
+            )
             return
+
         text = (
             f"❓ {item['question']}\n\n"
             f"{item['answer']}"
         )
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_faq_item(), disable_web_page_preview=True)
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_help_faq_item(faq_page),
+            disable_web_page_preview=True,
+        )
         return
 
 
