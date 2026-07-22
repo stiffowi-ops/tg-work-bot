@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "FAQ-COMMON-QA-TABLE-2026-07-22-V1"
+BUILD_VERSION = "FAQ-DYNAMIC-CARDS-SEARCH-2026-07-22-V1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -3516,6 +3516,10 @@ WAITING_FAQ_Q = "waiting_faq_q"
 WAITING_FAQ_A = "waiting_faq_a"
 PENDING_FAQ = "pending_faq"
 
+# faq employee search flow
+WAITING_FAQ_SEARCH = "waiting_faq_search"
+FAQ_SEARCH_QUERY = "faq_search_query"
+
 WAITING_RESTORE_ZIP = "waiting_restore_zip"
 # profiles add flow
 PROFILE_WIZ_ACTIVE = "profile_wiz_active"
@@ -3593,6 +3597,16 @@ def clear_faq_flow(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_FAQ_Q] = False
     context.chat_data[WAITING_FAQ_A] = False
     context.chat_data.pop(PENDING_FAQ, None)
+
+
+def clear_faq_search_flow(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    drop_query: bool = True,
+):
+    context.chat_data[WAITING_FAQ_SEARCH] = False
+    if drop_query:
+        context.chat_data.pop(FAQ_SEARCH_QUERY, None)
 
 
 
@@ -4411,27 +4425,171 @@ def kb_help_docs_categories():
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:docs")])
     return InlineKeyboardMarkup(rows)
 
-FAQ_PAGE_SIZE = 10
+FAQ_CARDS_PER_PAGE = 5
+FAQ_PAGE_TEXT_LIMIT = 3300
+FAQ_SINGLE_CARD_TEXT_LIMIT = 3050
+
+
+def faq_plain_text(value: str | None) -> str:
+    """Telegram HTML -> readable plain text for search and safe length checks."""
+    value = value or ""
+    plain = re.sub(r"(?is)<[^>]+>", " ", value)
+    plain = html_lib.unescape(plain)
+    plain = re.sub(r"[ \t\r\f\v]+", " ", plain)
+    plain = re.sub(r"\n{3,}", "\n\n", plain)
+    return plain.strip()
+
+
+def faq_search_items(query: str) -> list[dict]:
+    """Search all query words in both the question and the answer."""
+    tokens = [part.casefold() for part in re.findall(r"\S+", query or "")]
+    if not tokens:
+        return []
+
+    result: list[dict] = []
+    for item in db_faq_list_full():
+        haystack = (
+            faq_plain_text(item.get("question"))
+            + "\n"
+            + faq_plain_text(item.get("answer"))
+        ).casefold()
+        if all(token in haystack for token in tokens):
+            result.append(item)
+    return result
+
+
+def faq_split_plain_text(value: str, limit: int) -> list[str]:
+    """Split oversized plain text without cutting words where possible."""
+    clean = re.sub(r"\n{3,}", "\n\n", (value or "").strip())
+    if not clean:
+        return [""]
+    if len(clean) <= limit:
+        return [clean]
+
+    parts: list[str] = []
+    remaining = clean
+    while remaining:
+        if len(remaining) <= limit:
+            parts.append(remaining.strip())
+            break
+
+        cut = remaining.rfind("\n\n", 0, limit + 1)
+        if cut < max(100, limit // 3):
+            cut = remaining.rfind("\n", 0, limit + 1)
+        if cut < max(100, limit // 3):
+            cut = remaining.rfind(" ", 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+
+        parts.append(remaining[:cut].strip())
+        remaining = remaining[cut:].lstrip()
+
+    return [part for part in parts if part] or [""]
+
+
+def faq_card_html(number: int, item: dict) -> list[str]:
+    """
+    Build one FAQ card. Normally it returns one HTML block.
+    An exceptionally long answer is split into continuation blocks so Telegram's
+    message limit is never reached. The full question remains on the first block.
+    """
+    question_html = (item.get("question") or "Без названия").strip()
+    answer_html = (item.get("answer") or "Ответ пока не указан.").strip()
+    question_plain = faq_plain_text(question_html) or "Без названия"
+    answer_plain = faq_plain_text(answer_html) or "Ответ пока не указан."
+
+    normal = (
+        f"❓ <b>Вопрос {number}</b>\n"
+        f"<b>{html_lib.escape(question_plain)}</b>\n\n"
+        f"💬 <b>Ответ</b>\n"
+        f"{answer_html}"
+    )
+    if len(faq_plain_text(normal)) <= FAQ_SINGLE_CARD_TEXT_LIMIT:
+        return [normal]
+
+    # For an oversized entry, use escaped plain text while splitting. This keeps
+    # every generated HTML message valid even when the stored answer has entities.
+    first_prefix = (
+        f"❓ <b>Вопрос {number}</b>\n"
+        f"<b>{html_lib.escape(question_plain)}</b>\n\n"
+        f"💬 <b>Ответ</b>\n"
+    )
+    first_budget = max(
+        500,
+        FAQ_SINGLE_CARD_TEXT_LIMIT - len(faq_plain_text(first_prefix)) - 80,
+    )
+    answer_parts = faq_split_plain_text(answer_plain, first_budget)
+
+    blocks = [first_prefix + html_lib.escape(answer_parts[0])]
+    continuation_budget = FAQ_SINGLE_CARD_TEXT_LIMIT - 120
+    remaining = "\n\n".join(answer_parts[1:])
+    if remaining:
+        for index, part in enumerate(
+            faq_split_plain_text(remaining, continuation_budget),
+            start=2,
+        ):
+            blocks.append(
+                f"💬 <b>Продолжение ответа на вопрос {number} · часть {index}</b>\n\n"
+                f"{html_lib.escape(part)}"
+            )
+    return blocks
+
+
+def faq_pack_pages(items: list[dict]) -> list[list[str]]:
+    """Pack complete cards into pages by both card count and text length."""
+    blocks: list[str] = []
+    for number, item in enumerate(items, start=1):
+        blocks.extend(faq_card_html(number, item))
+
+    if not blocks:
+        return [[]]
+
+    pages: list[list[str]] = []
+    current: list[str] = []
+    current_length = 0
+
+    for block in blocks:
+        block_length = len(faq_plain_text(block))
+        separator_length = 24 if current else 0
+        should_break = bool(current) and (
+            len(current) >= FAQ_CARDS_PER_PAGE
+            or current_length + separator_length + block_length > FAQ_PAGE_TEXT_LIMIT
+        )
+        if should_break:
+            pages.append(current)
+            current = []
+            current_length = 0
+
+        current.append(block)
+        current_length += separator_length + block_length
+
+    if current:
+        pages.append(current)
+    return pages or [[]]
 
 
 def build_help_faq_menu() -> tuple[str, InlineKeyboardMarkup]:
-    """Главный экран FAQ без отдельных кнопок для каждого вопроса."""
+    """Main FAQ screen without a separate button for every question."""
     count = len(db_faq_list_full())
     count_line = (
-        f"Сейчас в базе: <b>{count}</b>"
+        f"В базе знаний: <b>{count}</b> вопросов"
         if count
         else "Пока вопросов и ответов нет."
     )
     text = (
-        "❓ <b>FAQ и калькулятор</b>\n\n"
+        "❓ <b>FAQ</b>\n\n"
         f"{count_line}\n\n"
-        "Все вопросы и ответы собраны в одной таблице. "
-        "Новые записи появляются в ней автоматически."
+        "Откройте ответы, чтобы увидеть вопросы целиком вместе с ответами, "
+        "или воспользуйтесь поиском."
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            "📋 Ответы на вопросы",
+            "📚 Ответы на вопросы",
             callback_data="help:faq:answers:0",
+        )],
+        [InlineKeyboardButton(
+            "🔎 Найти ответ",
+            callback_data="help:faq:search",
         )],
         [InlineKeyboardButton(
             "🧮 Калькулятор премии",
@@ -4442,53 +4600,33 @@ def build_help_faq_menu() -> tuple[str, InlineKeyboardMarkup]:
     return text, keyboard
 
 
-def build_help_faq_answers_page(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
-    """
-    Формирует общую таблицу «вопрос — ответ» по 10 записей на странице.
-
-    Для каждого вопроса нет отдельной inline-кнопки. Таблица всегда строится
-    непосредственно из faq_items, поэтому после добавления записи она
-    автоматически появляется последней строкой.
-    """
-    items = db_faq_list_full()
-    total_items = len(items)
-    total_pages = max(1, (total_items + FAQ_PAGE_SIZE - 1) // FAQ_PAGE_SIZE)
+def build_help_faq_cards_page(
+    items: list[dict],
+    page: int = 0,
+    *,
+    title: str = "📚 Ответы на вопросы",
+    subtitle: str | None = None,
+    callback_prefix: str = "help:faq:answers",
+    show_search: bool = True,
+) -> tuple[str, InlineKeyboardMarkup]:
+    pages = faq_pack_pages(items)
+    total_pages = max(1, len(pages))
     page = max(0, min(int(page), total_pages - 1))
+    page_blocks = pages[page]
 
-    start = page * FAQ_PAGE_SIZE
-    page_items = items[start:start + FAQ_PAGE_SIZE]
-
-    text_lines = [
-        "📋 <b>Ответы на вопросы</b>",
-        "",
-    ]
-
-    if not page_items:
-        text_lines.append("Пока вопросов и ответов нет.")
-    else:
-        text_lines.append(
+    text_lines = [f"<b>{title}</b>"]
+    if subtitle:
+        text_lines.extend(["", subtitle])
+    if items:
+        text_lines.extend([
+            "",
             f"Страница <b>{page + 1}</b> из <b>{total_pages}</b> · "
-            f"всего записей: <b>{total_items}</b>"
-        )
-        text_lines.append("")
-
-        for offset, item in enumerate(page_items, start=1):
-            number = start + offset
-            question = (item.get("question") or "Без названия").strip()
-            answer = (item.get("answer") or "Ответ пока не указан.").strip()
-
-            # Вопрос и ответ хранят Telegram HTML-разметку, созданную ботом
-            # из entities исходного сообщения. Поэтому форматирование и ссылки
-            # сохраняются, а текст вопроса нигде не сокращается.
-            text_lines.extend([
-                f"<b>┌ {number}. Вопрос</b>",
-                question,
-                "",
-                "<b>├ Ответ</b>",
-                answer,
-                "<b>└────────────────</b>",
-                "",
-            ])
+            f"всего вопросов: <b>{len(items)}</b>",
+            "",
+        ])
+        text_lines.append("\n\n━━━━━━━━━━━━━━\n\n".join(page_blocks))
+    else:
+        text_lines.extend(["", "Ничего не найдено."])
 
     rows: list[list[InlineKeyboardButton]] = []
     if total_pages > 1:
@@ -4496,39 +4634,76 @@ def build_help_faq_answers_page(page: int = 0) -> tuple[str, InlineKeyboardMarku
         if page > 0:
             nav_row.append(InlineKeyboardButton(
                 "⬅️ Предыдущая",
-                callback_data=f"help:faq:answers:{page - 1}",
+                callback_data=f"{callback_prefix}:{page - 1}",
             ))
-
         nav_row.append(InlineKeyboardButton(
             f"{page + 1}/{total_pages}",
             callback_data="noop",
         ))
-
         if page < total_pages - 1:
             nav_row.append(InlineKeyboardButton(
                 "Следующая ➡️",
-                callback_data=f"help:faq:answers:{page + 1}",
+                callback_data=f"{callback_prefix}:{page + 1}",
             ))
         rows.append(nav_row)
+
+    if show_search:
+        rows.append([InlineKeyboardButton(
+            "🔎 Найти ответ",
+            callback_data="help:faq:search",
+        )])
+    else:
+        rows.append([InlineKeyboardButton(
+            "📚 Все вопросы",
+            callback_data="help:faq:answers:0",
+        )])
+        rows.append([InlineKeyboardButton(
+            "🔎 Новый поиск",
+            callback_data="help:faq:search",
+        )])
 
     rows.append([InlineKeyboardButton("⬅️ В FAQ", callback_data="help:faq")])
     rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
     return "\n".join(text_lines).rstrip(), InlineKeyboardMarkup(rows)
 
 
+def build_help_faq_answers_page(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    return build_help_faq_cards_page(
+        db_faq_list_full(),
+        page,
+        callback_prefix="help:faq:answers",
+        show_search=True,
+    )
+
+
+def build_help_faq_search_page(
+    query: str,
+    page: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
+    items = faq_search_items(query)
+    return build_help_faq_cards_page(
+        items,
+        page,
+        title="🔎 Результаты поиска",
+        subtitle=f"Запрос: <b>{html_lib.escape(query)}</b>",
+        callback_prefix="help:faq:search_results",
+        show_search=False,
+    )
+
+
 def build_help_faq_page(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
-    """Обратная совместимость со старыми вызовами списка FAQ."""
+    """Backward compatibility with previous FAQ list callbacks."""
     return build_help_faq_answers_page(page)
 
 
 def kb_help_faq_list(page: int = 0):
-    """Обратная совместимость: возвращает клавиатуру общей таблицы FAQ."""
+    """Backward compatibility: return the dynamic FAQ cards keyboard."""
     _text, keyboard = build_help_faq_answers_page(page)
     return keyboard
 
 
 def kb_help_faq_item(page: int = 0):
-    """Клавиатура для старых сообщений, где вопрос открывался отдельно."""
+    """Keyboard for old messages where a question opened separately."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "⬅️ К ответам на вопросы",
@@ -4536,7 +4711,6 @@ def kb_help_faq_item(page: int = 0):
         )],
         [InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")],
     ])
-
 
 def kb_help_docs_files(category_id: int):
     items = db_docs_list_by_category(category_id)
@@ -8647,6 +8821,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help:faq":
         clear_bonus_calc_flow(context)
+        clear_faq_search_flow(context)
         text, keyboard = build_help_faq_menu()
         await q.edit_message_text(
             text,
@@ -8662,12 +8837,57 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or data.startswith("help:faq:page:")  # старые сообщения
     ):
         clear_bonus_calc_flow(context)
+        clear_faq_search_flow(context)
         try:
             page = int(data.rsplit(":", 1)[-1])
         except (TypeError, ValueError):
             page = 0
 
         text, keyboard = build_help_faq_answers_page(page)
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:faq:search":
+        clear_bonus_calc_flow(context)
+        clear_faq_search_flow(context)
+        context.chat_data[WAITING_FAQ_SEARCH] = True
+        await q.edit_message_text(
+            "🔎 <b>Поиск по FAQ</b>\n\n"
+            "Напишите слово или фразу. Поиск выполняется одновременно "
+            "по вопросам и ответам.\n\n"
+            "Например: <code>РОС</code>, <code>SaaS</code> или "
+            "<code>калькулятор премии</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data="help:faq")]
+            ]),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:faq:search_results" or data.startswith("help:faq:search_results:"):
+        clear_bonus_calc_flow(context)
+        clear_faq_search_flow(context, drop_query=False)
+        query_text = (context.chat_data.get(FAQ_SEARCH_QUERY) or "").strip()
+        if not query_text:
+            context.chat_data[WAITING_FAQ_SEARCH] = True
+            await q.edit_message_text(
+                "🔎 Напишите слово или фразу для поиска по FAQ.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отмена", callback_data="help:faq")]
+                ]),
+            )
+            return
+        try:
+            page = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            page = 0
+        text, keyboard = build_help_faq_search_page(query_text, page)
         await q.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
@@ -13099,6 +13319,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+    # ---------------- FAQ SEARCH FLOW ----------------
+    if context.chat_data.get(WAITING_FAQ_SEARCH):
+        query_text = (text or "").strip()
+        if len(query_text) < 2:
+            await update.message.reply_text(
+                "Введите минимум 2 символа для поиска."
+            )
+            return
+
+        context.chat_data[WAITING_FAQ_SEARCH] = False
+        context.chat_data[FAQ_SEARCH_QUERY] = query_text
+        result_text, result_keyboard = build_help_faq_search_page(query_text, 0)
+        await update.message.reply_text(
+            result_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=result_keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
+
         # ---------------- FAQ ADD FLOW ----------------
     if context.chat_data.get(WAITING_FAQ_Q):
         context.chat_data[WAITING_FAQ_Q] = False
@@ -13127,13 +13368,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         db_faq_add(q_html, a_html)
         await update.message.reply_text(
-            "✅ Вопрос добавлен в FAQ и появился в таблице «Ответы на вопросы».",
-            reply_markup=kb_help_settings(),
-        )
-        return
-        db_faq_add(q_text, a_text)
-        await update.message.reply_text(
-            "✅ Вопрос добавлен в FAQ и появился в таблице «Ответы на вопросы».",
+            "✅ Вопрос добавлен в FAQ и появился в разделе «Ответы на вопросы».",
             reply_markup=kb_help_settings(),
         )
         return
