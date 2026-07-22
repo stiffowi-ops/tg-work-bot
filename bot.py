@@ -3532,11 +3532,6 @@ WAITING_TEST_AVGSCORE_PID = "waiting_test_avgscore_pid"
 
 
 
-# bonus calculator (FAQ)
-WAITING_BONUS_CALC = "waiting_bonus_calc"
-BONUS_STEP = "bonus_step"
-BONUS_DATA = "bonus_data"
-
 # achievements award flow
 ACH_WIZ_ACTIVE = "ach_wiz_active"
 ACH_WIZ_STEP = "ach_wiz_step"
@@ -3668,11 +3663,6 @@ def clear_regular_meeting_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(REGULAR_MEETING_STEP, None)
     context.user_data.pop(REGULAR_MEETING_DATA, None)
 
-
-def clear_bonus_calc_flow(context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data[WAITING_BONUS_CALC] = False
-    context.chat_data.pop(BONUS_STEP, None)
-    context.chat_data.pop(BONUS_DATA, None)
 
 
 # ---------------- DUE RULES ----------------
@@ -4017,7 +4007,7 @@ def kb_help_main(is_admin_user: bool, unread_count: int = 0):
             InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links"),
         ],
         [
-            InlineKeyboardButton("❓ FAQ и калькулятор", callback_data="help:faq"),
+            InlineKeyboardButton("❓ FAQ", callback_data="help:faq"),
             InlineKeyboardButton("💡 Предложка", callback_data="help:suggest"),
         ],
     ]
@@ -4590,10 +4580,6 @@ def build_help_faq_menu() -> tuple[str, InlineKeyboardMarkup]:
         [InlineKeyboardButton(
             "🔎 Найти ответ",
             callback_data="help:faq:search",
-        )],
-        [InlineKeyboardButton(
-            "🧮 Калькулятор премии",
-            callback_data="help:faq:bonus",
         )],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
@@ -8820,7 +8806,6 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:faq":
-        clear_bonus_calc_flow(context)
         clear_faq_search_flow(context)
         text, keyboard = build_help_faq_menu()
         await q.edit_message_text(
@@ -8836,7 +8821,6 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or data.startswith("help:faq:answers:")
         or data.startswith("help:faq:page:")  # старые сообщения
     ):
-        clear_bonus_calc_flow(context)
         clear_faq_search_flow(context)
         try:
             page = int(data.rsplit(":", 1)[-1])
@@ -8853,15 +8837,13 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:faq:search":
-        clear_bonus_calc_flow(context)
         clear_faq_search_flow(context)
         context.chat_data[WAITING_FAQ_SEARCH] = True
         await q.edit_message_text(
             "🔎 <b>Поиск по FAQ</b>\n\n"
             "Напишите слово или фразу. Поиск выполняется одновременно "
             "по вопросам и ответам.\n\n"
-            "Например: <code>РОС</code>, <code>SaaS</code> или "
-            "<code>калькулятор премии</code>.",
+            "Например: <code>РОС</code>.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Отмена", callback_data="help:faq")]
@@ -8871,7 +8853,6 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "help:faq:search_results" or data.startswith("help:faq:search_results:"):
-        clear_bonus_calc_flow(context)
         clear_faq_search_flow(context, drop_query=False)
         query_text = (context.chat_data.get(FAQ_SEARCH_QUERY) or "").strip()
         if not query_text:
@@ -8896,22 +8877,6 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-
-    if data == "help:faq:bonus":
-        clear_bonus_calc_flow(context)
-        context.chat_data[WAITING_BONUS_CALC] = True
-        context.chat_data[BONUS_STEP] = 1
-        context.chat_data[BONUS_DATA] = {}
-
-        await q.message.reply_text(
-            "🧮 <b>Калькулятор премии</b>\n\n"
-            "Требования к премии:\n• Минимальный порог — <b>80%</b> плана\n• Максимальный порог — <b>200%</b> плана\n\nШаг 1/2: введите <b>оклад</b> (например: 40 000)",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")]
-            ]),
-        )
-        return
 
     if data.startswith("help:faq:item:"):
         parts = data.split(":")
@@ -12649,74 +12614,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data[TEST_WIZ_STEP] = TEST_WIZ_STEP_PICK_PROFILE
             await update.message.reply_text("Шаг 4/5: выберите сотрудников (можно несколько):", reply_markup=kb_pick_profiles_for_test(set(), back_cb="help:settings:test"))
             return
-
-    # ---------------- BONUS CALC (FAQ) ----------------
-    if context.chat_data.get(WAITING_BONUS_CALC):
-        step = int(context.chat_data.get(BONUS_STEP) or 1)
-        data = context.chat_data.get(BONUS_DATA) or {}
-
-        raw = (text or "")
-        raw = raw.replace("\u00A0", " ")  # nbsp
-        raw_num = raw.replace(" ", "").replace(",", ".").strip()
-        try:
-            val = float(raw_num)
-        except Exception:
-            await update.message.reply_text("Не понял число. Введите ещё раз:")
-            return
-
-        if step == 1:
-            if val <= 0:
-                await update.message.reply_text("Оклад должен быть больше 0. Введите ещё раз:")
-                return
-            data["salary"] = val
-            context.chat_data[BONUS_DATA] = data
-            context.chat_data[BONUS_STEP] = 2
-            await update.message.reply_text(
-                "✅ Оклад принят.\n\n"
-                "Шаг 2/2: введите <b>% выполнения плана</b> (например: 100)",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        # step == 2
-        salary = float(data.get("salary") or 0)
-        percent_in = val
-
-        # clamp rules
-        if percent_in < 80:
-            bonus = 0.0
-        else:
-            percent_eff = min(percent_in, 200.0)
-            bonus_gross = (salary / 2.0) * (percent_eff / 100.0)
-            bonus = bonus_gross * 0.87  # 13% tax
-
-        clear_bonus_calc_flow(context)
-
-        def fmt_money(x: float) -> str:
-            if abs(x - round(x)) < 1e-9:
-                return f"{x:,.0f}".replace(",", " ")
-            return f"{x:,.2f}".replace(",", " ")
-
-        note = ""
-        if percent_in > 200:
-            note = "\n\n<b>🔥 Вау, я поражён твоими результатами!</b>\nТак держать — видно, что ты умеешь выходить за рамки!"
-        elif percent_in < 80:
-            note = "\n\n<b>🌱 Каждый результат — это шаг вперёд.</b>\nПродолжай — и всё обязательно получится"
-
-        percent_used = 0.0 if percent_in < 0 else min(percent_in, 200.0)
-
-        await update.message.reply_text(
-            "🧾 <b>Результат</b>\n\n"
-            f"Оклад: <b>{fmt_money(salary)}</b>\n"
-            f"% выполнения (твой показатель): <b>{percent_in:.2f}</b>\n"
-            f"% выполнения (учитываем в расчётах): <b>{percent_used:.2f}</b>\n"
-            f"Премия: <b>{fmt_money(bonus)}</b>"
-            f"{note}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад к FAQ", callback_data="help:faq")],
-            ]),
-        )
 
 
     waiting_user = context.chat_data.get(WAITING_USER_ID)
