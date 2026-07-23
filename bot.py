@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "FAQ-DYNAMIC-CARDS-SEARCH-2026-07-22-V1"
+BUILD_VERSION = "NOTIFICATIONS-AUTO-CLEANUP-2026-07-23-V1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -2887,9 +2887,19 @@ def db_notifications_unread_count(user_id: int | None) -> int:
 
 
 def db_notifications_list(user_id: int, page: int = 0, page_size: int = 8) -> dict:
+    """
+    Возвращает только непрочитанные уведомления.
+
+    Прочитанные записи остаются в БД как техническая история доставки, чтобы
+    одноразовые напоминания не создавались повторно, но в пользовательском
+    разделе «Уведомления» они больше не отображаются.
+    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM notifications WHERE user_id=?", (int(user_id),))
+    cur.execute(
+        "SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0",
+        (int(user_id),),
+    )
     total = int((cur.fetchone() or [0])[0] or 0)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = max(0, min(int(page), total_pages - 1))
@@ -2897,7 +2907,7 @@ def db_notifications_list(user_id: int, page: int = 0, page_size: int = 8) -> di
         """
         SELECT id, notification_type, title, body, callback_data, is_read, created_at
         FROM notifications
-        WHERE user_id=?
+        WHERE user_id=? AND is_read=0
         ORDER BY id DESC
         LIMIT ? OFFSET ?
         """,
@@ -4445,11 +4455,10 @@ def kb_notifications(user_id: int, page: int = 0):
     data = db_notifications_list(int(user_id), page=page, page_size=8)
     rows = []
     for item in data["items"]:
-        marker = "⚪" if item["is_read"] else "🔴"
         title = item["title"] if len(item["title"]) <= 45 else item["title"][:42] + "…"
         rows.append([
             InlineKeyboardButton(
-                f"{marker} {title}",
+                f"🔴 {title}",
                 callback_data=f"help:notifications:open:{item['id']}:{data['page']}",
             )
         ])
@@ -4464,7 +4473,7 @@ def kb_notifications(user_id: int, page: int = 0):
             nav.append(InlineKeyboardButton("▶️", callback_data=f"help:notifications:page:{data['page'] + 1}"))
         rows.append(nav)
     if db_notifications_unread_count(int(user_id)):
-        rows.append([InlineKeyboardButton("✅ Отметить все прочитанными", callback_data="help:notifications:read_all")])
+        rows.append([InlineKeyboardButton("🧹 Прочитать и очистить все", callback_data="help:notifications:read_all")])
     rows.append([InlineKeyboardButton("⬅️ Главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -8793,7 +8802,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "🔔 <b>Уведомления</b>\n\n"
             f"Непрочитанных: <b>{unread}</b>\n"
-            "Откройте уведомление, чтобы отметить его прочитанным.",
+            "После прочтения уведомление автоматически исчезнет из раздела.",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_notifications(user_id, page),
         )
@@ -8850,9 +8859,9 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_id:
             return
         count = db_notifications_mark_all_read(user_id)
-        await q.answer(f"Прочитано: {count}")
+        await q.answer(f"Прочитано и убрано: {count}")
         await q.edit_message_text(
-            "🔔 <b>Уведомления</b>\n\nВсе уведомления отмечены прочитанными.",
+            "🔔 <b>Уведомления</b>\n\nРаздел очищен — непрочитанных уведомлений нет.",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_notifications(user_id, 0),
         )
