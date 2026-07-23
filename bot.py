@@ -1675,6 +1675,29 @@ def db_docs_search(query: str, limit: int = 40) -> list[dict]:
     return _db_doc_rows_to_dicts(rows)
 
 
+def db_docs_search_by_tag(tag_id: int, limit: int = 40) -> list[dict]:
+    """Возвращает документы, у которых выбранный тег назначен явно."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT DISTINCT d.id, d.category_id, d.title, d.description, d.file_id,
+               d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
+               COALESCE(d.updated_at, d.uploaded_at), c.title
+        FROM docs d
+        JOIN doc_categories c ON c.id=d.category_id
+        JOIN doc_tag_links l ON l.doc_id=d.id
+        WHERE l.tag_id=?
+        ORDER BY d.title COLLATE NOCASE ASC
+        LIMIT ?
+        """,
+        (int(tag_id), int(limit)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return _db_doc_rows_to_dicts(rows)
+
+
 def db_docs_new(days: int = 30, limit: int = 40) -> list[dict]:
     threshold = (datetime.utcnow() - timedelta(days=max(1, int(days)))).isoformat()
     con = sqlite3.connect(DB_PATH)
@@ -5022,6 +5045,26 @@ def kb_help_docs_main(is_admin_user: bool):
             [InlineKeyboardButton("🏷 Управление тегами", callback_data="help:docs:admin:tags")],
             [InlineKeyboardButton("🎓 Управление подборками", callback_data="help:docs:admin:collections")],
         ])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_docs_search_tags():
+    """Кнопки доступных тегов для быстрого поиска документов."""
+    tags = db_doc_tags_list()
+    rows = []
+    if tags:
+        tag_buttons = [
+            InlineKeyboardButton(
+                f"#{tag['title']}",
+                callback_data=f"help:docs:search:tag:{int(tag['id'])}",
+            )
+            for tag in tags[:60]
+        ]
+        for index in range(0, len(tag_buttons), 2):
+            rows.append(tag_buttons[index:index + 2])
+    else:
+        rows.append([InlineKeyboardButton("— тегов пока нет —", callback_data="noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:docs")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -9334,6 +9377,27 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_files(cid))
         return
 
+    if data.startswith("help:docs:search:tag:"):
+        try:
+            tag_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await q.answer("Тег не найден.", show_alert=True)
+            return
+        tag = next((item for item in db_doc_tags_list() if item["id"] == tag_id), None)
+        if not tag:
+            await q.answer("Тег не найден.", show_alert=True)
+            return
+        clear_docs_flow(context)
+        items = db_docs_search_by_tag(tag_id)
+        context.user_data[DOCS_RETURN_CB] = "help:docs"
+        await q.edit_message_text(
+            f"🏷 <b>#{escape(tag['title'])}</b>\n\n"
+            f"Найдено документов: <b>{len(items)}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_docs_result_list(items, "— документов с этим тегом нет —"),
+        )
+        return
+
     if data == "help:docs:search":
         clear_docs_flow(context)
         context.chat_data[WAITING_DOC_SEARCH] = True
@@ -9341,9 +9405,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data[WAITING_SINCE_TS] = int(time.time())
         await q.edit_message_text(
             "🔎 <b>Поиск документов</b>\n\n"
-            "Введите название, фразу из описания, категорию или тег.",
+            "Введите название, фразу из описания, категорию или тег.\n\n"
+            "Или выберите тег:",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="help:docs")]]),
+            reply_markup=kb_docs_search_tags(),
         )
         return
 
