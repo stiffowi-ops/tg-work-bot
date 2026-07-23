@@ -1435,9 +1435,10 @@ def db_docs_delete_category_if_empty(category_id: int) -> bool:
         con.close()
         return False
     cur.execute("DELETE FROM doc_categories WHERE id=?", (category_id,))
+    deleted = cur.rowcount > 0
     con.commit()
     con.close()
-    return True
+    return deleted
 
 def db_docs_list_by_category(category_id: int) -> list[tuple[int, str]]:
     con = sqlite3.connect(DB_PATH)
@@ -1466,10 +1467,24 @@ def db_docs_get(doc_id: int):
 def db_docs_add_doc(category_id: int, title: str, description: str | None, file_id: str, file_unique_id: str | None, mime_type: str | None, local_path: str | None) -> int:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
+    now = datetime.utcnow().isoformat()
     cur.execute("""
-        INSERT INTO docs(category_id, title, description, file_id, file_unique_id, mime_type, local_path, uploaded_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (category_id, title.strip(), (description or "").strip() or None, file_id, file_unique_id, mime_type, (local_path or None), datetime.utcnow().isoformat()))
+        INSERT INTO docs(
+            category_id, title, description, file_id, file_unique_id,
+            mime_type, local_path, uploaded_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        category_id,
+        title.strip(),
+        (description or "").strip() or None,
+        file_id,
+        file_unique_id,
+        mime_type,
+        (local_path or None),
+        now,
+        now,
+    ))
     con.commit()
     did = cur.lastrowid
     con.close()
@@ -1538,9 +1553,19 @@ def db_docs_upsert_by_unique(category_id: int, title: str, description: str | No
             cur = con.cursor()
             cur.execute(
                 """UPDATE docs
-                   SET category_id=?, title=?, description=?, file_id=?, mime_type=?, local_path=COALESCE(?, local_path)
+                   SET category_id=?, title=?, description=?, file_id=?, mime_type=?,
+                       local_path=COALESCE(?, local_path), updated_at=?
                    WHERE file_unique_id=?""",
-                (category_id, title.strip(), (description or None), file_id, mime_type, local_path, file_unique_id),
+                (
+                    category_id,
+                    title.strip(),
+                    (description or None),
+                    file_id,
+                    mime_type,
+                    local_path,
+                    datetime.utcnow().isoformat(),
+                    file_unique_id,
+                ),
             )
             con.commit()
             con.close()
@@ -1645,34 +1670,66 @@ def db_docs_list_all(limit: int = 100) -> list[dict]:
     return _db_doc_rows_to_dicts(rows)
 
 
+def _doc_search_tokens(query: str) -> list[str]:
+    """Разбивает запрос на слова и корректно приводит кириллицу к нижнему регистру."""
+    return [
+        token.casefold().lstrip("#")
+        for token in re.findall(r"[^\W_]+", query or "", flags=re.UNICODE)
+        if token.strip("#")
+    ]
+
+
 def db_docs_search(query: str, limit: int = 40) -> list[dict]:
-    q = (query or "").strip()
-    if not q:
+    """
+    Ищет по названию, описанию, категории и связанным тегам.
+
+    SQLite ``NOCASE`` работает только для ASCII, поэтому сравнение выполняется
+    в Python через ``casefold``. Все слова запроса обязательны, что позволяет
+    искать, например, ``отпуск hr`` независимо от порядка слов в карточке.
+    """
+    tokens = _doc_search_tokens(query)
+    if not tokens:
         return []
-    like = f"%{q}%"
+    safe_limit = int(limit)
+    if safe_limit <= 0:
+        return []
+
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
         """
-        SELECT DISTINCT d.id, d.category_id, d.title, d.description, d.file_id,
+        SELECT d.id, d.category_id, d.title, d.description, d.file_id,
                d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
-               COALESCE(d.updated_at, d.uploaded_at), c.title
+               COALESCE(d.updated_at, d.uploaded_at), c.title,
+               COALESCE(GROUP_CONCAT(t.title, ' '), '')
         FROM docs d
         JOIN doc_categories c ON c.id=d.category_id
         LEFT JOIN doc_tag_links l ON l.doc_id=d.id
         LEFT JOIN doc_tags t ON t.id=l.tag_id
-        WHERE d.title LIKE ? COLLATE NOCASE
-           OR COALESCE(d.description, '') LIKE ? COLLATE NOCASE
-           OR c.title LIKE ? COLLATE NOCASE
-           OR COALESCE(t.title, '') LIKE ? COLLATE NOCASE
-        ORDER BY d.title COLLATE NOCASE ASC
-        LIMIT ?
-        """,
-        (like, like, like, like, int(limit)),
+        GROUP BY d.id, d.category_id, d.title, d.description, d.file_id,
+                 d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
+                 d.updated_at, c.title
+        """
     )
     rows = cur.fetchall()
     con.close()
-    return _db_doc_rows_to_dicts(rows)
+
+    matches: list[dict] = []
+    for row in rows:
+        doc = _db_doc_rows_to_dicts([row[:11]])[0]
+        haystack = " ".join(
+            (
+                doc.get("title") or "",
+                doc.get("description") or "",
+                doc.get("category_title") or "",
+                row[11] or "",
+            )
+        ).casefold()
+        if all(token in haystack for token in tokens):
+            matches.append(doc)
+
+    matches.sort(key=lambda item: (str(item.get("title") or "").casefold(), int(item["id"])))
+    return matches[:safe_limit]
 
 
 def db_docs_search_by_tag(tag_id: int, limit: int = 40) -> list[dict]:
@@ -5020,6 +5077,13 @@ def kb_help_docs_files(category_id: int):
     rows.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="help:docs")])
     rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
+
+
+DOCS_RECOMMENDATION_TEXT = (
+    "🔎 Рекомендация\n\n"
+    "Рекомендую воспользоваться поиском — он поможет быстрее найти нужный "
+    "документ в списке по связанным тегам."
+)
 
 
 
@@ -9354,7 +9418,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data[DOCS_RETURN_CB] = "help:docs"
         text = (
             "📚 <b>Документы</b>\n\n"
-            "Поиск, избранное, история просмотров, новые материалы, категории и подборки."
+            "Поиск, избранное, история просмотров, новые материалы, категории и подборки.\n\n"
+            f"{DOCS_RECOMMENDATION_TEXT}"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_help_docs_main(is_adm))
         return
@@ -9405,7 +9470,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data[WAITING_SINCE_TS] = int(time.time())
         await q.edit_message_text(
             "🔎 <b>Поиск документов</b>\n\n"
-            "Введите название, фразу из описания, категорию или тег.\n\n"
+            "Введите название, фразу из описания, категорию или тег.\n"
+            "Поиск учитывает связанные теги и несколько слов в любом порядке.\n\n"
             "Или выберите тег:",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_docs_search_tags(),
