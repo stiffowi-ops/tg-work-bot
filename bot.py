@@ -169,6 +169,13 @@ STORAGE_DIR = os.getenv("STORAGE_DIR", "storage")
 # -------- ACCESS CONTROL --------
 ACCESS_CHAT_ID = -1003399576556
 
+# Пользователи из этого списка получают доступ к обычным функциям бота,
+# даже если не состоят в ACCESS_CHAT_ID. Администраторские права им
+# принудительно не выдаются.
+NON_ADMIN_ACCESS_USER_IDS = {
+    458562748,
+}
+
 NO_ACCESS_TEXT = (
     "🕵️♂️ Еще никогда Штирлиц не был так близок к провалу!\n\n"
     "🚫 Не нашёл Вас в чате — данные вам недоступны!"
@@ -3646,6 +3653,8 @@ async def notify_regular_meeting_change(context: ContextTypes.DEFAULT_TYPE, data
 # ---------------- ADMIN CHECK (scoped) ----------------
 
 async def is_admin_in_chat(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if int(user_id) in NON_ADMIN_ACCESS_USER_IDS:
+        return False
     try:
         member = await context.bot.get_chat_member(chat_id, user_id)
         return member.status in ("administrator", "creator")
@@ -3656,8 +3665,11 @@ async def is_admin_in_chat(chat_id: int, user_id: int, context: ContextTypes.DEF
 
 async def is_member_of_access_chat(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    True если пользователь состоит в ACCESS_CHAT_ID.
+    True, если пользователь состоит в ACCESS_CHAT_ID или получил отдельный
+    пользовательский допуск без прав администратора.
     """
+    if int(user_id) in NON_ADMIN_ACCESS_USER_IDS:
+        return True
     try:
         member = await context.bot.get_chat_member(ACCESS_CHAT_ID, user_id)
         return member.status in ("member", "administrator", "creator")
