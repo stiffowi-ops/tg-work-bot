@@ -3873,6 +3873,7 @@ PROFILE_WIZ_EDIT_PID = "profile_wiz_edit_pid"
 # suggest box flow
 WAITING_SUGGESTION_TEXT = "waiting_suggestion_text"
 SUGGESTION_MODE = "suggestion_mode"  # anon|named
+SUGGESTION_STEP = "suggestion_step"  # mode|text
 
 # broadcast flow
 BCAST_ACTIVE = "bcast_active"
@@ -3962,6 +3963,7 @@ def clear_nomination_flow(context: ContextTypes.DEFAULT_TYPE):
 def clear_suggest_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data[WAITING_SUGGESTION_TEXT] = False
     context.user_data.pop(SUGGESTION_MODE, None)
+    context.user_data.pop(SUGGESTION_STEP, None)
 
 def clear_bcast_tag_waiting(context: ContextTypes.DEFAULT_TYPE):
     context.user_data[WAITING_BCAST_TAG_NAME] = False
@@ -9452,7 +9454,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "💡 <b>Предложка</b>\n\n"
             "Тут ты можешь отправить свой вопрос/предложение/жалобу/просьбу и т.д. 🙂\n\n"
-            "Для этого воспользуйся одним из режимов ниже 👇"
+            "<b>Шаг 1 из 2.</b> Выбери, как отправить сообщение 👇"
         )
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_suggest_modes(), disable_web_page_preview=True)
         return
@@ -9478,9 +9480,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data[WAITING_SUGGESTION_TEXT] = True
         context.user_data[SUGGESTION_MODE] = mode
+        context.user_data[SUGGESTION_STEP] = "text"
 
         await q.edit_message_text(
-            "✍️ <b>Напиши сообщение для тимлида</b>\n\n"
+            "✍️ <b>Шаг 2 из 2. Напиши сообщение для тимлида</b>\n\n"
             "Можно одним сообщением. Я передам его тимлиду\n"
             "Чтобы отменить — нажми «Отмена».",
             parse_mode=ParseMode.HTML,
@@ -13427,7 +13430,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"⏳ Можно отправлять не чаще 1 раза в 5 минут. Попробуйте через ~{mins} мин.")
                 return
 
-        mode = context.user_data.get(SUGGESTION_MODE, "anon")
+        mode = context.user_data.get(SUGGESTION_MODE)
+        if mode not in {"anon", "named"}:
+            # Не отправляем сообщение в случайном режиме, если состояние
+            # формы было очищено или повреждено между двумя шагами.
+            clear_suggest_flow(context)
+            await update.message.reply_text(
+                "⚠️ Не удалось определить режим отправки. "
+                "Откройте «Предложку» заново через /help."
+            )
+            return
         scope_chat_id = get_scope_chat_id(update, context) or ACCESS_CHAT_ID
 
         try:
@@ -14359,15 +14371,15 @@ async def send_suggestion_to_admins(scope_chat_id: int, update: Update, context:
         if not message_html:
             message_html = html_lib.escape(raw_text, quote=False)
 
-    if mode == "anon":
-        sender_line = "От: <b>Анонимно</b>"
-    else:
-        user_name_html = html_lib.escape(str(user_name), quote=False)
-        username_html = html_lib.escape(username, quote=False)
-        sender_line = (
-            f"От: <b>{user_name_html}</b> {username_html} "
-            f"(<code>{int(user_id)}</code>)"
-        )
+    # Режим «Анонимно» влияет только на то, что видит сотрудник в интерфейсе.
+    # Администратору всегда показываем реального автора, чтобы он мог
+    # отреагировать на сообщение и при необходимости уточнить детали.
+    user_name_html = html_lib.escape(str(user_name), quote=False)
+    username_html = html_lib.escape(username, quote=False)
+    sender_line = (
+        f"От: <b>{user_name_html}</b> {username_html} "
+        f"(<code>{int(user_id)}</code>)"
+    )
 
     admin_text = (
         f"💡 <b>Предложка</b> ({mode_label})\n"
