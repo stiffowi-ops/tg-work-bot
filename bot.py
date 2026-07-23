@@ -4672,8 +4672,12 @@ def kb_help_docs_categories():
     if not cats:
         rows.append([InlineKeyboardButton("— категорий нет —", callback_data="noop")])
     else:
-        for cid, title in cats:
-            rows.append([InlineKeyboardButton(title, callback_data=f"help:docs:cat:{cid}")])
+        category_buttons = [
+            InlineKeyboardButton(title, callback_data=f"help:docs:cat:{cid}")
+            for cid, title in cats
+        ]
+        for index in range(0, len(category_buttons), 3):
+            rows.append(category_buttons[index:index + 3])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:docs")])
     return InlineKeyboardMarkup(rows)
 
@@ -5004,7 +5008,7 @@ def kb_help_docs_main(is_admin_user: bool):
             InlineKeyboardButton("🕘 Недавние", callback_data="help:docs:recent"),
         ],
         [InlineKeyboardButton("🆕 Новые документы", callback_data="help:docs:new")],
-        [InlineKeyboardButton("📂 Все категории", callback_data="help:docs:categories")],
+        [InlineKeyboardButton("📂 Все документы", callback_data="help:docs:categories")],
         [InlineKeyboardButton("🎓 Подборки", callback_data="help:docs:collections")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ]
@@ -9315,7 +9319,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "help:docs:categories":
         context.user_data[DOCS_RETURN_CB] = "help:docs:categories"
         await q.edit_message_text(
-            "📂 <b>Все категории</b>\n\nВыберите категорию:",
+            "📂 <b>Все документы</b>\n\nВыберите категорию:",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_help_docs_categories(),
         )
