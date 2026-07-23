@@ -21,6 +21,7 @@ from telegram import (
     Update,
     InputMediaPhoto,
     InputMediaVideo,
+    InlineQueryResultCachedDocument,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -31,6 +32,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    InlineQueryHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -154,7 +156,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "CASES-CATALOG-2026-07-23-V2"
+BUILD_VERSION = "CASES-CATALOG-2026-07-23-V3"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -5154,6 +5156,12 @@ def kb_doc_card(doc_id: int, user_id: int | None, back_cb: str = "help:docs"):
     fav = db_doc_is_favorite(user_id, doc_id)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 Получить файл", callback_data=f"help:docs:download:{doc_id}")],
+        [
+            InlineKeyboardButton(
+                "🤝 Поделиться с коллегой",
+                switch_inline_query=f"doc:{int(doc_id)}",
+            )
+        ],
         [InlineKeyboardButton("★ Убрать из избранного" if fav else "⭐ В избранное", callback_data=f"help:docs:favorite:{doc_id}")],
         [InlineKeyboardButton("⬅️ Назад к списку", callback_data=back_cb)],
         [InlineKeyboardButton("🏠 Документы", callback_data="help:docs")],
@@ -5311,6 +5319,66 @@ def build_doc_card_text(doc: dict) -> str:
     if description:
         text += f"\n\n{escape(description)}"
     return text
+
+
+async def inline_query_documents(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """
+    Отдаёт документ в inline-режиме Telegram.
+
+    Пользователь сам выбирает чат и отправляет результат, поэтому в
+    переписке отправителем будет его аккаунт (Telegram может добавить
+    пометку ``via @bot``). Бот лишь предоставляет cached document result.
+    """
+    inline_query = update.inline_query
+    if not inline_query:
+        return
+
+    if not inline_query.from_user or not await is_member_of_access_chat(
+        inline_query.from_user.id,
+        context,
+    ):
+        await inline_query.answer([], cache_time=0, is_personal=True)
+        return
+
+    raw_query = (inline_query.query or "").strip()
+    if not raw_query.startswith("doc:"):
+        return
+
+    try:
+        doc_id = int(raw_query.split(":", 1)[1])
+    except (TypeError, ValueError):
+        await inline_query.answer([], cache_time=0, is_personal=True)
+        return
+
+    doc = db_docs_get(doc_id)
+    if not doc:
+        await inline_query.answer([], cache_time=0, is_personal=True)
+        return
+
+    caption = f"📄 <b>{escape(doc['title'])}</b>"
+    if doc.get("description"):
+        caption += f"\n\n{escape(doc['description'])}"
+
+    result = InlineQueryResultCachedDocument(
+        id=f"document-{doc_id}",
+        title=str(doc.get("title") or "Документ")[:128],
+        document_file_id=doc["file_id"],
+        description=str(doc.get("description") or "")[:256],
+        caption=caption[:1024],
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        await inline_query.answer(
+            [result],
+            cache_time=0,
+            is_personal=True,
+        )
+    except Exception:
+        logger.exception("Failed to answer inline document query for doc %s", doc_id)
+
 
 # -------- LINKS (описание) --------
 
@@ -9559,6 +9627,48 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=kb_doc_card(doc_id, update.effective_user.id if update.effective_user else None, back_cb),
             disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:docs:share:"):
+        parts = data.split(":")
+        try:
+            doc_id = int(parts[3])
+        except (IndexError, TypeError, ValueError):
+            await q.answer("Некорректный документ.", show_alert=True)
+            return
+        doc = db_docs_get(doc_id)
+        if not doc:
+            await q.answer("Документ не найден.", show_alert=True)
+            return
+        await q.edit_message_text(
+            f"🤝 <b>Поделиться документом</b>\n\n"
+            f"Документ: <b>{escape(doc['title'])}</b>\n\n"
+            "Нажмите кнопку ниже, выберите чат и отправьте файл. "
+            "Сообщение будет отправлено от вашего аккаунта, а не от бота:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🤝 Выбрать чат в Telegram",
+                        switch_inline_query=f"doc:{int(doc_id)}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⬅️ К документу",
+                        callback_data=f"help:docs:open:{int(doc_id)}",
+                    )
+                ],
+            ]),
+        )
+        return
+
+    if data.startswith("help:docs:share_to:"):
+        await q.answer(
+            "Используйте кнопку «Выбрать чат в Telegram», "
+            "чтобы отправить документ от своего аккаунта.",
+            show_alert=True,
         )
         return
 
@@ -21802,6 +21912,9 @@ def main():
 
     # callbacks: help
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^(help:|noop)"))
+
+    # inline sharing: result is sent to the selected chat by the user
+    app.add_handler(InlineQueryHandler(inline_query_documents))
 
     # employee chat membership sync + welcome
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
