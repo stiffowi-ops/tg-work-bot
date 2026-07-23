@@ -6151,6 +6151,14 @@ ACTIVE_TEST_MULTI_SELECTED = "active_test_multi_selected"  # dict[qid] -> set[in
 EMPLOYEE_TEST_FINISH_TEXT = "✅ Отлично. Тест пройден. Результаты сообщит твой руководитель."
 EMPLOYEE_TEST_EXPIRED_TEXT = "⏳ Время на тестирование истекло.\n\n" + EMPLOYEE_TEST_FINISH_TEXT
 
+# Для каждого назначения сотруднику доступна ровно одна попытка. Повторное
+# прохождение появляется только после нового назначения администратором.
+TEST_MAX_ATTEMPTS = 1
+TEST_RETAKE_POLICY_TEXT = (
+    "Доступна только одна попытка. После завершения тест нельзя пройти повторно; "
+    "новая попытка появится только после повторного назначения администратором."
+)
+
 def clear_test_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.user_data[TEST_WIZ_ACTIVE] = False
     context.user_data.pop(TEST_WIZ_STEP, None)
@@ -6309,17 +6317,24 @@ def db_test_update_assignment_start(aid: int, deadline_at_iso: str | None):
     cur = con.cursor()
     cur.execute(
         """UPDATE test_assignments
-             SET status='in_progress', started_at=?, deadline_at=?, current_idx=0
-             WHERE id=?""",
+             SET status='in_progress', started_at=COALESCE(started_at,?), deadline_at=COALESCE(deadline_at,?),
+                 current_idx=CASE WHEN status='assigned' THEN 0 ELSE current_idx END
+             WHERE id=? AND status IN ('assigned', 'in_progress')""",
         (_now_iso(), deadline_at_iso, int(aid)),
     )
+    ok = cur.rowcount > 0
     con.commit()
     con.close()
+    return ok
 
 def db_test_update_assignment_progress(aid: int, current_idx: int):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("UPDATE test_assignments SET current_idx=? WHERE id=?", (int(current_idx), int(aid)))
+    cur.execute(
+        "UPDATE test_assignments SET current_idx=? "
+        "WHERE id=? AND status IN ('assigned', 'in_progress', 'saved')",
+        (int(current_idx), int(aid)),
+    )
     con.commit()
     con.close()
 
@@ -6346,6 +6361,14 @@ def db_test_save_answer(assignment_id: int, question_id: int, answer_obj: dict, 
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
+        "SELECT status FROM test_assignments WHERE id=?",
+        (int(assignment_id),),
+    )
+    status_row = cur.fetchone()
+    if not status_row or status_row[0] not in ("assigned", "in_progress", "saved"):
+        con.close()
+        return False
+    cur.execute(
         """INSERT INTO test_answers(assignment_id, question_id, answer_json, is_correct, answered_at)
              VALUES(?, ?, ?, ?, ?)
              ON CONFLICT(assignment_id, question_id) DO UPDATE SET
@@ -6356,6 +6379,7 @@ def db_test_save_answer(assignment_id: int, question_id: int, answer_obj: dict, 
     )
     con.commit()
     con.close()
+    return True
 
 def db_test_list_recent_results(limit: int = 20) -> list[dict]:
     con = sqlite3.connect(DB_PATH)
@@ -8567,6 +8591,16 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Этот тест назначен другому сотруднику.", show_alert=True)
             return
 
+        # Старые уведомления могли содержать прямую ссылку `test:start`.
+        # Она не должна возвращать сотрудника в уже завершённое назначение.
+        if a.get("status") not in ("assigned", "in_progress"):
+            await q.answer(
+                "Этот тест уже завершён или недоступен. Новая попытка возможна "
+                "только после повторного назначения администратором.",
+                show_alert=True,
+            )
+            return
+
         # deadline check (assigned but already expired is rare)
         if await _expire_assignment_if_needed(a, context):
             clear_active_test(context)
@@ -8578,7 +8612,12 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         deadline_iso = None
         if a.get("time_limit_sec"):
             deadline_iso = (datetime.utcnow() + timedelta(seconds=int(a["time_limit_sec"]))).isoformat()
-        db_test_update_assignment_start(aid, deadline_iso)
+        if not db_test_update_assignment_start(aid, deadline_iso):
+            await q.answer(
+                "Этот тест уже завершён или недоступен.",
+                show_alert=True,
+            )
+            return
         context.user_data[ACTIVE_TEST_ASSIGNMENT_ID] = aid
         context.user_data[ACTIVE_TEST_MULTI_SELECTED] = {}
         a = db_test_get_assignment(aid)
@@ -8592,6 +8631,14 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qid = int(parts[3])
     a = db_test_get_assignment(aid)
     if not a:
+        return
+
+    if a.get("status") not in ("in_progress", "assigned"):
+        await q.answer(
+            "Этот тест уже завершён или недоступен. Новая попытка возможна "
+            "только после повторного назначения администратором.",
+            show_alert=True,
+        )
         return
 
     # deadline check
@@ -8770,6 +8817,21 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_notification_mark_read(notification_id, user_id)
         rows = []
         callback_data = (item.get("callback_data") or "").strip()
+        # Старые записи центра уведомлений вели напрямую в `test:start`.
+        # Перенаправляем их на информационную карточку назначения: карточка
+        # сама покажет кнопку только для реально назначенного/незавершённого
+        # теста и никогда не запускает повторное прохождение.
+        if callback_data.startswith("test:start:"):
+            try:
+                legacy_aid = int(callback_data.rsplit(":", 1)[-1])
+            except (TypeError, ValueError):
+                legacy_aid = 0
+            legacy_assignment = db_test_get_assignment(legacy_aid) if legacy_aid else None
+            callback_data = (
+                f"help:testv2:myopen:{legacy_aid}"
+                if legacy_assignment
+                else ""
+            )
         if callback_data.startswith(("help:", "test:")) and len(callback_data.encode("utf-8")) <= 64:
             rows.append([InlineKeyboardButton("➡️ Перейти", callback_data=callback_data)])
         rows.append([InlineKeyboardButton("⬅️ К уведомлениям", callback_data=f"help:notifications:page:{page}")])
@@ -11434,21 +11496,22 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         notify_text = (
                             f"📝 Назначен тест: {title}\n"
                             f"⏱ Длительность: {duration_text}\n\n"
-                            "Результаты теста покажут твою подкованность в данной тематике 💪"
-                            "Нажми кнопку ниже, чтобы начать."
+                            "Результаты теста покажут твою подкованность в данной тематике 💪\n"
+                            f"{TEST_RETAKE_POLICY_TEXT}"
                         )
+                        assignment_callback = f"help:testv2:myopen:{aid}"
                         await context.bot.send_message(
                             chat_id=tg_user_id,
                             text=notify_text,
-                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Начать тест", callback_data=f"test:start:{aid}")]]),
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Открыть назначение", callback_data=assignment_callback)]]),
                             disable_web_page_preview=True,
                         )
                         db_notification_add(
                             tg_user_id,
                             "test_assigned",
                             f"Назначен тест: {title}",
-                            f"Длительность: {duration_text}",
-                            callback_data=f"test:start:{aid}",
+                            f"Длительность: {duration_text}. {TEST_RETAKE_POLICY_TEXT}",
+                            callback_data=assignment_callback,
                         )
                         ok = True
                     except Exception:
@@ -14561,13 +14624,13 @@ def tv2_fmt_dt(value: str | None) -> str:
 def tv2_template_defaults(mode: str) -> dict:
     if mode == "learning":
         return {
-            "passing_score": 70, "max_attempts": 99, "scoring_policy": "best",
+            "passing_score": 70, "max_attempts": TEST_MAX_ATTEMPTS, "scoring_policy": "best",
             "result_mode": "all", "test_mode": "learning", "shuffle_questions": 0,
             "shuffle_options": 0, "allow_back": 1, "allow_skip": 1,
             "immediate_feedback": 1,
         }
     return {
-        "passing_score": 80, "max_attempts": 1, "scoring_policy": "last",
+        "passing_score": 80, "max_attempts": TEST_MAX_ATTEMPTS, "scoring_policy": "last",
         "result_mode": "score", "test_mode": "exam", "shuffle_questions": 1,
         "shuffle_options": 1, "allow_back": 0, "allow_skip": 0,
         "immediate_feedback": 0,
@@ -14826,7 +14889,12 @@ def tv2_create_assignment(template_id: int, profile_id: int, assigned_by: int | 
             indexes = list(range(len(q.get("options") or [])))
             random.shuffle(indexes)
             option_orders[str(q["id"])] = indexes
-    group = attempt_group or f"{profile_id}-{template_id}-{int(time.time())}-{random.randint(1000,9999)}"
+    # Ретрай не создаётся из пользовательского потока. Новый assignment
+    # всегда является отдельным администраторским назначением с одной попыткой.
+    attempt_no = TEST_MAX_ATTEMPTS
+    attempt_group = None
+    parent_assignment_id = None
+    group = f"{profile_id}-{template_id}-{int(time.time())}-{random.randint(1000,9999)}"
     now = datetime.utcnow().isoformat()
     with tv2_connect() as con:
         cur = con.execute(
@@ -14837,7 +14905,7 @@ def tv2_create_assignment(template_id: int, profile_id: int, assigned_by: int | 
                    option_order_json, flagged_json
                ) VALUES(?,?,?,?,?,NULL,'assigned',0,?,?,?,?,?,?,?,?)""",
             (int(template_id), int(profile_id), assigned_by, now, time_limit_sec,
-             due_at, int(attempt_no), group, parent_assignment_id, "none",
+             due_at, TEST_MAX_ATTEMPTS, group, None, "none",
              _safe_json_dumps(order), _safe_json_dumps(option_orders), _safe_json_dumps([])),
         )
         return int(cur.lastrowid)
@@ -14891,6 +14959,12 @@ def tv2_save_answer(aid: int, qid: int, answer: dict, is_correct: int | None,
                     awarded_points: float | None, review_status: str = "auto"):
     now = datetime.utcnow().isoformat()
     with tv2_connect() as con:
+        status_row = con.execute(
+            "SELECT status FROM test_assignments WHERE id=?",
+            (int(aid),),
+        ).fetchone()
+        if not status_row or status_row[0] not in ("assigned", "in_progress", "saved"):
+            return False
         con.execute(
             """INSERT INTO test_answers(
                    assignment_id, question_id, answer_json, is_correct, answered_at,
@@ -14907,39 +14981,53 @@ def tv2_save_answer(aid: int, qid: int, answer: dict, is_correct: int | None,
         )
         con.execute("INSERT INTO test_attempt_events(assignment_id,event_type,payload_json,created_at) VALUES(?,?,?,?)",
                     (int(aid), "answer_saved", _safe_json_dumps({"question_id": qid}), now))
+    return True
 
 
 def tv2_set_current(aid: int, idx: int):
     with tv2_connect() as con:
-        con.execute("UPDATE test_assignments SET current_idx=? WHERE id=?", (max(0, int(idx)), int(aid)))
+        con.execute(
+            "UPDATE test_assignments SET current_idx=? "
+            "WHERE id=? AND status IN ('assigned','in_progress','saved')",
+            (max(0, int(idx)), int(aid)),
+        )
 
 
 def tv2_toggle_flag(aid: int, qid: int) -> bool:
     a = tv2_get_assignment(aid)
+    if not a or a.get("status") not in ("assigned", "in_progress", "saved"):
+        return False
     flags = set(int(x) for x in _safe_json_loads((a or {}).get("flagged_json"), []))
     if int(qid) in flags:
         flags.remove(int(qid)); active = False
     else:
         flags.add(int(qid)); active = True
     with tv2_connect() as con:
-        con.execute("UPDATE test_assignments SET flagged_json=? WHERE id=?", (_safe_json_dumps(sorted(flags)), int(aid)))
+        con.execute(
+            "UPDATE test_assignments SET flagged_json=? "
+            "WHERE id=? AND status IN ('assigned','in_progress','saved')",
+            (_safe_json_dumps(sorted(flags)), int(aid)),
+        )
     return active
 
 
 def tv2_start_assignment(aid: int):
     a = tv2_get_assignment(aid)
     if not a:
-        return
+        return False
+    if a.get("status") not in ("assigned", "in_progress", "saved"):
+        return False
     deadline = None
     if a.get("time_limit_sec"):
         deadline = (datetime.utcnow() + timedelta(seconds=int(a["time_limit_sec"]))).isoformat()
     with tv2_connect() as con:
-        con.execute(
+        cur = con.execute(
             """UPDATE test_assignments SET status='in_progress',
                    started_at=COALESCE(started_at,?), deadline_at=COALESCE(deadline_at,?)
                WHERE id=? AND status IN ('assigned','saved','in_progress')""",
             (datetime.utcnow().isoformat(), deadline, int(aid)),
         )
+        return cur.rowcount > 0
 
 
 def tv2_is_expired(a: dict) -> bool:
@@ -15050,19 +15138,14 @@ def tv2_attempts_summary(a: dict) -> dict:
 
 
 def tv2_can_retry(a: dict) -> bool:
-    if a.get("status") not in ("finished", "expired"):
-        return False
-    return int(a.get("attempt_no") or 1) < int(a.get("max_attempts") or 1)
+    # Повторное прохождение возможно только через новое назначение администратором.
+    return False
 
 
 def tv2_create_retry(aid: int, user_id: int | None) -> int | None:
-    a = tv2_get_assignment(aid)
-    if not a or not tv2_can_retry(a):
-        return None
-    return tv2_create_assignment(int(a["template_id"]), int(a["profile_id"]), user_id,
-                                 a.get("due_at"), a.get("time_limit_sec"),
-                                 int(a.get("attempt_no") or 1) + 1,
-                                 a.get("attempt_group"), int(aid))
+    # Оставляем функцию для совместимости со старыми callback_data, но никогда
+    # не создаём пользовательский retry.
+    return None
 
 
 def tv2_my_tests(profile_id: int, status_filter: str = "all", page: int = 0):
@@ -15101,7 +15184,7 @@ def tv2_result_text(aid: int) -> str:
         lines.append(f"Проходной балл: <b>{int(a.get('passing_score') or 70)}%</b>")
         lines.append("Статус: " + ("✅ успешно пройден" if calc["passed"] else "❌ не пройден"))
     summary = tv2_attempts_summary(a)
-    lines.append(f"Попытка: <b>{int(a.get('attempt_no') or 1)} из {int(a.get('max_attempts') or 1)}</b>")
+    lines.append(f"Попытка: <b>{TEST_MAX_ATTEMPTS} из {TEST_MAX_ATTEMPTS}</b>")
     if summary.get("final") is not None:
         policy_names = {"best": "лучший", "last": "последний", "average": "средний"}
         lines.append(f"Зачётный результат ({policy_names.get(a.get('scoring_policy'),'лучший')}): <b>{summary['final']:.0f}%</b>")
@@ -15188,7 +15271,7 @@ def tv2_template_text(tid: int) -> str:
         f"Режим: <b>{escape(str(mode))}</b>\n"
         f"Вопросов: <b>{len(qs)}</b>\n"
         f"Проходной балл: <b>{int(t.get('passing_score') or 70)}%</b>\n"
-        f"Попыток: <b>{int(t.get('max_attempts') or 1)}</b>\n"
+        f"Попыток: <b>{TEST_MAX_ATTEMPTS}</b>\n"
         f"Зачёт: <b>{escape(str(t.get('scoring_policy') or 'best'))}</b>\n"
         f"Показывать результат: <b>{escape(str(result_mode))}</b>\n"
         f"Перемешивать вопросы: <b>{'да' if int(t.get('shuffle_questions') or 0) else 'нет'}</b>\n"
@@ -15224,7 +15307,6 @@ def tv2_kb_settings(tid: int):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"Режим: {t.get('test_mode','exam')}", callback_data=f"help:testv2:set:mode:{tid}")],
         [InlineKeyboardButton(f"Проходной: {int(t.get('passing_score') or 70)}%", callback_data=f"help:testv2:set:passing:{tid}")],
-        [InlineKeyboardButton(f"Попыток: {int(t.get('max_attempts') or 1)}", callback_data=f"help:testv2:set:attempts:{tid}")],
         [InlineKeyboardButton(f"Зачёт: {t.get('scoring_policy','best')}", callback_data=f"help:testv2:set:policy:{tid}")],
         [InlineKeyboardButton(f"Результаты: {t.get('result_mode','errors')}", callback_data=f"help:testv2:set:result:{tid}")],
         [InlineKeyboardButton(f"{yn(t.get('shuffle_questions'))} Перемешивать вопросы", callback_data=f"help:testv2:toggle:shuffleq:{tid}")],
@@ -15306,7 +15388,8 @@ def tv2_my_open_text(a: dict) -> str:
           f"Время на сам тест: <b>{duration}</b>\n"
           f"Пройти до: <b>{escape(tv2_fmt_dt(a.get('due_at')))}</b>\n"
           f"Проходной балл: <b>{int(a.get('passing_score') or 70)}%</b>\n"
-          f"Попытка: <b>{int(a.get('attempt_no') or 1)} из {int(a.get('max_attempts') or 1)}</b>")
+          f"Попытка: <b>{TEST_MAX_ATTEMPTS} из {TEST_MAX_ATTEMPTS}</b>\n"
+          f"ℹ️ {escape(TEST_RETAKE_POLICY_TEXT)}")
     if a.get("status") in ("finished","needs_review"):
         text += "\n\n" + tv2_result_text(int(a["id"]))
     return text
@@ -15318,7 +15401,6 @@ def tv2_kb_my_open(a: dict):
     elif a["status"] in ("in_progress","saved"): rows.append([InlineKeyboardButton("⏳ Продолжить",callback_data=f"test:v2:continue:{aid}")])
     if a["status"] in ("finished","needs_review"):
         rows.append([InlineKeyboardButton("📊 Результат",callback_data=f"help:testv2:result:{aid}")])
-    if tv2_can_retry(a): rows.append([InlineKeyboardButton("🔄 Повторить",callback_data=f"test:v2:retry:{aid}")])
     rows.append([InlineKeyboardButton("⬅️ К моим тестам",callback_data="help:testv2:my:all:0")])
     return InlineKeyboardMarkup(rows)
 
@@ -15361,6 +15443,13 @@ def tv2_question_display(a: dict, q: dict, position: int) -> tuple[str, InlineKe
 async def tv2_send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, aid: int, position: int | None = None):
     a=tv2_get_assignment(aid)
     if not a: return
+    if a.get("status") not in ("assigned", "in_progress", "saved"):
+        await context.bot.send_message(
+            update.effective_user.id,
+            "Этот тест уже завершён или недоступен. Новая попытка возможна "
+            "только после повторного назначения администратором.",
+        )
+        return
     if tv2_is_expired(a):
         tv2_mark_expired(aid)
         await context.bot.send_message(update.effective_user.id,"⌛ Время или срок прохождения теста истёк.")
@@ -15464,7 +15553,8 @@ async def tv2_notify_assignment(context, aid: int):
         (
             f"Пройти до: {due_text}. "
             f"Время после запуска: {duration}. "
-            "Тест ещё не начат."
+            "Тест ещё не начат. "
+            f"{TEST_RETAKE_POLICY_TEXT}"
         ),
         callback_data=callback,
     )
@@ -15473,7 +15563,8 @@ async def tv2_notify_assignment(context, aid: int):
         f"📝 Вам назначен новый тест: <b>{escape(assignment['title'])}</b>\n"
         f"⏱ После запуска: <b>{escape(duration)}</b>\n"
         f"📅 Пройти до: <b>{escape(due_text)}</b>\n"
-        f"🎯 Проходной балл: <b>{int(assignment.get('passing_score') or 70)}%</b>"
+        f"🎯 Проходной балл: <b>{int(assignment.get('passing_score') or 70)}%</b>\n"
+        f"ℹ️ {escape(TEST_RETAKE_POLICY_TEXT)}"
     )
     try:
         await context.bot.send_message(
@@ -15559,7 +15650,8 @@ async def tv2_send_reminders(context):
                 notification_title = f"Срочно начните тест: {title}"
                 notification_body = (
                     f"До предельного срока осталось менее 2 часов. "
-                    f"Пройти до: {due_text}. Тест ещё не начат."
+                    f"Пройти до: {due_text}. Тест ещё не начат. "
+                    f"{TEST_RETAKE_POLICY_TEXT}"
                 )
                 message_text = (
                     f"🚨 <b>Вы ещё не приступили к тесту</b>\n\n"
@@ -15583,7 +15675,8 @@ async def tv2_send_reminders(context):
                 notification_title = f"Пора начать тест: {title}"
                 notification_body = (
                     f"До предельного срока осталось менее суток. "
-                    f"Пройти до: {due_text}. Тест ещё не начат."
+                    f"Пройти до: {due_text}. Тест ещё не начат. "
+                    f"{TEST_RETAKE_POLICY_TEXT}"
                 )
                 message_text = (
                     f"⏰ <b>Вы ещё не приступили к тесту</b>\n\n"
@@ -15805,7 +15898,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         choices={
             "mode":[("📚 Обучение","learning"),("🎓 Аттестация","exam"),("⚙️ Свой","custom")],
             "passing":[("60%","60"),("70%","70"),("80%","80"),("90%","90"),("✍️ Ввести","custom")],
-            "attempts":[("1","1"),("2","2"),("3","3"),("Без ограничений","99")],
+            "attempts":[("1","1")],
             "policy":[("Лучший","best"),("Последний","last"),("Средний","average")],
             "result":[("Только балл","score"),("Ошибки","errors"),("Все ответы","all"),("Скрыть","hidden")],
             "time":[("Без ограничения","0"),("10 минут","600"),("20 минут","1200"),("30 минут","1800"),("✍️ Ввести","custom")],
@@ -15822,7 +15915,9 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt="Введите число:" if setting!="time" else "Введите длительность в минутах:"
             await q.edit_message_text(prompt,reply_markup=tv2_kb_cancel(f"help:testv2:settings:{tid}")); return
         col={"mode":"test_mode","passing":"passing_score","attempts":"max_attempts","policy":"scoring_policy","result":"result_mode","time":"default_time_limit_sec"}[setting]
-        value=int(val) if setting in ("passing","attempts","time") else val
+        # Даже старые кнопки/ссылки с values 2, 3 или 99 не могут включить
+        # повторное прохождение.
+        value=(TEST_MAX_ATTEMPTS if setting == "attempts" else int(val)) if setting in ("passing","attempts","time") else val
         with tv2_connect() as con:
             con.execute(f"UPDATE test_templates SET {col}=?, updated_at=? WHERE id=?",(value,datetime.utcnow().isoformat(),tid))
             if setting=="mode" and val in ("learning","exam"):
@@ -16124,13 +16219,26 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not a or not p or int(a["profile_id"])!=int(p["id"]): await q.answer("Тест назначен другому сотруднику",show_alert=True); return
 
     if action in ("start","continue"):
+        if a.get("status") not in ("assigned", "in_progress", "saved"):
+            await q.answer(
+                "Этот тест уже завершён или недоступен. Новая попытка возможна "
+                "только после повторного назначения администратором.",
+                show_alert=True,
+            )
+            return
         if tv2_is_expired(a): tv2_mark_expired(aid); await q.edit_message_text("⌛ Срок теста истёк."); return
-        tv2_start_assignment(aid); tv2_clear(context); await tv2_send_question(update,context,aid); return
+        if not tv2_start_assignment(aid):
+            await q.answer("Этот тест уже завершён или недоступен.", show_alert=True)
+            return
+        tv2_clear(context); await tv2_send_question(update,context,aid); return
 
     if action=="retry":
-        new_id=tv2_create_retry(aid,update.effective_user.id)
-        if not new_id: await q.answer("Повторная попытка недоступна",show_alert=True); return
-        await q.edit_message_text("🔄 Новая попытка создана.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Начать",callback_data=f"test:v2:start:{new_id}")]])); return
+        await q.answer(
+            "Повторное прохождение недоступно. Новая попытка появится только "
+            "после повторного назначения администратором.",
+            show_alert=True,
+        )
+        return
 
     if tv2_is_expired(a): tv2_mark_expired(aid); await q.edit_message_text("⌛ Время теста истекло."); return
     order=tv2_assignment_order(a)
@@ -16252,6 +16360,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state.startswith("custom_"):
         setting=state[len("custom_"):]; tid=int(d["template_id"])
+        if setting == "attempts":
+            tv2_clear(context)
+            await update.message.reply_text(
+                "✅ Для всех тестов доступна только одна попытка.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Настройки", callback_data=f"help:testv2:settings:{tid}")]
+                ]),
+            )
+            return
         try: value=int(text); assert value>=0
         except Exception: await update.message.reply_text("Введите целое неотрицательное число."); return
         col={"passing":"passing_score","time":"default_time_limit_sec"}[setting]
@@ -18023,8 +18140,7 @@ def tv2_result_text(aid: int) -> str:
         lines.append("Статус: " + ("✅ успешно пройден" if calc["passed"] else "❌ не пройден"))
     summary = tv2_attempts_summary(assignment)
     lines.append(
-        f"Попытка: <b>{int(assignment.get('attempt_no') or 1)} "
-        f"из {int(assignment.get('max_attempts') or 1)}</b>"
+        f"Попытка: <b>{TEST_MAX_ATTEMPTS} из {TEST_MAX_ATTEMPTS}</b>"
     )
     if assignment.get("status") == "finished" and summary.get("final") is not None:
         names = {"best": "лучший", "last": "последний", "average": "средний"}
@@ -18093,7 +18209,7 @@ def tv2_template_text(tid: int) -> str:
         f"(1 ответ: {type_counts['single']}, несколько: {type_counts['multi']}, открытые: {type_counts['open']})\n"
         f"Время: <b>{escape(tv3_time_label(template.get('default_time_limit_sec')))}</b>\n"
         f"Проходной балл: <b>{int(template.get('passing_score') or 70)}%</b>\n"
-        f"Попыток: <b>{int(template.get('max_attempts') or 1)}</b>\n"
+        f"Попыток: <b>{TEST_MAX_ATTEMPTS}</b>\n"
         f"Зачёт: <b>{escape(str(template.get('scoring_policy') or 'best'))}</b>\n"
         f"Показывать результат: <b>{escape(str(result_mode))}</b>\n"
         f"Перемешивать вопросы: <b>{'да' if int(template.get('shuffle_questions') or 0) else 'нет'}</b>\n"
@@ -18133,10 +18249,6 @@ def tv2_kb_settings(tid: int):
         [InlineKeyboardButton(
             f"Проходной: {int(template.get('passing_score') or 70)}%",
             callback_data=f"help:testv2:set:passing:{tid}",
-        )],
-        [InlineKeyboardButton(
-            f"Попыток: {int(template.get('max_attempts') or 1)}",
-            callback_data=f"help:testv2:set:attempts:{tid}",
         )],
         [InlineKeyboardButton(
             f"Зачёт: {template.get('scoring_policy','best')}",
@@ -18294,6 +18406,18 @@ async def tv3_notify_result_ready(context, aid: int):
     assignment = tv2_get_assignment(aid)
     if not assignment or not assignment.get("tg_user_id"):
         return
+    calc = tv3_calculation(aid)
+    result_status = "тест пройден" if calc.get("passed") else "тест не пройден"
+    db_notification_add_once(
+        int(assignment["tg_user_id"]),
+        "test_result_ready",
+        f"Результат теста готов: {assignment['title']}",
+        (
+            f"Результат: {calc.get('percent', 0):.0f}%. Статус: {result_status}. "
+            f"{TEST_RETAKE_POLICY_TEXT}"
+        ),
+        callback_data=f"help:testv2:result:{aid}",
+    )
     try:
         await context.bot.send_message(
             int(assignment["tg_user_id"]),
@@ -18856,8 +18980,22 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    mode = tv3_grading_mode(assignment)
     query = update.callback_query
+    if action == "retry" or (
+        action not in ("start", "continue")
+        and assignment.get("status") not in ("assigned", "in_progress", "saved")
+    ):
+        try:
+            await query.answer(
+                "Этот тест уже завершён или недоступен. Новая попытка возможна "
+                "только после повторного назначения администратором.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
+        return
+
+    mode = tv3_grading_mode(assignment)
 
     if action == "single":
         try:
@@ -18958,6 +19096,7 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 """,
                 (datetime.utcnow().isoformat(), int(aid)),
             )
+        await tv3_notify_result_ready(context, aid)
         await tv3_notify_assigned_by(context, aid, "instant")
         await query.edit_message_text(
             tv2_result_text(aid),
@@ -19271,6 +19410,18 @@ def db_init():
     _tv2_add_column(cur, "test_assignments", "admin_deleted_at TEXT")
     _tv2_add_column(cur, "test_questions", "bank_question_id INTEGER")
     _tv2_add_column(cur, "test_question_bank", "deleted_at TEXT")
+
+    # Единая политика: у каждого теста ровно одна попытка. Это также
+    # нормализует старые шаблоны, где раньше были доступны 2/3/99 попыток,
+    # и старые назначения, созданные через прежний retry-поток.
+    cur.execute(
+        "UPDATE test_templates SET max_attempts=? WHERE COALESCE(max_attempts, 1)<>?",
+        (TEST_MAX_ATTEMPTS, TEST_MAX_ATTEMPTS),
+    )
+    cur.execute(
+        "UPDATE test_assignments SET attempt_no=? WHERE COALESCE(attempt_no, 1)<>?",
+        (TEST_MAX_ATTEMPTS, TEST_MAX_ATTEMPTS),
+    )
 
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_test_assign_admin_visible "
