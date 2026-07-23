@@ -156,7 +156,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "CASES-CATALOG-2026-07-23-V4"
+BUILD_VERSION = "CASES-CATALOG-2026-07-23-V3"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -5155,7 +5155,6 @@ def kb_docs_result_list(items: list[dict], empty_text: str = "— докумен
 def kb_doc_card(doc_id: int, user_id: int | None, back_cb: str = "help:docs"):
     fav = db_doc_is_favorite(user_id, doc_id)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👁 Быстрый просмотр", callback_data=f"help:docs:preview:{doc_id}")],
         [InlineKeyboardButton("📥 Получить файл", callback_data=f"help:docs:download:{doc_id}")],
         [
             InlineKeyboardButton(
@@ -5320,120 +5319,6 @@ def build_doc_card_text(doc: dict) -> str:
     if description:
         text += f"\n\n{escape(description)}"
     return text
-
-
-DOC_PREVIEW_IMAGE_MAX_BYTES = 10 * 1024 * 1024
-DOC_PREVIEW_VIDEO_MAX_BYTES = 50 * 1024 * 1024
-
-
-def _doc_preview_kind(doc: dict) -> str:
-    mime = str(doc.get("mime") or "").casefold()
-    title = str(doc.get("title") or "")
-    local_path = str(doc.get("local_path") or "")
-    suffix = Path(local_path or title).suffix.casefold()
-
-    if mime == "application/pdf" or suffix == ".pdf":
-        return "document"
-    if (
-        (mime.startswith("image/") and mime not in {"image/svg+xml", "image/tiff"})
-        or suffix in {".jpg", ".jpeg", ".png", ".webp"}
-    ):
-        return "image"
-    if (
-        (mime.startswith("video/") and mime in {"video/mp4", "video/quicktime", "video/webm"})
-        or suffix in {".mp4", ".mov", ".m4v", ".webm"}
-    ):
-        return "video"
-    return "document"
-
-
-def _doc_preview_caption(doc: dict) -> str:
-    caption = f"👁 <b>Быстрый просмотр</b>\n\n📄 <b>{escape(doc['title'])}</b>"
-    if doc.get("description"):
-        caption += f"\n\n{escape(doc['description'])}"
-    return caption[:1024]
-
-
-async def _doc_preview_source(
-    context: ContextTypes.DEFAULT_TYPE,
-    doc: dict,
-    max_bytes: int,
-):
-    local_path = Path(str(doc.get("local_path") or ""))
-    if local_path.is_file():
-        try:
-            if local_path.stat().st_size <= max_bytes:
-                source = local_path.open("rb")
-                return source
-        except OSError:
-            logger.warning("Cannot read local preview for document %s", doc.get("id"))
-
-    # Старые карточки могут не иметь local_path — попробуем получить копию
-    # из Telegram только для небольших медиа, пригодных для inline-просмотра.
-    try:
-        tg_file = await context.bot.get_file(doc["file_id"])
-        source = io.BytesIO()
-        download_to_memory = getattr(tg_file, "download_to_memory", None)
-        if not download_to_memory:
-            return None
-        await download_to_memory(out=source)
-        source.seek(0, io.SEEK_END)
-        if source.tell() > max_bytes:
-            source.close()
-            return None
-        source.seek(0)
-        try:
-            source.name = str(doc.get("title") or "preview")
-        except (AttributeError, TypeError):
-            pass
-        return source
-    except Exception:
-        logger.exception("Cannot download preview for document %s", doc.get("id"))
-        return None
-
-
-async def send_doc_preview(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    doc: dict,
-):
-    """Показывает медиа inline, а PDF/прочие документы отправляет как файл."""
-    kind = _doc_preview_kind(doc)
-    caption = _doc_preview_caption(doc)
-    if kind == "image":
-        source = await _doc_preview_source(context, doc, DOC_PREVIEW_IMAGE_MAX_BYTES)
-        if source:
-            try:
-                return await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=source,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )
-            finally:
-                source.close()
-    elif kind == "video":
-        source = await _doc_preview_source(context, doc, DOC_PREVIEW_VIDEO_MAX_BYTES)
-        if source:
-            try:
-                return await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=source,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    supports_streaming=True,
-                )
-            finally:
-                source.close()
-
-    # Telegram-клиент умеет открыть PDF и другие документы из сообщения
-    # без отдельной логики для форматов, поэтому оставляем file_id.
-    return await context.bot.send_document(
-        chat_id=chat_id,
-        document=doc["file_id"],
-        caption=caption,
-        parse_mode=ParseMode.HTML,
-    )
 
 
 async def inline_query_documents(
@@ -9785,29 +9670,6 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "чтобы отправить документ от своего аккаунта.",
             show_alert=True,
         )
-        return
-
-    if data.startswith("help:docs:preview:"):
-        try:
-            doc_id = int(data.split(":")[-1])
-        except (TypeError, ValueError):
-            await q.answer("Некорректный документ.", show_alert=True)
-            return
-        doc = db_docs_get(doc_id)
-        if not doc:
-            await q.answer("Документ не найден.", show_alert=True)
-            return
-        if not update.effective_chat:
-            await q.answer("Чат для просмотра недоступен.", show_alert=True)
-            return
-
-        db_doc_record_view(update.effective_user.id if update.effective_user else None, doc_id)
-        try:
-            await send_doc_preview(context, update.effective_chat.id, doc)
-            await q.answer("Предпросмотр отправлен")
-        except Exception:
-            logger.exception("Document preview failed for doc %s", doc_id)
-            await q.answer("Не удалось открыть быстрый просмотр.", show_alert=True)
         return
 
     if data.startswith("help:docs:download:"):
