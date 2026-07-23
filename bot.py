@@ -20423,6 +20423,18 @@ CASES_CATEGORY_DEFS = [
 CASES_CATEGORY_LABELS = dict(CASES_CATEGORY_DEFS)
 
 
+def _cases_category_options() -> list[tuple[str, str]]:
+    """Возвращает отрасли в порядке убывания длины названия."""
+    return sorted(
+        (
+            (key, label)
+            for key, label in CASES_CATEGORY_DEFS
+            if key != "all"
+        ),
+        key=lambda item: (-len(item[1]), item[1].casefold()),
+    )
+
+
 def _case(
     case_id: str,
     company: str,
@@ -20837,13 +20849,14 @@ def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
             )
         ]
     )
-    category_buttons = [
-        InlineKeyboardButton(label, callback_data=f"help:cases:cat:{key}:0")
-        for key, label in CASES_CATEGORY_DEFS
-        if key != "all"
-    ]
-    for index in range(0, len(category_buttons), 2):
-        rows.append(category_buttons[index:index + 2])
+    # Выводим по одной кнопке в строке: так длинные названия не ломают
+    # сетку и порядок сверху вниз хорошо считывается.
+    rows.extend(
+        [
+            [InlineKeyboardButton(label, callback_data=f"help:cases:cat:{key}:0")]
+            for key, label in _cases_category_options()
+        ]
+    )
     rows.extend(
         [
             [InlineKeyboardButton("🔎 Поиск по кейсам", callback_data="help:cases:search")],
@@ -20874,9 +20887,7 @@ def cases_menu_text(user_id: int | None = None) -> str:
 def kb_cases_industry_picker(user_id: int | None = None) -> InlineKeyboardMarkup:
     selected_key = db_case_get_industry(user_id)
     rows = []
-    for key, label in CASES_CATEGORY_DEFS:
-        if key == "all":
-            continue
+    for key, label in _cases_category_options():
         prefix = "✅ " if key == selected_key else ""
         rows.append(
             [
