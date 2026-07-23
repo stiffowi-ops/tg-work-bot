@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import asyncio
 import os
 import re
 import random
@@ -156,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "CASES-CATALOG-2026-07-23-V3"
+BUILD_VERSION = "DOCS-SEARCH-INDEX-2026-07-23-V4"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -166,6 +167,17 @@ INDUSTRY_ZOOM_URL = os.getenv("INDUSTRY_ZOOM_URL")  # отраслевая
 DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH", "bot.db")
 
 STORAGE_DIR = os.getenv("STORAGE_DIR", "storage")
+
+# Полнотекстовый индекс документов. Текст ограничивается по размеру, чтобы
+# очень большие файлы не раздували SQLite. OCR по умолчанию распознаёт русский
+# и английский; язык можно переопределить через DOC_OCR_LANG.
+DOC_INDEX_MAX_CHARS = max(10_000, int(os.getenv("DOC_INDEX_MAX_CHARS", "1000000")))
+DOC_OCR_LANG = os.getenv("DOC_OCR_LANG", "rus+eng")
+DOC_OCR_MAX_PAGES = max(1, int(os.getenv("DOC_OCR_MAX_PAGES", "50")))
+DOC_OCR_MAX_IMAGES = max(1, int(os.getenv("DOC_OCR_MAX_IMAGES", "50")))
+DOCS_SEARCH_PAGE_SIZE = 8
+DOC_INDEX_CONCURRENCY = max(1, int(os.getenv("DOC_INDEX_CONCURRENCY", "2")))
+DOC_INDEX_SEMAPHORE = asyncio.Semaphore(DOC_INDEX_CONCURRENCY)
 
 
 # -------- ACCESS CONTROL --------
@@ -642,6 +654,30 @@ def db_init():
         pass
     cur.execute("UPDATE docs SET updated_at=uploaded_at WHERE updated_at IS NULL OR updated_at='' ")
 
+    # Извлечённый текст и состояние полнотекстовой индексации. Для старых баз
+    # новые колонки автоматически получают pending и индексируются в фоне.
+    try:
+        cur.execute("ALTER TABLE docs ADD COLUMN content_text TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE docs ADD COLUMN content_index_status TEXT NOT NULL DEFAULT 'pending'")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE docs ADD COLUMN content_indexed_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE docs ADD COLUMN content_index_error TEXT")
+    except sqlite3.OperationalError:
+        pass
+    cur.execute(
+        """UPDATE docs
+           SET content_index_status='pending'
+           WHERE content_index_status IS NULL OR content_index_status=''"""
+    )
+
     # ------- DOCUMENTS: теги, избранное, история и подборки -------
     cur.execute("""
         CREATE TABLE IF NOT EXISTS doc_tags (
@@ -698,6 +734,7 @@ def db_init():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_uploaded_at ON docs(uploaded_at DESC)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_doc_views_user_time ON doc_views(user_id, last_viewed_at DESC)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_content_status ON docs(content_index_status)")
 
     # ------- HELP MENU: FAQ -------
     cur.execute("""
@@ -1556,7 +1593,9 @@ def db_docs_upsert_by_unique(category_id: int, title: str, description: str | No
             cur.execute(
                 """UPDATE docs
                    SET category_id=?, title=?, description=?, file_id=?, mime_type=?,
-                       local_path=COALESCE(?, local_path), updated_at=?
+                       local_path=COALESCE(?, local_path), updated_at=?,
+                       content_text=NULL, content_index_status='pending',
+                       content_indexed_at=NULL, content_index_error=NULL
                    WHERE file_unique_id=?""",
                 (
                     category_id,
@@ -1681,9 +1720,9 @@ def _doc_search_tokens(query: str) -> list[str]:
     ]
 
 
-def db_docs_search(query: str, limit: int = 40) -> list[dict]:
+def db_docs_search(query: str, limit: int = 500) -> list[dict]:
     """
-    Ищет по названию, описанию, категории и связанным тегам.
+    Ищет по названию, описанию, категории, тегам и содержимому файла.
 
     SQLite ``NOCASE`` работает только для ASCII, поэтому сравнение выполняется
     в Python через ``casefold``. Все слова запроса обязательны, что позволяет
@@ -1703,7 +1742,8 @@ def db_docs_search(query: str, limit: int = 40) -> list[dict]:
         SELECT d.id, d.category_id, d.title, d.description, d.file_id,
                d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
                COALESCE(d.updated_at, d.uploaded_at), c.title,
-               COALESCE(GROUP_CONCAT(t.title, ' '), '')
+               COALESCE(GROUP_CONCAT(t.title, ' '), ''),
+               COALESCE(d.content_text, '')
         FROM docs d
         JOIN doc_categories c ON c.id=d.category_id
         LEFT JOIN doc_tag_links l ON l.doc_id=d.id
@@ -1725,6 +1765,7 @@ def db_docs_search(query: str, limit: int = 40) -> list[dict]:
                 doc.get("description") or "",
                 doc.get("category_title") or "",
                 row[11] or "",
+                row[12] or "",
             )
         ).casefold()
         if all(token in haystack for token in tokens):
@@ -1734,7 +1775,7 @@ def db_docs_search(query: str, limit: int = 40) -> list[dict]:
     return matches[:safe_limit]
 
 
-def db_docs_search_by_tag(tag_id: int, limit: int = 40) -> list[dict]:
+def db_docs_search_by_tag(tag_id: int, limit: int = 500) -> list[dict]:
     """Возвращает документы, у которых выбранный тег назначен явно."""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -2004,7 +2045,9 @@ def db_doc_replace_file(
     cur.execute(
         """
         UPDATE docs
-        SET file_id=?, file_unique_id=?, mime_type=?, local_path=?, updated_at=?
+        SET file_id=?, file_unique_id=?, mime_type=?, local_path=?, updated_at=?,
+            content_text=NULL, content_index_status='pending',
+            content_indexed_at=NULL, content_index_error=NULL
         WHERE id=?
         """,
         (
@@ -2020,6 +2063,522 @@ def db_doc_replace_file(
     con.commit()
     con.close()
     return ok
+
+
+def db_doc_set_local_path(doc_id: int, local_path: str) -> None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("UPDATE docs SET local_path=? WHERE id=?", (local_path, int(doc_id)))
+    con.commit()
+    con.close()
+
+
+def db_doc_set_content_index(
+    doc_id: int,
+    content_text: str | None,
+    status: str,
+    error: str | None = None,
+) -> None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE docs
+        SET content_text=?, content_index_status=?, content_indexed_at=?,
+            content_index_error=?
+        WHERE id=?
+        """,
+        (
+            (content_text or None),
+            status,
+            datetime.utcnow().isoformat(),
+            (error or "")[:1000] or None,
+            int(doc_id),
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def db_docs_pending_content_index(limit: int = 10) -> list[dict]:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, file_id, file_unique_id, mime_type, local_path, title
+        FROM docs
+        WHERE content_index_status='pending'
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return [
+        {
+            "id": int(row[0]),
+            "file_id": row[1],
+            "file_unique_id": row[2],
+            "mime": row[3],
+            "local_path": row[4],
+            "title": row[5],
+        }
+        for row in rows
+    ]
+
+
+def _normalize_document_text(text: str) -> str:
+    value = (text or "").replace("\x00", " ")
+    value = re.sub(r"[ \t\f\v]+", " ", value)
+    value = re.sub(r"\s*\n\s*", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value).strip()
+    return value[:DOC_INDEX_MAX_CHARS]
+
+
+def _xml_visible_text(data: bytes) -> str:
+    """Извлекает пользовательский текст из XML внутри Office-файла."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(data)
+    chunks: list[str] = []
+    text_tags = {"t", "instrText", "delText"}
+    break_tags = {"p", "tr", "br", "cr"}
+    for element in root.iter():
+        local_name = element.tag.rsplit("}", 1)[-1]
+        if local_name in text_tags and element.text:
+            chunks.append(element.text)
+        elif local_name == "tab":
+            chunks.append("\t")
+        elif local_name in break_tags:
+            chunks.append("\n")
+    return _normalize_document_text(" ".join(chunks))
+
+
+def _ocr_pil_image(image) -> tuple[str, str | None]:
+    """OCR PIL-изображения: сначала pytesseract, затем системный tesseract."""
+    languages = [DOC_OCR_LANG]
+    if DOC_OCR_LANG != "eng":
+        languages.append("eng")
+
+    package_error = None
+    try:
+        import pytesseract
+
+        for language in languages:
+            try:
+                value = pytesseract.image_to_string(image, lang=language)
+                if value and value.strip():
+                    return value, None
+            except Exception as exc:
+                package_error = str(exc)
+    except Exception as exc:
+        package_error = str(exc)
+
+    try:
+        import subprocess
+
+        image_buffer = io.BytesIO()
+        image.save(image_buffer, format="PNG")
+        last_error = package_error
+        for language in languages:
+            result = subprocess.run(
+                ["tesseract", "stdin", "stdout", "-l", language],
+                input=image_buffer.getvalue(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+                check=False,
+            )
+            if result.returncode == 0:
+                value = result.stdout.decode("utf-8", errors="ignore")
+                if value.strip():
+                    return value, None
+            last_error = result.stderr.decode("utf-8", errors="ignore").strip() or last_error
+        return "", last_error or "Tesseract не вернул текст"
+    except Exception as exc:
+        return "", package_error or str(exc)
+
+
+def _ocr_image_blobs(blobs: list[bytes]) -> tuple[str, list[str]]:
+    if not blobs:
+        return "", []
+    errors: list[str] = []
+    parts: list[str] = []
+    try:
+        from PIL import Image
+    except Exception as exc:
+        return "", [f"OCR недоступен: {exc}"]
+
+    for blob in blobs[:DOC_OCR_MAX_IMAGES]:
+        try:
+            with Image.open(io.BytesIO(blob)) as image:
+                value, ocr_error = _ocr_pil_image(image)
+            if value and value.strip():
+                parts.append(value)
+            elif ocr_error:
+                errors.append(ocr_error)
+        except Exception as exc:
+            errors.append(str(exc))
+    return _normalize_document_text("\n".join(parts)), errors
+
+
+def _extract_docx_text(path: Path) -> tuple[str, bool, list[str]]:
+    errors: list[str] = []
+    parts: list[str] = []
+    ocr_used = False
+    with zipfile.ZipFile(path, "r") as zf:
+        names = zf.namelist()
+        xml_names = [
+            name
+            for name in names
+            if name == "word/document.xml"
+            or (
+                name.startswith("word/")
+                and name.endswith(".xml")
+                and any(key in name for key in ("header", "footer", "footnotes", "endnotes", "comments"))
+            )
+        ]
+        for name in sorted(xml_names):
+            try:
+                value = _xml_visible_text(zf.read(name))
+                if value:
+                    parts.append(value)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+
+        # Документы-сканы часто состоят только из изображений. OCR запускается
+        # лишь при отсутствии нормального текстового слоя.
+        text = _normalize_document_text("\n".join(parts))
+        if len(text) < 100:
+            image_blobs = [
+                zf.read(name)
+                for name in names
+                if name.startswith("word/media/") and not name.endswith("/")
+            ]
+            ocr_text, ocr_errors = _ocr_image_blobs(image_blobs)
+            errors.extend(ocr_errors)
+            if ocr_text:
+                parts.append(ocr_text)
+                ocr_used = True
+    return _normalize_document_text("\n".join(parts)), ocr_used, errors
+
+
+def _extract_xlsx_text(path: Path) -> tuple[str, bool, list[str]]:
+    import xml.etree.ElementTree as ET
+
+    errors: list[str] = []
+    parts: list[str] = []
+    ocr_used = False
+    with zipfile.ZipFile(path, "r") as zf:
+        names = zf.namelist()
+        shared_strings: list[str] = []
+        if "xl/sharedStrings.xml" in names:
+            try:
+                root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+                for item in root.iter():
+                    if item.tag.rsplit("}", 1)[-1] != "si":
+                        continue
+                    value = " ".join(
+                        node.text or ""
+                        for node in item.iter()
+                        if node.tag.rsplit("}", 1)[-1] == "t"
+                    ).strip()
+                    shared_strings.append(value)
+            except Exception as exc:
+                errors.append(f"sharedStrings.xml: {exc}")
+
+        for name in sorted(n for n in names if n.startswith("xl/worksheets/") and n.endswith(".xml")):
+            try:
+                root = ET.fromstring(zf.read(name))
+                parts.append(Path(name).stem)
+                for cell in root.iter():
+                    if cell.tag.rsplit("}", 1)[-1] != "c":
+                        continue
+                    cell_type = cell.attrib.get("t", "")
+                    raw_value = None
+                    inline_values: list[str] = []
+                    formula = None
+                    for node in cell.iter():
+                        local_name = node.tag.rsplit("}", 1)[-1]
+                        if local_name == "v":
+                            raw_value = node.text
+                        elif local_name == "t" and node.text:
+                            inline_values.append(node.text)
+                        elif local_name == "f" and node.text:
+                            formula = node.text
+                    if cell_type == "s" and raw_value is not None:
+                        try:
+                            parts.append(shared_strings[int(raw_value)])
+                        except (IndexError, TypeError, ValueError):
+                            pass
+                    elif inline_values:
+                        parts.append(" ".join(inline_values))
+                    elif raw_value is not None:
+                        parts.append(raw_value)
+                    if formula:
+                        parts.append(formula)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+
+        text = _normalize_document_text("\n".join(parts))
+        if len(text) < 100:
+            image_blobs = [
+                zf.read(name)
+                for name in names
+                if name.startswith("xl/media/") and not name.endswith("/")
+            ]
+            ocr_text, ocr_errors = _ocr_image_blobs(image_blobs)
+            errors.extend(ocr_errors)
+            if ocr_text:
+                parts.append(ocr_text)
+                ocr_used = True
+    return _normalize_document_text("\n".join(parts)), ocr_used, errors
+
+
+def _extract_pdf_text(path: Path) -> tuple[str, bool, list[str]]:
+    errors: list[str] = []
+    parts: list[str] = []
+    page_count = 0
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(path))
+        page_count = len(reader.pages)
+        for page in reader.pages:
+            try:
+                value = page.extract_text() or ""
+                if value.strip():
+                    parts.append(value)
+            except Exception as exc:
+                errors.append(f"PDF page: {exc}")
+    except Exception as exc:
+        errors.append(f"PDF text layer: {exc}")
+
+    text = _normalize_document_text("\n".join(parts))
+    minimum_text = max(80, min(page_count or 1, DOC_OCR_MAX_PAGES) * 20)
+    if len(text) < minimum_text:
+        # pdftotext — дополнительный fallback для окружений без pypdf.
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["pdftotext", "-layout", str(path), "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+                check=False,
+            )
+            if result.returncode == 0:
+                cli_text = result.stdout.decode("utf-8", errors="ignore")
+                if cli_text.strip():
+                    text = _normalize_document_text(f"{text}\n{cli_text}")
+            else:
+                errors.append(result.stderr.decode("utf-8", errors="ignore").strip())
+        except Exception as exc:
+            errors.append(f"pdftotext: {exc}")
+    if len(text) >= minimum_text:
+        return text, False, errors
+
+    # Если текстового слоя нет или он почти пустой, рендерим страницы и
+    # распознаём изображения. При отсутствии Python-обвязки используем
+    # системные pdftoppm и tesseract.
+    try:
+        last_page = min(page_count or DOC_OCR_MAX_PAGES, DOC_OCR_MAX_PAGES)
+        try:
+            from pdf2image import convert_from_path
+
+            images = convert_from_path(
+                str(path),
+                dpi=200,
+                first_page=1,
+                last_page=last_page,
+            )
+        except Exception:
+            import subprocess
+            import tempfile
+            from PIL import Image
+
+            with tempfile.TemporaryDirectory(prefix="doc_ocr_") as tmp_dir:
+                output_prefix = str(Path(tmp_dir) / "page")
+                render_error = "pdftoppm недоступен"
+                rendered = False
+                executables = ["pdftoppm"]
+                if Path("/usr/bin/pdftoppm").exists():
+                    executables.append("/usr/bin/pdftoppm")
+                for executable in dict.fromkeys(executables):
+                    try:
+                        result = subprocess.run(
+                            [
+                                executable, "-png", "-r", "200",
+                                "-f", "1", "-l", str(last_page),
+                                str(path), output_prefix,
+                            ],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            timeout=300,
+                            check=False,
+                        )
+                        if result.returncode == 0:
+                            rendered = True
+                            break
+                        render_error = result.stderr.decode("utf-8", errors="ignore").strip() or render_error
+                    except Exception as exc:
+                        render_error = str(exc)
+                if not rendered:
+                    raise RuntimeError(render_error)
+                images = []
+                for image_path in sorted(Path(tmp_dir).glob("page-*.png")):
+                    with Image.open(image_path) as image:
+                        images.append(image.copy())
+
+        ocr_parts: list[str] = []
+        for image in images:
+            value, ocr_error = _ocr_pil_image(image)
+            if value and value.strip():
+                ocr_parts.append(value)
+            elif ocr_error:
+                errors.append(ocr_error)
+        ocr_text = _normalize_document_text("\n".join(ocr_parts))
+        if ocr_text:
+            return _normalize_document_text(f"{text}\n{ocr_text}"), True, errors
+    except Exception as exc:
+        errors.append(f"PDF OCR: {exc}")
+    return text, False, errors
+
+
+def extract_document_text(local_path: str, mime_type: str | None) -> tuple[str, str, str | None]:
+    """Возвращает (текст, статус, диагностическая ошибка) для поискового индекса."""
+    path = Path(local_path)
+    if not path.exists() or not path.is_file():
+        return "", "pending", "Локальный файл пока недоступен"
+
+    suffix = path.suffix.casefold()
+    mime = (mime_type or "").casefold()
+    errors: list[str] = []
+    ocr_used = False
+    try:
+        if suffix == ".pdf" or mime == "application/pdf":
+            text, ocr_used, errors = _extract_pdf_text(path)
+        elif suffix == ".docx" or "wordprocessingml.document" in mime:
+            text, ocr_used, errors = _extract_docx_text(path)
+        elif suffix == ".xlsx" or "spreadsheetml.sheet" in mime:
+            text, ocr_used, errors = _extract_xlsx_text(path)
+        elif suffix in {".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".html", ".htm"} or mime.startswith("text/"):
+            text = path.read_text(encoding="utf-8-sig", errors="ignore")
+        else:
+            return "", "unsupported", None
+    except Exception as exc:
+        return "", "error", str(exc)
+
+    text = _normalize_document_text(text)
+    error_text = "; ".join(errors[:5]) or None
+    if text:
+        return text, ("indexed_ocr" if ocr_used else "indexed"), error_text
+    return "", "empty", error_text
+
+
+def index_document_content(doc_id: int, local_path: str, mime_type: str | None) -> str:
+    text, status, error = extract_document_text(local_path, mime_type)
+    db_doc_set_content_index(doc_id, text, status, error)
+    if error:
+        logger.warning("Document index diagnostic: doc_id=%s status=%s error=%s", doc_id, status, error)
+    return status
+
+
+def _doc_index_file_suffix(mime_type: str | None, local_path: str | None = None) -> str:
+    if local_path and Path(local_path).suffix:
+        return Path(local_path).suffix
+    mime = (mime_type or "").casefold()
+    if mime == "application/pdf":
+        return ".pdf"
+    if "wordprocessingml.document" in mime:
+        return ".docx"
+    if "spreadsheetml.sheet" in mime:
+        return ".xlsx"
+    return ".bin"
+
+
+async def _index_document_for_search_unlocked(
+    context: ContextTypes.DEFAULT_TYPE,
+    doc_id: int,
+    local_path: str | None,
+    mime_type: str | None,
+    file_id: str | None = None,
+) -> str:
+    """Гарантирует локальную копию и индексирует документ вне event loop."""
+    resolved_path = local_path
+    if not resolved_path or not Path(resolved_path).exists():
+        if not file_id:
+            db_doc_set_content_index(doc_id, None, "unavailable", "Нет локальной копии и Telegram file_id")
+            return "unavailable"
+        try:
+            suffix = _doc_index_file_suffix(mime_type, local_path)
+            resolved_path = str(Path(STORAGE_DIR) / "docs" / f"index_{int(doc_id)}{suffix}")
+            tg_file = await context.bot.get_file(file_id)
+            await tg_file.download_to_drive(custom_path=resolved_path)
+            db_doc_set_local_path(doc_id, resolved_path)
+        except Exception as exc:
+            logger.exception("Cannot download document for indexing: doc_id=%s", doc_id)
+            return "pending"
+    return await asyncio.to_thread(index_document_content, int(doc_id), resolved_path, mime_type)
+
+
+async def index_document_for_search(
+    context: ContextTypes.DEFAULT_TYPE,
+    doc_id: int,
+    local_path: str | None,
+    mime_type: str | None,
+    file_id: str | None = None,
+) -> str:
+    async with DOC_INDEX_SEMAPHORE:
+        return await _index_document_for_search_unlocked(
+            context,
+            doc_id,
+            local_path,
+            mime_type,
+            file_id,
+        )
+
+
+def schedule_document_index(
+    context: ContextTypes.DEFAULT_TYPE,
+    doc_id: int,
+    local_path: str | None,
+    mime_type: str | None,
+    file_id: str | None,
+) -> None:
+    context.application.create_task(
+        index_document_for_search(context, doc_id, local_path, mime_type, file_id),
+        name=f"document-index:{int(doc_id)}",
+    )
+
+
+async def job_index_pending_documents(context: ContextTypes.DEFAULT_TYPE):
+    """Небольшими пачками индексирует старые и недавно добавленные документы."""
+    items = db_docs_pending_content_index(limit=20)
+    if not items:
+        return
+    results = await asyncio.gather(
+        *[
+            index_document_for_search(
+                context,
+                int(item["id"]),
+                item.get("local_path"),
+                item.get("mime"),
+                item.get("file_id"),
+            )
+            for item in items
+        ],
+        return_exceptions=True,
+    )
+    for item, result in zip(items, results):
+        if isinstance(result, Exception):
+            logger.error(
+                "Background document indexing failed: doc_id=%s error=%s",
+                item["id"],
+                result,
+            )
 
 
 def db_doc_collections_list() -> list[dict]:
@@ -3833,6 +4392,7 @@ WAITING_DOC_REPLACE_ID = "waiting_doc_replace_id"
 WAITING_DOC_TAG_NAME = "waiting_doc_tag_name"
 WAITING_DOC_COLLECTION_NAME = "waiting_doc_collection_name"
 DOCS_RETURN_CB = "docs_return_cb"
+DOCS_SEARCH_STATE = "docs_search_state"
 
 
 # faq add flow
@@ -5090,7 +5650,7 @@ def kb_help_docs_files(category_id: int):
 DOCS_RECOMMENDATION_TEXT = (
     "🔎 Рекомендация\n\n"
     "Рекомендую воспользоваться поиском — он поможет быстрее найти нужный "
-    "документ в списке по связанным тегам."
+    "документ по названию, тегам и тексту внутри PDF, DOCX или XLSX."
 )
 
 
@@ -5138,6 +5698,133 @@ def kb_docs_search_tags():
         rows.append([InlineKeyboardButton("— тегов пока нет —", callback_data="noop")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:docs")])
     return InlineKeyboardMarkup(rows)
+
+
+def set_docs_search_state(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    query: str = "",
+    filters_state: dict | None = None,
+    page: int = 0,
+) -> dict:
+    state = {
+        "query": (query or "").strip()[:300],
+        "filters": dict(filters_state or {}),
+        "page": max(0, int(page)),
+    }
+    context.user_data[DOCS_SEARCH_STATE] = state
+    return state
+
+
+def get_docs_search_state(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    raw = context.user_data.get(DOCS_SEARCH_STATE)
+    if not isinstance(raw, dict):
+        return None
+    filters_state = raw.get("filters")
+    if not isinstance(filters_state, dict):
+        filters_state = {}
+    try:
+        page = max(0, int(raw.get("page") or 0))
+    except (TypeError, ValueError):
+        page = 0
+    return {
+        "query": str(raw.get("query") or "").strip()[:300],
+        "filters": filters_state,
+        "page": page,
+    }
+
+
+def _docs_search_items_from_state(state: dict) -> list[dict]:
+    query = (state.get("query") or "").strip()
+    filters_state = state.get("filters") or {}
+    try:
+        tag_id = int(filters_state.get("tag_id")) if filters_state.get("tag_id") is not None else None
+    except (TypeError, ValueError):
+        tag_id = None
+
+    if query:
+        items = db_docs_search(query)
+        if tag_id is not None:
+            tagged_ids = {int(item["id"]) for item in db_docs_search_by_tag(tag_id)}
+            items = [item for item in items if int(item["id"]) in tagged_ids]
+        return items
+    if tag_id is not None:
+        return db_docs_search_by_tag(tag_id)
+    return []
+
+
+def kb_docs_search_result_list(items: list[dict], page: int, total_pages: int):
+    start = page * DOCS_SEARCH_PAGE_SIZE
+    page_items = items[start:start + DOCS_SEARCH_PAGE_SIZE]
+    rows = []
+    if not page_items:
+        rows.append([InlineKeyboardButton("— ничего не найдено —", callback_data="noop")])
+    else:
+        for item in page_items:
+            title = str(item.get("title") or "Документ")
+            category = str(item.get("category_title") or "")
+            label = f"📄 {title}"
+            if category:
+                label += f" · {category}"
+            if len(label) > 60:
+                label = label[:57] + "…"
+            rows.append([
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"help:docs:open:{int(item['id'])}",
+                )
+            ])
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"help:docs:search:results:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f"help:docs:search:results:{page + 1}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔎 Новый поиск", callback_data="help:docs:search")])
+    rows.append([InlineKeyboardButton("🏠 Документы", callback_data="help:docs")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_docs_search_results(
+    context: ContextTypes.DEFAULT_TYPE,
+    requested_page: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    state = get_docs_search_state(context)
+    if not state:
+        return (
+            "⌛ <b>Результаты поиска больше не сохранены</b>\n\nЗапустите поиск ещё раз.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔎 Новый поиск", callback_data="help:docs:search")],
+                [InlineKeyboardButton("🏠 Документы", callback_data="help:docs")],
+            ]),
+        )
+
+    items = _docs_search_items_from_state(state)
+    total_pages = max(1, (len(items) + DOCS_SEARCH_PAGE_SIZE - 1) // DOCS_SEARCH_PAGE_SIZE)
+    page = state["page"] if requested_page is None else max(0, int(requested_page))
+    page = min(page, total_pages - 1)
+    state["page"] = page
+    context.user_data[DOCS_SEARCH_STATE] = state
+    context.user_data[DOCS_RETURN_CB] = f"help:docs:search:results:{page}"
+
+    query = state.get("query") or ""
+    filters_state = state.get("filters") or {}
+    filter_lines = []
+    if query:
+        filter_lines.append(f"Запрос: <code>{escape(query[:80])}</code>")
+    if filters_state.get("tag_title"):
+        filter_lines.append(f"Тег: <b>#{escape(str(filters_state['tag_title']))}</b>")
+    criteria = "\n".join(filter_lines) or "Все документы"
+    page_line = f"\nСтраница: <b>{page + 1}/{total_pages}</b>" if items else ""
+    text = (
+        "🔎 <b>Результаты поиска</b>\n\n"
+        f"{criteria}\n"
+        f"Найдено: <b>{len(items)}</b>{page_line}"
+    )
+    return text, kb_docs_search_result_list(items, page, total_pages)
 
 
 def kb_docs_result_list(items: list[dict], empty_text: str = "— документов нет —", back_cb: str = "help:docs"):
@@ -9494,6 +10181,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "help:docs":
         clear_docs_flow(context)
+        context.user_data.pop(DOCS_SEARCH_STATE, None)
         context.user_data[DOCS_RETURN_CB] = "help:docs"
         text = (
             "📚 <b>Документы</b>\n\n"
@@ -9532,25 +10220,45 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Тег не найден.", show_alert=True)
             return
         clear_docs_flow(context)
-        items = db_docs_search_by_tag(tag_id)
-        context.user_data[DOCS_RETURN_CB] = "help:docs"
+        set_docs_search_state(
+            context,
+            filters_state={"tag_id": tag_id, "tag_title": tag["title"]},
+            page=0,
+        )
+        search_text, search_keyboard = build_docs_search_results(context, 0)
         await q.edit_message_text(
-            f"🏷 <b>#{escape(tag['title'])}</b>\n\n"
-            f"Найдено документов: <b>{len(items)}</b>",
+            search_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_docs_result_list(items, "— документов с этим тегом нет —"),
+            reply_markup=search_keyboard,
+        )
+        return
+
+    if data.startswith("help:docs:search:results:"):
+        try:
+            page = max(0, int(data.rsplit(":", 1)[-1]))
+        except (TypeError, ValueError):
+            page = 0
+        search_text, search_keyboard = build_docs_search_results(context, page)
+        await q.edit_message_text(
+            search_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=search_keyboard,
+            disable_web_page_preview=True,
         )
         return
 
     if data == "help:docs:search":
         clear_docs_flow(context)
+        context.user_data.pop(DOCS_SEARCH_STATE, None)
+        context.user_data[DOCS_RETURN_CB] = "help:docs"
         context.chat_data[WAITING_DOC_SEARCH] = True
         context.chat_data[WAITING_USER_ID] = update.effective_user.id if update.effective_user else None
         context.chat_data[WAITING_SINCE_TS] = int(time.time())
         await q.edit_message_text(
             "🔎 <b>Поиск документов</b>\n\n"
-            "Введите название, фразу из описания, категорию или тег.\n"
-            "Поиск учитывает связанные теги и несколько слов в любом порядке.\n\n"
+            "Введите название, фразу из описания или самого файла, категорию или тег.\n"
+            "Поиск читает содержимое PDF, DOCX и XLSX, учитывает связанные теги "
+            "и несколько слов в любом порядке.\n\n"
             "Или выберите тег:",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_docs_search_tags(),
@@ -12303,6 +13011,13 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
                 return
             new_doc_id = db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
+            schedule_document_index(
+                context,
+                new_doc_id,
+                pending.get("local_path"),
+                pending.get("mime"),
+                pending.get("file_id"),
+            )
             clear_docs_flow(context)
             await q.edit_message_text(
                 "✅ Документ добавлен. Теперь при необходимости назначьте ему теги или добавьте в подборку.",
@@ -12720,7 +13435,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             skipped_docs += 1
                             continue
 
-                        db_docs_upsert_by_unique(
+                        imported_doc_id = db_docs_upsert_by_unique(
                             cid,
                             title=title,
                             description=description,
@@ -12728,6 +13443,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             file_unique_id=file_unique_id,
                             mime_type=mime_type,
                             local_path=local_path,
+                        )
+                        schedule_document_index(
+                            context,
+                            imported_doc_id,
+                            local_path,
+                            mime_type,
+                            file_id,
                         )
                         ok_docs += 1
 
@@ -12906,7 +13628,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     skipped_docs += 1
                     continue
 
-                db_docs_upsert_by_unique(
+                imported_doc_id = db_docs_upsert_by_unique(
                     cid,
                     title=title,
                     description=description,
@@ -12914,6 +13636,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     file_unique_id=file_unique_id,
                     mime_type=mime_type,
                     local_path=local_path,
+                )
+                schedule_document_index(
+                    context,
+                    imported_doc_id,
+                    local_path,
+                    mime_type,
+                    file_id,
                 )
                 ok_docs += 1
                 continue
@@ -12956,6 +13685,14 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc.mime_type,
             local_path,
         )
+        if ok:
+            schedule_document_index(
+                context,
+                int(replace_doc_id),
+                local_path,
+                doc.mime_type,
+                doc.file_id,
+            )
         clear_docs_flow(context)
         await update.message.reply_text(
             "✅ Файл заменён. Название, описание, теги, избранное и подборки сохранены."
@@ -13814,12 +14551,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data[WAITING_DOC_SEARCH] = False
         context.chat_data.pop(WAITING_USER_ID, None)
         context.chat_data.pop(WAITING_SINCE_TS, None)
-        items = db_docs_search(text)
-        context.user_data[DOCS_RETURN_CB] = "help:docs"
+        set_docs_search_state(context, query=text, filters_state={}, page=0)
+        search_text, search_keyboard = build_docs_search_results(context, 0)
         await update.message.reply_text(
-            f"🔎 <b>Результаты поиска</b>\n\nЗапрос: <code>{escape(text[:80])}</code>\nНайдено: <b>{len(items)}</b>",
+            search_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_docs_result_list(items, "— ничего не найдено —"),
+            reply_markup=search_keyboard,
         )
         return
 
@@ -14110,6 +14847,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending = context.chat_data.get(PENDING_DOC_INFO)
         if pending:
             new_doc_id = db_docs_add_doc(cid, pending["title"], pending.get("description"), pending["file_id"], pending["file_unique_id"], pending.get("mime"), pending.get("local_path"))
+            schedule_document_index(
+                context,
+                new_doc_id,
+                pending.get("local_path"),
+                pending.get("mime"),
+                pending.get("file_id"),
+            )
             clear_docs_flow(context)
             await update.message.reply_text(
                 "✅ Категория создана и документ добавлен.",
@@ -21999,6 +22743,12 @@ def main():
 
     # schedule checker
     app.job_queue.run_repeating(check_and_send_jobs, interval=60, first=10, name="meetings_checker")
+    app.job_queue.run_repeating(
+        job_index_pending_documents,
+        interval=2 * 60,
+        first=5,
+        name="document_content_indexer",
+    )
 
     logger.warning(
         "=== BOT BUILD: %s | FILE: %s | DB: %s ===",
