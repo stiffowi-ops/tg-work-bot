@@ -20933,16 +20933,46 @@ def cases_list_text(
     return "\n".join(lines), page, total_pages
 
 
+def cases_my_industry_view(
+    user_id: int | None,
+    page: int = 0,
+    notice: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup] | None:
+    """Рендерит только кейсы сохранённой отрасли без остальных разделов каталога."""
+    selected_key = db_case_get_industry(user_id)
+    if not selected_key:
+        return None
+    label = CASES_CATEGORY_LABELS[selected_key]
+    items = cases_search_items(category_key=selected_key)
+    list_text, page, _ = cases_list_text(
+        items,
+        category_key=selected_key,
+        page=page,
+        heading=f"🎯 <b>Моя отрасль: {escape(label)}</b>",
+    )
+    if notice:
+        list_text = f"{notice}\n\n{list_text}"
+    return list_text, kb_cases_list(
+        items,
+        category_key=selected_key,
+        page=page,
+        industry=True,
+    )
+
+
 def kb_cases_list(
     items: list[dict],
     category_key: str = "all",
     page: int = 0,
     query: str = "",
     favorites: bool = False,
+    industry: bool = False,
 ) -> InlineKeyboardMarkup:
     page_items, page, total_pages = _cases_page(items, page)
     rows = []
-    if favorites:
+    if industry:
+        open_prefix = "help:cases:my_open"
+    elif favorites:
         open_prefix = "help:cases:favorites_open"
     elif query:
         open_prefix = "help:cases:search_open"
@@ -20960,7 +20990,9 @@ def kb_cases_list(
     if total_pages > 1:
         nav = []
         if page > 0:
-            if favorites:
+            if industry:
+                callback = f"help:cases:my_cases:{page - 1}"
+            elif favorites:
                 callback = f"help:cases:favorites:{page - 1}"
             else:
                 callback = (
@@ -20970,7 +21002,9 @@ def kb_cases_list(
             nav.append(InlineKeyboardButton("◀️", callback_data=callback))
         nav.append(InlineKeyboardButton(f"{page + 1} / {total_pages}", callback_data="noop"))
         if page < total_pages - 1:
-            if favorites:
+            if industry:
+                callback = f"help:cases:my_cases:{page + 1}"
+            elif favorites:
                 callback = f"help:cases:favorites:{page + 1}"
             else:
                 callback = (
@@ -20979,16 +21013,24 @@ def kb_cases_list(
                 )
             nav.append(InlineKeyboardButton("▶️", callback_data=callback))
         rows.append(nav)
-    rows.append([InlineKeyboardButton("🔎 Поиск по кейсам", callback_data="help:cases:search")])
-    rows.append([
-        InlineKeyboardButton(
-            "⬅️ К категориям" if favorites or not query else "⬅️ К результатам",
-            callback_data=(
-                "help:cases"
-                if favorites or not query else "help:cases:search_results:0"
-            ),
-        )
-    ])
+    if industry:
+        rows.append([
+            InlineKeyboardButton("🔄 Сменить отрасль", callback_data="help:cases:industry")
+        ])
+        rows.append([
+            InlineKeyboardButton("🧹 Убрать мою отрасль", callback_data="help:cases:industry:clear")
+        ])
+    else:
+        rows.append([InlineKeyboardButton("🔎 Поиск по кейсам", callback_data="help:cases:search")])
+        rows.append([
+            InlineKeyboardButton(
+                "⬅️ К категориям" if favorites or not query else "⬅️ К результатам",
+                callback_data=(
+                    "help:cases"
+                    if favorites or not query else "help:cases:search_results:0"
+                ),
+            )
+        ])
     rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -21071,6 +21113,16 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "help:cases":
         context.user_data[CASES_WAITING_SEARCH] = False
         context.user_data.pop(CASES_SEARCH_QUERY, None)
+        my_industry = cases_my_industry_view(user_id)
+        if my_industry:
+            list_text, markup = my_industry
+            await query.edit_message_text(
+                list_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+            return
         await query.edit_message_text(
             cases_menu_text(user_id),
             parse_mode=ParseMode.HTML,
@@ -21083,6 +21135,17 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data[CASES_WAITING_SEARCH] = False
         selected_key = db_case_get_industry(user_id)
         selected_label = CASES_CATEGORY_LABELS.get(selected_key or "", "")
+        if selected_key:
+            my_industry = cases_my_industry_view(user_id)
+            if my_industry:
+                list_text, markup = my_industry
+                await query.edit_message_text(
+                    list_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+                return
         await query.edit_message_text(
             "🎯 <b>Моя отрасль</b>\n\n"
             + (
@@ -21112,7 +21175,12 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             f"✅ Отрасль сохранена.\n\n{list_text}",
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_cases_list(items, category_key=key, page=page),
+            reply_markup=kb_cases_list(
+                items,
+                category_key=key,
+                page=page,
+                industry=True,
+            ),
             disable_web_page_preview=True,
         )
         return
@@ -21128,7 +21196,7 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    if data == "help:cases:my_cases":
+    if data == "help:cases:my_cases" or data.startswith("help:cases:my_cases:"):
         selected_key = db_case_get_industry(user_id)
         if not selected_key:
             await query.edit_message_text(
@@ -21137,17 +21205,24 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=kb_cases_industry_picker(user_id),
             )
             return
-        label = CASES_CATEGORY_LABELS[selected_key]
-        items = cases_search_items(category_key=selected_key)
-        list_text, page, _ = cases_list_text(
-            items,
-            category_key=selected_key,
-            heading=f"🎯 <b>Моя отрасль: {escape(label)}</b>",
-        )
+        try:
+            page = int(data.rsplit(":", 1)[-1]) if len(data.split(":")) > 3 else 0
+        except (TypeError, ValueError):
+            page = 0
+        my_industry = cases_my_industry_view(user_id, page=page)
+        if not my_industry:
+            await query.edit_message_text(
+                cases_menu_text(user_id),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cases_categories(user_id),
+                disable_web_page_preview=True,
+            )
+            return
+        list_text, markup = my_industry
         await query.edit_message_text(
             list_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_cases_list(items, category_key=selected_key, page=page),
+            reply_markup=markup,
             disable_web_page_preview=True,
         )
         return
@@ -21192,7 +21267,7 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
         case_id = parts[3] if len(parts) > 3 else ""
         source = parts[4] if len(parts) > 4 else ""
         item = CASES_BY_ID.get(case_id)
-        if not item or source not in ("s", "c", "f"):
+        if not item or source not in ("s", "c", "f", "m"):
             await query.answer("Кейс не найден.", show_alert=True)
             return
         if source == "s":
@@ -21209,6 +21284,13 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 page = 0
             back_callback = f"help:cases:favorites:{page}"
             favorite_context = f"f:{page}"
+        elif source == "m":
+            try:
+                page = int(parts[5]) if len(parts) > 5 else 0
+            except (TypeError, ValueError):
+                page = 0
+            back_callback = f"help:cases:my_cases:{page}"
+            favorite_context = f"m:{page}"
         else:
             key = parts[5] if len(parts) > 5 else "all"
             try:
@@ -21231,6 +21313,30 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer(
             "Кейс добавлен в избранное." if marked
             else "Кейс убран из избранного."
+        )
+        return
+
+    if data.startswith("help:cases:my_open:"):
+        parts = data.split(":")
+        case_id = parts[3] if len(parts) > 3 else ""
+        try:
+            page = int(parts[4]) if len(parts) > 4 else 0
+        except (TypeError, ValueError):
+            page = 0
+        item = CASES_BY_ID.get(case_id)
+        if not item:
+            await query.answer("Кейс не найден.", show_alert=True)
+            return
+        await query.edit_message_text(
+            cases_detail_text(item),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_case_detail(
+                item,
+                user_id,
+                f"m:{page}",
+                f"help:cases:my_cases:{page}",
+            ),
+            disable_web_page_preview=True,
         )
         return
 
