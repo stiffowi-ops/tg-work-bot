@@ -154,7 +154,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "NOTIFICATIONS-AUTO-CLEANUP-2026-07-23-V1"
+BUILD_VERSION = "CASES-CATALOG-2026-07-23-V2"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -17065,6 +17065,12 @@ def kb_help_main(is_admin_user: bool, unread_count: int = 0):
         unread_count=unread_count,
     )
     legacy_rows = [list(row) for row in legacy_markup.inline_keyboard]
+    cases_row = [
+        InlineKeyboardButton(
+            "📚 Кейсы",
+            callback_data="help:cases",
+        )
+    ]
     reminder_row = [
         InlineKeyboardButton(
             "⏰ Напоминалка",
@@ -17072,9 +17078,9 @@ def kb_help_main(is_admin_user: bool, unread_count: int = 0):
         )
     ]
 
-    # Ставим длинную кнопку «Напоминалка» непосредственно перед
+    # Ставим длинные кнопки «Кейсы» и «Напоминалка» непосредственно перед
     # администраторской кнопкой «Управление ботом». Для обычного сотрудника,
-    # у которого такой кнопки нет, «Напоминалка» будет последней строкой меню.
+    # у которого такой кнопки нет, они будут последними строками меню.
     settings_row_index = next(
         (
             index
@@ -17088,7 +17094,7 @@ def kb_help_main(is_admin_user: bool, unread_count: int = 0):
     )
     rows = (
         legacy_rows[:settings_row_index]
-        + [reminder_row]
+        + [cases_row, reminder_row]
         + legacy_rows[settings_row_index:]
     )
     return InlineKeyboardMarkup(rows)
@@ -19121,6 +19127,8 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get(CASES_WAITING_SEARCH):
+        return await handle_cases_search_text(update, context)
     state = context.user_data.get(TV2_STATE)
     if not state:
         return await _test_modes_legacy_on_text(update, context)
@@ -20364,8 +20372,607 @@ def _faq_favorites_back_callback(source: str, page: int) -> str:
     return f"help:faq:answers:{max(0, int(page))}"
 
 
+# ===================== CASES CATALOG =====================
+# Снимок публичных карточек со страницы https://yandex.ru/routing/cases.
+# Длинные статьи открываются отдельной URL-кнопкой; для карточек без
+# отдельной статьи используется общий раздел кейсов.
+
+CASES_HOME_URL = "https://yandex.ru/routing/cases"
+CASES_WAITING_SEARCH = "cases_waiting_search"
+CASES_SEARCH_QUERY = "cases_search_query"
+CASES_PAGE_SIZE = 8
+
+CASES_CATEGORY_DEFS = [
+    ("all", "Все кейсы"),
+    ("home", "Дом, ремонт, сад"),
+    ("auto", "Автотовары"),
+    ("alcohol", "Алкоголь и табак"),
+    ("production", "Производство и промышленность"),
+    ("fmcg", "FMCG"),
+    ("logistics", "Логистика"),
+    ("bakery", "Хлебобулочные изделия"),
+    ("ecom", "E-com"),
+    ("medicine", "Медицина и фармацевтика"),
+    ("services", "Сервисные услуги"),
+    ("finance", "Банки и финансы"),
+    ("retail", "Ритейл"),
+]
+CASES_CATEGORY_LABELS = dict(CASES_CATEGORY_DEFS)
+
+
+def _case(
+    case_id: str,
+    company: str,
+    categories: tuple[str, ...],
+    metric: str,
+    summary: str,
+    url: str = CASES_HOME_URL,
+) -> dict:
+    if isinstance(categories, str):
+        categories = (categories,)
+    return {
+        "id": case_id,
+        "company": company,
+        "categories": list(categories),
+        "metric": metric,
+        "summary": summary,
+        "url": url or CASES_HOME_URL,
+    }
+
+
+CASES_DATA = [
+    _case(
+        "maria", "Мария", ("Дом, ремонт, сад"),
+        "−35% затрат на последнюю милю",
+        "Утилизировали свой автопарк и ушли от наёмного; доля наёмных машин доходила до 40% всех ТС.",
+        "https://yandex.ru/routing/articles/kukhni-mariya/",
+    ),
+    _case(
+        "rossko", "Росско", ("Автотовары"),
+        "25% сокращение затрат на логистику",
+        "Взяли под контроль показатели и снизили влияние человеческого фактора.",
+        "https://yandex.ru/routing/articles/rossko/",
+    ),
+    _case(
+        "novabev", "Новабев", ("Алкоголь и табак"),
+        "20% экономии на внутригородской логистике",
+        "На 18,3% снизили время работы водителей.",
+    ),
+    _case(
+        "euromebel", "Euromebel", ("Дом, ремонт, сад"),
+        "30% экономии на логистике доставки",
+        "Организовали централизованное управление доставкой по всей стране.",
+        "https://yandex.ru/routing/articles/euromebel/",
+    ),
+    _case(
+        "sibur", "Сибур", ("Производство и промышленность"),
+        "350 тыс. перевозок мониторят в год",
+        "Время получения статуса доставки сократилось с 2,5 часов до 30 секунд.",
+        "https://yandex.ru/routing/articles/sibur/",
+    ),
+    _case(
+        "iceberry", "Айсберри", ("FMCG"),
+        "10% снижение пробега",
+        "Ввели новую мотивацию водителей и окупили проект в первый год.",
+        "https://yandex.ru/routing/articles/iceberry/",
+    ),
+    _case(
+        "skif_cargo", "Скиф-Карго", ("Логистика"),
+        "На 20% снизили стоимость перевозки м³/км",
+        "До 98% возросло количество своевременных доставок.",
+        "https://rutube.ru/video/f8ade0a0b42b599f71e89d021699852d/?r=wd",
+    ),
+    _case(
+        "perekrestok", "Перекрёсток Впрок", ("FMCG"),
+        "31 800 ₽ ежедневной экономии на ТС",
+        "95% доставок попадают во временные интервалы.",
+        "https://yandex.ru/routing/articles/perekrestok/",
+    ),
+    _case(
+        "okraina", "Окраина", ("FMCG"),
+        "−10% используемого транспорта",
+        "Новых логистов обучают 2 недели вместо прежних 6 месяцев.",
+        "https://yandex.ru/routing/articles/okraina/",
+    ),
+    _case(
+        "lavka", "Яндекс Лавка", ("FMCG"),
+        "Менее 15 минут дороги курьера до дарксторов",
+        "Маршрутизируют двухуровневую логистику: распределительный центр → даркстор → покупатель.",
+        "https://yandex.ru/routing/articles/lavka/",
+    ),
+    _case(
+        "askona", "Askona", ("Дом, ремонт, сад"),
+        "Рост оценки доставки до 4,65",
+        "Снизили долю несогласованных интервалов с 3,6% до 2,5%.",
+        "https://yandex.ru/routing/articles/askona/",
+    ),
+    _case(
+        "heidelbergcement", "HeidelbergCement", ("Производство и промышленность"),
+        "80 000+ доставок отслеживается через мониторинг",
+        "В 2 раза сократили время ожидания и разгрузки.",
+        "https://yandex.ru/routing/articles/heidelbergcement/",
+    ),
+    _case(
+        "baltika", "Балтика", ("Алкоголь и табак"),
+        "98% поставок отслеживают в реальном времени",
+        "Плотность на маршруте выросла на 15%, время обслуживания машин снизилось на 30%.",
+        "https://yandex.ru/routing/articles/baltika/",
+    ),
+    _case(
+        "kolomenskoe", "БКК «Коломенский»", ("FMCG", "Хлебобулочные изделия"),
+        "800+ торговых точек в едином контуре планирования",
+        "Маршрутизируют ночную и раннюю доставку скоропортящейся продукции для 500 машин ежедневно.",
+        "https://yandex.ru/routing/articles/kolomenskoe/",
+    ),
+    _case(
+        "simple", "Simple Group", ("Алкоголь и табак"),
+        "≈23,4% поставок отслеживают в реальном времени",
+        "Плотность на маршруте выросла на 15%, время обслуживания машин снизилось на 30%.",
+        "https://yandex.ru/routing/articles/simple/",
+    ),
+    _case(
+        "yandex_market", "Яндекс Маркет", ("E-com"),
+        "95% точность попадания во временной интервал доставки",
+        "Автоматизация помогла масштабироваться на крупные города и перейти к собственной службе доставки.",
+        "https://yandex.ru/routing/articles/yandex-market/",
+    ),
+    _case(
+        "biocodex", "Биокодекс", ("Медицина и фармацевтика"),
+        "До 97% контактов из базы успевают посетить представители",
+        "Еженедельно планируют 4 500 визитов для 75 медицинских представителей.",
+    ),
+    _case(
+        "apteka_aprel", "Аптеки Апрель", ("Медицина и фармацевтика"),
+        "До 99% утилизации транспорта",
+        "Время планирования отгрузки снизили в 4 раза.",
+        "https://yandex.ru/routing/articles/apteka-aprel/",
+    ),
+    _case(
+        "volga_ice", "Волга Айс", ("FMCG"),
+        "До 40 точек на маршруте вместо 25",
+        "Сохранили качество — мороженое не тает даже при большем количестве точек.",
+        "https://yandex.ru/routing/articles/volga-ice1/",
+    ),
+    _case(
+        "sever_avto", "Север Авто", ("Автотовары"),
+        "100% клиентов получают уведомления о статусе доставки",
+        "Время планирования сократили в 2 раза.",
+        "https://yandex.ru/routing/articles/sever_avto/",
+    ),
+    _case(
+        "gemotest", "Гемотест", ("Медицина и фармацевтика"),
+        "Интервал визита 2–3 часа вместо целого дня",
+        "Теперь пациенты знают, в какое время ожидать специалиста.",
+        "https://yandex.ru/routing/articles/gemotest/",
+    ),
+    _case(
+        "fasco", "Гарден Ритейл Сервис (Фаско)", ("Дом, ремонт, сад"),
+        "−7% затрат на логистику при росте цен на транспорт",
+        "Сократили планирование маршрутов с 2–3 часов до 40 минут.",
+        "https://yandex.ru/routing/articles/fasco/",
+    ),
+    _case(
+        "bulka", "Булка", ("FMCG", "Хлебобулочные изделия"),
+        "В 2 раза сократилась протяжённость маршрутов",
+        "Автоматизация поддерживает прибыльность бизнеса при резком росте заказов без расширения штата.",
+        "https://yandex.ru/routing/articles/bulka/",
+    ),
+    _case(
+        "baton", "Онлайн-булочная «Закажи Батон»", ("FMCG", "Хлебобулочные изделия"),
+        "В 2 раза сократилась протяжённость маршрутов",
+        "Поддержали рост спроса с 200 до 3 000 заказов в месяц без потери качества.",
+        "https://yandex.ru/routing/articles/baton/",
+    ),
+    _case(
+        "vishera", "Вишера-Плюс", ("FMCG"),
+        "−13% пробега транспорта",
+        "Сократили холостой ход на 2–4 часа в день.",
+        "https://yandex.ru/routing/articles/vishera-plus/",
+    ),
+    _case(
+        "love_pirogova", "Любовь Пирогова", ("FMCG"),
+        "+70% скорости планирования",
+        "Попадают в интервал доставки с вероятностью 95%.",
+        "https://yandex.ru/routing/articles/lovepirogova/",
+    ),
+    _case(
+        "expoparts", "Expoparts", ("Автотовары"),
+        "Рост с 7–8 до 13–15 заказов в сутки на водителя",
+        "Свели к нулю недовозы и внедрили доставку в день заказа.",
+        "https://yandex.ru/routing/articles/expoparts/",
+    ),
+    _case(
+        "mariara", "Мария-Ра", ("FMCG"),
+        "До 400 км радиус доставки свежих продуктов",
+        "Реализуют маршрутизацию тягачей с прицепами и многодневные маршруты.",
+        "https://yandex.ru/routing/articles/mariara/",
+    ),
+    _case(
+        "bianca", "BIANCA", ("Сервисные услуги"),
+        "До 99% попадания во временной интервал",
+        "Планирование маршрутов занимает от 10 минут.",
+        "https://yandex.ru/routing/articles/bianca/",
+    ),
+    _case(
+        "petline", "Pet Line", ("FMCG"),
+        "В 1,5–2 раза увеличили количество выполняемых заявок",
+        "Время на планирование сократили в 6 раз.",
+        "https://yandex.ru/routing/articles/petline/",
+    ),
+    _case(
+        "raiffeisen", "Raiffeisen Bank", ("Банки и финансы"),
+        "В 2 раза выросла эффективность выездных консультантов",
+        "Доля заказов, доставляемых на следующий день, выросла на 13%.",
+        "https://yandex.ru/routing/articles/raiffeisen/",
+    ),
+    _case(
+        "gkb52", "Городская клиническая больница № 52", ("Медицина и фармацевтика"),
+        "В 2,5 раза сократилась общая длительность маршрута",
+        "Маршрутизируют доставку пациентов домой с учётом комфортного времени в пути.",
+        "https://yandex.ru/routing/articles/gkb52/",
+    ),
+    _case(
+        "valta", "Валта Пет Продактс", ("FMCG"),
+        "Масштабирование на 55 городов без увеличения штата логистов",
+        "Время маршрутизации сократили в 4 раза.",
+        "https://yandex.ru/routing/articles/valta/",
+    ),
+    _case(
+        "repropark", "ReproПарк", ("Производство и промышленность"),
+        "20% снижение времени доставки по Москве",
+        "Ввели единый инструмент контроля KPI водителей и аналитики процессов.",
+        "https://yandex.ru/routing/articles/repropark/",
+    ),
+    _case(
+        "holodilnik", "Холодильник.ру", ("Дом, ремонт, сад"),
+        "−15% затрат на последнюю милю",
+        "Повысили доставляемость заказов на 4%.",
+        "https://yandex.ru/routing/articles/holodilnik/",
+    ),
+    _case(
+        "santekhnika", "Сантехника Онлайн", ("Дом, ремонт, сад"),
+        "В 6 раз сократилось время маршрутизации",
+        "Уровень выкупаемости заказов с маршрута вырос на 6–7%.",
+        "https://yandex.ru/routing/articles/santekhnika-online/",
+    ),
+    _case(
+        "sunlight", "SUNLIGHT", ("Ритейл"),
+        "С 20 до 25 заказов на маршруте одного курьера",
+        "Уровень удовлетворённости клиентов по итогам доставки вырос на 4%.",
+        "https://yandex.ru/routing/articles/sunlight/",
+    ),
+    _case(
+        "kidsway", "KidsWay", ("Сервисные услуги"),
+        "≈15 минут время построения маршрута",
+        "Система адаптируется к изменениям расписания и позволяет допланировать разовые заказы.",
+        "https://yandex.ru/routing/articles/kidsway/",
+    ),
+    _case(
+        "justfood", "Justfood", ("FMCG"),
+        "−17% затрат на доставку",
+        "Перешли на новую систему маршрутизации и снизили расходы ещё до полного внедрения.",
+        "https://yandex.ru/routing/articles/justfood/",
+    ),
+]
+CASES_BY_ID = {item["id"]: item for item in CASES_DATA}
+
+
+def _cases_normalize(value: str) -> str:
+    value = html_lib.unescape(str(value or "")).casefold().replace("ё", "е")
+    return re.sub(r"[^0-9a-zа-я]+", " ", value).strip()
+
+
+def _cases_token_matches(token: str, search_blob: str) -> bool:
+    if token in search_blob:
+        return True
+    # Учитываем русские окончания: например, «последняя миля» и
+    # «последнюю милю» должны находиться одним запросом.
+    if len(token) < 3:
+        return False
+    stem = token[:3] if re.search(r"[а-я]", token) else token[:4]
+    return any(part.startswith(stem) for part in search_blob.split())
+
+
+def cases_search_items(query: str = "", category_key: str = "all") -> list[dict]:
+    category = CASES_CATEGORY_LABELS.get(category_key, CASES_CATEGORY_LABELS["all"])
+    query_tokens = [token for token in _cases_normalize(query).split() if token]
+    result = []
+    for item in CASES_DATA:
+        if category_key != "all" and category not in item["categories"]:
+            continue
+        search_blob = _cases_normalize(
+            " ".join(
+                [
+                    item["company"],
+                    item["metric"],
+                    item["summary"],
+                    " ".join(item["categories"]),
+                    "кейс логистика доставка маршруты маршрутизация планирование транспорт",
+                ]
+            )
+        )
+        if query_tokens and not all(
+            _cases_token_matches(token, search_blob) for token in query_tokens
+        ):
+            continue
+        result.append(item)
+    return result
+
+
+def _cases_page(items: list[dict], page: int) -> tuple[list[dict], int, int]:
+    total_pages = max(1, (len(items) + CASES_PAGE_SIZE - 1) // CASES_PAGE_SIZE)
+    page = max(0, min(int(page), total_pages - 1))
+    start = page * CASES_PAGE_SIZE
+    return items[start:start + CASES_PAGE_SIZE], page, total_pages
+
+
+def kb_cases_categories() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("📚 Все кейсы", callback_data="help:cases:cat:all:0")]]
+    category_buttons = [
+        InlineKeyboardButton(label, callback_data=f"help:cases:cat:{key}:0")
+        for key, label in CASES_CATEGORY_DEFS
+        if key != "all"
+    ]
+    for index in range(0, len(category_buttons), 2):
+        rows.append(category_buttons[index:index + 2])
+    rows.extend(
+        [
+            [InlineKeyboardButton("🔎 Поиск по кейсам", callback_data="help:cases:search")],
+            [InlineKeyboardButton("⬅️ Главное меню", callback_data="help:main")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def cases_menu_text() -> str:
+    return (
+        "📚 <b>Кейсы Яндекс Маршрутизации</b>\n\n"
+        "Выберите отрасль или найдите кейс по названию компании, "
+        "отрасли и ключевым словам."
+    )
+
+
+def cases_list_text(
+    items: list[dict],
+    category_key: str = "all",
+    page: int = 0,
+    query: str = "",
+) -> tuple[str, int, int]:
+    page_items, page, total_pages = _cases_page(items, page)
+    if query:
+        title = f"🔎 <b>Результаты поиска</b>\nЗапрос: <b>{escape(query)}</b>"
+    else:
+        label = CASES_CATEGORY_LABELS.get(category_key, CASES_CATEGORY_LABELS["all"])
+        title = f"📚 <b>{escape(label)}</b>"
+    if not items:
+        return f"{title}\n\nНичего не найдено.", page, total_pages
+    lines = [title, f"\nНайдено кейсов: <b>{len(items)}</b>", "\nВыберите компанию:"]
+    for item in page_items:
+        lines.append(f"• {escape(item['company'])}")
+    if total_pages > 1:
+        lines.append(f"\nСтраница {page + 1} из {total_pages}")
+    return "\n".join(lines), page, total_pages
+
+
+def kb_cases_list(
+    items: list[dict],
+    category_key: str = "all",
+    page: int = 0,
+    query: str = "",
+) -> InlineKeyboardMarkup:
+    page_items, page, total_pages = _cases_page(items, page)
+    rows = []
+    if query:
+        open_prefix = "help:cases:search_open"
+    else:
+        open_prefix = f"help:cases:open:{category_key}"
+    for item in page_items:
+        if query:
+            callback_data = f"{open_prefix}:{item['id']}:{page}"
+        else:
+            callback_data = f"{open_prefix}:{item['id']}:{page}"
+        rows.append([InlineKeyboardButton(
+            f"🏢 {item['company']}",
+            callback_data=callback_data,
+        )])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            callback = (
+                f"help:cases:search_results:{page - 1}"
+                if query else f"help:cases:cat:{category_key}:{page - 1}"
+            )
+            nav.append(InlineKeyboardButton("◀️", callback_data=callback))
+        nav.append(InlineKeyboardButton(f"{page + 1} / {total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            callback = (
+                f"help:cases:search_results:{page + 1}"
+                if query else f"help:cases:cat:{category_key}:{page + 1}"
+            )
+            nav.append(InlineKeyboardButton("▶️", callback_data=callback))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔎 Поиск по кейсам", callback_data="help:cases:search")])
+    rows.append([
+        InlineKeyboardButton(
+            "⬅️ К категориям" if not query else "⬅️ К результатам",
+            callback_data="help:cases" if not query else "help:cases:search_results:0",
+        )
+    ])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def cases_detail_text(item: dict) -> str:
+    categories = ", ".join(item["categories"])
+    return (
+        f"🏢 <b>{escape(item['company'])}</b>\n"
+        f"🏷 Отрасль: <b>{escape(categories)}</b>\n\n"
+        f"📊 <b>{escape(item['metric'])}</b>\n\n"
+        "✅ <b>Что сделали и основные преимущества:</b>\n"
+        f"• {escape(item['summary'])}"
+    )
+
+
+def kb_case_detail(item: dict, back_callback: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔗 Подробнее на сайте", url=item["url"])],
+            [InlineKeyboardButton("⬅️ Назад к списку", callback_data=back_callback)],
+            [InlineKeyboardButton("📚 К категориям", callback_data="help:cases")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
+        ]
+    )
+
+
+async def handle_cases_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if await deny_no_access(update, context):
+        return
+    await sync_profile_user_id_from_update(update)
+    query_text = (update.message.text or "").strip()
+    if len(query_text) < 2:
+        await update.message.reply_text("Введите минимум 2 символа для поиска по кейсам.")
+        return
+    context.user_data[CASES_WAITING_SEARCH] = False
+    context.user_data[CASES_SEARCH_QUERY] = query_text
+    items = cases_search_items(query_text)
+    result_text, _, _ = cases_list_text(items, query=query_text)
+    await update.message.reply_text(
+        result_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_cases_list(items, query=query_text),
+        disable_web_page_preview=True,
+    )
+
+
+async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+    if not query:
+        return
+    if await deny_no_access(update, context):
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    if data == "help:cases":
+        context.user_data[CASES_WAITING_SEARCH] = False
+        context.user_data.pop(CASES_SEARCH_QUERY, None)
+        await query.edit_message_text(
+            cases_menu_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cases_categories(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:cases:search":
+        context.user_data[CASES_WAITING_SEARCH] = True
+        context.user_data.pop(CASES_SEARCH_QUERY, None)
+        await query.edit_message_text(
+            "🔎 <b>Поиск по кейсам</b>\n\n"
+            "Введите название компании, отрасль или ключевое слово.\n"
+            "Например: <code>медицина</code>, <code>последняя миля</code> или <code>маршруты</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Отмена", callback_data="help:cases")]]
+            ),
+        )
+        return
+
+    if data == "help:cases:search_results" or data.startswith("help:cases:search_results:"):
+        query_text = (context.user_data.get(CASES_SEARCH_QUERY) or "").strip()
+        if not query_text:
+            context.user_data[CASES_WAITING_SEARCH] = True
+            await query.edit_message_text(
+                "🔎 Введите запрос для поиска по кейсам.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Отмена", callback_data="help:cases")]]
+                ),
+            )
+            return
+        try:
+            page = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            page = 0
+        items = cases_search_items(query_text)
+        result_text, page, _ = cases_list_text(items, page=page, query=query_text)
+        await query.edit_message_text(
+            result_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cases_list(items, page=page, query=query_text),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:cases:cat:"):
+        parts = data.split(":")
+        key = parts[3] if len(parts) > 3 else "all"
+        try:
+            page = int(parts[4]) if len(parts) > 4 else 0
+        except (TypeError, ValueError):
+            page = 0
+        if key not in CASES_CATEGORY_LABELS:
+            key = "all"
+        context.user_data[CASES_WAITING_SEARCH] = False
+        context.user_data.pop(CASES_SEARCH_QUERY, None)
+        items = cases_search_items(category_key=key)
+        list_text, page, _ = cases_list_text(items, category_key=key, page=page)
+        await query.edit_message_text(
+            list_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_cases_list(items, category_key=key, page=page),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:cases:search_open:"):
+        parts = data.split(":")
+        case_id = parts[3] if len(parts) > 3 else ""
+        try:
+            page = int(parts[4]) if len(parts) > 4 else 0
+        except (TypeError, ValueError):
+            page = 0
+        item = CASES_BY_ID.get(case_id)
+        if not item:
+            await query.answer("Кейс не найден.", show_alert=True)
+            return
+        await query.edit_message_text(
+            cases_detail_text(item),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_case_detail(item, f"help:cases:search_results:{page}"),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:cases:open:"):
+        parts = data.split(":")
+        key = parts[3] if len(parts) > 3 else "all"
+        case_id = parts[4] if len(parts) > 4 else ""
+        try:
+            page = int(parts[5]) if len(parts) > 5 else 0
+        except (TypeError, ValueError):
+            page = 0
+        item = CASES_BY_ID.get(case_id)
+        if not item:
+            await query.answer("Кейс не найден.", show_alert=True)
+            return
+        await query.edit_message_text(
+            cases_detail_text(item),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_case_detail(item, f"help:cases:cat:{key}:{page}"),
+            disable_web_page_preview=True,
+        )
+        return
+
+
 async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = (update.callback_query.data or "") if update.callback_query else ""
+    if data.startswith("help:cases"):
+        return await handle_cases_callback(update, context)
     if not data.startswith("help:faq"):
         return await _faq_favorites_legacy_cb_help(update, context)
 
