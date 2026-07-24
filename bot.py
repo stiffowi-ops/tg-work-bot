@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "CASES-ADAPTIVE-COLUMNS-2026-07-24-V10"
+BUILD_VERSION = "PROFILE-FIELD-EDIT-2026-07-24-V11"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -4429,6 +4429,9 @@ PROFILE_WIZ_STEP = "profile_wiz_step"
 PROFILE_WIZ_DATA = "profile_wiz_data"
 PROFILE_WIZ_MODE = "profile_wiz_mode"          # admin_add|admin_edit|self_create|self_edit
 PROFILE_WIZ_EDIT_PID = "profile_wiz_edit_pid"
+# Для самостоятельного редактирования одного выбранного поля.
+# Если ключ отсутствует, мастер работает в прежнем пошаговом режиме.
+PROFILE_WIZ_SINGLE_FIELD = "profile_wiz_single_field"
 
 # suggest box flow
 WAITING_SUGGESTION_TEXT = "waiting_suggestion_text"
@@ -4505,6 +4508,7 @@ def clear_profile_wiz(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop(PROFILE_WIZ_DATA, None)
     context.chat_data.pop(PROFILE_WIZ_MODE, None)
     context.chat_data.pop(PROFILE_WIZ_EDIT_PID, None)
+    context.chat_data.pop(PROFILE_WIZ_SINGLE_FIELD, None)
 
 def clear_zip_import(context: ContextTypes.DEFAULT_TYPE):
     context.chat_data[WAITING_ZIP_IMPORT] = False
@@ -4983,6 +4987,77 @@ def kb_my_account(profile: dict):
         ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
     ])
+
+
+PROFILE_SELF_EDIT_FIELDS = {
+    "full_name": "👤 Имя и фамилия",
+    "year_start": "📅 Год начала работы",
+    "city": "🏙️ Город",
+    "birthday": "🎂 День рождения",
+    "about": "📝 О себе",
+    "topics": "💬 Темы для обращений",
+    "tg_link": "✈️ Telegram",
+    "photo": "📷 Фотография",
+}
+
+
+def kb_my_profile_edit_fields():
+    """Меню выбора отдельного поля собственной анкеты."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(PROFILE_SELF_EDIT_FIELDS["full_name"], callback_data="help:me:edit:full_name"),
+            InlineKeyboardButton(PROFILE_SELF_EDIT_FIELDS["year_start"], callback_data="help:me:edit:year_start"),
+        ],
+        [
+            InlineKeyboardButton(PROFILE_SELF_EDIT_FIELDS["city"], callback_data="help:me:edit:city"),
+            InlineKeyboardButton(PROFILE_SELF_EDIT_FIELDS["birthday"], callback_data="help:me:edit:birthday"),
+        ],
+        [
+            InlineKeyboardButton(PROFILE_SELF_EDIT_FIELDS["about"], callback_data="help:me:edit:about"),
+            InlineKeyboardButton(PROFILE_SELF_EDIT_FIELDS["topics"], callback_data="help:me:edit:topics"),
+        ],
+        [
+            InlineKeyboardButton(PROFILE_SELF_EDIT_FIELDS["tg_link"], callback_data="help:me:edit:tg_link"),
+            InlineKeyboardButton(PROFILE_SELF_EDIT_FIELDS["photo"], callback_data="help:me:edit:photo"),
+        ],
+        [InlineKeyboardButton("🔄 Изменить всё по шагам", callback_data="help:me:edit:all")],
+        [InlineKeyboardButton("⬅️ В мой кабинет", callback_data="help:me")],
+    ])
+
+
+def profile_self_edit_prompt(field: str, profile: dict) -> str:
+    """Текст запроса нового значения для выбранного поля."""
+    prompts = {
+        "full_name": "Отправьте новые <b>имя и фамилию</b>.\nПример: <code>Иван Петров</code>",
+        "year_start": "Отправьте новый <b>год начала работы</b>.\nПример: <code>2022</code>",
+        "city": "Отправьте новый <b>город проживания</b>.\nПример: <code>Москва</code>",
+        "birthday": (
+            "Отправьте новый <b>день рождения</b> в формате <code>ДД.ММ</code>.\n"
+            "Чтобы удалить дату, отправьте <code>-</code>."
+        ),
+        "about": "Отправьте новый текст раздела <b>«О себе»</b>.",
+        "topics": "Отправьте новые <b>темы и вопросы, по которым к вам можно обращаться</b>.",
+        "tg_link": (
+            "Отправьте новый Telegram: <code>@username</code> или "
+            "<code>https://t.me/username</code>."
+        ),
+        "photo": (
+            "Отправьте новую фотографию как <b>фото</b> или выберите действие кнопкой ниже."
+        ),
+    }
+    current = profile.get(field)
+    if field == "birthday":
+        current = current or "не указано"
+    elif field == "photo":
+        current = "есть" if profile.get("photo_file_id") else "не установлена"
+    else:
+        current = current if current not in (None, "") else "не указано"
+
+    return (
+        f"✏️ <b>{PROFILE_SELF_EDIT_FIELDS[field]}</b>\n\n"
+        f"Текущее значение: <code>{html_lib.escape(str(current))}</code>\n\n"
+        f"{prompts[field]}"
+    )
 
 
 def kb_my_tests(profile_id: int):
@@ -7859,6 +7934,23 @@ async def finalize_profile_wizard(update: Update, context: ContextTypes.DEFAULT_
     return True, msg, markup
 
 
+async def finalize_single_profile_field_if_needed(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    field: str,
+) -> bool:
+    """Сохраняет анкету сразу после изменения выбранного пользователем поля."""
+    if context.chat_data.get(PROFILE_WIZ_MODE) != "self_edit":
+        return False
+    if context.chat_data.get(PROFILE_WIZ_SINGLE_FIELD) != field:
+        return False
+
+    _ok, message_text, markup = await finalize_profile_wizard(update, context)
+    if update.message:
+        await update.message.reply_text(message_text, reply_markup=markup)
+    return True
+
+
 def get_profile_for_user(update: Update) -> dict | None:
     user = update.effective_user
     if not user:
@@ -9804,7 +9896,46 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Ваша анкета не найдена.", show_alert=True)
             return
 
-        # В мастер передаётся только анкета текущего пользователя.
+        clear_profile_wiz(context)
+        await q.edit_message_text(
+            "✏️ <b>Редактирование моей анкеты</b>\n\n"
+            "Выберите раздел, который хотите изменить. Остальные данные останутся без изменений.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_my_profile_edit_fields(),
+        )
+        return
+
+    if data.startswith("help:me:edit:"):
+        profile = get_profile_for_user(update)
+        if not profile:
+            await q.answer("Ваша анкета не найдена.", show_alert=True)
+            return
+
+        field = data.rsplit(":", 1)[-1]
+        if field == "all":
+            # Сохраняем прежний сценарий полного редактирования анкеты.
+            start_profile_wizard(
+                context,
+                update.effective_user.id,
+                mode="self_edit",
+                initial_data=profile,
+                edit_pid=int(profile["id"]),
+            )
+            await q.edit_message_text(
+                "✏️ <b>Полное редактирование анкеты</b>\n\n"
+                "Шаг 1/8: отправьте <b>Имя и Фамилию</b>.\n"
+                f"Текущее значение: <code>{html_lib.escape(profile['full_name'])}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_cancel_wizard_settings(),
+            )
+            return
+
+        if field not in PROFILE_SELF_EDIT_FIELDS:
+            await q.answer("Неизвестный раздел анкеты.", show_alert=True)
+            return
+
+        # Загружаем всю текущую анкету, но просим изменить только выбранное поле.
+        # Это позволяет использовать существующую валидацию и общий безопасный save.
         start_profile_wizard(
             context,
             update.effective_user.id,
@@ -9812,14 +9943,18 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             initial_data=profile,
             edit_pid=int(profile["id"]),
         )
+        context.chat_data[PROFILE_WIZ_STEP] = field
+        context.chat_data[PROFILE_WIZ_SINGLE_FIELD] = field
+
+        reply_markup = (
+            kb_profile_photo_step(has_current_photo=bool(profile.get("photo_file_id")))
+            if field == "photo"
+            else kb_cancel_wizard_settings()
+        )
         await q.edit_message_text(
-            "✏️ <b>Редактирование моей анкеты</b>\n\n"
-            "Вы можете обновить имя, год начала работы, город, день рождения, "
-            "описание, темы для обращений, Telegram и фотографию.\n\n"
-            "Шаг 1/8: отправьте <b>Имя и Фамилию</b>.\n"
-            f"Текущее значение: <code>{html_lib.escape(profile['full_name'])}</code>",
+            profile_self_edit_prompt(field, profile),
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_cancel_wizard_settings(),
+            reply_markup=reply_markup,
         )
         return
     if data == "help:me:achievements":
@@ -14900,6 +15035,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             data["full_name"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
+            if await finalize_single_profile_field_if_needed(update, context, "full_name"):
+                return
             context.chat_data[PROFILE_WIZ_STEP] = "year_start"
             await update.message.reply_text("Шаг 2/8: с какого года работает? Пример: 2022", reply_markup=kb_cancel_wizard_settings())
             return
@@ -14915,6 +15052,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             data["year_start"] = year
             context.chat_data[PROFILE_WIZ_DATA] = data
+            if await finalize_single_profile_field_if_needed(update, context, "year_start"):
+                return
             context.chat_data[PROFILE_WIZ_STEP] = "city"
             await update.message.reply_text("Шаг 3/8: город проживания. Пример: Москва", reply_markup=kb_cancel_wizard_settings())
             return
@@ -14925,6 +15064,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             data["city"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
+            if await finalize_single_profile_field_if_needed(update, context, "city"):
+                return
             context.chat_data[PROFILE_WIZ_STEP] = "birthday"
             await update.message.reply_text(
                 "Шаг 4/8: день рождения (формат <b>ДД.ММ</b>)\n"
@@ -14956,6 +15097,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data["birthday"] = b
 
             context.chat_data[PROFILE_WIZ_DATA] = data
+            if await finalize_single_profile_field_if_needed(update, context, "birthday"):
+                return
             context.chat_data[PROFILE_WIZ_STEP] = "about"
             await update.message.reply_text("Шаг 5/8: кратко о себе (1–3 предложения)", reply_markup=kb_cancel_wizard_settings())
             return
@@ -14966,6 +15109,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             data["about"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
+            if await finalize_single_profile_field_if_needed(update, context, "about"):
+                return
             context.chat_data[PROFILE_WIZ_STEP] = "topics"
             await update.message.reply_text("Шаг 6/8: по каким вопросам обращаться?", reply_markup=kb_cancel_wizard_settings())
             return
@@ -14976,6 +15121,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             data["topics"] = text
             context.chat_data[PROFILE_WIZ_DATA] = data
+            if await finalize_single_profile_field_if_needed(update, context, "topics"):
+                return
             context.chat_data[PROFILE_WIZ_STEP] = "tg_link"
             await update.message.reply_text("Шаг 7/8: Telegram (@username или https://t.me/username)", reply_markup=kb_cancel_wizard_settings())
             return
@@ -14995,6 +15142,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             data["tg_link"] = tg
             context.chat_data[PROFILE_WIZ_DATA] = data
+            if await finalize_single_profile_field_if_needed(update, context, "tg_link"):
+                return
             context.chat_data[PROFILE_WIZ_STEP] = "photo"
             has_current_photo = bool(data.get("photo_file_id"))
             text_photo = (
