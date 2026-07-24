@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "CASES-THREE-INDUSTRIES-2026-07-24-V8"
+BUILD_VERSION = "CASES-THREE-COLUMNS-2026-07-24-V9"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -21582,7 +21582,7 @@ def _faq_favorites_back_callback(source: str, page: int) -> str:
 CASES_HOME_URL = "https://yandex.ru/routing/cases"
 CASES_WAITING_SEARCH = "cases_waiting_search"
 CASES_SEARCH_QUERY = "cases_search_query"
-CASES_PAGE_SIZE = 8
+CASES_PAGE_SIZE = 9
 CASES_MAX_INDUSTRIES = 3
 
 CASES_CATEGORY_DEFS = [
@@ -22090,10 +22090,17 @@ def cases_search_items(
 
 
 def _cases_page(items: list[dict], page: int) -> tuple[list[dict], int, int]:
-    total_pages = max(1, (len(items) + CASES_PAGE_SIZE - 1) // CASES_PAGE_SIZE)
+    ordered_items = sorted(
+        items,
+        key=lambda item: (
+            -len(str(item.get("company") or "").strip()),
+            str(item.get("company") or "").casefold(),
+        ),
+    )
+    total_pages = max(1, (len(ordered_items) + CASES_PAGE_SIZE - 1) // CASES_PAGE_SIZE)
     page = max(0, min(int(page), total_pages - 1))
     start = page * CASES_PAGE_SIZE
-    return items[start:start + CASES_PAGE_SIZE], page, total_pages
+    return ordered_items[start:start + CASES_PAGE_SIZE], page, total_pages
 
 
 def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
@@ -22282,15 +22289,18 @@ def kb_cases_list(
         open_prefix = "help:cases:search_open"
     else:
         open_prefix = f"help:cases:open:{category_key}"
+    case_buttons = []
     for item in page_items:
         if favorites or query:
             callback_data = f"{open_prefix}:{item['id']}:{page}"
         else:
             callback_data = f"{open_prefix}:{item['id']}:{page}"
-        rows.append([InlineKeyboardButton(
+        case_buttons.append(InlineKeyboardButton(
             f"🏢 {item['company']}",
             callback_data=callback_data,
-        )])
+        ))
+    for index in range(0, len(case_buttons), 3):
+        rows.append(case_buttons[index:index + 3])
     if total_pages > 1:
         nav = []
         if page > 0:
