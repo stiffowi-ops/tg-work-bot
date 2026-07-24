@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "TEST-CONFIRM-ANSWER-2026-07-24-V6"
+BUILD_VERSION = "CASES-THREE-INDUSTRIES-2026-07-24-V8"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -16483,6 +16483,17 @@ def tv2_kb_my_open(a: dict):
     return InlineKeyboardMarkup(rows)
 
 
+def tv2_option_display_text(option: object) -> str:
+    raw_text = str(option).strip()
+    clean_text = re.sub(
+        r"^\s*\d{1,3}\s*[.)]\s*",
+        "",
+        raw_text,
+        count=1,
+    ).strip()
+    return clean_text or raw_text
+
+
 def tv2_question_display(
     a: dict,
     q: dict,
@@ -16507,7 +16518,9 @@ def tv2_question_display(
         visible_options=[]
         for display_idx, original_idx in enumerate(option_order, start=1):
             if 0 <= int(original_idx) < len(q.get("options") or []):
-                option_text=str(q["options"][int(original_idx)])
+                option_text=tv2_option_display_text(
+                    q["options"][int(original_idx)]
+                )
                 visible_options.append(
                     f"<b>{display_idx}.</b> {escape(option_text)}"
                 )
@@ -21306,6 +21319,32 @@ def db_init():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS case_user_industry_choices (
+            user_id INTEGER NOT NULL,
+            category_key TEXT NOT NULL,
+            selected_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, category_key)
+        )
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_case_industry_choices_user "
+        "ON case_user_industry_choices(user_id, selected_at ASC)"
+    )
+    # Переносим прежнюю единственную отрасль в новый список выбора.
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO case_user_industry_choices(
+            user_id, category_key, selected_at
+        )
+        SELECT user_id, category_key, updated_at
+        FROM case_user_industries
+        WHERE category_key <> 'all'
+        """
+    )
+    cur.execute("DELETE FROM case_user_industries")
     con.commit()
     con.close()
     logger.warning("=== %s ===", FAQ_FAVORITES_V5_BUILD)
@@ -21544,6 +21583,7 @@ CASES_HOME_URL = "https://yandex.ru/routing/cases"
 CASES_WAITING_SEARCH = "cases_waiting_search"
 CASES_SEARCH_QUERY = "cases_search_query"
 CASES_PAGE_SIZE = 8
+CASES_MAX_INDUSTRIES = 3
 
 CASES_CATEGORY_DEFS = [
     ("all", "Все кейсы"),
@@ -21886,35 +21926,99 @@ def db_case_favorites(user_id: int | None, limit: int = 100) -> list[dict]:
     ]
 
 
-def db_case_get_industry(user_id: int | None) -> str | None:
+def db_case_get_industries(user_id: int | None) -> list[str]:
     if user_id is None:
-        return None
+        return []
     with sqlite3.connect(DB_PATH) as con:
-        row = con.execute(
-            "SELECT category_key FROM case_user_industries WHERE user_id=?",
+        rows = con.execute(
+            """
+            SELECT category_key
+            FROM case_user_industry_choices
+            WHERE user_id=?
+            ORDER BY selected_at ASC, category_key ASC
+            """,
             (int(user_id),),
+        ).fetchall()
+    result = []
+    for row in rows:
+        key = row[0]
+        if key in CASES_CATEGORY_LABELS and key != "all" and key not in result:
+            result.append(key)
+        if len(result) >= CASES_MAX_INDUSTRIES:
+            break
+    return result
+
+
+def db_case_get_industry(user_id: int | None) -> str | None:
+    """Совместимость со старым кодом: возвращает первую выбранную отрасль."""
+    selected = db_case_get_industries(user_id)
+    return selected[0] if selected else None
+
+
+def db_case_toggle_industry(
+    user_id: int | None,
+    category_key: str,
+) -> tuple[str, list[str]]:
+    if user_id is None or category_key not in CASES_CATEGORY_LABELS or category_key == "all":
+        return "invalid", db_case_get_industries(user_id)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("BEGIN IMMEDIATE")
+        existing = con.execute(
+            """
+            SELECT 1
+            FROM case_user_industry_choices
+            WHERE user_id=? AND category_key=?
+            """,
+            (int(user_id), category_key),
         ).fetchone()
-    key = row[0] if row else None
-    if key not in CASES_CATEGORY_LABELS or key == "all":
-        return None
-    return key
+        if existing:
+            con.execute(
+                """
+                DELETE FROM case_user_industry_choices
+                WHERE user_id=? AND category_key=?
+                """,
+                (int(user_id), category_key),
+            )
+            status = "removed"
+        else:
+            selected_rows = con.execute(
+                """
+                SELECT category_key
+                FROM case_user_industry_choices
+                WHERE user_id=?
+                """,
+                (int(user_id),),
+            ).fetchall()
+            selected_count = sum(
+                1
+                for row in selected_rows
+                if row[0] in CASES_CATEGORY_LABELS and row[0] != "all"
+            )
+            if selected_count >= CASES_MAX_INDUSTRIES:
+                status = "limit"
+            else:
+                con.execute(
+                    """
+                    INSERT INTO case_user_industry_choices(
+                        user_id, category_key, selected_at
+                    ) VALUES(?,?,?)
+                    """,
+                    (
+                        int(user_id),
+                        category_key,
+                        datetime.utcnow().isoformat(),
+                    ),
+                )
+                status = "added"
+    return status, db_case_get_industries(user_id)
 
 
 def db_case_set_industry(user_id: int | None, category_key: str) -> bool:
-    if user_id is None or category_key not in CASES_CATEGORY_LABELS or category_key == "all":
-        return False
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute(
-            """
-            INSERT INTO case_user_industries(user_id, category_key, updated_at)
-            VALUES(?,?,?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                category_key=excluded.category_key,
-                updated_at=excluded.updated_at
-            """,
-            (int(user_id), category_key, datetime.utcnow().isoformat()),
-        )
-    return True
+    """Добавляет отрасль, не снимая уже выбранные значения."""
+    if category_key in db_case_get_industries(user_id):
+        return True
+    status, _selected = db_case_toggle_industry(user_id, category_key)
+    return status == "added"
 
 
 def db_case_clear_industry(user_id: int | None) -> bool:
@@ -21922,10 +22026,15 @@ def db_case_clear_industry(user_id: int | None) -> bool:
         return False
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute(
+            "DELETE FROM case_user_industry_choices WHERE user_id=?",
+            (int(user_id),),
+        )
+        # Старую таблицу тоже очищаем, чтобы выбор не вернулся при откате.
+        legacy_cur = con.execute(
             "DELETE FROM case_user_industries WHERE user_id=?",
             (int(user_id),),
         )
-    return cur.rowcount > 0
+    return cur.rowcount > 0 or legacy_cur.rowcount > 0
 
 
 def _cases_normalize(value: str) -> str:
@@ -21944,12 +22053,22 @@ def _cases_token_matches(token: str, search_blob: str) -> bool:
     return any(part.startswith(stem) for part in search_blob.split())
 
 
-def cases_search_items(query: str = "", category_key: str = "all") -> list[dict]:
-    category = CASES_CATEGORY_LABELS.get(category_key, CASES_CATEGORY_LABELS["all"])
+def cases_search_items(
+    query: str = "",
+    category_key: str = "all",
+    category_keys: list[str] | tuple[str, ...] | None = None,
+) -> list[dict]:
+    if category_keys is None:
+        category_keys = [] if category_key == "all" else [category_key]
+    selected_categories = {
+        CASES_CATEGORY_LABELS[key]
+        for key in category_keys
+        if key in CASES_CATEGORY_LABELS and key != "all"
+    }
     query_tokens = [token for token in _cases_normalize(query).split() if token]
     result = []
     for item in CASES_DATA:
-        if category_key != "all" and category not in item["categories"]:
+        if selected_categories and not selected_categories.intersection(item["categories"]):
             continue
         search_blob = _cases_normalize(
             " ".join(
@@ -21978,13 +22097,15 @@ def _cases_page(items: list[dict], page: int) -> tuple[list[dict], int, int]:
 
 
 def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
-    selected_key = db_case_get_industry(user_id)
-    selected_label = CASES_CATEGORY_LABELS.get(selected_key or "", "")
+    selected_keys = db_case_get_industries(user_id)
     rows = [[InlineKeyboardButton("📚 Все кейсы", callback_data="help:cases:cat:all:0")]]
     rows.append(
         [
             InlineKeyboardButton(
-                f"🎯 Моя отрасль: {selected_label}" if selected_label else "🎯 Моя отрасль",
+                (
+                    f"🎯 Мои отрасли: {len(selected_keys)} из {CASES_MAX_INDUSTRIES}"
+                    if selected_keys else "🎯 Выбрать мои отрасли"
+                ),
                 callback_data="help:cases:industry",
             )
         ]
@@ -22008,13 +22129,17 @@ def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
 
 
 def cases_menu_text(user_id: int | None = None) -> str:
-    selected_key = db_case_get_industry(user_id)
-    selected_label = CASES_CATEGORY_LABELS.get(selected_key or "", "")
+    selected_keys = db_case_get_industries(user_id)
+    selected_labels = [
+        CASES_CATEGORY_LABELS[key]
+        for key in selected_keys
+    ]
     industry_line = (
-        f"\n🎯 <b>Моя отрасль:</b> {escape(selected_label)}\n"
-        "Кнопка «Моя отрасль» позволяет изменить или убрать фильтр.\n"
-        if selected_label
-        else "\n🎯 Моя отрасль пока не выбрана.\n"
+        f"\n🎯 <b>Мои отрасли ({len(selected_labels)}/{CASES_MAX_INDUSTRIES}):</b> "
+        f"{escape(', '.join(selected_labels))}\n"
+        "Кнопка «Мои отрасли» позволяет изменить или очистить фильтр.\n"
+        if selected_labels
+        else f"\n🎯 Можно выбрать до {CASES_MAX_INDUSTRIES} отраслей.\n"
     )
     return (
         "📚 <b>Кейсы Яндекс Маршрутизации</b>\n\n"
@@ -22025,10 +22150,11 @@ def cases_menu_text(user_id: int | None = None) -> str:
 
 
 def kb_cases_industry_picker(user_id: int | None = None) -> InlineKeyboardMarkup:
-    selected_key = db_case_get_industry(user_id)
+    selected_keys = db_case_get_industries(user_id)
+    selected_set = set(selected_keys)
     category_buttons = [
         InlineKeyboardButton(
-            f"{'✅ ' if key == selected_key else ''}{label}",
+            f"{'✅ ' if key in selected_set else '▫️ '}{label}",
             callback_data=f"help:cases:industry:set:{key}",
         )
         for key, label in _cases_category_options()
@@ -22037,11 +22163,11 @@ def kb_cases_industry_picker(user_id: int | None = None) -> InlineKeyboardMarkup
         category_buttons[index:index + 2]
         for index in range(0, len(category_buttons), 2)
     ]
-    if selected_key:
+    if selected_keys:
         rows.append(
             [
                 InlineKeyboardButton(
-                    "📂 Показать кейсы моей отрасли",
+                    f"📂 Показать кейсы ({len(selected_keys)} отрасл.)",
                     callback_data="help:cases:my_cases",
                 )
             ]
@@ -22049,13 +22175,39 @@ def kb_cases_industry_picker(user_id: int | None = None) -> InlineKeyboardMarkup
         rows.append(
             [
                 InlineKeyboardButton(
-                    "🧹 Убрать мою отрасль",
+                    "🧹 Очистить выбор",
                     callback_data="help:cases:industry:clear",
                 )
             ]
         )
     rows.append([InlineKeyboardButton("⬅️ К кейсам", callback_data="help:cases")])
     return InlineKeyboardMarkup(rows)
+
+
+def cases_industry_picker_text(
+    user_id: int | None,
+    notice: str | None = None,
+) -> str:
+    selected_keys = db_case_get_industries(user_id)
+    selected_labels = [
+        CASES_CATEGORY_LABELS[key]
+        for key in selected_keys
+    ]
+    lines = [
+        "🎯 <b>Мои отрасли</b>",
+        "",
+        f"Выберите до <b>{CASES_MAX_INDUSTRIES}</b> отраслей. "
+        "Повторное нажатие снимает выбор.",
+        "",
+        f"Выбрано: <b>{len(selected_keys)} из {CASES_MAX_INDUSTRIES}</b>",
+    ]
+    if selected_labels:
+        lines.extend(
+            ["", *[f"• {escape(label)}" for label in selected_labels]]
+        )
+    if notice:
+        lines = [notice, "", *lines]
+    return "\n".join(lines)
 
 
 def cases_list_text(
@@ -22089,23 +22241,24 @@ def cases_my_industry_view(
     page: int = 0,
     notice: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup] | None:
-    """Рендерит только кейсы сохранённой отрасли без остальных разделов каталога."""
-    selected_key = db_case_get_industry(user_id)
-    if not selected_key:
+    """Рендерит кейсы всех выбранных пользователем отраслей."""
+    selected_keys = db_case_get_industries(user_id)
+    if not selected_keys:
         return None
-    label = CASES_CATEGORY_LABELS[selected_key]
-    items = cases_search_items(category_key=selected_key)
+    labels = [CASES_CATEGORY_LABELS[key] for key in selected_keys]
+    items = cases_search_items(category_keys=selected_keys)
     list_text, page, _ = cases_list_text(
         items,
-        category_key=selected_key,
         page=page,
-        heading=f"🎯 <b>Моя отрасль: {escape(label)}</b>",
+        heading=(
+            f"🎯 <b>Мои отрасли ({len(selected_keys)}/{CASES_MAX_INDUSTRIES}):</b>\n"
+            f"{escape(', '.join(labels))}"
+        ),
     )
     if notice:
         list_text = f"{notice}\n\n{list_text}"
     return list_text, kb_cases_list(
         items,
-        category_key=selected_key,
         page=page,
         industry=True,
     )
@@ -22166,10 +22319,10 @@ def kb_cases_list(
         rows.append(nav)
     if industry:
         rows.append([
-            InlineKeyboardButton("🔄 Сменить отрасль", callback_data="help:cases:industry")
+            InlineKeyboardButton("🔄 Изменить отрасли", callback_data="help:cases:industry")
         ])
         rows.append([
-            InlineKeyboardButton("🧹 Убрать мою отрасль", callback_data="help:cases:industry:clear")
+            InlineKeyboardButton("🧹 Очистить выбор отраслей", callback_data="help:cases:industry:clear")
         ])
     else:
         rows.append([InlineKeyboardButton("🔎 Поиск по кейсам", callback_data="help:cases:search")])
@@ -22284,27 +22437,8 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "help:cases:industry":
         context.user_data[CASES_WAITING_SEARCH] = False
-        selected_key = db_case_get_industry(user_id)
-        selected_label = CASES_CATEGORY_LABELS.get(selected_key or "", "")
-        if selected_key:
-            my_industry = cases_my_industry_view(user_id)
-            if my_industry:
-                list_text, markup = my_industry
-                await query.edit_message_text(
-                    list_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=markup,
-                    disable_web_page_preview=True,
-                )
-                return
         await query.edit_message_text(
-            "🎯 <b>Моя отрасль</b>\n\n"
-            + (
-                f"Сейчас выбрана: <b>{escape(selected_label)}</b>\n"
-                "Выберите другую отрасль или уберите текущую.\n"
-                if selected_label
-                else "Выберите отрасль, чтобы в один клик открывать подходящие кейсы.\n"
-            ),
+            cases_industry_picker_text(user_id),
             parse_mode=ParseMode.HTML,
             reply_markup=kb_cases_industry_picker(user_id),
         )
@@ -22315,30 +22449,32 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if key not in CASES_CATEGORY_LABELS or key == "all":
             await query.answer("Неизвестная отрасль.", show_alert=True)
             return
-        db_case_set_industry(user_id, key)
-        label = CASES_CATEGORY_LABELS[key]
-        items = cases_search_items(category_key=key)
-        list_text, page, _ = cases_list_text(
-            items,
-            category_key=key,
-            heading=f"🎯 <b>Моя отрасль: {escape(label)}</b>",
-        )
+        status, _selected_keys = db_case_toggle_industry(user_id, key)
+        if status == "added":
+            notice = f"✅ Добавлено: <b>{escape(CASES_CATEGORY_LABELS[key])}</b>"
+        elif status == "removed":
+            notice = f"➖ Убрано: <b>{escape(CASES_CATEGORY_LABELS[key])}</b>"
+        elif status == "limit":
+            notice = (
+                f"⚠️ Можно выбрать не более <b>{CASES_MAX_INDUSTRIES}</b> отраслей. "
+                "Сначала снимите один из текущих вариантов."
+            )
+        else:
+            notice = "⚠️ Не удалось изменить выбор."
         await query.edit_message_text(
-            f"✅ Отрасль сохранена.\n\n{list_text}",
+            cases_industry_picker_text(user_id, notice=notice),
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_cases_list(
-                items,
-                category_key=key,
-                page=page,
-                industry=True,
-            ),
+            reply_markup=kb_cases_industry_picker(user_id),
             disable_web_page_preview=True,
         )
         return
 
     if data == "help:cases:industry:clear":
         db_case_clear_industry(user_id)
-        await query.answer("Фильтр отрасли убран.")
+        try:
+            await query.answer("Выбор отраслей очищен.")
+        except Exception:
+            pass
         await query.edit_message_text(
             cases_menu_text(user_id),
             parse_mode=ParseMode.HTML,
@@ -22348,10 +22484,11 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "help:cases:my_cases" or data.startswith("help:cases:my_cases:"):
-        selected_key = db_case_get_industry(user_id)
-        if not selected_key:
+        selected_keys = db_case_get_industries(user_id)
+        if not selected_keys:
             await query.edit_message_text(
-                "🎯 <b>Моя отрасль</b>\n\nСначала выберите отрасль.",
+                f"🎯 <b>Мои отрасли</b>\n\n"
+                f"Сначала выберите от одной до {CASES_MAX_INDUSTRIES} отраслей.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_cases_industry_picker(user_id),
             )
