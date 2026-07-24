@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "CASES-ADAPTIVE-COLUMNS-2026-07-24-V10"
+BUILD_VERSION = "CASES-THREE-COLUMNS-2026-07-24-V9"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -21584,7 +21584,6 @@ CASES_WAITING_SEARCH = "cases_waiting_search"
 CASES_SEARCH_QUERY = "cases_search_query"
 CASES_PAGE_SIZE = 9
 CASES_MAX_INDUSTRIES = 3
-CASES_THREE_COLUMN_MAX_CHARS = 10
 
 CASES_CATEGORY_DEFS = [
     ("all", "Все кейсы"),
@@ -22290,27 +22289,18 @@ def kb_cases_list(
         open_prefix = "help:cases:search_open"
     else:
         open_prefix = f"help:cases:open:{category_key}"
-    grid_buttons = []
+    case_buttons = []
     for item in page_items:
         if favorites or query:
             callback_data = f"{open_prefix}:{item['id']}:{page}"
         else:
             callback_data = f"{open_prefix}:{item['id']}:{page}"
-        button = InlineKeyboardButton(
+        case_buttons.append(InlineKeyboardButton(
             f"🏢 {item['company']}",
             callback_data=callback_data,
-        )
-        company_length = len(str(item.get("company") or "").strip())
-        if company_length > CASES_THREE_COLUMN_MAX_CHARS:
-            if grid_buttons:
-                for index in range(0, len(grid_buttons), 3):
-                    rows.append(grid_buttons[index:index + 3])
-                grid_buttons = []
-            rows.append([button])
-        else:
-            grid_buttons.append(button)
-    for index in range(0, len(grid_buttons), 3):
-        rows.append(grid_buttons[index:index + 3])
+        ))
+    for index in range(0, len(case_buttons), 3):
+        rows.append(case_buttons[index:index + 3])
     if total_pages > 1:
         nav = []
         if page > 0:
