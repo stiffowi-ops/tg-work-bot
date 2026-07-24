@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "DOCS-SEARCH-INDEX-2026-07-23-V4"
+BUILD_VERSION = "TEST-FULL-OPTIONS-2026-07-24-V5"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -16497,15 +16497,25 @@ def tv2_question_display(a: dict, q: dict, position: int) -> tuple[str, InlineKe
     else:
         rows=[]
         option_order=_safe_json_loads(a.get("option_order_json"),{}).get(str(qid),list(range(len(q.get("options") or []))))
-        selected=set((context_selected := []))
-        # Current multi selection is read in callback renderer; default empty here.
-        for original_idx in option_order:
+        visible_options=[]
+        for display_idx, original_idx in enumerate(option_order, start=1):
             if 0 <= int(original_idx) < len(q.get("options") or []):
-                label=q["options"][int(original_idx)]
+                option_text=str(q["options"][int(original_idx)])
+                visible_options.append(
+                    f"<b>{display_idx}.</b> {escape(option_text)}"
+                )
                 if q["q_type"]=="single":
-                    rows.append([InlineKeyboardButton(label[:60],callback_data=f"test:v2:single:{aid}:{qid}:{int(original_idx)}")])
+                    rows.append([InlineKeyboardButton(
+                        f"Ответ {display_idx}",
+                        callback_data=f"test:v2:single:{aid}:{qid}:{int(original_idx)}",
+                    )])
                 else:
-                    rows.append([InlineKeyboardButton("▫️ "+label[:55],callback_data=f"test:v2:toggle:{aid}:{qid}:{int(original_idx)}")])
+                    rows.append([InlineKeyboardButton(
+                        f"▫️ Ответ {display_idx}",
+                        callback_data=f"test:v2:toggle:{aid}:{qid}:{int(original_idx)}",
+                    )])
+        if visible_options:
+            text += "\n\n" + "\n\n".join(visible_options)
         if q["q_type"]=="multi": rows.append([InlineKeyboardButton("✅ Сохранить ответ",callback_data=f"test:v2:multisubmit:{aid}:{qid}")])
     nav=[]
     if int(a.get("allow_back") or 0) and position>0: nav.append(InlineKeyboardButton("◀️ Назад",callback_data=f"test:v2:goto:{aid}:{position-1}"))
@@ -17330,11 +17340,15 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action=="toggle":
         qid=int(parts[4]); opt=int(parts[5]); selmap=context.user_data.get(TV2_MULTI) or {}; cur=set(selmap.get(str(qid),[])); cur.discard(opt) if opt in cur else cur.add(opt); selmap[str(qid)]=sorted(cur); context.user_data[TV2_MULTI]=selmap; qq=tv2_question_by_id(qid); a=tv2_get_assignment(aid); pos=tv2_assignment_order(a).index(qid); text,kb=tv2_question_display(a,qq,pos)
         rows=[]
+        display_idx=0
         for row in kb.inline_keyboard:
             new=[]
             for b in row:
                 if b.callback_data and b.callback_data.startswith(f"test:v2:toggle:{aid}:{qid}:"):
-                    oi=int(b.callback_data.rsplit(":",1)[-1]); label=("✅ " if oi in cur else "▫️ ")+qq["options"][oi][:55]; new.append(InlineKeyboardButton(label,callback_data=b.callback_data))
+                    display_idx+=1
+                    oi=int(b.callback_data.rsplit(":",1)[-1])
+                    label=("✅ " if oi in cur else "▫️ ")+f"Ответ {display_idx}"
+                    new.append(InlineKeyboardButton(label,callback_data=b.callback_data))
                 else:new.append(b)
             rows.append(new)
         await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows)); return
