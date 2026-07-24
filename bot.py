@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "TEST-FULL-OPTIONS-2026-07-24-V5"
+BUILD_VERSION = "TEST-CONFIRM-ANSWER-2026-07-24-V6"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -15512,6 +15512,7 @@ TEST_V2_BUILD = "TESTING-V2-ALL-FEATURES-2026-07-20"
 TV2_STATE = "tv2_state"
 TV2_DATA = "tv2_data"
 TV2_MULTI = "tv2_multi"
+TV2_SINGLE = "tv2_single"
 TV2_ACTIVE_ASSIGNMENT = "tv2_active_assignment"
 TV2_ADMIN_PAGE_SIZE = 8
 TV2_MY_PAGE_SIZE = 6
@@ -15664,6 +15665,7 @@ def tv2_clear(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(TV2_STATE, None)
     context.user_data.pop(TV2_DATA, None)
     context.user_data.pop(TV2_MULTI, None)
+    context.user_data.pop(TV2_SINGLE, None)
 
 
 def tv2_set_state(context: ContextTypes.DEFAULT_TYPE, state: str, **data):
@@ -16481,15 +16483,20 @@ def tv2_kb_my_open(a: dict):
     return InlineKeyboardMarkup(rows)
 
 
-def tv2_question_display(a: dict, q: dict, position: int) -> tuple[str, InlineKeyboardMarkup | None]:
+def tv2_question_display(
+    a: dict,
+    q: dict,
+    position: int,
+    selected_options: set[int] | None = None,
+) -> tuple[str, InlineKeyboardMarkup | None]:
     order=tv2_assignment_order(a); aid=int(a["id"]); qid=int(q["id"])
+    selected_options=set(int(x) for x in (selected_options or set()))
     remaining=""
     if a.get("deadline_at"):
         try:
             sec=max(0,int((datetime.fromisoformat(a["deadline_at"])-datetime.utcnow()).total_seconds()))
             remaining=f" · ⏱ {sec//60:02d}:{sec%60:02d}"
         except Exception: pass
-    flags=set(int(x) for x in _safe_json_loads(a.get("flagged_json"),[]))
     text=f"📝 <b>{escape(a['title'])}</b>\nВопрос <b>{position+1} из {len(order)}</b>{remaining}\n\n<b>{escape(q['question_text'])}</b>"
     if q["q_type"]=="open":
         text += "\n\nОтправьте ответ следующим сообщением."
@@ -16506,23 +16513,32 @@ def tv2_question_display(a: dict, q: dict, position: int) -> tuple[str, InlineKe
                 )
                 if q["q_type"]=="single":
                     rows.append([InlineKeyboardButton(
-                        f"Ответ {display_idx}",
+                        ("✅ " if int(original_idx) in selected_options else "▫️ ")
+                        + f"Ответ {display_idx}",
                         callback_data=f"test:v2:single:{aid}:{qid}:{int(original_idx)}",
                     )])
                 else:
                     rows.append([InlineKeyboardButton(
-                        f"▫️ Ответ {display_idx}",
+                        ("✅ " if int(original_idx) in selected_options else "▫️ ")
+                        + f"Ответ {display_idx}",
                         callback_data=f"test:v2:toggle:{aid}:{qid}:{int(original_idx)}",
                     )])
         if visible_options:
             text += "\n\n" + "\n\n".join(visible_options)
-        if q["q_type"]=="multi": rows.append([InlineKeyboardButton("✅ Сохранить ответ",callback_data=f"test:v2:multisubmit:{aid}:{qid}")])
+        if q["q_type"]=="single":
+            rows.append([InlineKeyboardButton(
+                "✅ Подтвердить ответ",
+                callback_data=f"test:v2:singlesubmit:{aid}:{qid}",
+            )])
+        elif q["q_type"]=="multi":
+            rows.append([InlineKeyboardButton(
+                "✅ Подтвердить ответ",
+                callback_data=f"test:v2:multisubmit:{aid}:{qid}",
+            )])
     nav=[]
     if int(a.get("allow_back") or 0) and position>0: nav.append(InlineKeyboardButton("◀️ Назад",callback_data=f"test:v2:goto:{aid}:{position-1}"))
-    nav.append(InlineKeyboardButton("🚩" if qid in flags else "🏳️",callback_data=f"test:v2:flag:{aid}:{qid}"))
     if int(a.get("allow_skip") or 0) and position+1<len(order): nav.append(InlineKeyboardButton("Пропустить ▶️",callback_data=f"test:v2:goto:{aid}:{position+1}"))
     if nav: rows.append(nav)
-    rows.append([InlineKeyboardButton("📋 Проверить ответы",callback_data=f"test:v2:reviewpage:{aid}")])
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -16554,7 +16570,19 @@ async def tv2_send_question(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     else:
         context.user_data.pop(TV2_STATE, None)
         context.user_data.pop(TV2_DATA, None)
-    text,kb=tv2_question_display(tv2_get_assignment(aid),q,position)
+    selected_options=set()
+    saved_answer=tv2_answer(aid,int(q["id"]))
+    if saved_answer:
+        selected_options.update(
+            int(x) for x in (saved_answer.get("answer") or {}).get("selected", [])
+        )
+    selection_key=TV2_SINGLE if q["q_type"]=="single" else TV2_MULTI
+    draft_selections=context.user_data.get(selection_key) or {}
+    if str(q["id"]) in draft_selections:
+        selected_options=set(int(x) for x in draft_selections[str(q["id"])])
+    text,kb=tv2_question_display(
+        tv2_get_assignment(aid),q,position,selected_options
+    )
     cq=update.callback_query
     if cq:
         try:
@@ -17338,20 +17366,8 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cb_test_goto_next(update,context,aid)
 
     if action=="toggle":
-        qid=int(parts[4]); opt=int(parts[5]); selmap=context.user_data.get(TV2_MULTI) or {}; cur=set(selmap.get(str(qid),[])); cur.discard(opt) if opt in cur else cur.add(opt); selmap[str(qid)]=sorted(cur); context.user_data[TV2_MULTI]=selmap; qq=tv2_question_by_id(qid); a=tv2_get_assignment(aid); pos=tv2_assignment_order(a).index(qid); text,kb=tv2_question_display(a,qq,pos)
-        rows=[]
-        display_idx=0
-        for row in kb.inline_keyboard:
-            new=[]
-            for b in row:
-                if b.callback_data and b.callback_data.startswith(f"test:v2:toggle:{aid}:{qid}:"):
-                    display_idx+=1
-                    oi=int(b.callback_data.rsplit(":",1)[-1])
-                    label=("✅ " if oi in cur else "▫️ ")+f"Ответ {display_idx}"
-                    new.append(InlineKeyboardButton(label,callback_data=b.callback_data))
-                else:new.append(b)
-            rows.append(new)
-        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows)); return
+        qid=int(parts[4]); opt=int(parts[5]); selmap=context.user_data.get(TV2_MULTI) or {}; cur=set(selmap.get(str(qid),[])); cur.discard(opt) if opt in cur else cur.add(opt); selmap[str(qid)]=sorted(cur); context.user_data[TV2_MULTI]=selmap; qq=tv2_question_by_id(qid); a=tv2_get_assignment(aid); pos=tv2_assignment_order(a).index(qid); text,kb=tv2_question_display(a,qq,pos,cur)
+        await q.edit_message_reply_markup(reply_markup=kb); return
 
     if action=="multisubmit":
         qid=int(parts[4]); qq=tv2_question_by_id(qid); selected=set((context.user_data.get(TV2_MULTI) or {}).get(str(qid),[])); correct=set(int(x) for x in qq.get("correct") or []); ok=1 if selected==correct else 0; pts=float(qq.get("points") or 1) if ok else 0; tv2_save_answer(aid,qid,{"selected":sorted(selected)},ok,pts,"auto")
@@ -20094,10 +20110,6 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = tv3_grading_mode(assignment)
 
     if action == "single":
-        try:
-            await query.answer()
-        except Exception:
-            pass
         if tv2_is_expired(assignment):
             tv2_mark_expired(aid)
             await query.edit_message_text("⌛ Время теста истекло.")
@@ -20105,10 +20117,51 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qid = int(parts[4])
         option = int(parts[5])
         question = tv2_question_by_id(qid) or {}
+        options = question.get("options") or []
+        if option < 0 or option >= len(options):
+            await query.answer("Этот вариант ответа недоступен.", show_alert=True)
+            return
+        try:
+            position = tv2_assignment_order(assignment).index(qid)
+        except ValueError:
+            await query.answer("Этот вопрос недоступен.", show_alert=True)
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        selections = context.user_data.get(TV2_SINGLE) or {}
+        selections[str(qid)] = [option]
+        context.user_data[TV2_SINGLE] = selections
+        _text, keyboard = tv2_question_display(
+            assignment, question, position, {option}
+        )
+        await query.edit_message_reply_markup(reply_markup=keyboard)
+        return
+
+    if action == "singlesubmit":
+        if tv2_is_expired(assignment):
+            tv2_mark_expired(aid)
+            await query.edit_message_text("⌛ Время теста истекло.")
+            return
+        qid = int(parts[4])
+        question = tv2_question_by_id(qid) or {}
+        selections = context.user_data.get(TV2_SINGLE) or {}
+        selected = set(int(x) for x in selections.get(str(qid), []))
+        if len(selected) != 1:
+            await query.answer("Сначала выберите один ответ.", show_alert=True)
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        option = next(iter(selected))
         correct_options = set(int(x) for x in question.get("correct") or [])
         correct = {option} == correct_options
         points = float(question.get("points") or 1) if correct else 0
         tv2_save_answer(aid, qid, {"selected": [option]}, 1 if correct else 0, points, "auto")
+        selections.pop(str(qid), None)
+        context.user_data[TV2_SINGLE] = selections
         if mode == "instant":
             await query.edit_message_text(
                 tv3_feedback_text(question, correct),
@@ -20121,10 +20174,6 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cb_test_goto_next(update, context, aid)
 
     if action == "multisubmit":
-        try:
-            await query.answer()
-        except Exception:
-            pass
         if tv2_is_expired(assignment):
             tv2_mark_expired(aid)
             await query.edit_message_text("⌛ Время теста истекло.")
@@ -20132,12 +20181,22 @@ async def cb_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qid = int(parts[4])
         question = tv2_question_by_id(qid) or {}
         selected = set((context.user_data.get(TV2_MULTI) or {}).get(str(qid), []))
+        if not selected:
+            await query.answer("Сначала выберите хотя бы один ответ.", show_alert=True)
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
         correct_options = set(int(x) for x in question.get("correct") or [])
         correct = selected == correct_options
         points = float(question.get("points") or 1) if correct else 0
         tv2_save_answer(
             aid, qid, {"selected": sorted(selected)}, 1 if correct else 0, points, "auto"
         )
+        selections = context.user_data.get(TV2_MULTI) or {}
+        selections.pop(str(qid), None)
+        context.user_data[TV2_MULTI] = selections
         if mode == "instant":
             await query.edit_message_text(
                 tv3_feedback_text(question, correct),
