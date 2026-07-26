@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "INDUSTRY-DIVISION-CASES-2026-07-26-V14"
+BUILD_VERSION = "INDUSTRY-DIVISION-COSMETICS-NOTE-2026-07-26-V15"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -18350,7 +18350,7 @@ INDUSTRY_DIVISION_ITEMS = (
     ),
     (
         "grocery_retail",
-        "Продуктовый ритейл",
+        "Ритейл",
         INDUSTRY_DIVISION_GROCERY_RETAIL_URL,
     ),
     (
@@ -18384,7 +18384,8 @@ INDUSTRY_DIVISION_BY_KEY = {
 INDUSTRY_DIVISION_CASE_CATEGORIES = {
     "alcohol_tobacco": ("alcohol",),
     "grocery_retail": ("retail",),
-    "cosmetics_perfumery": ("fmcg", "retail"),
+    # Для косметики открытых кейсов пока нет — показываем близкую подборку ритейла.
+    "cosmetics_perfumery": ("retail",),
     "fmcg_cpg": ("fmcg",),
     "auto_goods": ("auto",),
     "pharma": ("medicine",),
@@ -18599,12 +18600,24 @@ def industry_division_text(
     user_id: int | None = None,
     notice: str | None = None,
 ) -> str:
-    selected_labels = industry_division_selected_labels(user_id)
+    selected_keys = db_industry_division_get_choices(user_id)
+    selected_labels = [
+        INDUSTRY_DIVISION_BY_KEY[key]["title"]
+        for key in selected_keys
+        if key in INDUSTRY_DIVISION_BY_KEY
+    ]
     lines = [
         "🏭 <b>Отраслевое деление</b>",
         "",
         "Выбери от <b>одной до трёх отраслей</b>, с которыми ты работаешь. "
-        "Бот запомнит выбор и покажет подходящие материалы, инструменты и кейсы.",
+        "Бот запомнит твой выбор и покажет подходящие материалы, инструменты и кейсы.",
+        "",
+        "📚 <b>«Показать кейсы моей отрасли»</b> — подборка кейсов "
+        "по выбранным направлениям.",
+        "",
+        "🧰 <b>«Открыть инструменты моих отраслей»</b> — раздел со всеми "
+        "полезными рабочими ресурсами, включая ссылку на Wiki по каждой "
+        "выбранной отрасли.",
         "",
         (
             f"Выбрано: <b>{len(selected_labels)} "
@@ -18613,6 +18626,16 @@ def industry_division_text(
     ]
     if selected_labels:
         lines.extend(["", *[f"• {escape(label)}" for label in selected_labels]])
+
+    if "cosmetics_perfumery" in selected_keys:
+        lines.extend([
+            "",
+            "ℹ️ <b>Косметика и парфюмерия:</b> по этой отрасли открытых "
+            "кейсов пока нет. Посмотри кейсы ритейла или воспользуйся "
+            "разделом <b>«Открыть инструменты моих отраслей»</b> — там "
+            "доступна ссылка на Wiki по этой отрасли.",
+        ])
+
     if notice:
         lines = [notice, "", *lines]
     return "\n".join(lines)
@@ -18627,7 +18650,7 @@ def industry_division_tools_text(user_id: int | None = None) -> str:
         )
     return (
         "🧰 <b>Инструменты выбранных отраслей</b>\n\n"
-        "Открой нужный рабочий ресурс:\n\n"
+        "Открой нужный рабочий ресурс, включая Wiki по выбранным отраслям:\n\n"
         + "\n".join(f"• {escape(label)}" for label in selected_labels)
     )
 
