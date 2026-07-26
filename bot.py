@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "PROFILE-FIELD-EDIT-2026-07-24-V11"
+BUILD_VERSION = "INDUSTRY-DIVISION-2026-07-26-V12"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -196,6 +196,28 @@ NO_ACCESS_TEXT = (
 )
 
 INDUSTRY_WIKI_URL = os.getenv("INDUSTRY_WIKI_URL", "")
+
+# Ссылки раздела «Отраслевое деление». Пока переменная не заполнена,
+# соответствующая кнопка показывает уведомление вместо открытия пустого URL.
+INDUSTRY_DIVISION_ALCOHOL_TOBACCO_URL = os.getenv(
+    "INDUSTRY_DIVISION_ALCOHOL_TOBACCO_URL", ""
+)
+INDUSTRY_DIVISION_GROCERY_RETAIL_URL = os.getenv(
+    "INDUSTRY_DIVISION_GROCERY_RETAIL_URL", ""
+)
+INDUSTRY_DIVISION_COSMETICS_PERFUMERY_URL = os.getenv(
+    "INDUSTRY_DIVISION_COSMETICS_PERFUMERY_URL", ""
+)
+INDUSTRY_DIVISION_FMCG_CPG_URL = os.getenv(
+    "INDUSTRY_DIVISION_FMCG_CPG_URL", ""
+)
+INDUSTRY_DIVISION_AUTO_GOODS_URL = os.getenv(
+    "INDUSTRY_DIVISION_AUTO_GOODS_URL", ""
+)
+INDUSTRY_DIVISION_PHARMA_URL = os.getenv(
+    "INDUSTRY_DIVISION_PHARMA_URL", ""
+)
+
 STAFF_URL = os.getenv("STAFF_URL", "")
 SITE_URL = os.getenv("SITE_URL", "")
 LITE_FORM_URL = os.getenv("LITE_FORM_URL", "")
@@ -18318,12 +18340,146 @@ def help_text_main(
     )
 
 
+INDUSTRY_DIVISION_ITEMS = (
+    (
+        "alcohol_tobacco",
+        "Алкоголь и табак",
+        INDUSTRY_DIVISION_ALCOHOL_TOBACCO_URL,
+    ),
+    (
+        "grocery_retail",
+        "Продуктовый ритейл",
+        INDUSTRY_DIVISION_GROCERY_RETAIL_URL,
+    ),
+    (
+        "cosmetics_perfumery",
+        "Косметика и парфюмерия",
+        INDUSTRY_DIVISION_COSMETICS_PERFUMERY_URL,
+    ),
+    (
+        "fmcg_cpg",
+        "FMCG и CPG",
+        INDUSTRY_DIVISION_FMCG_CPG_URL,
+    ),
+    (
+        "auto_goods",
+        "Автотовары",
+        INDUSTRY_DIVISION_AUTO_GOODS_URL,
+    ),
+    (
+        "pharma",
+        "Фарма",
+        INDUSTRY_DIVISION_PHARMA_URL,
+    ),
+)
+INDUSTRY_DIVISION_BY_KEY = {
+    key: {"title": title, "url": url}
+    for key, title, url in INDUSTRY_DIVISION_ITEMS
+}
+
+
+def _green_inline_button(
+    text: str,
+    *,
+    callback_data: str,
+) -> InlineKeyboardButton:
+    """Создаёт зелёную inline-кнопку, включая совместимость с PTB < 22.7."""
+    try:
+        return InlineKeyboardButton(
+            text,
+            callback_data=callback_data,
+            style="success",
+        )
+    except TypeError:
+        # В старых версиях python-telegram-bot поле можно передать напрямую
+        # в Bot API через api_kwargs.
+        return InlineKeyboardButton(
+            text,
+            callback_data=callback_data,
+            api_kwargs={"style": "success"},
+        )
+
+
+def kb_industry_division() -> InlineKeyboardMarkup:
+    # Как в «Кейсах»: более длинные названия идут первыми, кнопки — по две.
+    ordered_items = sorted(
+        INDUSTRY_DIVISION_ITEMS,
+        key=lambda item: -len(item[1]),
+    )
+    buttons = []
+    for key, title, url in ordered_items:
+        clean_url = (url or "").strip()
+        if clean_url:
+            button = InlineKeyboardButton(title, url=clean_url)
+        else:
+            button = InlineKeyboardButton(
+                title,
+                callback_data=f"help:industry_division:missing:{key}",
+            )
+        buttons.append(button)
+
+    rows = [
+        buttons[index:index + 2]
+        for index in range(0, len(buttons), 2)
+    ]
+    rows.append([
+        InlineKeyboardButton("⬅️ Главное меню", callback_data="help:main")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def industry_division_text() -> str:
+    return (
+        "🏭 <b>Отраслевое деление</b>\n\n"
+        "Выберите отрасль, чтобы открыть соответствующий ресурс."
+    )
+
+
+async def handle_industry_division_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    if not query:
+        return
+    if await deny_no_access(update, context):
+        return
+
+    data = query.data or ""
+    if data.startswith("help:industry_division:missing:"):
+        key = data.rsplit(":", 1)[-1]
+        item = INDUSTRY_DIVISION_BY_KEY.get(key)
+        title = item["title"] if item else "этой отрасли"
+        await query.answer(
+            f"Ссылка для «{title}» пока не настроена.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    await query.edit_message_text(
+        industry_division_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_industry_division(),
+        disable_web_page_preview=True,
+    )
+
+
 def kb_help_main(is_admin_user: bool, unread_count: int = 0):
     legacy_markup = _reminder_legacy_kb_help_main(
         is_admin_user=is_admin_user,
         unread_count=unread_count,
     )
     legacy_rows = [list(row) for row in legacy_markup.inline_keyboard]
+    industry_division_row = [
+        _green_inline_button(
+            "🏭 Отраслевое деление",
+            callback_data="help:industry_division",
+        )
+    ]
     cases_row = [
         InlineKeyboardButton(
             "📚 Кейсы",
@@ -18337,9 +18493,9 @@ def kb_help_main(is_admin_user: bool, unread_count: int = 0):
         )
     ]
 
-    # Ставим длинные кнопки «Кейсы» и «Напоминалка» непосредственно перед
-    # администраторской кнопкой «Управление ботом». Для обычного сотрудника,
-    # у которого такой кнопки нет, они будут последними строками меню.
+    # Ставим полноширинные кнопки «Отраслевое деление», «Кейсы» и
+    # «Напоминалка» непосредственно перед администраторской кнопкой
+    # «Управление ботом».
     settings_row_index = next(
         (
             index
@@ -18353,7 +18509,7 @@ def kb_help_main(is_admin_user: bool, unread_count: int = 0):
     )
     rows = (
         legacy_rows[:settings_row_index]
-        + [cases_row, reminder_row]
+        + [industry_division_row, cases_row, reminder_row]
         + legacy_rows[settings_row_index:]
     )
     return InlineKeyboardMarkup(rows)
@@ -22910,6 +23066,8 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = (update.callback_query.data or "") if update.callback_query else ""
+    if data.startswith("help:industry_division"):
+        return await handle_industry_division_callback(update, context)
     if data.startswith("help:cases"):
         return await handle_cases_callback(update, context)
     if not data.startswith("help:faq"):
