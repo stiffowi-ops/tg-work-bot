@@ -23566,6 +23566,731 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- APP ----------------
 
+
+# ===================== INDUSTRY SPECIALISTS V1 =====================
+# Редактор отраслевых специалистов использует тот же источник отраслей,
+# что и пользовательский раздел «Отраслевое деление». Поэтому при добавлении
+# новой записи в INDUSTRY_DIVISION_ITEMS новая кнопка автоматически появляется
+# и в редакторе специалистов.
+
+INDUSTRY_SPECIALIST_STATE = "industry_specialist_state"
+INDUSTRY_SPECIALIST_DRAFT = "industry_specialist_draft"
+
+
+def clear_industry_specialist_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop(INDUSTRY_SPECIALIST_STATE, None)
+    context.user_data.pop(INDUSTRY_SPECIALIST_DRAFT, None)
+
+
+def industry_specialist_industry_items() -> list[tuple[str, str]]:
+    """Единый список отраслей для раздела и административного редактора."""
+    return [(str(key), str(title)) for key, title, _url in INDUSTRY_DIVISION_ITEMS]
+
+
+def industry_specialist_industry_title(industry_key: str) -> str:
+    item = INDUSTRY_DIVISION_BY_KEY.get(str(industry_key))
+    return str(item.get("title") or industry_key) if item else str(industry_key)
+
+
+def industry_specialist_normalize_tg_link(value: str | None) -> str | None:
+    """Принимает @username, username или ссылку t.me и хранит @username."""
+    return normalize_tg_mention(value or "")
+
+
+def industry_specialist_tg_url(value: str | None) -> str | None:
+    mention = industry_specialist_normalize_tg_link(value)
+    return f"https://t.me/{mention[1:]}" if mention else None
+
+
+_industry_specialists_legacy_db_init = db_init
+
+def db_init():
+    _industry_specialists_legacy_db_init()
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS industry_specialists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_name TEXT NOT NULL,
+                industry_key TEXT NOT NULL,
+                telegram_link TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_industry_specialists_industry "
+            "ON industry_specialists(industry_key, full_name COLLATE NOCASE)"
+        )
+
+
+def db_industry_specialists_list(industry_keys: list[str] | tuple[str, ...] | None = None) -> list[dict]:
+    if industry_keys is not None:
+        clean_keys = [str(key) for key in industry_keys if str(key)]
+        if not clean_keys:
+            return []
+    with sqlite3.connect(DB_PATH) as con:
+        if industry_keys is not None:
+            placeholders = ",".join("?" for _ in clean_keys)
+            rows = con.execute(
+                f"""
+                SELECT id, full_name, industry_key, telegram_link, created_at, updated_at
+                FROM industry_specialists
+                WHERE industry_key IN ({placeholders})
+                ORDER BY industry_key ASC, full_name COLLATE NOCASE ASC, id ASC
+                """,
+                clean_keys,
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """
+                SELECT id, full_name, industry_key, telegram_link, created_at, updated_at
+                FROM industry_specialists
+                ORDER BY industry_key ASC, full_name COLLATE NOCASE ASC, id ASC
+                """
+            ).fetchall()
+    return [
+        {
+            "id": int(row[0]),
+            "full_name": row[1],
+            "industry_key": row[2],
+            "telegram_link": row[3],
+            "created_at": row[4],
+            "updated_at": row[5],
+        }
+        for row in rows
+    ]
+
+
+def db_industry_specialist_get(specialist_id: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            """
+            SELECT id, full_name, industry_key, telegram_link, created_at, updated_at
+            FROM industry_specialists
+            WHERE id=?
+            """,
+            (int(specialist_id),),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": int(row[0]),
+        "full_name": row[1],
+        "industry_key": row[2],
+        "telegram_link": row[3],
+        "created_at": row[4],
+        "updated_at": row[5],
+    }
+
+
+def db_industry_specialist_add(full_name: str, industry_key: str, telegram_link: str) -> int:
+    clean_name = re.sub(r"\s+", " ", (full_name or "").strip())[:120]
+    clean_tg = industry_specialist_normalize_tg_link(telegram_link)
+    if len(clean_name) < 3:
+        raise ValueError("Имя специалиста слишком короткое")
+    if industry_key not in INDUSTRY_DIVISION_BY_KEY:
+        raise ValueError("Неизвестная отрасль")
+    if not clean_tg:
+        raise ValueError("Некорректная ссылка на Telegram")
+    now = datetime.utcnow().isoformat()
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            """
+            INSERT INTO industry_specialists(
+                full_name, industry_key, telegram_link, created_at, updated_at
+            ) VALUES(?,?,?,?,?)
+            """,
+            (clean_name, industry_key, clean_tg, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def db_industry_specialist_update(
+    specialist_id: int,
+    *,
+    full_name: str | None = None,
+    industry_key: str | None = None,
+    telegram_link: str | None = None,
+) -> bool:
+    item = db_industry_specialist_get(int(specialist_id))
+    if not item:
+        return False
+    clean_name = item["full_name"]
+    clean_industry = item["industry_key"]
+    clean_tg = item["telegram_link"]
+    if full_name is not None:
+        clean_name = re.sub(r"\s+", " ", full_name.strip())[:120]
+        if len(clean_name) < 3:
+            raise ValueError("Имя специалиста слишком короткое")
+    if industry_key is not None:
+        if industry_key not in INDUSTRY_DIVISION_BY_KEY:
+            raise ValueError("Неизвестная отрасль")
+        clean_industry = industry_key
+    if telegram_link is not None:
+        clean_tg = industry_specialist_normalize_tg_link(telegram_link)
+        if not clean_tg:
+            raise ValueError("Некорректная ссылка на Telegram")
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            """
+            UPDATE industry_specialists
+            SET full_name=?, industry_key=?, telegram_link=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                clean_name,
+                clean_industry,
+                clean_tg,
+                datetime.utcnow().isoformat(),
+                int(specialist_id),
+            ),
+        )
+        return cur.rowcount > 0
+
+
+def db_industry_specialist_delete(specialist_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            "DELETE FROM industry_specialists WHERE id=?",
+            (int(specialist_id),),
+        )
+        return cur.rowcount > 0
+
+
+def industry_specialist_card_text(item: dict, *, admin: bool = False) -> str:
+    title = industry_specialist_industry_title(item.get("industry_key") or "")
+    prefix = "🧑‍💼 <b>Редактор отраслевого специалиста</b>" if admin else "👤 <b>Отраслевой специалист</b>"
+    return (
+        f"{prefix}\n\n"
+        f"<b>Имя и фамилия:</b> {escape(item.get('full_name') or '—')}\n"
+        f"<b>Отрасль:</b> {escape(title)}\n"
+        f"<b>Telegram:</b> {escape(item.get('telegram_link') or '—')}"
+    )
+
+
+def kb_industry_specialists_public() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                item["full_name"][:60],
+                callback_data=f"help:industry_specialist:{int(item['id'])}:all",
+            )
+        ]
+        for item in db_industry_specialists_list()
+    ]
+    if not rows:
+        rows.append([InlineKeyboardButton("— специалисты пока не добавлены —", callback_data="noop")])
+    rows.append([
+        InlineKeyboardButton("⬅️ В отраслевое деление", callback_data="help:industry_division")
+    ])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def industry_specialists_public_text() -> str:
+    items = db_industry_specialists_list()
+    lines = [
+        "👥 <b>Отраслевые специалисты</b>",
+        "",
+        "Выбери специалиста, чтобы посмотреть его отрасль и открыть контакт в Telegram.",
+    ]
+    if not items:
+        lines.extend(["", "Специалисты пока не добавлены."])
+        return "\n".join(lines)
+    current_key = None
+    for item in items:
+        key = item["industry_key"]
+        if key != current_key:
+            current_key = key
+            lines.extend(["", f"<b>{escape(industry_specialist_industry_title(key))}</b>"])
+        lines.append(f"• {escape(item['full_name'])}")
+    return "\n".join(lines)
+
+
+def kb_industry_specialist_card(item: dict, source: str = "all") -> InlineKeyboardMarkup:
+    rows = []
+    tg_url = industry_specialist_tg_url(item.get("telegram_link"))
+    if tg_url:
+        rows.append([InlineKeyboardButton("✈️ Написать в Telegram", url=tg_url)])
+    if source == "tools":
+        rows.append([
+            InlineKeyboardButton(
+                "⬅️ К инструментам",
+                callback_data="help:industry_division:tools",
+            )
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(
+                "⬅️ К специалистам",
+                callback_data="help:industry_specialists",
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton("🏭 В отраслевое деление", callback_data="help:industry_division")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_industry_specialists_admin() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("➕ Добавить специалиста", callback_data="help:ispec:add")]]
+    for item in db_industry_specialists_list():
+        rows.append([
+            InlineKeyboardButton(
+                f"✏️ {item['full_name'][:52]}",
+                callback_data=f"help:ispec:open:{int(item['id'])}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:settings:content")])
+    return InlineKeyboardMarkup(rows)
+
+
+def industry_specialists_admin_text() -> str:
+    items = db_industry_specialists_list()
+    return (
+        "🧑‍💼 <b>Отраслевые специалисты</b>\n\n"
+        "Здесь можно создать специалиста и изменить его имя, отрасль или "
+        "Telegram-ссылку. Отрасли для выбора берутся напрямую из раздела "
+        "«Отраслевое деление».\n\n"
+        f"Создано специалистов: <b>{len(items)}</b>"
+    )
+
+
+def kb_industry_specialist_admin_card(item: dict) -> InlineKeyboardMarkup:
+    specialist_id = int(item["id"])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Имя и фамилия", callback_data=f"help:ispec:editn:{specialist_id}")],
+        [InlineKeyboardButton("🏭 Изменить отрасль", callback_data=f"help:ispec:editi:{specialist_id}")],
+        [InlineKeyboardButton("✈️ Изменить Telegram", callback_data=f"help:ispec:editt:{specialist_id}")],
+        [InlineKeyboardButton("🗑 Удалить специалиста", callback_data=f"help:ispec:delask:{specialist_id}")],
+        [InlineKeyboardButton("⬅️ К списку", callback_data="help:ispec")],
+    ])
+
+
+def kb_industry_specialist_industry_picker(mode: str, specialist_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    buttons = []
+    for key, title in sorted(
+        industry_specialist_industry_items(),
+        key=lambda item: (-len(item[1]), item[1].casefold()),
+    ):
+        if mode == "add":
+            callback_data = f"help:ispec:addind:{key}"
+        else:
+            callback_data = f"help:ispec:seti:{int(specialist_id)}:{key}"
+        buttons.append(InlineKeyboardButton(title, callback_data=callback_data))
+    rows.extend(buttons[index:index + 2] for index in range(0, len(buttons), 2))
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="help:ispec")])
+    return InlineKeyboardMarkup(rows)
+
+
+_industry_specialists_legacy_kb_settings_content = kb_settings_content
+
+def kb_settings_content():
+    legacy = _industry_specialists_legacy_kb_settings_content()
+    rows = [list(row) for row in legacy.inline_keyboard]
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [
+        InlineKeyboardButton("🧑‍💼 Отраслевые специалисты", callback_data="help:ispec")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+_industry_specialists_legacy_kb_industry_division = kb_industry_division
+
+def kb_industry_division(user_id: int | None = None) -> InlineKeyboardMarkup:
+    legacy = _industry_specialists_legacy_kb_industry_division(user_id)
+    rows = [list(row) for row in legacy.inline_keyboard]
+    # Кнопка видна всегда, даже если пользователь пока не выбрал отрасль.
+    back_index = next(
+        (
+            index for index, row in enumerate(rows)
+            if any((button.callback_data or "") == "help:main" for button in row)
+        ),
+        len(rows),
+    )
+    rows.insert(back_index, [
+        InlineKeyboardButton("👥 Отраслевые специалисты", callback_data="help:industry_specialists")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+_industry_specialists_legacy_kb_industry_division_tools = kb_industry_division_tools
+
+def kb_industry_division_tools(user_id: int | None = None) -> InlineKeyboardMarkup:
+    legacy = _industry_specialists_legacy_kb_industry_division_tools(user_id)
+    rows = [list(row) for row in legacy.inline_keyboard]
+    specialists = db_industry_specialists_list(db_industry_division_get_choices(user_id))
+    insert_at = next(
+        (
+            index for index, row in enumerate(rows)
+            if any((button.callback_data or "") == "help:industry_division" for button in row)
+        ),
+        len(rows),
+    )
+    specialist_rows = [
+        [
+            InlineKeyboardButton(
+                f"👤 {item['full_name'][:55]}",
+                callback_data=f"help:industry_specialist:{int(item['id'])}:tools",
+            )
+        ]
+        for item in specialists
+    ]
+    rows[insert_at:insert_at] = specialist_rows
+    return InlineKeyboardMarkup(rows)
+
+
+_industry_specialists_legacy_industry_division_tools_text = industry_division_tools_text
+
+def industry_division_tools_text(user_id: int | None = None) -> str:
+    base = _industry_specialists_legacy_industry_division_tools_text(user_id)
+    specialists = db_industry_specialists_list(db_industry_division_get_choices(user_id))
+    if not specialists:
+        return base + "\n\n👥 Для выбранных отраслей специалисты пока не добавлены."
+    lines = [base, "", "👥 <b>Отраслевые специалисты:</b>"]
+    for item in specialists:
+        lines.append(
+            f"• {escape(item['full_name'])} — "
+            f"{escape(industry_specialist_industry_title(item['industry_key']))}"
+        )
+    return "\n".join(lines)
+
+
+_industry_specialists_legacy_cb_help = cb_help
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+
+    if data == "help:industry_specialists":
+        if await deny_no_access(update, context):
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            industry_specialists_public_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_specialists_public(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:industry_specialist:"):
+        if await deny_no_access(update, context):
+            return
+        parts = data.split(":")
+        try:
+            specialist_id = int(parts[2])
+        except (IndexError, TypeError, ValueError):
+            await query.answer("Специалист не найден.", show_alert=True)
+            return
+        source = parts[3] if len(parts) > 3 else "all"
+        item = db_industry_specialist_get(specialist_id)
+        if not item:
+            await query.answer("Специалист не найден.", show_alert=True)
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            industry_specialist_card_text(item),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_specialist_card(item, source),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:ispec"):
+        if not await is_admin_scoped(update, context):
+            try:
+                await query.answer("Доступно администраторам.", show_alert=True)
+            except Exception:
+                pass
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        if data == "help:ispec":
+            clear_industry_specialist_flow(context)
+            await query.edit_message_text(
+                industry_specialists_admin_text(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_industry_specialists_admin(),
+            )
+            return
+
+        if data == "help:ispec:add":
+            clear_industry_specialist_flow(context)
+            context.user_data[INDUSTRY_SPECIALIST_STATE] = "add_name"
+            context.user_data[INDUSTRY_SPECIALIST_DRAFT] = {}
+            await query.edit_message_text(
+                "🧑‍💼 <b>Новый отраслевой специалист</b>\n\n"
+                "Введите имя и фамилию специалиста.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="help:ispec")
+                ]]),
+            )
+            return
+
+        if data.startswith("help:ispec:addind:"):
+            industry_key = data.rsplit(":", 1)[-1]
+            draft = dict(context.user_data.get(INDUSTRY_SPECIALIST_DRAFT) or {})
+            if not draft.get("full_name") or industry_key not in INDUSTRY_DIVISION_BY_KEY:
+                clear_industry_specialist_flow(context)
+                await query.edit_message_text(
+                    "Сценарий добавления устарел. Начните заново.",
+                    reply_markup=kb_industry_specialists_admin(),
+                )
+                return
+            draft["industry_key"] = industry_key
+            context.user_data[INDUSTRY_SPECIALIST_DRAFT] = draft
+            context.user_data[INDUSTRY_SPECIALIST_STATE] = "add_telegram"
+            await query.edit_message_text(
+                "✈️ <b>Telegram специалиста</b>\n\n"
+                "Отправьте <code>@username</code>, имя пользователя или ссылку "
+                "<code>https://t.me/username</code>.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="help:ispec")
+                ]]),
+            )
+            return
+
+        if data.startswith("help:ispec:open:"):
+            specialist_id = int(data.rsplit(":", 1)[-1])
+            item = db_industry_specialist_get(specialist_id)
+            if not item:
+                await query.edit_message_text(
+                    "Специалист не найден.", reply_markup=kb_industry_specialists_admin()
+                )
+                return
+            clear_industry_specialist_flow(context)
+            await query.edit_message_text(
+                industry_specialist_card_text(item, admin=True),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_industry_specialist_admin_card(item),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("help:ispec:editn:"):
+            specialist_id = int(data.rsplit(":", 1)[-1])
+            item = db_industry_specialist_get(specialist_id)
+            if not item:
+                await query.edit_message_text("Специалист не найден.", reply_markup=kb_industry_specialists_admin())
+                return
+            context.user_data[INDUSTRY_SPECIALIST_STATE] = "edit_name"
+            context.user_data[INDUSTRY_SPECIALIST_DRAFT] = {"specialist_id": specialist_id}
+            await query.edit_message_text(
+                f"✏️ Текущее имя: <b>{escape(item['full_name'])}</b>\n\nВведите новое имя и фамилию.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data=f"help:ispec:open:{specialist_id}")
+                ]]),
+            )
+            return
+
+        if data.startswith("help:ispec:editi:"):
+            specialist_id = int(data.rsplit(":", 1)[-1])
+            item = db_industry_specialist_get(specialist_id)
+            if not item:
+                await query.edit_message_text("Специалист не найден.", reply_markup=kb_industry_specialists_admin())
+                return
+            await query.edit_message_text(
+                "🏭 <b>Выберите отрасль</b>\n\n"
+                "Кнопки формируются из действующего списка раздела «Отраслевое деление».",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_industry_specialist_industry_picker("edit", specialist_id),
+            )
+            return
+
+        if data.startswith("help:ispec:seti:"):
+            parts = data.split(":")
+            try:
+                specialist_id = int(parts[3])
+                industry_key = parts[4]
+            except (IndexError, TypeError, ValueError):
+                await query.edit_message_text("Некорректные данные.", reply_markup=kb_industry_specialists_admin())
+                return
+            try:
+                db_industry_specialist_update(specialist_id, industry_key=industry_key)
+            except ValueError as exc:
+                await query.edit_message_text(str(exc), reply_markup=kb_industry_specialists_admin())
+                return
+            item = db_industry_specialist_get(specialist_id)
+            await query.edit_message_text(
+                "✅ Отрасль изменена.\n\n" + industry_specialist_card_text(item, admin=True),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_industry_specialist_admin_card(item),
+            )
+            return
+
+        if data.startswith("help:ispec:editt:"):
+            specialist_id = int(data.rsplit(":", 1)[-1])
+            item = db_industry_specialist_get(specialist_id)
+            if not item:
+                await query.edit_message_text("Специалист не найден.", reply_markup=kb_industry_specialists_admin())
+                return
+            context.user_data[INDUSTRY_SPECIALIST_STATE] = "edit_telegram"
+            context.user_data[INDUSTRY_SPECIALIST_DRAFT] = {"specialist_id": specialist_id}
+            await query.edit_message_text(
+                f"✈️ Текущий Telegram: <b>{escape(item['telegram_link'])}</b>\n\n"
+                "Отправьте новый <code>@username</code>, username или ссылку t.me.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data=f"help:ispec:open:{specialist_id}")
+                ]]),
+            )
+            return
+
+        if data.startswith("help:ispec:delask:"):
+            specialist_id = int(data.rsplit(":", 1)[-1])
+            item = db_industry_specialist_get(specialist_id)
+            if not item:
+                await query.edit_message_text("Специалист не найден.", reply_markup=kb_industry_specialists_admin())
+                return
+            await query.edit_message_text(
+                f"⚠️ Удалить специалиста <b>{escape(item['full_name'])}</b>?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"help:ispec:del:{specialist_id}")],
+                    [InlineKeyboardButton("Отмена", callback_data=f"help:ispec:open:{specialist_id}")],
+                ]),
+            )
+            return
+
+        if data.startswith("help:ispec:del:"):
+            specialist_id = int(data.rsplit(":", 1)[-1])
+            deleted = db_industry_specialist_delete(specialist_id)
+            clear_industry_specialist_flow(context)
+            await query.edit_message_text(
+                "✅ Специалист удалён." if deleted else "Специалист уже удалён.",
+                reply_markup=kb_industry_specialists_admin(),
+            )
+            return
+
+    return await _industry_specialists_legacy_cb_help(update, context)
+
+
+_industry_specialists_legacy_on_text = on_text
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get(INDUSTRY_SPECIALIST_STATE)
+    if not state:
+        return await _industry_specialists_legacy_on_text(update, context)
+
+    if not await is_admin_scoped(update, context):
+        clear_industry_specialist_flow(context)
+        return await _industry_specialists_legacy_on_text(update, context)
+
+    text = re.sub(r"\s+", " ", (update.message.text or "").strip())
+    draft = dict(context.user_data.get(INDUSTRY_SPECIALIST_DRAFT) or {})
+
+    if state == "add_name":
+        if len(text) < 3:
+            await update.message.reply_text("Введите имя и фамилию длиной не менее трёх символов.")
+            return
+        draft["full_name"] = text[:120]
+        context.user_data[INDUSTRY_SPECIALIST_DRAFT] = draft
+        context.user_data[INDUSTRY_SPECIALIST_STATE] = "add_industry"
+        await update.message.reply_text(
+            "🏭 Выберите отрасль специалиста. Список синхронизирован с разделом «Отраслевое деление».",
+            reply_markup=kb_industry_specialist_industry_picker("add"),
+        )
+        return
+
+    if state == "add_industry":
+        await update.message.reply_text("Выберите отрасль кнопкой под предыдущим сообщением.")
+        return
+
+    if state == "add_telegram":
+        clean_tg = industry_specialist_normalize_tg_link(text)
+        if not clean_tg:
+            await update.message.reply_text(
+                "Не удалось распознать Telegram. Отправьте @username, username или ссылку https://t.me/username."
+            )
+            return
+        try:
+            specialist_id = db_industry_specialist_add(
+                draft.get("full_name") or "",
+                draft.get("industry_key") or "",
+                clean_tg,
+            )
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        clear_industry_specialist_flow(context)
+        item = db_industry_specialist_get(specialist_id)
+        await update.message.reply_text(
+            "✅ Специалист создан.\n\n" + industry_specialist_card_text(item, admin=True),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_specialist_admin_card(item),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if state == "edit_name":
+        specialist_id = int(draft.get("specialist_id") or 0)
+        if len(text) < 3:
+            await update.message.reply_text("Введите имя и фамилию длиной не менее трёх символов.")
+            return
+        try:
+            updated = db_industry_specialist_update(specialist_id, full_name=text)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        clear_industry_specialist_flow(context)
+        item = db_industry_specialist_get(specialist_id)
+        if not updated or not item:
+            await update.message.reply_text("Специалист не найден.", reply_markup=kb_industry_specialists_admin())
+            return
+        await update.message.reply_text(
+            "✅ Имя изменено.\n\n" + industry_specialist_card_text(item, admin=True),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_specialist_admin_card(item),
+        )
+        return
+
+    if state == "edit_telegram":
+        specialist_id = int(draft.get("specialist_id") or 0)
+        clean_tg = industry_specialist_normalize_tg_link(text)
+        if not clean_tg:
+            await update.message.reply_text(
+                "Не удалось распознать Telegram. Отправьте @username, username или ссылку https://t.me/username."
+            )
+            return
+        try:
+            updated = db_industry_specialist_update(specialist_id, telegram_link=clean_tg)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        clear_industry_specialist_flow(context)
+        item = db_industry_specialist_get(specialist_id)
+        if not updated or not item:
+            await update.message.reply_text("Специалист не найден.", reply_markup=kb_industry_specialists_admin())
+            return
+        await update.message.reply_text(
+            "✅ Telegram изменён.\n\n" + industry_specialist_card_text(item, admin=True),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_specialist_admin_card(item),
+            disable_web_page_preview=True,
+        )
+        return
+
+    clear_industry_specialist_flow(context)
+    return await _industry_specialists_legacy_on_text(update, context)
+
+# =================== END INDUSTRY SPECIALISTS V1 ===================
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
