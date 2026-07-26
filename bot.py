@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "INDUSTRY-DIVISION-2026-07-26-V12"
+BUILD_VERSION = "INDUSTRY-DIVISION-CASES-2026-07-26-V14"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -18340,6 +18340,8 @@ def help_text_main(
     )
 
 
+INDUSTRY_DIVISION_MAX_SELECTIONS = 3
+
 INDUSTRY_DIVISION_ITEMS = (
     (
         "alcohol_tobacco",
@@ -18377,6 +18379,17 @@ INDUSTRY_DIVISION_BY_KEY = {
     for key, title, url in INDUSTRY_DIVISION_ITEMS
 }
 
+# Соответствие разделов отраслевого деления категориям каталога кейсов.
+# Одна выбранная отрасль может объединять несколько близких категорий кейсов.
+INDUSTRY_DIVISION_CASE_CATEGORIES = {
+    "alcohol_tobacco": ("alcohol",),
+    "grocery_retail": ("retail",),
+    "cosmetics_perfumery": ("fmcg", "retail"),
+    "fmcg_cpg": ("fmcg",),
+    "auto_goods": ("auto",),
+    "pharma": ("medicine",),
+}
+
 
 def _green_inline_button(
     text: str,
@@ -18400,38 +18413,222 @@ def _green_inline_button(
         )
 
 
-def kb_industry_division() -> InlineKeyboardMarkup:
-    # Как в «Кейсах»: более длинные названия идут первыми, кнопки — по две.
+def db_industry_division_get_choices(user_id: int | None) -> list[str]:
+    """Возвращает выбранные пользователем разделы в порядке выбора."""
+    if user_id is None:
+        return []
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            """
+            SELECT industry_key
+            FROM industry_division_user_choices
+            WHERE user_id=?
+            ORDER BY selected_at ASC, industry_key ASC
+            """,
+            (int(user_id),),
+        ).fetchall()
+    result: list[str] = []
+    for row in rows:
+        key = str(row[0])
+        if key in INDUSTRY_DIVISION_BY_KEY and key not in result:
+            result.append(key)
+        if len(result) >= INDUSTRY_DIVISION_MAX_SELECTIONS:
+            break
+    return result
+
+
+def db_industry_division_toggle_choice(
+    user_id: int | None,
+    industry_key: str,
+) -> tuple[str, list[str]]:
+    """Переключает отрасль: added, removed, limit или invalid."""
+    if user_id is None or industry_key not in INDUSTRY_DIVISION_BY_KEY:
+        return "invalid", db_industry_division_get_choices(user_id)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("BEGIN IMMEDIATE")
+        exists = con.execute(
+            """
+            SELECT 1
+            FROM industry_division_user_choices
+            WHERE user_id=? AND industry_key=?
+            """,
+            (int(user_id), industry_key),
+        ).fetchone()
+        if exists:
+            con.execute(
+                """
+                DELETE FROM industry_division_user_choices
+                WHERE user_id=? AND industry_key=?
+                """,
+                (int(user_id), industry_key),
+            )
+            status = "removed"
+        else:
+            selected_count = con.execute(
+                """
+                SELECT COUNT(*)
+                FROM industry_division_user_choices
+                WHERE user_id=?
+                """,
+                (int(user_id),),
+            ).fetchone()[0]
+            if int(selected_count or 0) >= INDUSTRY_DIVISION_MAX_SELECTIONS:
+                status = "limit"
+            else:
+                con.execute(
+                    """
+                    INSERT INTO industry_division_user_choices(
+                        user_id, industry_key, selected_at
+                    ) VALUES(?,?,?)
+                    """,
+                    (
+                        int(user_id),
+                        industry_key,
+                        datetime.utcnow().isoformat(),
+                    ),
+                )
+                status = "added"
+    return status, db_industry_division_get_choices(user_id)
+
+
+def db_industry_division_clear_choices(user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            "DELETE FROM industry_division_user_choices WHERE user_id=?",
+            (int(user_id),),
+        )
+    return cur.rowcount > 0
+
+
+def industry_division_case_category_keys(user_id: int | None) -> list[str]:
+    """Преобразует выбранные разделы в уникальные категории каталога кейсов."""
+    category_keys: list[str] = []
+    for industry_key in db_industry_division_get_choices(user_id):
+        for category_key in INDUSTRY_DIVISION_CASE_CATEGORIES.get(industry_key, ()):
+            if category_key not in category_keys:
+                category_keys.append(category_key)
+    return category_keys
+
+
+def industry_division_selected_labels(user_id: int | None) -> list[str]:
+    return [
+        INDUSTRY_DIVISION_BY_KEY[key]["title"]
+        for key in db_industry_division_get_choices(user_id)
+        if key in INDUSTRY_DIVISION_BY_KEY
+    ]
+
+
+def kb_industry_division(user_id: int | None = None) -> InlineKeyboardMarkup:
+    selected_keys = db_industry_division_get_choices(user_id)
+    selected_set = set(selected_keys)
+
+    # Более длинные названия идут первыми, кнопки — по две в строке.
     ordered_items = sorted(
         INDUSTRY_DIVISION_ITEMS,
-        key=lambda item: -len(item[1]),
+        key=lambda item: (-len(item[1]), item[1].casefold()),
     )
-    buttons = []
-    for key, title, url in ordered_items:
-        clean_url = (url or "").strip()
-        if clean_url:
-            button = InlineKeyboardButton(title, url=clean_url)
-        else:
-            button = InlineKeyboardButton(
-                title,
-                callback_data=f"help:industry_division:missing:{key}",
-            )
-        buttons.append(button)
-
+    buttons = [
+        InlineKeyboardButton(
+            f"{'✅ ' if key in selected_set else '▫️ '}{title}",
+            callback_data=f"help:industry_division:set:{key}",
+        )
+        for key, title, _url in ordered_items
+    ]
     rows = [
         buttons[index:index + 2]
         for index in range(0, len(buttons), 2)
     ]
+    if selected_keys:
+        rows.append([
+            InlineKeyboardButton(
+                "📚 Показать кейсы моей отрасли",
+                callback_data="help:industry_division:cases",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "🧰 Открыть инструменты моих отраслей",
+                callback_data="help:industry_division:tools",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "🧹 Очистить выбор",
+                callback_data="help:industry_division:clear",
+            )
+        ])
     rows.append([
         InlineKeyboardButton("⬅️ Главное меню", callback_data="help:main")
     ])
     return InlineKeyboardMarkup(rows)
 
 
-def industry_division_text() -> str:
+def kb_industry_division_tools(user_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    for key in db_industry_division_get_choices(user_id):
+        item = INDUSTRY_DIVISION_BY_KEY.get(key)
+        if not item:
+            continue
+        clean_url = (item.get("url") or "").strip()
+        if clean_url:
+            button = InlineKeyboardButton(
+                f"🔗 {item['title']}",
+                url=clean_url,
+            )
+        else:
+            button = InlineKeyboardButton(
+                f"🔗 {item['title']}",
+                callback_data=f"help:industry_division:missing:{key}",
+            )
+        rows.append([button])
+    rows.append([
+        InlineKeyboardButton(
+            "⬅️ В отраслевое деление",
+            callback_data="help:industry_division",
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def industry_division_text(
+    user_id: int | None = None,
+    notice: str | None = None,
+) -> str:
+    selected_labels = industry_division_selected_labels(user_id)
+    lines = [
+        "🏭 <b>Отраслевое деление</b>",
+        "",
+        "Выбери от <b>одной до трёх отраслей</b>, с которыми ты работаешь. "
+        "Бот запомнит выбор и покажет подходящие материалы, инструменты и кейсы.",
+        "",
+        (
+            f"Выбрано: <b>{len(selected_labels)} "
+            f"из {INDUSTRY_DIVISION_MAX_SELECTIONS}</b>"
+        ),
+    ]
+    if selected_labels:
+        lines.extend(["", *[f"• {escape(label)}" for label in selected_labels]])
+    if notice:
+        lines = [notice, "", *lines]
+    return "\n".join(lines)
+
+
+def industry_division_tools_text(user_id: int | None = None) -> str:
+    selected_labels = industry_division_selected_labels(user_id)
+    if not selected_labels:
+        return (
+            "🧰 <b>Инструменты отраслей</b>\n\n"
+            "Сначала выбери хотя бы одну отрасль."
+        )
     return (
-        "🏭 <b>Отраслевое деление</b>\n\n"
-        "Выберите отрасль, чтобы открыть соответствующий ресурс."
+        "🧰 <b>Инструменты выбранных отраслей</b>\n\n"
+        "Открой нужный рабочий ресурс:\n\n"
+        + "\n".join(f"• {escape(label)}" for label in selected_labels)
     )
 
 
@@ -18446,6 +18643,8 @@ async def handle_industry_division_callback(
         return
 
     data = query.data or ""
+    user_id = update.effective_user.id if update.effective_user else None
+
     if data.startswith("help:industry_division:missing:"):
         key = data.rsplit(":", 1)[-1]
         item = INDUSTRY_DIVISION_BY_KEY.get(key)
@@ -18456,14 +18655,104 @@ async def handle_industry_division_callback(
         )
         return
 
+    if data.startswith("help:industry_division:set:"):
+        key = data.rsplit(":", 1)[-1]
+        status, _selected = db_industry_division_toggle_choice(user_id, key)
+        if status == "added":
+            notice = f"✅ Добавлено: <b>{escape(INDUSTRY_DIVISION_BY_KEY[key]['title'])}</b>"
+        elif status == "removed":
+            notice = f"➖ Убрано: <b>{escape(INDUSTRY_DIVISION_BY_KEY[key]['title'])}</b>"
+        elif status == "limit":
+            notice = (
+                f"⚠️ Можно выбрать не более <b>{INDUSTRY_DIVISION_MAX_SELECTIONS}</b> отраслей. "
+                "Сначала сними один из выбранных вариантов."
+            )
+        else:
+            notice = "⚠️ Не удалось изменить выбор."
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            industry_division_text(user_id, notice=notice),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_division(user_id),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:industry_division:clear":
+        db_industry_division_clear_choices(user_id)
+        # Очищаем и прежний фильтр кейсов, чтобы не осталось скрытого выбора.
+        db_case_clear_industry(user_id)
+        try:
+            await query.answer("Выбор отраслей очищен.")
+        except Exception:
+            pass
+        await query.edit_message_text(
+            industry_division_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_division(user_id),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:industry_division:tools":
+        selected_keys = db_industry_division_get_choices(user_id)
+        if not selected_keys:
+            try:
+                await query.answer("Сначала выбери отрасль.", show_alert=True)
+            except Exception:
+                pass
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            industry_division_tools_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_division_tools(user_id),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:industry_division:cases":
+        selected_keys = db_industry_division_get_choices(user_id)
+        if not selected_keys:
+            try:
+                await query.answer("Сначала выбери отрасль.", show_alert=True)
+            except Exception:
+                pass
+            return
+        my_industry = cases_my_industry_view(user_id)
+        if not my_industry:
+            try:
+                await query.answer("Для выбранных отраслей кейсы пока не найдены.", show_alert=True)
+            except Exception:
+                pass
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        list_text, markup = my_industry
+        await query.edit_message_text(
+            list_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+        return
+
     try:
         await query.answer()
     except Exception:
         pass
     await query.edit_message_text(
-        industry_division_text(),
+        industry_division_text(user_id),
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_industry_division(),
+        reply_markup=kb_industry_division(user_id),
         disable_web_page_preview=True,
     )
 
@@ -21638,6 +21927,41 @@ def db_init():
         "CREATE INDEX IF NOT EXISTS idx_case_industry_choices_user "
         "ON case_user_industry_choices(user_id, selected_at ASC)"
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS industry_division_user_choices (
+            user_id INTEGER NOT NULL,
+            industry_key TEXT NOT NULL,
+            selected_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, industry_key)
+        )
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_industry_division_choices_user "
+        "ON industry_division_user_choices(user_id, selected_at ASC)"
+    )
+    # Переносим совместимые отрасли из прежнего фильтра кейсов в единый
+    # раздел. INSERT OR IGNORE делает миграцию безопасной при каждом запуске.
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO industry_division_user_choices(
+            user_id, industry_key, selected_at
+        )
+        SELECT
+            user_id,
+            CASE category_key
+                WHEN 'alcohol' THEN 'alcohol_tobacco'
+                WHEN 'retail' THEN 'grocery_retail'
+                WHEN 'fmcg' THEN 'fmcg_cpg'
+                WHEN 'auto' THEN 'auto_goods'
+                WHEN 'medicine' THEN 'pharma'
+            END,
+            selected_at
+        FROM case_user_industry_choices
+        WHERE category_key IN ('alcohol', 'retail', 'fmcg', 'auto', 'medicine')
+        """
+    )
     # Переносим прежнюю единственную отрасль в новый список выбора.
     cur.execute(
         """
@@ -22409,17 +22733,37 @@ def _cases_page(items: list[dict], page: int) -> tuple[list[dict], int, int]:
     return ordered_items[start:start + CASES_PAGE_SIZE], page, total_pages
 
 
+def _cases_selected_context(
+    user_id: int | None,
+) -> tuple[list[str], list[str], int]:
+    """Возвращает категории кейсов, подписи выбранных отраслей и их количество."""
+    division_keys = db_industry_division_get_choices(user_id)
+    if division_keys:
+        category_keys = industry_division_case_category_keys(user_id)
+        labels = [
+            INDUSTRY_DIVISION_BY_KEY[key]["title"]
+            for key in division_keys
+            if key in INDUSTRY_DIVISION_BY_KEY
+        ]
+        return category_keys, labels, len(division_keys)
+
+    # Совместимость с пользователями, которые выбирали отрасли в старом меню кейсов.
+    legacy_keys = db_case_get_industries(user_id)
+    labels = [CASES_CATEGORY_LABELS[key] for key in legacy_keys]
+    return legacy_keys, labels, len(legacy_keys)
+
+
 def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
-    selected_keys = db_case_get_industries(user_id)
+    _category_keys, _labels, selected_count = _cases_selected_context(user_id)
     rows = [[InlineKeyboardButton("📚 Все кейсы", callback_data="help:cases:cat:all:0")]]
     rows.append(
         [
             InlineKeyboardButton(
                 (
-                    f"🎯 Мои отрасли: {len(selected_keys)} из {CASES_MAX_INDUSTRIES}"
-                    if selected_keys else "🎯 Выбрать мои отрасли"
+                    f"🏭 В отраслевое деление · выбрано {selected_count}"
+                    if selected_count else "🏭 В отраслевое деление"
                 ),
-                callback_data="help:cases:industry",
+                callback_data="help:industry_division",
             )
         ]
     )
@@ -22442,17 +22786,16 @@ def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
 
 
 def cases_menu_text(user_id: int | None = None) -> str:
-    selected_keys = db_case_get_industries(user_id)
-    selected_labels = [
-        CASES_CATEGORY_LABELS[key]
-        for key in selected_keys
-    ]
+    _category_keys, selected_labels, selected_count = _cases_selected_context(user_id)
     industry_line = (
-        f"\n🎯 <b>Мои отрасли ({len(selected_labels)}/{CASES_MAX_INDUSTRIES}):</b> "
+        f"\n🎯 <b>Мои отрасли ({selected_count}/{INDUSTRY_DIVISION_MAX_SELECTIONS}):</b> "
         f"{escape(', '.join(selected_labels))}\n"
-        "Кнопка «Мои отрасли» позволяет изменить или очистить фильтр.\n"
+        "Изменить выбор можно в разделе «Отраслевое деление».\n"
         if selected_labels
-        else f"\n🎯 Можно выбрать до {CASES_MAX_INDUSTRIES} отраслей.\n"
+        else (
+            f"\n🎯 В «Отраслевом делении» можно выбрать до "
+            f"{INDUSTRY_DIVISION_MAX_SELECTIONS} отраслей.\n"
+        )
     )
     return (
         "📚 <b>Кейсы Яндекс Маршрутизации</b>\n\n"
@@ -22463,61 +22806,30 @@ def cases_menu_text(user_id: int | None = None) -> str:
 
 
 def kb_cases_industry_picker(user_id: int | None = None) -> InlineKeyboardMarkup:
-    selected_keys = db_case_get_industries(user_id)
-    selected_set = set(selected_keys)
-    category_buttons = [
-        InlineKeyboardButton(
-            f"{'✅ ' if key in selected_set else '▫️ '}{label}",
-            callback_data=f"help:cases:industry:set:{key}",
-        )
-        for key, label in _cases_category_options()
-    ]
-    rows = [
-        category_buttons[index:index + 2]
-        for index in range(0, len(category_buttons), 2)
-    ]
-    if selected_keys:
-        rows.append(
+    """Старый экран выбора теперь ведёт в единый раздел отраслевого деления."""
+    return InlineKeyboardMarkup(
+        [
             [
                 InlineKeyboardButton(
-                    f"📂 Показать кейсы ({len(selected_keys)} отрасл.)",
-                    callback_data="help:cases:my_cases",
+                    "🏭 В отраслевое деление",
+                    callback_data="help:industry_division",
                 )
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "🧹 Очистить выбор",
-                    callback_data="help:cases:industry:clear",
-                )
-            ]
-        )
-    rows.append([InlineKeyboardButton("⬅️ К кейсам", callback_data="help:cases")])
-    return InlineKeyboardMarkup(rows)
+            ],
+            [InlineKeyboardButton("⬅️ К кейсам", callback_data="help:cases")],
+        ]
+    )
 
 
 def cases_industry_picker_text(
     user_id: int | None,
     notice: str | None = None,
 ) -> str:
-    selected_keys = db_case_get_industries(user_id)
-    selected_labels = [
-        CASES_CATEGORY_LABELS[key]
-        for key in selected_keys
-    ]
     lines = [
-        "🎯 <b>Мои отрасли</b>",
+        "🏭 <b>Выбор отраслей перенесён</b>",
         "",
-        f"Выберите до <b>{CASES_MAX_INDUSTRIES}</b> отраслей. "
-        "Повторное нажатие снимает выбор.",
-        "",
-        f"Выбрано: <b>{len(selected_keys)} из {CASES_MAX_INDUSTRIES}</b>",
+        "Теперь отрасли выбираются в разделе «Отраслевое деление». "
+        "Один выбор используется и для инструментов, и для подходящих кейсов.",
     ]
-    if selected_labels:
-        lines.extend(
-            ["", *[f"• {escape(label)}" for label in selected_labels]]
-        )
     if notice:
         lines = [notice, "", *lines]
     return "\n".join(lines)
@@ -22555,16 +22867,15 @@ def cases_my_industry_view(
     notice: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup] | None:
     """Рендерит кейсы всех выбранных пользователем отраслей."""
-    selected_keys = db_case_get_industries(user_id)
-    if not selected_keys:
+    selected_category_keys, labels, selected_count = _cases_selected_context(user_id)
+    if not selected_category_keys or not labels:
         return None
-    labels = [CASES_CATEGORY_LABELS[key] for key in selected_keys]
-    items = cases_search_items(category_keys=selected_keys)
+    items = cases_search_items(category_keys=selected_category_keys)
     list_text, page, _ = cases_list_text(
         items,
         page=page,
         heading=(
-            f"🎯 <b>Мои отрасли ({len(selected_keys)}/{CASES_MAX_INDUSTRIES}):</b>\n"
+            f"🎯 <b>Кейсы моих отраслей ({selected_count}/{INDUSTRY_DIVISION_MAX_SELECTIONS}):</b>\n"
             f"{escape(', '.join(labels))}"
         ),
     )
@@ -22644,10 +22955,10 @@ def kb_cases_list(
         rows.append(nav)
     if industry:
         rows.append([
-            InlineKeyboardButton("🔄 Изменить отрасли", callback_data="help:cases:industry")
-        ])
-        rows.append([
-            InlineKeyboardButton("🧹 Очистить выбор отраслей", callback_data="help:cases:industry:clear")
+            InlineKeyboardButton(
+                "🏭 В отраслевое деление",
+                callback_data="help:industry_division",
+            )
         ])
     else:
         rows.append([InlineKeyboardButton("🔎 Поиск по кейсам", callback_data="help:cases:search")])
@@ -22658,6 +22969,13 @@ def kb_cases_list(
                     "help:cases"
                     if favorites or not query else "help:cases:search_results:0"
                 ),
+            )
+        ])
+    if not industry:
+        rows.append([
+            InlineKeyboardButton(
+                "🏭 В отраслевое деление",
+                callback_data="help:industry_division",
             )
         ])
     rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
@@ -22699,6 +23017,12 @@ def kb_case_detail(
             [InlineKeyboardButton("🔗 Подробнее на сайте", url=item["url"])],
             [InlineKeyboardButton("⬅️ Назад к списку", callback_data=back_callback)],
             [InlineKeyboardButton("📚 К категориям", callback_data="help:cases")],
+            [
+                InlineKeyboardButton(
+                    "🏭 В отраслевое деление",
+                    callback_data="help:industry_division",
+                )
+            ],
             [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
         ]
     )
@@ -22763,39 +23087,38 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "help:cases:industry":
         context.user_data[CASES_WAITING_SEARCH] = False
         await query.edit_message_text(
-            cases_industry_picker_text(user_id),
+            industry_division_text(user_id),
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_cases_industry_picker(user_id),
+            reply_markup=kb_industry_division(user_id),
+            disable_web_page_preview=True,
         )
         return
 
     if data.startswith("help:cases:industry:set:"):
-        key = data.rsplit(":", 1)[-1]
-        if key not in CASES_CATEGORY_LABELS or key == "all":
-            await query.answer("Неизвестная отрасль.", show_alert=True)
-            return
-        status, _selected_keys = db_case_toggle_industry(user_id, key)
-        if status == "added":
-            notice = f"✅ Добавлено: <b>{escape(CASES_CATEGORY_LABELS[key])}</b>"
-        elif status == "removed":
-            notice = f"➖ Убрано: <b>{escape(CASES_CATEGORY_LABELS[key])}</b>"
-        elif status == "limit":
-            notice = (
-                f"⚠️ Можно выбрать не более <b>{CASES_MAX_INDUSTRIES}</b> отраслей. "
-                "Сначала снимите один из текущих вариантов."
-            )
-        else:
-            notice = "⚠️ Не удалось изменить выбор."
+        # Старые сообщения с кнопками выбора могут оставаться в чатах после
+        # обновления. Не меняем больше отдельный фильтр кейсов, а направляем
+        # пользователя в единый раздел отраслевого деления.
+        try:
+            await query.answer("Выбор отраслей перенесён в новый раздел.")
+        except Exception:
+            pass
         await query.edit_message_text(
-            cases_industry_picker_text(user_id, notice=notice),
+            industry_division_text(
+                user_id,
+                notice=(
+                    "ℹ️ Выбор отраслей теперь находится в разделе "
+                    "«Отраслевое деление»."
+                ),
+            ),
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_cases_industry_picker(user_id),
+            reply_markup=kb_industry_division(user_id),
             disable_web_page_preview=True,
         )
         return
 
     if data == "help:cases:industry:clear":
         db_case_clear_industry(user_id)
+        db_industry_division_clear_choices(user_id)
         try:
             await query.answer("Выбор отраслей очищен.")
         except Exception:
@@ -22809,13 +23132,13 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "help:cases:my_cases" or data.startswith("help:cases:my_cases:"):
-        selected_keys = db_case_get_industries(user_id)
-        if not selected_keys:
+        selected_category_keys, _selected_labels, _selected_count = _cases_selected_context(user_id)
+        if not selected_category_keys:
             await query.edit_message_text(
-                f"🎯 <b>Мои отрасли</b>\n\n"
-                f"Сначала выберите от одной до {CASES_MAX_INDUSTRIES} отраслей.",
+                "🏭 <b>Отраслевое деление</b>\n\n"
+                f"Сначала выберите от одной до {INDUSTRY_DIVISION_MAX_SELECTIONS} отраслей.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=kb_cases_industry_picker(user_id),
+                reply_markup=kb_industry_division(user_id),
             )
             return
         try:
