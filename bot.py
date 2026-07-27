@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "PROFILE-INTERESTS-SIMILAR-COLLEAGUES-2026-07-27-V17"
+BUILD_VERSION = "PROFILE-INTERESTS-MATCHING-FILTERS-2026-07-27-V18"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -222,6 +222,29 @@ def format_profile_interests(values, limit: int | None = None) -> str:
     if hidden > 0:
         labels.append(f"ещё {hidden}")
     return " · ".join(labels)
+
+
+def profile_shared_interests(left_profile: dict | None, right_profile: dict | None) -> list[str]:
+    """Общие интересы двух анкет в стабильном порядке каталога."""
+    if not left_profile or not right_profile:
+        return []
+    left = set(normalize_profile_interests(left_profile.get("interests")))
+    right = set(normalize_profile_interests(right_profile.get("interests")))
+    return [key for key, _label in PROFILE_INTERESTS if key in left and key in right]
+
+
+def filter_shared_interest_matches(matches: list[dict], interest_key: str | None = None) -> list[dict]:
+    """Фильтрует готовую подборку по одному общему интересу."""
+    if not interest_key or interest_key == "all":
+        return list(matches)
+    if interest_key not in PROFILE_INTEREST_KEYS:
+        return []
+    return [item for item in matches if interest_key in item.get("shared_interests", [])]
+
+
+def similar_colleagues_callback(interest_key: str | None, page: int = 0) -> str:
+    key = interest_key if interest_key in PROFILE_INTEREST_KEYS else "all"
+    return f"help:team:similar:filter:{key}:{max(0, int(page))}"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -2890,7 +2913,13 @@ def db_profiles_list() -> list[tuple[int, str]]:
     return [(r[0], r[1]) for r in rows]
 
 def db_profiles_with_shared_interests(profile_id: int) -> list[dict]:
-    """Активные коллеги, отсортированные по числу общих интересов."""
+    """
+    Активные коллеги с общими интересами.
+
+    Сортировка использует коэффициент Жаккара: число общих интересов делится
+    на число уникальных интересов двух сотрудников. Поэтому два совпадения
+    из двух считаются более близким профилем, чем два совпадения из пяти.
+    """
     current = db_profiles_get(int(profile_id))
     if not current:
         return []
@@ -2910,15 +2939,31 @@ def db_profiles_with_shared_interests(profile_id: int) -> list[dict]:
 
     matches = []
     for pid, full_name, raw_interests in rows:
-        shared = [key for key, _label in PROFILE_INTERESTS if key in own and key in set(_profile_interests_decode(raw_interests))]
-        if shared:
-            matches.append({
-                "id": int(pid),
-                "full_name": full_name,
-                "shared_interests": shared,
-                "shared_count": len(shared),
-            })
-    matches.sort(key=lambda item: (-item["shared_count"], str(item["full_name"]).casefold()))
+        colleague = set(_profile_interests_decode(raw_interests))
+        shared = [
+            key for key, _label in PROFILE_INTERESTS
+            if key in own and key in colleague
+        ]
+        if not shared:
+            continue
+        union_count = len(own | colleague)
+        similarity_score = (len(shared) / union_count) if union_count else 0.0
+        matches.append({
+            "id": int(pid),
+            "full_name": full_name,
+            "interests": [key for key, _label in PROFILE_INTERESTS if key in colleague],
+            "shared_interests": shared,
+            "shared_count": len(shared),
+            "similarity_score": similarity_score,
+        })
+
+    matches.sort(
+        key=lambda item: (
+            -float(item["similarity_score"]),
+            -int(item["shared_count"]),
+            str(item["full_name"]).casefold(),
+        )
+    )
     return matches
 
 
@@ -5372,11 +5417,23 @@ def kb_danger_confirm(confirm_callback: str, cancel_callback: str, confirm_text:
 
 def profile_interests_prompt(selected) -> str:
     selected_keys = normalize_profile_interests(selected)
+    selected_count = len(selected_keys)
     selected_text = format_profile_interests(selected_keys) if selected_keys else "пока ничего не выбрано"
+
+    if selected_count == 0:
+        hint = "Выберите несколько тем, которые вас действительно увлекают."
+    elif selected_count <= 2:
+        hint = "Можно добавить ещё — так подбор коллег будет точнее."
+    elif selected_count <= 4:
+        hint = "Отлично, уже есть из чего собрать интересные совпадения."
+    else:
+        hint = "Готово! Максимум интересов выбран — подбор будет самым точным."
+
     return (
-        f"🎯 <b>Интересы</b> · выбрано <b>{len(selected_keys)}/{PROFILE_INTEREST_MAX}</b>\n\n"
+        f"🎯 <b>Интересы</b> · выбрано <b>{selected_count}/{PROFILE_INTEREST_MAX}</b>\n\n"
         "Отметьте темы, которые вам действительно близки. Так коллегам будет проще найти "
         "общие точки для знакомства и общения.\n\n"
+        f"💬 {escape(hint)}\n\n"
         f"Сейчас: {escape(selected_text)}"
     )
 
@@ -6624,48 +6681,108 @@ def _team_clamp_page(page: int, people_count: int) -> int:
     return max(0, min(int(page), total_pages - 1))
 
 
-def build_similar_colleagues_text(profile: dict, matches: list[dict], page: int = 0) -> str:
+def build_similar_colleagues_text(
+    profile: dict,
+    matches: list[dict],
+    page: int = 0,
+    interest_key: str | None = None,
+) -> str:
     total_pages = _team_total_pages(len(matches))
     page = _team_clamp_page(page, len(matches))
-    text = (
-        "✨ <b>Коллеги на вашей волне</b>\n\n"
-        "Здесь собраны люди, с которыми у вас уже есть общие темы. "
-        "Чем больше совпадений, тем выше коллега в списке — отличный повод начать разговор.\n\n"
-        f"🎯 Ваши интересы: {escape(format_profile_interests(profile.get('interests')))}\n"
-        f"Нашлось коллег: <b>{len(matches)}</b>"
-    )
+    start = page * TEAM_PAGE_SIZE
+    page_matches = matches[start:start + TEAM_PAGE_SIZE]
+
+    if interest_key in PROFILE_INTEREST_KEYS:
+        label = PROFILE_INTEREST_LABELS[interest_key]
+        title = f"✨ <b>Кто тоже выбирает «{escape(label)}»</b>"
+        intro = (
+            "Здесь коллеги, с которыми у вас совпадает именно этот интерес. "
+            "Открывайте карточку — тема для первого сообщения уже найдена."
+        )
+    else:
+        title = "✨ <b>Коллеги на вашей волне</b>"
+        intro = (
+            "Здесь собраны люди, с которыми у вас уже есть общие темы. "
+            "Сначала идут самые близкие совпадения — не только по количеству, "
+            "но и по доле общих интересов."
+        )
+
+    lines = [
+        title,
+        "",
+        intro,
+        "",
+        f"🎯 Ваши интересы: {escape(format_profile_interests(profile.get('interests')))}",
+        f"Нашлось коллег: <b>{len(matches)}</b>",
+    ]
     if total_pages > 1:
-        text += f" · страница <b>{page + 1}/{total_pages}</b>"
-    return text
+        lines[-1] += f" · страница <b>{page + 1}/{total_pages}</b>"
+
+    if page_matches:
+        lines.extend(["", "<b>Что именно совпало:</b>", ""] )
+        for item in page_matches:
+            shared_text = format_profile_interests(item.get("shared_interests"))
+            lines.append(f"• <b>{escape(item['full_name'])}</b>")
+            lines.append(f"  {escape(shared_text)}")
+
+    return "\n".join(lines)
 
 
-def kb_help_team_similar(profile_id: int, page: int = 0):
-    matches = db_profiles_with_shared_interests(int(profile_id))
+def kb_help_team_similar(
+    profile: dict,
+    all_matches: list[dict],
+    page: int = 0,
+    interest_key: str | None = None,
+):
+    own_interests = normalize_profile_interests(profile.get("interests"))
+    selected_filter = interest_key if interest_key in PROFILE_INTEREST_KEYS else None
+    matches = filter_shared_interest_matches(all_matches, selected_filter)
     page = _team_clamp_page(page, len(matches))
     total_pages = _team_total_pages(len(matches))
     start = page * TEAM_PAGE_SIZE
     page_matches = matches[start:start + TEAM_PAGE_SIZE]
     rows = []
 
-    for item in page_matches:
-        count = int(item["shared_count"])
-        suffix = "совпадение" if count == 1 else ("совпадения" if 2 <= count <= 4 else "совпадений")
+    all_prefix = "✅ " if not selected_filter else ""
+    rows.append([
+        InlineKeyboardButton(
+            f"{all_prefix}🌈 Все совпадения · {len(all_matches)}",
+            callback_data=similar_colleagues_callback(None, 0),
+        )
+    ])
+
+    for key in own_interests:
+        count = sum(1 for item in all_matches if key in item.get("shared_interests", []))
+        prefix = "✅ " if selected_filter == key else ""
         rows.append([
             InlineKeyboardButton(
-                f"{compact_team_name(item['full_name'], 27)} · {count} {suffix}",
-                callback_data=f"help:team:similar:person:{int(item['id'])}:{page}",
+                f"{prefix}{PROFILE_INTEREST_LABELS[key]} · {count}",
+                callback_data=similar_colleagues_callback(key, 0),
+            )
+        ])
+
+    for item in page_matches:
+        icons = " ".join(PROFILE_INTEREST_LABELS[key].split(" ", 1)[0] for key in item["shared_interests"])
+        rows.append([
+            InlineKeyboardButton(
+                f"{compact_team_name(item['full_name'], 28)} · {icons}",
+                callback_data=(
+                    f"help:team:similar:person:{int(item['id'])}:"
+                    f"{selected_filter or 'all'}:{page}"
+                ),
             )
         ])
 
     if total_pages > 1:
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton("◀️", callback_data=f"help:team:similar:{page - 1}"))
+            nav.append(InlineKeyboardButton("◀️", callback_data=similar_colleagues_callback(selected_filter, page - 1)))
         nav.append(InlineKeyboardButton(f"{page + 1} / {total_pages}", callback_data="noop"))
         if page < total_pages - 1:
-            nav.append(InlineKeyboardButton("▶️", callback_data=f"help:team:similar:{page + 1}"))
+            nav.append(InlineKeyboardButton("▶️", callback_data=similar_colleagues_callback(selected_filter, page + 1)))
         rows.append(nav)
 
+    rows.append([InlineKeyboardButton("✏️ Изменить мои интересы", callback_data="help:me:edit:interests")])
     rows.append([InlineKeyboardButton("⬅️ Ко всей команде", callback_data="help:team")])
     rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
@@ -6805,27 +6922,24 @@ def kb_help_profile_card(
     back_callback: str | None = None,
     back_label: str = "⬅️ Назад к списку",
     show_carousel: bool = True,
+    viewer_profile: dict | None = None,
 ):
-    """Карточка сотрудника с переходами к предыдущему и следующему профилю."""
+    """Карточка сотрудника с навигацией и действиями для знакомства."""
     rows = []
     people = db_profiles_list()
 
-    # Находим текущего сотрудника в общем алфавитном списке.
     current_index = next(
         (index for index, (pid, _name) in enumerate(people) if int(pid) == int(profile["id"])),
         None,
     )
+    current_page = (
+        current_index // TEAM_PAGE_SIZE
+        if current_index is not None
+        else _team_clamp_page(page, len(people))
+    )
 
-    if current_index is not None:
-        current_page = current_index // TEAM_PAGE_SIZE
-    else:
-        current_page = _team_clamp_page(page, len(people))
-
-    # Циклическая карусель: после последнего сотрудника открывается первый.
     if show_carousel and current_index is not None and len(people) > 1:
         if len(people) == 2:
-            # При двух сотрудниках предыдущий и следующий совпадают,
-            # поэтому оставляем одну понятную кнопку.
             other_index = 1 - current_index
             other_pid, other_name = people[other_index]
             other_page = other_index // TEAM_PAGE_SIZE
@@ -6838,13 +6952,10 @@ def kb_help_profile_card(
         else:
             previous_index = (current_index - 1) % len(people)
             next_index = (current_index + 1) % len(people)
-
             previous_pid, previous_name = people[previous_index]
             next_pid, next_name = people[next_index]
-
             previous_page = previous_index // TEAM_PAGE_SIZE
             next_page = next_index // TEAM_PAGE_SIZE
-
             rows.append([
                 InlineKeyboardButton(
                     f"◀️ {compact_team_name(previous_name, 15)}",
@@ -6856,19 +6967,35 @@ def kb_help_profile_card(
                 ),
             ])
 
+    shared = []
+    if viewer_profile and int(viewer_profile.get("id") or 0) != int(profile.get("id") or 0):
+        shared = profile_shared_interests(viewer_profile, profile)
+    if shared:
+        rows.append([
+            InlineKeyboardButton(
+                "✨ Что у нас общего",
+                callback_data=f"help:team:common:{int(profile['id'])}:{current_page}",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "👥 Кто ещё этим интересуется",
+                callback_data=f"help:team:interest_people:{int(profile['id'])}:{current_page}",
+            )
+        ])
+
     tg = (profile.get("tg_link") or "").strip()
     if tg:
         if tg.startswith("@"):
             url = f"https://t.me/{tg[1:]}"
         elif tg.startswith("https://t.me/") or tg.startswith("http://t.me/"):
             url = tg
+        elif re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
+            url = f"https://t.me/{tg}"
         else:
-            if re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
-                url = f"https://t.me/{tg}"
-            else:
-                url = ""
+            url = ""
         if url:
-            rows.append([InlineKeyboardButton("🔗 Открыть Telegram", url=url)])
+            rows.append([InlineKeyboardButton("✉️ Написать коллеге", url=url)])
 
     rows.append([
         InlineKeyboardButton(
@@ -6897,6 +7024,7 @@ def _build_profile_card_text(
     name_limit: int = 180,
     city_limit: int = 120,
     tg_limit: int = 120,
+    shared_interests: list[str] | None = None,
 ) -> str:
     """Собирает карточку в едином формате с настраиваемыми лимитами полей."""
     full_name = _truncate_profile_field(profile.get("full_name"), name_limit)
@@ -6909,6 +7037,13 @@ def _build_profile_card_text(
     avg_text = f"{avg}%" if avg is not None and str(avg).strip() else "—"
     about = _truncate_profile_field(profile.get("about"), about_limit)
     interests = format_profile_interests(profile.get("interests"), limit=interests_limit)
+    shared_keys = normalize_profile_interests(shared_interests)
+    shared_block = ""
+    if shared_keys:
+        shared_block = (
+            f"✨ <b>У вас есть общие интересы</b>\n"
+            f"{escape(format_profile_interests(shared_keys))}\n\n"
+        )
     topics = _truncate_profile_field(profile.get("topics"), topics_limit)
 
     progress_items = db_achievement_progress_summary(int(profile["id"]))
@@ -6941,6 +7076,7 @@ def _build_profile_card_text(
         f"🎂 День рождения: <b>{escape(bday)}</b>\n\n"
         f"📝 <b>Кратко о себе</b>\n{escape(about)}\n\n"
         f"🎯 <b>Интересы</b>\n{escape(interests)}\n\n"
+        f"{shared_block}"
         f"❓ <b>По каким вопросам обращаться</b>\n{escape(topics)}\n\n"
         f"🔗 <b>TG:</b> {escape(tg_link)}\n"
         f"📈 <b>Средний балл тестирования:</b> <b>{escape(avg_text)}</b>\n\n"
@@ -6950,12 +7086,19 @@ def _build_profile_card_text(
     )
 
 
-def build_profile_card_text(profile: dict, compact: bool = False) -> str:
+def build_profile_card_text(
+    profile: dict,
+    compact: bool = False,
+    shared_interests: list[str] | None = None,
+) -> str:
     """Полная текстовая карточка для профилей без фотографии."""
-    return _build_profile_card_text(profile)
+    return _build_profile_card_text(profile, shared_interests=shared_interests)
 
 
-def build_profile_card_caption(profile: dict) -> str:
+def build_profile_card_caption(
+    profile: dict,
+    shared_interests: list[str] | None = None,
+) -> str:
     """
     Полная карточка для подписи к фотографии.
 
@@ -6984,7 +7127,7 @@ def build_profile_card_caption(profile: dict) -> str:
     ]
 
     for params in variants:
-        caption = _build_profile_card_text(profile, **params)
+        caption = _build_profile_card_text(profile, shared_interests=shared_interests, **params)
         if len(_html_plain_text(caption)) <= 1024:
             return caption
 
@@ -6999,6 +7142,7 @@ def build_profile_card_caption(profile: dict) -> str:
         name_limit=50,
         city_limit=35,
         tg_limit=40,
+        shared_interests=shared_interests,
     )
 
 
@@ -7093,12 +7237,23 @@ async def render_profile_card(
 
     За счёт caption ширина описания всегда совпадает с шириной фотографии.
     """
+    viewer_profile = None
+    viewer = getattr(query, "from_user", None)
+    if viewer:
+        viewer_profile = db_profiles_get_by_tg_user_id(int(viewer.id))
+        if not viewer_profile:
+            viewer_tg = _normalize_profile_tg_link(getattr(viewer, "username", None))
+            if viewer_tg:
+                viewer_profile = db_profiles_get_by_tg_link(viewer_tg)
+    shared_interests = profile_shared_interests(viewer_profile, profile)
+
     markup = kb_help_profile_card(
         profile,
         page=page,
         back_callback=back_callback,
         back_label=back_label,
         show_carousel=show_carousel,
+        viewer_profile=viewer_profile,
     )
     chat_id = int(query.message.chat_id)
     current_message_id = int(query.message.message_id)
@@ -7113,7 +7268,7 @@ async def render_profile_card(
     )
 
     if photo_file_id:
-        caption = build_profile_card_caption(profile)
+        caption = build_profile_card_caption(profile, shared_interests=shared_interests)
 
         if current_is_photo:
             await query.edit_message_media(
@@ -7143,7 +7298,7 @@ async def render_profile_card(
                 pass
         return
 
-    text = build_profile_card_text(profile, compact=False)
+    text = build_profile_card_text(profile, compact=False, shared_interests=shared_interests)
 
     if current_is_photo:
         sent = await context.bot.send_message(
@@ -11219,11 +11374,105 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data.startswith("help:team:common:"):
+        parts = data.split(":")
+        try:
+            pid = int(parts[3])
+            team_page = int(parts[4]) if len(parts) > 4 else _profile_team_page(pid)
+        except (IndexError, TypeError, ValueError):
+            await q.answer("Не удалось открыть совпадения.", show_alert=True)
+            return
+        own_profile = get_profile_for_user(update)
+        colleague = db_profiles_get(pid)
+        shared = profile_shared_interests(own_profile, colleague)
+        if not own_profile or not colleague or not shared:
+            await q.answer("Общие интересы пока не найдены.", show_alert=True)
+            return
+        rows = []
+        tg = (colleague.get("tg_link") or "").strip()
+        if tg.startswith("@"):
+            tg_url = f"https://t.me/{tg[1:]}"
+        elif tg.startswith("https://t.me/") or tg.startswith("http://t.me/"):
+            tg_url = tg
+        elif re.fullmatch(r"[A-Za-z0-9_]{4,}", tg):
+            tg_url = f"https://t.me/{tg}"
+        else:
+            tg_url = ""
+        if tg_url:
+            rows.append([InlineKeyboardButton("✉️ Написать коллеге", url=tg_url)])
+        rows.append([
+            InlineKeyboardButton(
+                "👥 Кто ещё этим интересуется",
+                callback_data=f"help:team:interest_people:{pid}:{team_page}",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "⬅️ Вернуться к карточке",
+                callback_data=f"help:team:person:{pid}:{team_page}",
+            )
+        ])
+        await replace_callback_message_with_text(
+            q,
+            context,
+            "✨ <b>Что у вас общего</b>\n\n"
+            f"С <b>{escape(colleague['full_name'])}</b> вас объединяют:\n\n"
+            f"{escape(format_profile_interests(shared))}\n\n"
+            "Это уже готовые темы для первого сообщения — можно начать с любимого фильма, "
+            "маршрута, книги или идеи, которая интересна вам обоим.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("help:team:interest_people:"):
+        parts = data.split(":")
+        try:
+            pid = int(parts[3])
+            team_page = int(parts[4]) if len(parts) > 4 else _profile_team_page(pid)
+        except (IndexError, TypeError, ValueError):
+            await q.answer("Не удалось открыть интересы.", show_alert=True)
+            return
+        own_profile = get_profile_for_user(update)
+        colleague = db_profiles_get(pid)
+        shared = profile_shared_interests(own_profile, colleague)
+        if not own_profile or not colleague or not shared:
+            await q.answer("Общие интересы пока не найдены.", show_alert=True)
+            return
+        rows = [
+            [InlineKeyboardButton(
+                PROFILE_INTEREST_LABELS[key],
+                callback_data=similar_colleagues_callback(key, 0),
+            )]
+            for key in shared
+        ]
+        rows.append([
+            InlineKeyboardButton(
+                "⬅️ Вернуться к карточке",
+                callback_data=f"help:team:person:{pid}:{team_page}",
+            )
+        ])
+        await replace_callback_message_with_text(
+            q,
+            context,
+            "👥 <b>Кто ещё разделяет этот интерес</b>\n\n"
+            f"Выберите общую тему с <b>{escape(colleague['full_name'])}</b>, "
+            "и мы покажем других коллег, которым она тоже близка.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
     if data.startswith("help:team:similar:person:"):
         parts = data.split(":")
         try:
             pid = int(parts[4])
-            page = int(parts[5]) if len(parts) > 5 else 0
+            if len(parts) >= 7:
+                interest_key = parts[5] if parts[5] in PROFILE_INTEREST_KEYS else None
+                page = int(parts[6])
+            else:
+                interest_key = None
+                page = int(parts[5]) if len(parts) > 5 else 0
         except (IndexError, TypeError, ValueError):
             await q.answer("Не удалось открыть анкету.", show_alert=True)
             return
@@ -11236,17 +11485,25 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             profile,
             page=_profile_team_page(pid),
             context=context,
-            back_callback=f"help:team:similar:{page}",
+            back_callback=similar_colleagues_callback(interest_key, page),
             back_label="⬅️ К коллегам на вашей волне",
             show_carousel=False,
         )
         return
 
     if data.startswith("help:team:similar:"):
+        parts = data.split(":")
+        interest_key = None
+        page = 0
         try:
-            page = int(data.rsplit(":", 1)[-1])
+            if len(parts) >= 6 and parts[3] == "filter":
+                interest_key = parts[4] if parts[4] in PROFILE_INTEREST_KEYS else None
+                page = int(parts[5])
+            else:
+                page = int(parts[-1])
         except (TypeError, ValueError):
             page = 0
+
         own_profile = get_profile_for_user(update)
         if not own_profile:
             await replace_callback_message_with_text(
@@ -11277,20 +11534,26 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        matches = db_profiles_with_shared_interests(int(own_profile["id"]))
+        all_matches = db_profiles_with_shared_interests(int(own_profile["id"]))
+        matches = filter_shared_interest_matches(all_matches, interest_key)
         if not matches:
+            if interest_key in PROFILE_INTEREST_KEYS:
+                empty_title = f"Пока никто не совпал по теме «{PROFILE_INTEREST_LABELS[interest_key]}»"
+                empty_body = "Попробуйте выбрать другой интерес или вернуться ко всем совпадениям."
+            else:
+                empty_title = "Ваши люди ещё не отметились"
+                empty_body = (
+                    "Пока среди заполненных анкет нет совпадений по интересам. "
+                    "Когда коллеги добавят свои увлечения, список появится здесь автоматически."
+                )
             await replace_callback_message_with_text(
                 q,
                 context,
-                "✨ <b>Ваши люди ещё не отметились</b>\n\n"
-                "Пока среди заполненных анкет нет совпадений по интересам. "
-                "Когда коллеги добавят свои увлечения, список появится здесь автоматически.\n\n"
+                f"✨ <b>{escape(empty_title)}</b>\n\n"
+                f"{escape(empty_body)}\n\n"
                 f"🎯 Ваши интересы: {escape(format_profile_interests(own_profile.get('interests')))}",
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✏️ Изменить мои интересы", callback_data="help:me:edit:interests")],
-                    [InlineKeyboardButton("⬅️ Ко всей команде", callback_data="help:team")],
-                ]),
+                reply_markup=kb_help_team_similar(own_profile, all_matches, 0, interest_key),
             )
             return
 
@@ -11298,9 +11561,9 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await replace_callback_message_with_text(
             q,
             context,
-            build_similar_colleagues_text(own_profile, matches, page),
+            build_similar_colleagues_text(own_profile, matches, page, interest_key),
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_team_similar(int(own_profile["id"]), page),
+            reply_markup=kb_help_team_similar(own_profile, all_matches, page, interest_key),
         )
         return
 
