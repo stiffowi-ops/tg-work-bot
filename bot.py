@@ -18543,7 +18543,7 @@ def kb_industry_division(user_id: int | None = None) -> InlineKeyboardMarkup:
     ]
     if selected_keys:
         rows.append([
-            InlineKeyboardButton(
+            _green_inline_button(
                 "📚 Показать кейсы моей отрасли",
                 callback_data="help:industry_division:cases",
             )
