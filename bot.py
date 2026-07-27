@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "INDUSTRY-DIVISION-COSMETICS-NOTE-2026-07-26-V15"
+BUILD_VERSION = "INDUSTRY-SPECIALISTS-FILTER-2026-07-27-V16"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ZOOM_URL = os.getenv("ZOOM_URL")  # планёрка
@@ -23770,7 +23770,20 @@ def industry_specialist_card_text(item: dict, *, admin: bool = False) -> str:
     )
 
 
-def kb_industry_specialists_public() -> InlineKeyboardMarkup:
+def industry_specialists_public_items(user_id: int | None = None) -> list[dict]:
+    """Фильтрует публичный список по отраслевому выбору пользователя.
+
+    Если пользователь ещё не выбрал ни одной отрасли, возвращается полный
+    список специалистов.
+    """
+    selected_keys = db_industry_division_get_choices(user_id)
+    if selected_keys:
+        return db_industry_specialists_list(selected_keys)
+    return db_industry_specialists_list()
+
+
+def kb_industry_specialists_public(user_id: int | None = None) -> InlineKeyboardMarkup:
+    items = industry_specialists_public_items(user_id)
     rows = [
         [
             InlineKeyboardButton(
@@ -23778,10 +23791,16 @@ def kb_industry_specialists_public() -> InlineKeyboardMarkup:
                 callback_data=f"help:industry_specialist:{int(item['id'])}:all",
             )
         ]
-        for item in db_industry_specialists_list()
+        for item in items
     ]
     if not rows:
-        rows.append([InlineKeyboardButton("— специалисты пока не добавлены —", callback_data="noop")])
+        selected_keys = db_industry_division_get_choices(user_id)
+        empty_label = (
+            "— для выбранных отраслей специалистов нет —"
+            if selected_keys
+            else "— специалисты пока не добавлены —"
+        )
+        rows.append([InlineKeyboardButton(empty_label, callback_data="noop")])
     rows.append([
         InlineKeyboardButton("⬅️ В отраслевое деление", callback_data="help:industry_division")
     ])
@@ -23789,16 +23808,38 @@ def kb_industry_specialists_public() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def industry_specialists_public_text() -> str:
-    items = db_industry_specialists_list()
+def industry_specialists_public_text(user_id: int | None = None) -> str:
+    selected_keys = db_industry_division_get_choices(user_id)
+    selected_labels = [
+        industry_specialist_industry_title(key)
+        for key in selected_keys
+        if key in INDUSTRY_DIVISION_BY_KEY
+    ]
+    items = industry_specialists_public_items(user_id)
     lines = [
         "👥 <b>Отраслевые специалисты</b>",
         "",
-        "Выбери специалиста, чтобы посмотреть его отрасль и открыть контакт в Telegram.",
     ]
+    if selected_labels:
+        lines.extend([
+            "Показаны специалисты выбранных отраслей:",
+            f"<b>{escape(', '.join(selected_labels))}</b>",
+            "",
+            "Выбери специалиста, чтобы открыть его контакт в Telegram.",
+        ])
+    else:
+        lines.append(
+            "Ни одна отрасль не выбрана, поэтому показаны все специалисты. "
+            "Выбери специалиста, чтобы посмотреть его отрасль и открыть контакт в Telegram."
+        )
+
     if not items:
-        lines.extend(["", "Специалисты пока не добавлены."])
+        if selected_labels:
+            lines.extend(["", "Для выбранных отраслей специалисты пока не добавлены."])
+        else:
+            lines.extend(["", "Специалисты пока не добавлены."])
         return "\n".join(lines)
+
     current_key = None
     for item in items:
         key = item["industry_key"]
@@ -23983,14 +24024,15 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "help:industry_specialists":
         if await deny_no_access(update, context):
             return
+        user_id = update.effective_user.id if update.effective_user else None
         try:
             await query.answer()
         except Exception:
             pass
         await query.edit_message_text(
-            industry_specialists_public_text(),
+            industry_specialists_public_text(user_id),
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_industry_specialists_public(),
+            reply_markup=kb_industry_specialists_public(user_id),
             disable_web_page_preview=True,
         )
         return
@@ -24008,6 +24050,18 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = db_industry_specialist_get(specialist_id)
         if not item:
             await query.answer("Специалист не найден.", show_alert=True)
+            return
+
+        # Не показываем карточку из устаревшего сообщения, если после его
+        # отправки пользователь сменил отраслевой выбор. При пустом выборе
+        # по-прежнему разрешены карточки всех специалистов.
+        user_id = update.effective_user.id if update.effective_user else None
+        selected_keys = db_industry_division_get_choices(user_id)
+        if selected_keys and item.get("industry_key") not in selected_keys:
+            await query.answer(
+                "Этот специалист не относится к выбранным сейчас отраслям.",
+                show_alert=True,
+            )
             return
         try:
             await query.answer()
