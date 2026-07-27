@@ -23903,16 +23903,31 @@ _industry_specialists_legacy_kb_industry_division = kb_industry_division
 def kb_industry_division(user_id: int | None = None) -> InlineKeyboardMarkup:
     legacy = _industry_specialists_legacy_kb_industry_division(user_id)
     rows = [list(row) for row in legacy.inline_keyboard]
-    # Кнопка видна всегда, даже если пользователь пока не выбрал отрасль.
-    back_index = next(
+
+    # Кнопка видна всегда и располагается сразу после кнопок выбора отраслей
+    # (после строки Retail / Pharma), но перед действиями с выбранными
+    # отраслями — в том числе перед «Показать кейсы моей отрасли».
+    action_callbacks = {
+        "help:industry_division:cases",
+        "help:industry_division:tools",
+        "help:industry_division:clear",
+        "help:main",
+    }
+    insert_at = next(
         (
             index for index, row in enumerate(rows)
-            if any((button.callback_data or "") == "help:main" for button in row)
+            if any(
+                (button.callback_data or "") in action_callbacks
+                for button in row
+            )
         ),
         len(rows),
     )
-    rows.insert(back_index, [
-        InlineKeyboardButton("👥 Отраслевые специалисты", callback_data="help:industry_specialists")
+    rows.insert(insert_at, [
+        InlineKeyboardButton(
+            "👥 Отраслевые специалисты",
+            callback_data="help:industry_specialists",
+        )
     ])
     return InlineKeyboardMarkup(rows)
 
