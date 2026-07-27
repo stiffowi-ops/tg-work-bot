@@ -11510,8 +11510,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 q,
                 context,
                 "✨ <b>Коллеги на вашей волне</b>\n\n"
-                "Сначала создайте свою анкету и отметьте интересы — тогда мы сможем найти людей, "
-                "с которыми у вас уже есть общие темы.",
+                "Сначала создай свою анкету и отметь интересы — тогда я смогу найти людей, "
+                "с которыми у тебя уже есть общие темы.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("➕ Создать анкету", callback_data="help:team:create_profile")],
@@ -11523,8 +11523,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await replace_callback_message_with_text(
                 q,
                 context,
-                "✨ <b>Пока не знаем, кто с вами на одной волне</b>\n\n"
-                "Добавьте до пяти интересов в свою анкету — и мы соберём коллег, с которыми будет "
+                "✨ <b>Пока не знаю, кто с тобой на одной волне</b>\n\n"
+                "Добавь до пяти интересов в свою анкету — и я соберу коллег, с которыми будет "
                 "легко начать разговор.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
