@@ -25604,25 +25604,23 @@ def kb_industry_card(
     specialists_count = len(stats.get("specialists") or [])
 
     return InlineKeyboardMarkup([
-        [wiki_button],
         [
             InlineKeyboardButton(
                 f"📚 Кейсы — {cases_count}",
                 callback_data=f"help:idv:k:{industry_key}:0",
-            )
-        ],
-        [
+            ),
             InlineKeyboardButton(
                 f"📄 Документы — {documents_count}",
                 callback_data=f"help:idv:d:{industry_key}",
-            )
+            ),
         ],
         [
             InlineKeyboardButton(
-                f"👥 Sales эксперты — {specialists_count}",
+                f"👥 Отраслевые эксперты — {specialists_count}",
                 callback_data=f"help:idv:e:{industry_key}",
             )
         ],
+        [wiki_button],
         [
             InlineKeyboardButton(
                 "⬅️ К выбору отраслей",
