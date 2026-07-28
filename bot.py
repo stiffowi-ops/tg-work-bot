@@ -27014,12 +27014,6 @@ def kb_calendar_planning_cases() -> InlineKeyboardMarkup:
     rows.extend([
         [
             InlineKeyboardButton(
-                "⬅️ К Календарному планированию",
-                callback_data="help:projects:calendar",
-            )
-        ],
-        [
-            InlineKeyboardButton(
                 "📚 Все кейсы",
                 callback_data="help:cases",
             )
@@ -27028,6 +27022,12 @@ def kb_calendar_planning_cases() -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 "🗂️ К проектам",
                 callback_data="help:projects",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ К Календарному планированию",
+                callback_data="help:projects:calendar",
             )
         ],
     ])
