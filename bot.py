@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "PROFILE-INTERESTS-MATCHING-FILTERS-2026-07-27-V18"
+BUILD_VERSION = "PROFILE-INTERESTS-MATCHING-FILTERS-2026-07-28-V19"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -19246,21 +19246,154 @@ def kb_industry_division_tools(user_id: int | None = None) -> InlineKeyboardMark
         if not item:
             continue
         clean_url = (item.get("url") or "").strip()
+        button_text = f"🔗 Ссылка на Wiki — {item['title']}"
         if clean_url:
             button = InlineKeyboardButton(
-                f"🔗 {item['title']}",
+                button_text,
                 url=clean_url,
             )
         else:
             button = InlineKeyboardButton(
-                f"🔗 {item['title']}",
+                button_text,
                 callback_data=f"help:industry_division:missing:{key}",
             )
         rows.append([button])
+
+    # Общие презентации вынесены в отдельный раздел, чтобы не дублировать
+    # одинаковые кнопки под каждой выбранной отраслью.
+    rows.append([
+        InlineKeyboardButton(
+            "📄 Документы",
+            callback_data="help:industry_division:documents",
+        )
+    ])
     rows.append([
         InlineKeyboardButton(
             "⬅️ В отраслевое деление",
             callback_data="help:industry_division",
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+INDUSTRY_DOCUMENT_SLOTS = [
+    {
+        "key": "common",
+        "label": "📊 Общая презентация",
+        "title": "Общая презентация",
+        "aliases": (
+            "общая презентация",
+            "общая презентация продукта",
+            "презентация продукта",
+        ),
+    },
+    {
+        "key": "calendar",
+        "label": "📅 Презентация по «Календарке»",
+        "title": "Презентация по «Календарке»",
+        "aliases": (
+            "презентация по календарке",
+            "презентация календарка",
+            "календарка",
+        ),
+    },
+]
+
+
+def _industry_document_normalize(value: str | None) -> str:
+    """Нормализует название документа для устойчивого сопоставления."""
+    clean = (value or "").casefold().replace("ё", "е")
+    clean = re.sub(r"[^0-9a-zа-я]+", " ", clean)
+    return re.sub(r"\s+", " ", clean).strip()
+
+
+def db_industry_document_find(aliases: tuple[str, ...]) -> dict | None:
+    """
+    Находит уже загруженный через Telegram документ.
+
+    Приоритет:
+    1) точное совпадение названия;
+    2) фраза-алиас входит в название;
+    3) обычный поиск базы документов по названию, описанию, тегам и содержимому.
+    """
+    normalized_aliases = [
+        _industry_document_normalize(alias)
+        for alias in aliases
+        if _industry_document_normalize(alias)
+    ]
+    if not normalized_aliases:
+        return None
+
+    items = db_docs_list_all(limit=10_000)
+
+    for item in items:
+        title = _industry_document_normalize(item.get("title"))
+        if title in normalized_aliases:
+            return item
+
+    for alias in normalized_aliases:
+        for item in items:
+            title = _industry_document_normalize(item.get("title"))
+            if alias and alias in title:
+                return item
+
+    seen_ids: set[int] = set()
+    for alias in aliases:
+        for item in db_docs_search(alias, limit=50):
+            doc_id = int(item["id"])
+            if doc_id in seen_ids:
+                continue
+            seen_ids.add(doc_id)
+            return item
+    return None
+
+
+def industry_division_documents_items() -> list[dict]:
+    """Возвращает два общих материала, ссылаясь на существующие записи docs."""
+    result: list[dict] = []
+    for slot in INDUSTRY_DOCUMENT_SLOTS:
+        item = db_industry_document_find(tuple(slot["aliases"]))
+        result.append({**slot, "document": item})
+    return result
+
+
+def kb_industry_division_documents(items: list[dict] | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    items = items if items is not None else industry_division_documents_items()
+
+    for slot in items:
+        document = slot.get("document")
+        if document:
+            rows.append([
+                InlineKeyboardButton(
+                    slot["label"],
+                    callback_data=f"help:docs:open:{int(document['id'])}",
+                )
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    slot["label"],
+                    callback_data=(
+                        "help:industry_division:document_missing:"
+                        f"{slot['key']}"
+                    ),
+                )
+            ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "📚 Все документы",
+            callback_data="help:docs",
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton(
+            "⬅️ К инструментам",
+            callback_data="help:industry_division:tools",
         )
     ])
     rows.append([
@@ -19289,8 +19422,8 @@ def industry_division_text(
         "по выбранным направлениям.",
         "",
         "🧰 <b>«Открыть инструменты моих отраслей»</b> — раздел со всеми "
-        "полезными рабочими ресурсами, включая ссылку на Wiki по каждой "
-        "выбранной отрасли.",
+        "полезными рабочими ресурсами: отдельной ссылкой на Wiki по каждой "
+        "выбранной отрасли и общими презентациями в разделе «Документы».",
         "",
         (
             f"Выбрано: <b>{len(selected_labels)} "
@@ -19323,9 +19456,42 @@ def industry_division_tools_text(user_id: int | None = None) -> str:
         )
     return (
         "🧰 <b>Инструменты выбранных отраслей</b>\n\n"
-        "Открой нужный рабочий ресурс, включая Wiki по выбранным отраслям:\n\n"
+        "Для каждой выбранной отрасли доступна отдельная ссылка на Wiki. "
+        "Общие презентации находятся в разделе <b>«Документы»</b>.\n\n"
         + "\n".join(f"• {escape(label)}" for label in selected_labels)
     )
+
+
+def industry_division_documents_text(items: list[dict] | None = None) -> str:
+    items = items if items is not None else industry_division_documents_items()
+    lines = [
+        "📄 <b>Документы</b>",
+        "",
+        "Материалы загружаются через обычный раздел <b>«Документы»</b> "
+        "и здесь используются повторно — без отдельных ссылок и повторной загрузки.",
+        "",
+    ]
+
+    for slot in items:
+        document = slot.get("document")
+        if document:
+            lines.append(
+                f"• <b>{escape(slot['title'])}</b> — "
+                f"найден документ «{escape(document.get('title') or 'Без названия')}»"
+            )
+        else:
+            lines.append(
+                f"• <b>{escape(slot['title'])}</b> — документ пока не найден"
+            )
+
+    lines.extend([
+        "",
+        "💡 <b>Важно:</b> у компаний может быть не только автомобильная логистика, "
+        "но и выездные сотрудники: торговые представители, мерчандайзеры, "
+        "сервисные инженеры и другие специалисты. Их визиты, маршруты и расписание "
+        "можно автоматизировать с помощью «Календарки».",
+    ])
+    return "\n".join(lines)
 
 
 async def handle_industry_division_callback(
@@ -19341,12 +19507,26 @@ async def handle_industry_division_callback(
     data = query.data or ""
     user_id = update.effective_user.id if update.effective_user else None
 
+    if data.startswith("help:industry_division:document_missing:"):
+        document_key = data.rsplit(":", 1)[-1]
+        slot = next(
+            (item for item in INDUSTRY_DOCUMENT_SLOTS if item["key"] == document_key),
+            None,
+        )
+        title = slot["title"] if slot else "Документ"
+        await query.answer(
+            f"«{title}» не найдена в разделе «Документы». "
+            "Загрузите её туда или добавьте название из текста кнопки в название/теги документа.",
+            show_alert=True,
+        )
+        return
+
     if data.startswith("help:industry_division:missing:"):
         key = data.rsplit(":", 1)[-1]
         item = INDUSTRY_DIVISION_BY_KEY.get(key)
         title = item["title"] if item else "этой отрасли"
         await query.answer(
-            f"Ссылка для «{title}» пока не настроена.",
+            f"Ссылка на Wiki для отрасли «{title}» пока не настроена.",
             show_alert=True,
         )
         return
@@ -19409,6 +19589,29 @@ async def handle_industry_division_callback(
             industry_division_tools_text(user_id),
             parse_mode=ParseMode.HTML,
             reply_markup=kb_industry_division_tools(user_id),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:industry_division:documents":
+        selected_keys = db_industry_division_get_choices(user_id)
+        if not selected_keys:
+            try:
+                await query.answer("Сначала выбери отрасль.", show_alert=True)
+            except Exception:
+                pass
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        items = industry_division_documents_items()
+        context.user_data[DOCS_RETURN_CB] = "help:industry_division:documents"
+        await query.edit_message_text(
+            industry_division_documents_text(items),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_division_documents(items),
             disable_web_page_preview=True,
         )
         return
