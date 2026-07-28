@@ -26860,6 +26860,464 @@ async def cb_help(
 
 # ============ END CALENDAR PLANNING EXPERTS V1 ============
 
+
+# ================ CALENDAR PLANNING CASES V1 ================
+
+CALENDAR_PLANNING_CASE_IDS = (
+    "na_polke",
+    "biocodex",
+    "gemotest",
+    "raiffeisen",
+)
+
+
+def _calendar_planning_case_upsert(item: dict):
+    """Добавляет новый кейс или обновляет существующую карточку каталога."""
+    case_id = str(item["id"])
+    existing_index = next(
+        (
+            index
+            for index, current in enumerate(CASES_DATA)
+            if str(current.get("id")) == case_id
+        ),
+        None,
+    )
+    if existing_index is None:
+        CASES_DATA.append(item)
+    else:
+        CASES_DATA[existing_index] = item
+    CASES_BY_ID[case_id] = item
+
+
+_calendar_planning_case_upsert(
+    _case(
+        "na_polke",
+        "на_полке",
+        ("FMCG", "Ритейл"),
+        "Более чем в 4 раза быстрее планируют маршруты",
+        "Для 30 торговых представителей строят недельные маршруты за 30 минут; "
+        "учитывают рабочие дни сотрудников и часы работы магазинов, "
+        "а количество посещений в день выросло на 10%.",
+        "https://yandex.ru/routing/articles/na_polke/",
+    )
+)
+
+_calendar_planning_case_upsert(
+    _case(
+        "biocodex",
+        "Biocodex",
+        ("Медицина и фармацевтика",),
+        "97% покрытия целевой базы и 91% целевой частоты посещений",
+        "Еженедельно планируют 4 500 визитов для 75 медицинских представителей; "
+        "итоговая проверка занимает около 30 минут вместо 2,5 часа "
+        "ручного планирования.",
+        "https://yandex.ru/routing/cases",
+    )
+)
+
+_calendar_planning_case_upsert(
+    _case(
+        "gemotest",
+        "Гемотест",
+        ("Медицина и фармацевтика",),
+        "Интервалы 2–3 часа и рост плотности маршрутов на 15%",
+        "Ежедневно строят маршруты для 50 выездных медсестёр — "
+        "по 8–15 пациентов на сотрудника; сократили общий пробег "
+        "и количество опозданий.",
+        "https://yandex.ru/routing/articles/gemotest/",
+    )
+)
+
+_calendar_planning_case_upsert(
+    _case(
+        "raiffeisen",
+        "Raiffeisen Bank",
+        ("Банки и финансы",),
+        "В 2 раза выше эффективность выездных консультантов",
+        "Маршруты учитывают временные слоты, загрузку, пробки и способ "
+        "передвижения; доля заказов на следующий день выросла на 13%, "
+        "а проект масштабировали на 26 городов.",
+        "https://yandex.ru/routing/articles/raiffeisen/",
+    )
+)
+
+
+def calendar_planning_cases_list() -> list[dict]:
+    return [
+        CASES_BY_ID[case_id]
+        for case_id in CALENDAR_PLANNING_CASE_IDS
+        if case_id in CASES_BY_ID
+    ]
+
+
+def calendar_planning_cases_text() -> str:
+    items = calendar_planning_cases_list()
+    lines = [
+        "📚 <b>Кейсы Календарного планирования</b>",
+        "",
+        "Здесь собраны примеры работы с торговыми представителями, "
+        "медицинскими и банковскими выездными командами.",
+        "",
+    ]
+    for item in items:
+        lines.append(
+            f"• <b>{escape(item['company'])}</b> — "
+            f"{escape(item['metric'])}"
+        )
+    lines.extend([
+        "",
+        "Выберите компанию, чтобы посмотреть подробности.",
+    ])
+    return "\n".join(lines)
+
+
+def kb_calendar_planning_cases() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"🏢 {item['company'][:55]}",
+                callback_data=f"help:calcase:{item['id']}",
+            )
+        ]
+        for item in calendar_planning_cases_list()
+    ]
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                "⬅️ К Календарному планированию",
+                callback_data="help:projects:calendar",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📚 Все кейсы",
+                callback_data="help:cases",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🗂️ К проектам",
+                callback_data="help:projects",
+            )
+        ],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def calendar_planning_case_text(item: dict) -> str:
+    return (
+        "📅 <b>Кейс Календарного планирования</b>\n\n"
+        + cases_detail_text(item)
+    )
+
+
+def kb_calendar_planning_case(
+    item: dict,
+    user_id: int | None,
+) -> InlineKeyboardMarkup:
+    marked = db_case_is_favorite(user_id, item["id"])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "★ Убрать из избранных кейсов"
+                if marked else "☆ Добавить в избранные кейсы",
+                callback_data=f"help:calcasefav:{item['id']}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔗 Открыть кейс на сайте",
+                url=item["url"],
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ К кейсам проекта",
+                callback_data="help:calcases",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📅 К Календарному планированию",
+                callback_data="help:projects:calendar",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📚 Все кейсы",
+                callback_data="help:cases",
+            )
+        ],
+    ])
+
+
+# Расширяем экран проекта: эксперты остаются на месте,
+# а над ними появляется отдельный вход в четыре профильных кейса.
+def calendar_planning_project_text() -> str:
+    experts = db_calendar_planning_experts_list()
+    cases_count = len(calendar_planning_cases_list())
+    lines = [
+        "📅 <b>Календарное планирование</b>",
+        "",
+        "Здесь собраны профильные кейсы и коллеги, которые занимаются "
+        "Календарным планированием и могут помочь по проекту.",
+        "",
+        f"📚 Кейсов проекта: <b>{cases_count}</b>",
+        f"👥 Экспертов: <b>{len(experts)}</b>",
+    ]
+
+    if experts:
+        lines.extend([
+            "",
+            "Эксперты проекта:",
+            "",
+        ])
+        for item in experts:
+            lines.append(f"• <b>{escape(item['full_name'])}</b>")
+    else:
+        lines.extend([
+            "",
+            "Эксперты пока не назначены.",
+        ])
+
+    return "\n".join(lines)
+
+
+def kb_calendar_planning_project() -> InlineKeyboardMarkup:
+    experts = db_calendar_planning_experts_list()
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            _green_inline_button(
+                f"📚 Кейсы проекта — {len(calendar_planning_cases_list())}",
+                callback_data="help:calcases",
+            )
+        ]
+    ]
+
+    for item in experts:
+        rows.append([
+            InlineKeyboardButton(
+                f"👤 {item['full_name'][:55]}",
+                callback_data=(
+                    f"help:industry_specialist:"
+                    f"{int(item['id'])}:calendar"
+                ),
+            )
+        ])
+
+    if not experts:
+        rows.append([
+            InlineKeyboardButton(
+                "— Эксперты пока не назначены —",
+                callback_data="noop",
+            )
+        ])
+
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                "⬅️ К проектам",
+                callback_data="help:projects",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Главное меню",
+                callback_data="help:main",
+            )
+        ],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _calendar_project_button_row() -> list[InlineKeyboardButton]:
+    return [
+        _green_inline_button(
+            "📅 Проект: Календарное планирование",
+            callback_data="help:projects:calendar",
+        )
+    ]
+
+
+def _insert_calendar_project_button(
+    rows: list[list[InlineKeyboardButton]],
+    *,
+    after_first: bool = False,
+) -> list[list[InlineKeyboardButton]]:
+    """Добавляет переход к проекту и не допускает дублирования кнопки."""
+    if any(
+        (button.callback_data or "") == "help:projects:calendar"
+        for row in rows
+        for button in row
+    ):
+        return rows
+
+    if after_first and rows:
+        rows.insert(1, _calendar_project_button_row())
+        return rows
+
+    main_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if any(
+                (button.callback_data or "") == "help:main"
+                for button in row
+            )
+        ),
+        len(rows),
+    )
+    rows.insert(main_index, _calendar_project_button_row())
+    return rows
+
+
+_calendar_cases_previous_kb_cases_categories = kb_cases_categories
+
+
+def kb_cases_categories(
+    user_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    legacy = _calendar_cases_previous_kb_cases_categories(user_id)
+    rows = [list(row) for row in legacy.inline_keyboard]
+    return InlineKeyboardMarkup(
+        _insert_calendar_project_button(rows, after_first=True)
+    )
+
+
+_calendar_cases_previous_kb_cases_industry_picker = (
+    kb_cases_industry_picker
+)
+
+
+def kb_cases_industry_picker(
+    user_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    legacy = _calendar_cases_previous_kb_cases_industry_picker(user_id)
+    rows = [list(row) for row in legacy.inline_keyboard]
+    return InlineKeyboardMarkup(
+        _insert_calendar_project_button(rows, after_first=True)
+    )
+
+
+_calendar_cases_previous_kb_cases_list = kb_cases_list
+
+
+def kb_cases_list(
+    items: list[dict],
+    category_key: str = "all",
+    page: int = 0,
+    query: str = "",
+    favorites: bool = False,
+    industry: bool = False,
+) -> InlineKeyboardMarkup:
+    legacy = _calendar_cases_previous_kb_cases_list(
+        items,
+        category_key=category_key,
+        page=page,
+        query=query,
+        favorites=favorites,
+        industry=industry,
+    )
+    rows = [list(row) for row in legacy.inline_keyboard]
+    return InlineKeyboardMarkup(
+        _insert_calendar_project_button(rows)
+    )
+
+
+_calendar_cases_previous_kb_case_detail = kb_case_detail
+
+
+def kb_case_detail(
+    item: dict,
+    user_id: int | None,
+    favorite_context: str,
+    back_callback: str,
+) -> InlineKeyboardMarkup:
+    legacy = _calendar_cases_previous_kb_case_detail(
+        item,
+        user_id,
+        favorite_context,
+        back_callback,
+    )
+    rows = [list(row) for row in legacy.inline_keyboard]
+    return InlineKeyboardMarkup(
+        _insert_calendar_project_button(rows)
+    )
+
+
+_calendar_cases_previous_cb_help = cb_help
+
+
+async def cb_help(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if data == "help:calcases":
+        if await deny_no_access(update, context):
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            calendar_planning_cases_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_calendar_planning_cases(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:calcasefav:"):
+        if await deny_no_access(update, context):
+            return
+        case_id = data.rsplit(":", 1)[-1]
+        item = CASES_BY_ID.get(case_id)
+        if not item or case_id not in CALENDAR_PLANNING_CASE_IDS:
+            await query.answer("Кейс не найден.", show_alert=True)
+            return
+
+        marked = db_case_toggle_favorite(user_id, case_id)
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=kb_calendar_planning_case(item, user_id)
+            )
+        except Exception:
+            pass
+        await query.answer(
+            "Кейс добавлен в избранное."
+            if marked else "Кейс убран из избранного."
+        )
+        return
+
+    if data.startswith("help:calcase:"):
+        if await deny_no_access(update, context):
+            return
+        case_id = data.rsplit(":", 1)[-1]
+        item = CASES_BY_ID.get(case_id)
+        if not item or case_id not in CALENDAR_PLANNING_CASE_IDS:
+            await query.answer("Кейс не найден.", show_alert=True)
+            return
+
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            calendar_planning_case_text(item),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_calendar_planning_case(item, user_id),
+            disable_web_page_preview=True,
+        )
+        return
+
+    return await _calendar_cases_previous_cb_help(update, context)
+
+# ============== END CALENDAR PLANNING CASES V1 ==============
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
