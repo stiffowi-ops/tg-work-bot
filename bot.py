@@ -19463,35 +19463,13 @@ def industry_division_tools_text(user_id: int | None = None) -> str:
 
 
 def industry_division_documents_text(items: list[dict] | None = None) -> str:
-    items = items if items is not None else industry_division_documents_items()
-    lines = [
-        "📄 <b>Документы</b>",
-        "",
-        "Материалы загружаются через обычный раздел <b>«Документы»</b> "
-        "и здесь используются повторно — без отдельных ссылок и повторной загрузки.",
-        "",
-    ]
-
-    for slot in items:
-        document = slot.get("document")
-        if document:
-            lines.append(
-                f"• <b>{escape(slot['title'])}</b> — "
-                f"найден документ «{escape(document.get('title') or 'Без названия')}»"
-            )
-        else:
-            lines.append(
-                f"• <b>{escape(slot['title'])}</b> — документ пока не найден"
-            )
-
-    lines.extend([
-        "",
+    return (
+        "📄 <b>Документы</b>\n\n"
         "💡 <b>Важно:</b> у компаний может быть не только автомобильная логистика, "
         "но и выездные сотрудники: торговые представители, мерчандайзеры, "
         "сервисные инженеры и другие специалисты. Их визиты, маршруты и расписание "
-        "можно автоматизировать с помощью «Календарки».",
-    ])
-    return "\n".join(lines)
+        "можно автоматизировать с помощью «Календарки»."
+    )
 
 
 async def handle_industry_division_callback(
