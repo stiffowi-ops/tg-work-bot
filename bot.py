@@ -26164,14 +26164,17 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def projects_menu_text() -> str:
     return (
         "🗂️ <b>Наши проекты</b>\n\n"
-        "Выберите нужный проект:"
+        "Здесь собраны направления, которыми занимается выделенная группа коллег. "
+        "Внутри каждого проекта вы найдёте полезные материалы, рабочие инструменты "
+        "и контакты коллег, к которым можно обратиться за помощью.\n\n"
+        "Выберите нужный проект 👇"
     )
 
 
 def kb_projects_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
+            _green_inline_button(
                 "🏭 Отраслевое деление",
                 callback_data="help:industry_division",
             )
