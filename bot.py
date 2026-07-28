@@ -26375,6 +26375,491 @@ async def cb_help(
 
 # ==================== END PROJECTS MENU V1 ====================
 
+
+# ============== CALENDAR PLANNING EXPERTS V1 ==============
+
+_calendar_experts_previous_db_init = db_init
+
+
+def db_init():
+    _calendar_experts_previous_db_init()
+    with sqlite3.connect(DB_PATH) as con:
+        try:
+            con.execute(
+                "ALTER TABLE industry_specialists "
+                "ADD COLUMN is_calendar_planning_expert "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+        con.execute(
+            "UPDATE industry_specialists "
+            "SET is_calendar_planning_expert=0 "
+            "WHERE is_calendar_planning_expert IS NULL"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "idx_industry_specialists_calendar_expert "
+            "ON industry_specialists("
+            "is_calendar_planning_expert, full_name COLLATE NOCASE)"
+        )
+
+
+def db_calendar_planning_expert_is(specialist_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            """
+            SELECT COALESCE(is_calendar_planning_expert, 0)
+            FROM industry_specialists
+            WHERE id=?
+            """,
+            (int(specialist_id),),
+        ).fetchone()
+    return bool(row and int(row[0]))
+
+
+def db_calendar_planning_expert_set(
+    specialist_id: int,
+    enabled: bool,
+) -> bool:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            """
+            UPDATE industry_specialists
+            SET is_calendar_planning_expert=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                1 if enabled else 0,
+                datetime.utcnow().isoformat(),
+                int(specialist_id),
+            ),
+        )
+        return cur.rowcount > 0
+
+
+def db_calendar_planning_expert_toggle(
+    specialist_id: int,
+) -> bool | None:
+    item = db_industry_specialist_get(int(specialist_id))
+    if not item:
+        return None
+    enabled = not db_calendar_planning_expert_is(int(specialist_id))
+    if not db_calendar_planning_expert_set(int(specialist_id), enabled):
+        return None
+    return enabled
+
+
+def db_calendar_planning_experts_list() -> list[dict]:
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            """
+            SELECT id
+            FROM industry_specialists
+            WHERE COALESCE(is_calendar_planning_expert, 0)=1
+            ORDER BY full_name COLLATE NOCASE ASC, id ASC
+            """
+        ).fetchall()
+
+    items: list[dict] = []
+    for row in rows:
+        item = db_industry_specialist_get(int(row[0]))
+        if item:
+            items.append(item)
+    return items
+
+
+def calendar_planning_experts_admin_text() -> str:
+    all_items = db_industry_specialists_list()
+    selected_count = sum(
+        1
+        for item in all_items
+        if db_calendar_planning_expert_is(int(item["id"]))
+    )
+    return (
+        "📅 <b>Эксперты по Календарному планированию</b>\n\n"
+        "Отметьте Sales экспертов, которые занимаются проектом "
+        "«Календарное планирование». Отмеченные коллеги автоматически "
+        "появятся в разделе <b>«Наши проекты» → "
+        "«Календарное планирование»</b>.\n\n"
+        "Повторное нажатие снимает отметку.\n\n"
+        f"Назначено экспертов: <b>{selected_count}</b>"
+    )
+
+
+def kb_calendar_planning_experts_admin() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    items = db_industry_specialists_list()
+
+    for item in items:
+        specialist_id = int(item["id"])
+        selected = db_calendar_planning_expert_is(specialist_id)
+        mark = "✅" if selected else "▫️"
+        rows.append([
+            InlineKeyboardButton(
+                f"{mark} {item['full_name'][:55]}",
+                callback_data=f"help:ispec:caltoggle:{specialist_id}",
+            )
+        ])
+
+    if not items:
+        rows.append([
+            InlineKeyboardButton(
+                "— Сначала добавьте Sales экспертов —",
+                callback_data="noop",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "⬅️ К Sales экспертам",
+            callback_data="help:ispec",
+        )
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+_calendar_experts_previous_kb_industry_specialists_admin = (
+    kb_industry_specialists_admin
+)
+
+
+def kb_industry_specialists_admin() -> InlineKeyboardMarkup:
+    legacy = _calendar_experts_previous_kb_industry_specialists_admin()
+    rows = [list(row) for row in legacy.inline_keyboard]
+
+    insert_at = 1 if rows else 0
+    rows.insert(insert_at, [
+        InlineKeyboardButton(
+            "📅 Эксперты Календарного планирования",
+            callback_data="help:ispec:calendar",
+        )
+    ])
+
+    # Показываем отметку прямо в общем списке.
+    for row in rows:
+        for index, button in enumerate(row):
+            callback_data = button.callback_data or ""
+            if not callback_data.startswith("help:ispec:open:"):
+                continue
+            try:
+                specialist_id = int(callback_data.rsplit(":", 1)[-1])
+            except (TypeError, ValueError):
+                continue
+            if db_calendar_planning_expert_is(specialist_id):
+                label = button.text or ""
+                if not label.startswith("📅 "):
+                    row[index] = InlineKeyboardButton(
+                        f"📅 {label}",
+                        callback_data=callback_data,
+                    )
+
+    return InlineKeyboardMarkup(rows)
+
+
+_calendar_experts_previous_industry_specialist_card_text = (
+    industry_specialist_card_text
+)
+
+
+def industry_specialist_card_text(
+    item: dict,
+    *,
+    admin: bool = False,
+) -> str:
+    base = _calendar_experts_previous_industry_specialist_card_text(
+        item,
+        admin=admin,
+    )
+    if not admin:
+        return base
+
+    status = (
+        "✅ назначен"
+        if db_calendar_planning_expert_is(int(item["id"]))
+        else "— не назначен"
+    )
+    return (
+        base
+        + "\n"
+        + f"<b>Календарное планирование:</b> {status}"
+    )
+
+
+_calendar_experts_previous_kb_industry_specialist_admin_card = (
+    kb_industry_specialist_admin_card
+)
+
+
+def kb_industry_specialist_admin_card(
+    item: dict,
+) -> InlineKeyboardMarkup:
+    legacy = _calendar_experts_previous_kb_industry_specialist_admin_card(item)
+    rows = [list(row) for row in legacy.inline_keyboard]
+    specialist_id = int(item["id"])
+    selected = db_calendar_planning_expert_is(specialist_id)
+
+    label = (
+        "✅ Эксперт по Календарному планированию"
+        if selected
+        else "▫️ Назначить экспертом по Календарному планированию"
+    )
+    rows.insert(
+        max(0, len(rows) - 2),
+        [
+            InlineKeyboardButton(
+                label,
+                callback_data=f"help:ispec:caltogglecard:{specialist_id}",
+            )
+        ],
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def calendar_planning_project_text() -> str:
+    experts = db_calendar_planning_experts_list()
+    lines = [
+        "📅 <b>Календарное планирование</b>",
+        "",
+        "Здесь собраны коллеги, которые занимаются Календарным "
+        "планированием и могут помочь по проекту.",
+    ]
+
+    if not experts:
+        lines.extend([
+            "",
+            "Эксперты пока не назначены.",
+        ])
+        return "\n".join(lines)
+
+    lines.extend([
+        "",
+        "Выберите эксперта, чтобы посмотреть контакт:",
+        "",
+    ])
+    for item in experts:
+        lines.append(f"• <b>{escape(item['full_name'])}</b>")
+
+    return "\n".join(lines)
+
+
+def kb_calendar_planning_project() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"👤 {item['full_name'][:55]}",
+                callback_data=(
+                    f"help:industry_specialist:"
+                    f"{int(item['id'])}:calendar"
+                ),
+            )
+        ]
+        for item in db_calendar_planning_experts_list()
+    ]
+
+    if not rows:
+        rows.append([
+            InlineKeyboardButton(
+                "— Эксперты пока не назначены —",
+                callback_data="noop",
+            )
+        ])
+
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                "⬅️ К проектам",
+                callback_data="help:projects",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Главное меню",
+                callback_data="help:main",
+            )
+        ],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def calendar_planning_expert_card_text(item: dict) -> str:
+    titles = industry_specialist_industry_titles(item)
+    industries_text = ", ".join(titles) if titles else "—"
+    return (
+        "📅 <b>Эксперт по Календарному планированию</b>\n\n"
+        f"<b>Имя и фамилия:</b> "
+        f"{escape(item.get('full_name') or '—')}\n"
+        f"<b>Отрасли:</b> {escape(industries_text)}\n"
+        f"<b>Telegram:</b> "
+        f"{escape(item.get('telegram_link') or '—')}"
+    )
+
+
+def kb_calendar_planning_expert_card(
+    item: dict,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    tg_url = industry_specialist_tg_url(item.get("telegram_link"))
+    if tg_url:
+        rows.append([
+            InlineKeyboardButton(
+                "✈️ Написать в Telegram",
+                url=tg_url,
+            )
+        ])
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                "⬅️ К Календарному планированию",
+                callback_data="help:projects:calendar",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🗂️ К проектам",
+                callback_data="help:projects",
+            )
+        ],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+_calendar_experts_previous_cb_help = cb_help
+
+
+async def cb_help(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+
+    if data == "help:ispec:calendar":
+        if not await is_admin_scoped(update, context):
+            try:
+                await query.answer(
+                    "Доступно администраторам.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
+        clear_industry_specialist_flow(context)
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            calendar_planning_experts_admin_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_calendar_planning_experts_admin(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:ispec:caltoggle:"):
+        if not await is_admin_scoped(update, context):
+            try:
+                await query.answer(
+                    "Доступно администраторам.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
+        try:
+            specialist_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await query.answer("Sales эксперт не найден.", show_alert=True)
+            return
+
+        enabled = db_calendar_planning_expert_toggle(specialist_id)
+        if enabled is None:
+            await query.answer("Sales эксперт не найден.", show_alert=True)
+            return
+
+        await query.answer(
+            "Эксперт добавлен в Календарное планирование."
+            if enabled
+            else "Эксперт убран из Календарного планирования."
+        )
+        await query.edit_message_text(
+            calendar_planning_experts_admin_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_calendar_planning_experts_admin(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:ispec:caltogglecard:"):
+        if not await is_admin_scoped(update, context):
+            try:
+                await query.answer(
+                    "Доступно администраторам.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
+        try:
+            specialist_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await query.answer("Sales эксперт не найден.", show_alert=True)
+            return
+
+        enabled = db_calendar_planning_expert_toggle(specialist_id)
+        item = db_industry_specialist_get(specialist_id)
+        if enabled is None or not item:
+            await query.answer("Sales эксперт не найден.", show_alert=True)
+            return
+
+        await query.answer(
+            "Эксперт добавлен в Календарное планирование."
+            if enabled
+            else "Эксперт убран из Календарного планирования."
+        )
+        await query.edit_message_text(
+            industry_specialist_card_text(item, admin=True),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_specialist_admin_card(item),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:industry_specialist:") and data.endswith(":calendar"):
+        if await deny_no_access(update, context):
+            return
+        parts = data.split(":")
+        try:
+            specialist_id = int(parts[2])
+        except (IndexError, TypeError, ValueError):
+            await query.answer("Эксперт не найден.", show_alert=True)
+            return
+
+        item = db_industry_specialist_get(specialist_id)
+        if not item or not db_calendar_planning_expert_is(specialist_id):
+            await query.answer(
+                "Эксперт больше не назначен на этот проект.",
+                show_alert=True,
+            )
+            return
+
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            calendar_planning_expert_card_text(item),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_calendar_planning_expert_card(item),
+            disable_web_page_preview=True,
+        )
+        return
+
+    return await _calendar_experts_previous_cb_help(update, context)
+
+# ============ END CALENDAR PLANNING EXPERTS V1 ============
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
