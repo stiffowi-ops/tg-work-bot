@@ -25513,6 +25513,653 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== END INDUSTRY SPECIALISTS V2 ===================
 
+
+# =================== INDUSTRY INDIVIDUAL CARDS V1 ===================
+
+def industry_card_is_selected(
+    user_id: int | None,
+    industry_key: str,
+) -> bool:
+    return (
+        industry_key in INDUSTRY_DIVISION_BY_KEY
+        and industry_key in db_industry_division_get_choices(user_id)
+    )
+
+
+def industry_card_cases(industry_key: str) -> list[dict]:
+    category_keys = INDUSTRY_DIVISION_CASE_CATEGORIES.get(industry_key, ())
+    if not category_keys:
+        return []
+    return cases_search_items(category_keys=list(category_keys))
+
+
+def industry_card_stats(industry_key: str) -> dict:
+    return {
+        "cases": industry_card_cases(industry_key),
+        "documents": industry_division_documents_items(),
+        "specialists": db_industry_specialists_list([industry_key]),
+    }
+
+
+def industry_card_text(
+    industry_key: str,
+    stats: dict | None = None,
+) -> str:
+    item = INDUSTRY_DIVISION_BY_KEY.get(industry_key)
+    if not item:
+        return "🏭 <b>Отрасль не найдена</b>"
+
+    stats = stats or industry_card_stats(industry_key)
+    cases_count = len(stats.get("cases") or [])
+    documents_count = sum(
+        1
+        for slot in (stats.get("documents") or [])
+        if slot.get("document")
+    )
+    specialists_count = len(stats.get("specialists") or [])
+    wiki_ready = bool((item.get("url") or "").strip())
+
+    lines = [
+        f"🏭 <b>{escape(item['title'])}</b>",
+        "",
+        "Все основные материалы и контакты по выбранной отрасли собраны в одном месте.",
+        "",
+        f"🔗 Wiki: <b>{'доступна' if wiki_ready else 'не настроена'}</b>",
+        f"📚 Кейсы: <b>{cases_count}</b>",
+        f"📄 Документы: <b>{documents_count}</b>",
+        f"👥 Sales эксперты: <b>{specialists_count}</b>",
+    ]
+
+    if industry_key == "cosmetics_perfumery":
+        lines.extend([
+            "",
+            "ℹ️ Пока для этой отрасли используются близкие кейсы категории «Ритейл».",
+        ])
+
+    return "\n".join(lines)
+
+
+def kb_industry_card(
+    industry_key: str,
+    stats: dict | None = None,
+) -> InlineKeyboardMarkup:
+    item = INDUSTRY_DIVISION_BY_KEY.get(industry_key)
+    stats = stats or industry_card_stats(industry_key)
+
+    wiki_url = ((item or {}).get("url") or "").strip()
+    if wiki_url:
+        wiki_button = InlineKeyboardButton("🔗 Ссылка на Wiki", url=wiki_url)
+    else:
+        wiki_button = InlineKeyboardButton(
+            "🔗 Ссылка на Wiki",
+            callback_data=f"help:idv:w:{industry_key}",
+        )
+
+    cases_count = len(stats.get("cases") or [])
+    documents_count = sum(
+        1
+        for slot in (stats.get("documents") or [])
+        if slot.get("document")
+    )
+    specialists_count = len(stats.get("specialists") or [])
+
+    return InlineKeyboardMarkup([
+        [wiki_button],
+        [
+            InlineKeyboardButton(
+                f"📚 Кейсы — {cases_count}",
+                callback_data=f"help:idv:k:{industry_key}:0",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"📄 Документы — {documents_count}",
+                callback_data=f"help:idv:d:{industry_key}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"👥 Sales эксперты — {specialists_count}",
+                callback_data=f"help:idv:e:{industry_key}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ К выбору отраслей",
+                callback_data="help:industry_division",
+            )
+        ],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
+    ])
+
+
+def industry_card_documents_text(industry_key: str) -> str:
+    item = INDUSTRY_DIVISION_BY_KEY.get(industry_key)
+    title = (item or {}).get("title") or "Отрасль"
+    return (
+        f"📄 <b>Документы: {escape(title)}</b>\n\n"
+        "💡 <b>Важно:</b> у компаний может быть не только автомобильная логистика, "
+        "но и выездные сотрудники: торговые представители, мерчандайзеры, "
+        "сервисные инженеры и другие специалисты. Их визиты, маршруты и расписание "
+        "можно автоматизировать с помощью «Календарки»."
+    )
+
+
+def kb_industry_card_documents(
+    industry_key: str,
+    items: list[dict] | None = None,
+) -> InlineKeyboardMarkup:
+    items = items if items is not None else industry_division_documents_items()
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for slot in items:
+        document = slot.get("document")
+        if document:
+            rows.append([
+                InlineKeyboardButton(
+                    slot["label"],
+                    callback_data=f"help:docs:open:{int(document['id'])}",
+                )
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    slot["label"],
+                    callback_data=(
+                        "help:industry_division:document_missing:"
+                        f"{slot['key']}"
+                    ),
+                )
+            ])
+
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                "📚 Все документы",
+                callback_data="help:docs",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ К карточке отрасли",
+                callback_data=f"help:idv:c:{industry_key}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏭 К выбору отраслей",
+                callback_data="help:industry_division",
+            )
+        ],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def industry_card_specialists_text(industry_key: str) -> str:
+    item = INDUSTRY_DIVISION_BY_KEY.get(industry_key)
+    title = (item or {}).get("title") or "Отрасль"
+    specialists = db_industry_specialists_list([industry_key])
+
+    lines = [f"👥 <b>Sales эксперты: {escape(title)}</b>", ""]
+    if not specialists:
+        lines.append("Для этой отрасли Sales эксперты пока не добавлены.")
+        return "\n".join(lines)
+
+    lines.append("Выберите эксперта, чтобы открыть его карточку:")
+    lines.append("")
+    for specialist in specialists:
+        industries = ", ".join(
+            industry_specialist_industry_titles(specialist)
+        ) or "—"
+        lines.append(
+            f"• <b>{escape(specialist['full_name'])}</b> — "
+            f"{escape(industries)}"
+        )
+    return "\n".join(lines)
+
+
+def kb_industry_card_specialists(
+    industry_key: str,
+) -> InlineKeyboardMarkup:
+    specialists = db_industry_specialists_list([industry_key])
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"👤 {item['full_name'][:55]}",
+                callback_data=(
+                    f"help:industry_specialist:{int(item['id'])}:"
+                    f"idv_{industry_key}"
+                ),
+            )
+        ]
+        for item in specialists
+    ]
+
+    if not rows:
+        rows.append([
+            InlineKeyboardButton(
+                "— Sales эксперты пока не добавлены —",
+                callback_data="noop",
+            )
+        ])
+
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                "⬅️ К карточке отрасли",
+                callback_data=f"help:idv:c:{industry_key}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏭 К выбору отраслей",
+                callback_data="help:industry_division",
+            )
+        ],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def industry_card_cases_text(
+    industry_key: str,
+    page: int = 0,
+) -> tuple[str, int, int, list[dict]]:
+    item = INDUSTRY_DIVISION_BY_KEY.get(industry_key)
+    title = (item or {}).get("title") or "Отрасль"
+    cases = industry_card_cases(industry_key)
+    list_text, page, total_pages = cases_list_text(
+        cases,
+        page=page,
+        heading=f"📚 <b>Кейсы: {escape(title)}</b>",
+        empty_text="Для этой отрасли кейсы пока не найдены.",
+    )
+    return list_text, page, total_pages, cases
+
+
+def kb_industry_card_cases(
+    industry_key: str,
+    cases: list[dict],
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    page_items, page, total_pages = _cases_page(cases, page)
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for case_item in page_items:
+        rows.append([
+            InlineKeyboardButton(
+                f"🏢 {case_item['company']}",
+                callback_data=(
+                    f"help:idv:o:{industry_key}:"
+                    f"{case_item['id']}:{page}"
+                ),
+            )
+        ])
+
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton(
+                    "◀️",
+                    callback_data=f"help:idv:k:{industry_key}:{page - 1}",
+                )
+            )
+        nav.append(
+            InlineKeyboardButton(
+                f"{page + 1} / {total_pages}",
+                callback_data="noop",
+            )
+        )
+        if page < total_pages - 1:
+            nav.append(
+                InlineKeyboardButton(
+                    "▶️",
+                    callback_data=f"help:idv:k:{industry_key}:{page + 1}",
+                )
+            )
+        rows.append(nav)
+
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                "⬅️ К карточке отрасли",
+                callback_data=f"help:idv:c:{industry_key}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏭 К выбору отраслей",
+                callback_data="help:industry_division",
+            )
+        ],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_industry_card_case_detail(
+    industry_key: str,
+    case_item: dict,
+    user_id: int | None,
+    page: int,
+) -> InlineKeyboardMarkup:
+    marked = db_case_is_favorite(user_id, case_item["id"])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "★ Убрать из избранных кейсов"
+                if marked else "☆ Добавить в избранные кейсы",
+                callback_data=(
+                    f"help:idv:f:{industry_key}:"
+                    f"{case_item['id']}:{page}"
+                ),
+            )
+        ],
+        [InlineKeyboardButton("🔗 Подробнее на сайте", url=case_item["url"])],
+        [
+            InlineKeyboardButton(
+                "⬅️ Назад к кейсам",
+                callback_data=f"help:idv:k:{industry_key}:{page}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏭 К карточке отрасли",
+                callback_data=f"help:idv:c:{industry_key}",
+            )
+        ],
+    ])
+
+
+# На главном экране вместо общего набора действий показываем отдельные карточки.
+_industry_cards_previous_kb_industry_division = kb_industry_division
+
+
+def kb_industry_division(user_id: int | None = None) -> InlineKeyboardMarkup:
+    legacy = _industry_cards_previous_kb_industry_division(user_id)
+    rows = [list(row) for row in legacy.inline_keyboard]
+
+    obsolete_callbacks = {
+        "help:industry_division:cases",
+        "help:industry_division:tools",
+        "help:industry_specialists",
+    }
+    rows = [
+        row
+        for row in rows
+        if not any(
+            (button.callback_data or "") in obsolete_callbacks
+            for button in row
+        )
+    ]
+
+    selected_keys = db_industry_division_get_choices(user_id)
+    insert_at = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if any(
+                (button.callback_data or "")
+                in {"help:industry_division:clear", "help:main"}
+                for button in row
+            )
+        ),
+        len(rows),
+    )
+
+    card_rows = [
+        [
+            _green_inline_button(
+                f"🏭 Открыть: {INDUSTRY_DIVISION_BY_KEY[key]['title']}",
+                callback_data=f"help:idv:c:{key}",
+            )
+        ]
+        for key in selected_keys
+        if key in INDUSTRY_DIVISION_BY_KEY
+    ]
+    rows[insert_at:insert_at] = card_rows
+    return InlineKeyboardMarkup(rows)
+
+
+def industry_division_text(
+    user_id: int | None = None,
+    notice: str | None = None,
+) -> str:
+    selected_keys = db_industry_division_get_choices(user_id)
+    selected_labels = [
+        INDUSTRY_DIVISION_BY_KEY[key]["title"]
+        for key in selected_keys
+        if key in INDUSTRY_DIVISION_BY_KEY
+    ]
+
+    lines = [
+        "🏭 <b>Отраслевое деление</b>",
+        "",
+        "Выбери от <b>одной до трёх отраслей</b>, с которыми ты работаешь. "
+        "Бот запомнит выбор.",
+        "",
+        "Для каждой выбранной отрасли появится отдельная карточка с Wiki, "
+        "кейсами, документами и профильными Sales экспертами.",
+        "",
+        (
+            f"Выбрано: <b>{len(selected_labels)} "
+            f"из {INDUSTRY_DIVISION_MAX_SELECTIONS}</b>"
+        ),
+    ]
+
+    if selected_labels:
+        lines.extend([
+            "",
+            *[f"• {escape(label)}" for label in selected_labels],
+            "",
+            "Откройте нужную отрасль отдельной зелёной кнопкой ниже.",
+        ])
+
+    if "cosmetics_perfumery" in selected_keys:
+        lines.extend([
+            "",
+            "ℹ️ Для «Косметики и парфюмерии» пока используются "
+            "близкие кейсы категории «Ритейл».",
+        ])
+
+    if notice:
+        lines = [notice, "", *lines]
+    return "\n".join(lines)
+
+
+# Из карточки эксперта возвращаемся в список конкретной отрасли.
+_industry_cards_previous_kb_industry_specialist_card = kb_industry_specialist_card
+
+
+def kb_industry_specialist_card(
+    item: dict,
+    source: str = "all",
+) -> InlineKeyboardMarkup:
+    if source.startswith("idv_"):
+        industry_key = source[4:]
+        rows: list[list[InlineKeyboardButton]] = []
+        tg_url = industry_specialist_tg_url(item.get("telegram_link"))
+        if tg_url:
+            rows.append([
+                InlineKeyboardButton("✈️ Написать в Telegram", url=tg_url)
+            ])
+        rows.extend([
+            [
+                InlineKeyboardButton(
+                    "⬅️ К Sales экспертам отрасли",
+                    callback_data=f"help:idv:e:{industry_key}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏭 К карточке отрасли",
+                    callback_data=f"help:idv:c:{industry_key}",
+                )
+            ],
+        ])
+        return InlineKeyboardMarkup(rows)
+
+    return _industry_cards_previous_kb_industry_specialist_card(item, source)
+
+
+async def handle_industry_card_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    if not query:
+        return
+    if await deny_no_access(update, context):
+        return
+
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[2] if len(parts) > 2 else ""
+    industry_key = parts[3] if len(parts) > 3 else ""
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if industry_key not in INDUSTRY_DIVISION_BY_KEY:
+        await query.answer("Отрасль не найдена.", show_alert=True)
+        return
+
+    if not industry_card_is_selected(user_id, industry_key):
+        await query.answer(
+            "Эта отрасль больше не выбрана. Вернитесь к выбору отраслей.",
+            show_alert=True,
+        )
+        return
+
+    if action == "w":
+        title = INDUSTRY_DIVISION_BY_KEY[industry_key]["title"]
+        await query.answer(
+            f"Ссылка на Wiki для отрасли «{title}» пока не настроена.",
+            show_alert=True,
+        )
+        return
+
+    if action == "c":
+        stats = industry_card_stats(industry_key)
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            industry_card_text(industry_key, stats),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_card(industry_key, stats),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if action == "d":
+        items = industry_division_documents_items()
+        context.user_data[DOCS_RETURN_CB] = f"help:idv:d:{industry_key}"
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            industry_card_documents_text(industry_key),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_card_documents(industry_key, items),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if action == "e":
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            industry_card_specialists_text(industry_key),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_card_specialists(industry_key),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if action == "k":
+        try:
+            page = int(parts[4]) if len(parts) > 4 else 0
+        except (TypeError, ValueError):
+            page = 0
+
+        list_text, page, _total_pages, cases = industry_card_cases_text(
+            industry_key, page
+        )
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            list_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_card_cases(
+                industry_key, cases, page
+            ),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if action in {"o", "f"}:
+        case_id = parts[4] if len(parts) > 4 else ""
+        try:
+            page = int(parts[5]) if len(parts) > 5 else 0
+        except (TypeError, ValueError):
+            page = 0
+
+        case_item = CASES_BY_ID.get(case_id)
+        allowed_ids = {
+            item["id"] for item in industry_card_cases(industry_key)
+        }
+        if not case_item or case_id not in allowed_ids:
+            await query.answer("Кейс не найден.", show_alert=True)
+            return
+
+        if action == "f":
+            marked = db_case_toggle_favorite(user_id, case_id)
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=kb_industry_card_case_detail(
+                        industry_key, case_item, user_id, page
+                    )
+                )
+            except Exception:
+                pass
+            await query.answer(
+                "Кейс добавлен в избранное."
+                if marked else "Кейс убран из избранного."
+            )
+            return
+
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            cases_detail_text(case_item),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_industry_card_case_detail(
+                industry_key, case_item, user_id, page
+            ),
+            disable_web_page_preview=True,
+        )
+        return
+
+    await query.answer("Неизвестное действие.", show_alert=True)
+
+
+_industry_cards_previous_cb_help = cb_help
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = (update.callback_query.data or "") if update.callback_query else ""
+    if data.startswith("help:idv:"):
+        return await handle_industry_card_callback(update, context)
+    return await _industry_cards_previous_cb_help(update, context)
+
+# ================= END INDUSTRY INDIVIDUAL CARDS V1 =================
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
