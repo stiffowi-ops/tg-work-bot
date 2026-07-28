@@ -27400,6 +27400,97 @@ async def cb_help(
 
 # ============== END CALENDAR PLANNING CASES V1 ==============
 
+
+# ============== CASES INDUSTRY GREEN BUTTON V1 ==============
+
+def _greenify_industry_division_button(
+    markup: InlineKeyboardMarkup,
+) -> InlineKeyboardMarkup:
+    """Выделяет зелёным переход в «Отраслевое деление» на экранах кейсов."""
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for row in markup.inline_keyboard:
+        new_row: list[InlineKeyboardButton] = []
+        for button in row:
+            if (button.callback_data or "") == "help:industry_division":
+                new_row.append(
+                    _green_inline_button(
+                        button.text or "🏭 В отраслевое деление",
+                        callback_data="help:industry_division",
+                    )
+                )
+            else:
+                new_row.append(button)
+        rows.append(new_row)
+
+    return InlineKeyboardMarkup(rows)
+
+
+_cases_green_previous_kb_cases_categories = kb_cases_categories
+
+
+def kb_cases_categories(
+    user_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    return _greenify_industry_division_button(
+        _cases_green_previous_kb_cases_categories(user_id)
+    )
+
+
+_cases_green_previous_kb_cases_industry_picker = kb_cases_industry_picker
+
+
+def kb_cases_industry_picker(
+    user_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    return _greenify_industry_division_button(
+        _cases_green_previous_kb_cases_industry_picker(user_id)
+    )
+
+
+_cases_green_previous_kb_cases_list = kb_cases_list
+
+
+def kb_cases_list(
+    items: list[dict],
+    category_key: str = "all",
+    page: int = 0,
+    query: str = "",
+    favorites: bool = False,
+    industry: bool = False,
+) -> InlineKeyboardMarkup:
+    return _greenify_industry_division_button(
+        _cases_green_previous_kb_cases_list(
+            items,
+            category_key=category_key,
+            page=page,
+            query=query,
+            favorites=favorites,
+            industry=industry,
+        )
+    )
+
+
+_cases_green_previous_kb_case_detail = kb_case_detail
+
+
+def kb_case_detail(
+    item: dict,
+    user_id: int | None,
+    favorite_context: str,
+    back_callback: str,
+) -> InlineKeyboardMarkup:
+    return _greenify_industry_division_button(
+        _cases_green_previous_kb_case_detail(
+            item,
+            user_id,
+            favorite_context,
+            back_callback,
+        )
+    )
+
+# ============ END CASES INDUSTRY GREEN BUTTON V1 ============
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
