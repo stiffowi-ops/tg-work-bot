@@ -26158,6 +26158,220 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= END INDUSTRY INDIVIDUAL CARDS V1 =================
 
+
+# ====================== PROJECTS MENU V1 ======================
+
+def projects_menu_text() -> str:
+    return (
+        "🗂️ <b>Наши проекты</b>\n\n"
+        "Выберите нужный проект:"
+    )
+
+
+def kb_projects_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🏭 Отраслевое деление",
+                callback_data="help:industry_division",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📅 Календарное планирование",
+                callback_data="help:projects:calendar",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Главное меню",
+                callback_data="help:main",
+            )
+        ],
+    ])
+
+
+def calendar_planning_project_text() -> str:
+    return (
+        "📅 <b>Календарное планирование</b>\n\n"
+        "Раздел пока пуст."
+    )
+
+
+def kb_calendar_planning_project() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "⬅️ К проектам",
+                callback_data="help:projects",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Главное меню",
+                callback_data="help:main",
+            )
+        ],
+    ])
+
+
+# В главном меню заменяем прямой вход в отраслевое деление
+# на зелёную полноширинную кнопку «Наши проекты».
+_projects_previous_kb_help_main = kb_help_main
+
+
+def kb_help_main(
+    is_admin_user: bool,
+    unread_count: int = 0,
+) -> InlineKeyboardMarkup:
+    legacy = _projects_previous_kb_help_main(
+        is_admin_user=is_admin_user,
+        unread_count=unread_count,
+    )
+    rows = [list(row) for row in legacy.inline_keyboard]
+
+    replaced = False
+    new_rows: list[list[InlineKeyboardButton]] = []
+    for row in rows:
+        if any(
+            (button.callback_data or "") == "help:industry_division"
+            for button in row
+        ):
+            if not replaced:
+                new_rows.append([
+                    _green_inline_button(
+                        "🗂️ Наши проекты",
+                        callback_data="help:projects",
+                    )
+                ])
+                replaced = True
+            continue
+        new_rows.append(row)
+
+    # Защита для старых конфигураций, где отраслевой кнопки ещё нет:
+    # вставляем «Наши проекты» перед «Кейсами».
+    if not replaced:
+        insert_at = next(
+            (
+                index
+                for index, row in enumerate(new_rows)
+                if any(
+                    (button.callback_data or "") == "help:cases"
+                    for button in row
+                )
+            ),
+            len(new_rows),
+        )
+        new_rows.insert(
+            insert_at,
+            [
+                _green_inline_button(
+                    "🗂️ Наши проекты",
+                    callback_data="help:projects",
+                )
+            ],
+        )
+
+    return InlineKeyboardMarkup(new_rows)
+
+
+# Из экрана отраслевого деления возвращаем пользователя в «Наши проекты»,
+# так как весь отраслевой функционал теперь расположен внутри этого меню.
+_projects_previous_kb_industry_division = kb_industry_division
+
+
+def kb_industry_division(
+    user_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    legacy = _projects_previous_kb_industry_division(user_id)
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for row in legacy.inline_keyboard:
+        new_row: list[InlineKeyboardButton] = []
+        for button in row:
+            if (button.callback_data or "") == "help:main":
+                new_row.append(
+                    InlineKeyboardButton(
+                        "⬅️ К проектам",
+                        callback_data="help:projects",
+                    )
+                )
+            else:
+                new_row.append(button)
+        rows.append(new_row)
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def render_projects_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    if not query:
+        return
+    if await deny_no_access(update, context):
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    await query.edit_message_text(
+        projects_menu_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_projects_menu(),
+        disable_web_page_preview=True,
+    )
+
+
+async def render_calendar_planning_project(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    if not query:
+        return
+    if await deny_no_access(update, context):
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    await query.edit_message_text(
+        calendar_planning_project_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_calendar_planning_project(),
+        disable_web_page_preview=True,
+    )
+
+
+_projects_previous_cb_help = cb_help
+
+
+async def cb_help(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    data = (
+        update.callback_query.data or ""
+        if update.callback_query
+        else ""
+    )
+
+    if data == "help:projects":
+        return await render_projects_menu(update, context)
+
+    if data == "help:projects:calendar":
+        return await render_calendar_planning_project(update, context)
+
+    return await _projects_previous_cb_help(update, context)
+
+# ==================== END PROJECTS MENU V1 ====================
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
