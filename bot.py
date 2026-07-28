@@ -26951,6 +26951,12 @@ def calendar_planning_cases_list() -> list[dict]:
 
 
 def calendar_planning_cases_text() -> str:
+    emoji_by_case = {
+        "na_polke": "🛒",
+        "biocodex": "💊",
+        "gemotest": "🧪",
+        "raiffeisen": "🏦",
+    }
     items = calendar_planning_cases_list()
     lines = [
         "📚 <b>Кейсы Календарного планирования</b>",
@@ -26960,8 +26966,9 @@ def calendar_planning_cases_text() -> str:
         "",
     ]
     for item in items:
+        emoji = emoji_by_case.get(item["id"], "🏢")
         lines.append(
-            f"• <b>{escape(item['company'])}</b> — "
+            f"{emoji} <b>{escape(item['company'])}</b> — "
             f"{escape(item['metric'])}"
         )
     lines.extend([
@@ -26972,15 +26979,38 @@ def calendar_planning_cases_text() -> str:
 
 
 def kb_calendar_planning_cases() -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                f"🏢 {item['company'][:55]}",
-                callback_data=f"help:calcase:{item['id']}",
-            )
-        ]
+    case_by_id = {
+        item["id"]: item
         for item in calendar_planning_cases_list()
-    ]
+    }
+
+    first_row: list[InlineKeyboardButton] = []
+    first_row_specs = (
+        ("na_polke", "🛒на_полке"),
+        ("biocodex", "💊 Biocodex"),
+        ("gemotest", "🧪 Гемотест"),
+    )
+    for case_id, label in first_row_specs:
+        if case_id in case_by_id:
+            first_row.append(
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"help:calcase:{case_id}",
+                )
+            )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if first_row:
+        rows.append(first_row)
+
+    if "raiffeisen" in case_by_id:
+        rows.append([
+            InlineKeyboardButton(
+                "🏦 Raiffeisen Bank",
+                callback_data="help:calcase:raiffeisen",
+            )
+        ])
+
     rows.extend([
         [
             InlineKeyboardButton(
@@ -27051,48 +27081,85 @@ def kb_calendar_planning_case(
     ])
 
 
-# Расширяем экран проекта: эксперты остаются на месте,
-# а над ними появляется отдельный вход в четыре профильных кейса.
+# На главном экране проекта показываем только входы в кейсы и экспертов.
+# Имена экспертов вынесены в отдельный раздел по аналогии с отраслевыми экспертами.
 def calendar_planning_project_text() -> str:
-    experts = db_calendar_planning_experts_list()
+    experts_count = len(db_calendar_planning_experts_list())
     cases_count = len(calendar_planning_cases_list())
-    lines = [
-        "📅 <b>Календарное планирование</b>",
-        "",
-        "Здесь собраны профильные кейсы и коллеги, которые занимаются "
-        "Календарным планированием и могут помочь по проекту.",
-        "",
-        f"📚 Кейсов проекта: <b>{cases_count}</b>",
-        f"👥 Экспертов: <b>{len(experts)}</b>",
-    ]
-
-    if experts:
-        lines.extend([
-            "",
-            "Эксперты проекта:",
-            "",
-        ])
-        for item in experts:
-            lines.append(f"• <b>{escape(item['full_name'])}</b>")
-    else:
-        lines.extend([
-            "",
-            "Эксперты пока не назначены.",
-        ])
-
-    return "\n".join(lines)
+    return (
+        "📅 <b>Календарное планирование</b>\n\n"
+        "Здесь собраны профильные кейсы и контакты коллег, которые "
+        "занимаются Календарным планированием и могут помочь по проекту.\n\n"
+        f"📚 Кейсов проекта: <b>{cases_count}</b>\n"
+        f"👤 Sales экспертов: <b>{experts_count}</b>"
+    )
 
 
 def kb_calendar_planning_project() -> InlineKeyboardMarkup:
-    experts = db_calendar_planning_experts_list()
+    experts_count = len(db_calendar_planning_experts_list())
     rows: list[list[InlineKeyboardButton]] = [
         [
             _green_inline_button(
                 f"📚 Кейсы проекта — {len(calendar_planning_cases_list())}",
                 callback_data="help:calcases",
             )
-        ]
+        ],
+        [
+            InlineKeyboardButton(
+                (
+                    "👤 Sales эксперт по Календарке"
+                    if experts_count == 1
+                    else f"👥 Sales эксперты по Календарке — {experts_count}"
+                ),
+                callback_data="help:calexperts",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ К проектам",
+                callback_data="help:projects",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Главное меню",
+                callback_data="help:main",
+            )
+        ],
     ]
+    return InlineKeyboardMarkup(rows)
+
+
+def calendar_planning_experts_public_text() -> str:
+    experts = db_calendar_planning_experts_list()
+    lines = [
+        "👤 <b>Sales эксперт по Календарке</b>",
+        "",
+        "Здесь собраны коллеги, которые помогают по проекту "
+        "«Календарное планирование».",
+    ]
+
+    if not experts:
+        lines.extend([
+            "",
+            "Эксперт пока не назначен.",
+        ])
+        return "\n".join(lines)
+
+    lines.extend([
+        "",
+        "Выберите эксперта, чтобы открыть его карточку:",
+        "",
+    ])
+    for item in experts:
+        lines.append(f"• <b>{escape(item['full_name'])}</b>")
+
+    return "\n".join(lines)
+
+
+def kb_calendar_planning_experts_public() -> InlineKeyboardMarkup:
+    experts = db_calendar_planning_experts_list()
+    rows: list[list[InlineKeyboardButton]] = []
 
     for item in experts:
         rows.append([
@@ -27105,10 +27172,10 @@ def kb_calendar_planning_project() -> InlineKeyboardMarkup:
             )
         ])
 
-    if not experts:
+    if not rows:
         rows.append([
             InlineKeyboardButton(
-                "— Эксперты пока не назначены —",
+                "— Эксперт пока не назначен —",
                 callback_data="noop",
             )
         ])
@@ -27116,14 +27183,14 @@ def kb_calendar_planning_project() -> InlineKeyboardMarkup:
     rows.extend([
         [
             InlineKeyboardButton(
-                "⬅️ К проектам",
-                callback_data="help:projects",
+                "⬅️ К Календарному планированию",
+                callback_data="help:projects:calendar",
             )
         ],
         [
             InlineKeyboardButton(
-                "🏠 Главное меню",
-                callback_data="help:main",
+                "🗂️ К проектам",
+                callback_data="help:projects",
             )
         ],
     ])
@@ -27255,6 +27322,21 @@ async def cb_help(
     query = update.callback_query
     data = (query.data or "") if query else ""
     user_id = update.effective_user.id if update.effective_user else None
+
+    if data == "help:calexperts":
+        if await deny_no_access(update, context):
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        await query.edit_message_text(
+            calendar_planning_experts_public_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_calendar_planning_experts_public(),
+            disable_web_page_preview=True,
+        )
+        return
 
     if data == "help:calcases":
         if await deny_no_access(update, context):
