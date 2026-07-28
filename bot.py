@@ -27491,6 +27491,320 @@ def kb_case_detail(
 
 # ============ END CASES INDUSTRY GREEN BUTTON V1 ============
 
+
+# ============== PROJECT DOCUMENTS GREEN LAYOUT V1 ==============
+
+CALENDAR_PLANNING_DOCUMENT_SLOTS = (
+    {
+        "key": "presentation",
+        "label": "📊 Календарное планирование",
+        "title": "Презентация «Календарное планирование»",
+        "aliases": (
+            "презентация календарное планирование",
+            "календарное планирование",
+        ),
+    },
+    {
+        "key": "letter",
+        "label": "✉️ Календарка письмо",
+        "title": "Календарка письмо",
+        "aliases": (
+            "календарка письмо",
+            "письмо календарка",
+        ),
+    },
+)
+
+
+def calendar_planning_documents_items() -> list[dict]:
+    """Находит два уже загруженных документа проекта в общей базе документов."""
+    result: list[dict] = []
+    for slot in CALENDAR_PLANNING_DOCUMENT_SLOTS:
+        document = db_industry_document_find(tuple(slot["aliases"]))
+        result.append({**slot, "document": document})
+    return result
+
+
+def calendar_planning_documents_count() -> int:
+    return sum(
+        1
+        for slot in calendar_planning_documents_items()
+        if slot.get("document")
+    )
+
+
+def calendar_planning_documents_text() -> str:
+    return (
+        "📄 <b>Документы: Календарное планирование</b>\n\n"
+        "Здесь собраны основные материалы по проекту."
+    )
+
+
+def kb_calendar_planning_documents(
+    items: list[dict] | None = None,
+) -> InlineKeyboardMarkup:
+    items = items if items is not None else calendar_planning_documents_items()
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            _green_inline_button(
+                "📚 Все документы",
+                callback_data="help:docs",
+            )
+        ]
+    ]
+
+    for slot in items:
+        document = slot.get("document")
+        if document:
+            rows.append([
+                InlineKeyboardButton(
+                    slot["label"],
+                    callback_data=f"help:docs:open:{int(document['id'])}",
+                )
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    slot["label"],
+                    callback_data=f"help:caldocmissing:{slot['key']}",
+                )
+            ])
+
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                "⬅️ К Календарному планированию",
+                callback_data="help:projects:calendar",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🗂️ К проектам",
+                callback_data="help:projects",
+            )
+        ],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+# В проекте «Календарное планирование» кейсы и документы стоят
+# на одной строке и обе кнопки выделены зелёным.
+def calendar_planning_project_text() -> str:
+    experts_count = len(db_calendar_planning_experts_list())
+    cases_count = len(calendar_planning_cases_list())
+    documents_count = calendar_planning_documents_count()
+    return (
+        "📅 <b>Календарное планирование</b>\n\n"
+        "Здесь собраны профильные кейсы, документы и контакты коллег, "
+        "которые занимаются Календарным планированием и могут помочь по проекту.\n\n"
+        f"📚 Кейсов проекта: <b>{cases_count}</b>\n"
+        f"📄 Документов: <b>{documents_count}</b>\n"
+        f"👤 Sales экспертов: <b>{experts_count}</b>"
+    )
+
+
+def kb_calendar_planning_project() -> InlineKeyboardMarkup:
+    experts_count = len(db_calendar_planning_experts_list())
+    return InlineKeyboardMarkup([
+        [
+            _green_inline_button(
+                f"📚 Кейсы — {len(calendar_planning_cases_list())}",
+                callback_data="help:calcases",
+            ),
+            _green_inline_button(
+                f"📄 Документы — {calendar_planning_documents_count()}",
+                callback_data="help:caldocs",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                (
+                    "👤 Sales эксперт по Календарке"
+                    if experts_count == 1
+                    else f"👥 Sales эксперты по Календарке — {experts_count}"
+                ),
+                callback_data="help:calexperts",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ К проектам",
+                callback_data="help:projects",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Главное меню",
+                callback_data="help:main",
+            )
+        ],
+    ])
+
+
+# В карточке отрасли кейсы и документы уже стоят на одной строке;
+# здесь дополнительно выделяем обе кнопки зелёным.
+_industry_project_green_previous_kb_industry_card = kb_industry_card
+
+
+def kb_industry_card(
+    industry_key: str,
+    stats: dict | None = None,
+) -> InlineKeyboardMarkup:
+    legacy = _industry_project_green_previous_kb_industry_card(
+        industry_key,
+        stats,
+    )
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for row in legacy.inline_keyboard:
+        new_row: list[InlineKeyboardButton] = []
+        for button in row:
+            callback_data = button.callback_data or ""
+            if (
+                callback_data.startswith("help:idv:k:")
+                or callback_data.startswith("help:idv:d:")
+            ):
+                new_row.append(
+                    _green_inline_button(
+                        button.text or "Открыть",
+                        callback_data=callback_data,
+                    )
+                )
+            else:
+                new_row.append(button)
+        rows.append(new_row)
+
+    return InlineKeyboardMarkup(rows)
+
+
+# В отраслевых документах переносим «Все документы» наверх
+# и также выделяем кнопку зелёным.
+_industry_docs_top_previous_kb = kb_industry_card_documents
+
+
+def kb_industry_card_documents(
+    industry_key: str,
+    items: list[dict] | None = None,
+) -> InlineKeyboardMarkup:
+    legacy = _industry_docs_top_previous_kb(industry_key, items)
+    rows = [list(row) for row in legacy.inline_keyboard]
+
+    all_docs_button: InlineKeyboardButton | None = None
+    filtered_rows: list[list[InlineKeyboardButton]] = []
+
+    for row in rows:
+        kept: list[InlineKeyboardButton] = []
+        for button in row:
+            if (button.callback_data or "") == "help:docs":
+                all_docs_button = button
+            else:
+                kept.append(button)
+        if kept:
+            filtered_rows.append(kept)
+
+    if all_docs_button:
+        filtered_rows.insert(
+            0,
+            [
+                _green_inline_button(
+                    all_docs_button.text or "📚 Все документы",
+                    callback_data="help:docs",
+                )
+            ],
+        )
+
+    return InlineKeyboardMarkup(filtered_rows)
+
+
+# В основном разделе «Документы» кнопка «Все документы»
+# теперь находится первой и подсвечена зелёным.
+_docs_all_top_previous_kb_help_docs_main = kb_help_docs_main
+
+
+def kb_help_docs_main(is_admin_user: bool):
+    legacy = _docs_all_top_previous_kb_help_docs_main(is_admin_user)
+    rows = [list(row) for row in legacy.inline_keyboard]
+
+    all_docs_button: InlineKeyboardButton | None = None
+    filtered_rows: list[list[InlineKeyboardButton]] = []
+
+    for row in rows:
+        kept: list[InlineKeyboardButton] = []
+        for button in row:
+            if (button.callback_data or "") == "help:docs:categories":
+                all_docs_button = button
+            else:
+                kept.append(button)
+        if kept:
+            filtered_rows.append(kept)
+
+    if all_docs_button:
+        filtered_rows.insert(
+            0,
+            [
+                _green_inline_button(
+                    all_docs_button.text or "📂 Все документы",
+                    callback_data="help:docs:categories",
+                )
+            ],
+        )
+
+    return InlineKeyboardMarkup(filtered_rows)
+
+
+_project_documents_previous_cb_help = cb_help
+
+
+async def cb_help(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+
+    if data == "help:caldocs":
+        if await deny_no_access(update, context):
+            return
+
+        items = calendar_planning_documents_items()
+        context.user_data[DOCS_RETURN_CB] = "help:caldocs"
+
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        await query.edit_message_text(
+            calendar_planning_documents_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_calendar_planning_documents(items),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:caldocmissing:"):
+        document_key = data.rsplit(":", 1)[-1]
+        slot = next(
+            (
+                item
+                for item in CALENDAR_PLANNING_DOCUMENT_SLOTS
+                if item["key"] == document_key
+            ),
+            None,
+        )
+        title = slot["title"] if slot else "Документ"
+        await query.answer(
+            f"«{title}» не найден в разделе «Документы». "
+            "Проверьте название загруженного файла.",
+            show_alert=True,
+        )
+        return
+
+    return await _project_documents_previous_cb_help(update, context)
+
+# ============ END PROJECT DOCUMENTS GREEN LAYOUT V1 ============
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
