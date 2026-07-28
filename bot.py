@@ -24571,9 +24571,9 @@ def industry_specialist_card_text(item: dict, *, admin: bool = False) -> str:
     titles = industry_specialist_industry_titles(item)
     industries_text = ", ".join(titles) if titles else "—"
     prefix = (
-        "🧑‍💼 <b>Редактор отраслевого специалиста</b>"
+        "🧑‍💼 <b>Редактор отраслевого Sales эксперта</b>"
         if admin
-        else "👤 <b>Отраслевой специалист</b>"
+        else "👤 <b>Отраслевой Sales эксперт</b>"
     )
     return (
         f"{prefix}\n\n"
@@ -24605,9 +24605,9 @@ def kb_industry_specialists_public(user_id: int | None = None) -> InlineKeyboard
     if not rows:
         selected_keys = db_industry_division_get_choices(user_id)
         empty_label = (
-            "— для выбранных отраслей специалистов нет —"
+            "— для выбранных отраслей Sales экспертов нет —"
             if selected_keys
-            else "— специалисты пока не добавлены —"
+            else "— Sales эксперты пока не добавлены —"
         )
         rows.append([InlineKeyboardButton(empty_label, callback_data="noop")])
     rows.append([
@@ -24627,32 +24627,32 @@ def industry_specialists_public_text(user_id: int | None = None) -> str:
         if key in INDUSTRY_DIVISION_BY_KEY
     ]
     items = industry_specialists_public_items(user_id)
-    lines = ["👥 <b>Отраслевые специалисты</b>", ""]
+    lines = ["👥 <b>Отраслевые Sales эксперты</b>", ""]
     if selected_labels:
         lines.extend([
-            "Показаны специалисты, у которых есть хотя бы одна из выбранных отраслей:",
+            "Показаны Sales эксперты, у которых есть хотя бы одна из выбранных отраслей:",
             f"<b>{escape(', '.join(selected_labels))}</b>",
             "",
-            "Выбери специалиста, чтобы открыть его контакт в Telegram.",
+            "Выбери Sales эксперта, чтобы открыть его контакт в Telegram.",
         ])
     else:
         lines.append(
-            "Ни одна отрасль не выбрана, поэтому показаны все специалисты. "
-            "Один специалист может работать сразу с несколькими отраслями."
+            "Ни одна отрасль не выбрана, поэтому показаны все Sales эксперты. "
+            "Один Sales эксперт может работать сразу с несколькими отраслями."
         )
 
     if not items:
         if selected_labels:
-            lines.extend(["", "Для выбранных отраслей специалисты пока не добавлены."])
+            lines.extend(["", "Для выбранных отраслей Sales эксперты пока не добавлены."])
         else:
-            lines.extend(["", "Специалисты пока не добавлены."])
+            lines.extend(["", "Sales эксперты пока не добавлены."])
         return "\n".join(lines)
 
     lines.append("")
     for item in items:
         titles = ", ".join(industry_specialist_industry_titles(item)) or "—"
         lines.append(
-            f"• {escape(item['full_name'])} — {escape(titles)}"
+            f"• <b>{escape(item['full_name'])}</b> — {escape(titles)}"
         )
     return "\n".join(lines)
 
@@ -24672,7 +24672,7 @@ def kb_industry_specialist_card(item: dict, source: str = "all") -> InlineKeyboa
     else:
         rows.append([
             InlineKeyboardButton(
-                "⬅️ К специалистам",
+                "⬅️ К Sales экспертам",
                 callback_data="help:industry_specialists",
             )
         ])
@@ -24685,7 +24685,7 @@ def kb_industry_specialist_card(item: dict, source: str = "all") -> InlineKeyboa
 
 
 def kb_industry_specialists_admin() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("➕ Добавить специалиста", callback_data="help:ispec:add")]]
+    rows = [[InlineKeyboardButton("➕ Добавить Sales эксперта", callback_data="help:ispec:add")]]
     for item in db_industry_specialists_list():
         rows.append([
             InlineKeyboardButton(
@@ -24700,11 +24700,11 @@ def kb_industry_specialists_admin() -> InlineKeyboardMarkup:
 def industry_specialists_admin_text() -> str:
     items = db_industry_specialists_list()
     return (
-        "🧑‍💼 <b>Отраслевые специалисты</b>\n\n"
-        "Здесь можно создать специалиста и изменить его имя, отрасли или "
-        "Telegram-ссылку. Одному специалисту можно назначить несколько "
+        "🧑‍💼 <b>Отраслевые Sales эксперты</b>\n\n"
+        "Здесь можно создать Sales эксперта и изменить его имя, отрасли или "
+        "Telegram-ссылку. Одному Sales эксперту можно назначить несколько "
         "отраслей.\n\n"
-        f"Создано специалистов: <b>{len(items)}</b>"
+        f"Создано Sales экспертов: <b>{len(items)}</b>"
     )
 
 
@@ -24714,7 +24714,7 @@ def kb_industry_specialist_admin_card(item: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✏️ Имя и фамилия", callback_data=f"help:ispec:editn:{specialist_id}")],
         [InlineKeyboardButton("🏭 Изменить отрасли", callback_data=f"help:ispec:editi:{specialist_id}")],
         [InlineKeyboardButton("✈️ Изменить Telegram", callback_data=f"help:ispec:editt:{specialist_id}")],
-        [InlineKeyboardButton("🗑 Удалить специалиста", callback_data=f"help:ispec:delask:{specialist_id}")],
+        [InlineKeyboardButton("🗑 Удалить Sales эксперта", callback_data=f"help:ispec:delask:{specialist_id}")],
         [InlineKeyboardButton("⬅️ К списку", callback_data="help:ispec")],
     ])
 
@@ -24764,7 +24764,7 @@ def industry_specialist_picker_text(selected_keys) -> str:
     ]
     selected_text = ", ".join(titles) if titles else "ничего не выбрано"
     return (
-        "🏭 <b>Выберите отрасли специалиста</b>\n\n"
+        "🏭 <b>Выберите отрасли Sales эксперта</b>\n\n"
         "Можно отметить несколько отраслей. Повторное нажатие снимает выбор.\n\n"
         f"<b>Сейчас выбрано:</b> {escape(selected_text)}"
     )
@@ -24778,7 +24778,7 @@ def kb_settings_content():
     rows = [list(row) for row in legacy.inline_keyboard]
     insert_at = max(0, len(rows) - 1)
     rows.insert(insert_at, [
-        InlineKeyboardButton("🧑‍💼 Отраслевые специалисты", callback_data="help:ispec")
+        InlineKeyboardButton("🧑‍💼 Отраслевые Sales эксперты", callback_data="help:ispec")
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -24804,7 +24804,7 @@ def kb_industry_division(user_id: int | None = None) -> InlineKeyboardMarkup:
     )
     rows.insert(insert_at, [
         InlineKeyboardButton(
-            "👥 Отраслевые специалисты",
+            "👥 Отраслевые Sales эксперты",
             callback_data="help:industry_specialists",
         )
     ])
@@ -24849,11 +24849,11 @@ def industry_division_tools_text(user_id: int | None = None) -> str:
         db_industry_division_get_choices(user_id)
     )
     if not specialists:
-        return base + "\n\n👥 Для выбранных отраслей специалисты пока не добавлены."
-    lines = [base, "", "👥 <b>Отраслевые специалисты:</b>"]
+        return base + "\n\n👥 Для выбранных отраслей Sales эксперты пока не добавлены."
+    lines = [base, "", "👥 <b>Отраслевые Sales эксперты:</b>"]
     for item in specialists:
         titles = ", ".join(industry_specialist_industry_titles(item)) or "—"
-        lines.append(f"• {escape(item['full_name'])} — {escape(titles)}")
+        lines.append(f"• <b>{escape(item['full_name'])}</b> — {escape(titles)}")
     return "\n".join(lines)
 
 
@@ -24938,8 +24938,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data[INDUSTRY_SPECIALIST_STATE] = "add_name"
             context.user_data[INDUSTRY_SPECIALIST_DRAFT] = {}
             await query.edit_message_text(
-                "🧑‍💼 <b>Новый отраслевой специалист</b>\n\n"
-                "Введите имя и фамилию специалиста.",
+                "🧑‍💼 <b>Новый отраслевой Sales эксперт</b>\n\n"
+                "Введите имя и фамилию Sales эксперта.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("❌ Отмена", callback_data="help:ispec")
