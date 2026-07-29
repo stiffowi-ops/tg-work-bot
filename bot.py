@@ -27871,7 +27871,7 @@ async def cb_help(
 
 # ====================== VIDEO GUIDES + FINAL MAIN MENU V1 ======================
 
-BUILD_VERSION = "VIDEO-GUIDES-MAIN-MENU-2026-07-29-V23"
+BUILD_VERSION = "FAQ-NUMBERED-LIST-2026-07-29-V25"
 
 VIDEO_GUIDE_STATE = "video_guide_state"
 VIDEO_GUIDE_DRAFT = "video_guide_draft"
@@ -28773,7 +28773,7 @@ async def on_video(
 # - состояние поиска персональное (user_data), а результаты заменяют приглашение
 #   к поиску вместо создания цепочки новых сообщений.
 
-FAQ_LIST_PAGE_SIZE = 8
+FAQ_LIST_PAGE_SIZE = 6
 FAQ_SEARCH_MESSAGE_ID = "faq_search_message_id"
 FAQ_SEARCH_CHAT_ID = "faq_search_chat_id"
 FAQ_ITEM_TEXT_LIMIT = 3400
@@ -28844,6 +28844,13 @@ def build_help_faq_cards_page(
     user_id: int | None = None,
     item_source: str = "all",
 ) -> tuple[str, InlineKeyboardMarkup]:
+    """Показывает вопросы в тексте, а в клавиатуре — короткие кнопки открытия.
+
+    Telegram не переносит текст inline-кнопок на несколько строк и может
+    обрезать его по-разному в разных клиентах. Поэтому полный вопрос выводится
+    в обычном сообщении, где он корректно переносится, а кнопка содержит только
+    номер соответствующего вопроса.
+    """
     total_items = len(items)
     total_pages = max(1, (total_items + FAQ_LIST_PAGE_SIZE - 1) // FAQ_LIST_PAGE_SIZE)
     page = max(0, min(int(page), total_pages - 1))
@@ -28863,16 +28870,31 @@ def build_help_faq_cards_page(
     else:
         text_lines.extend(["", "По вашему запросу ничего не найдено."])
 
-    rows: list[list[InlineKeyboardButton]] = []
-    for item in page_items:
+    open_buttons: list[InlineKeyboardButton] = []
+    for local_index, item in enumerate(page_items, start=1):
         faq_id = int(item["id"])
-        prefix = "★" if db_faq_is_favorite(user_id, faq_id) else "❓"
-        rows.append([
+        question_number = start + local_index
+        question = faq_plain_text(item.get("question")) or "Без названия"
+        question = re.sub(r"\s+", " ", question).strip()
+        favorite = "★ " if db_faq_is_favorite(user_id, faq_id) else ""
+
+        # В тексте сообщения вопрос виден полностью и переносится по словам.
+        text_lines.extend([
+            "",
+            f"<b>{question_number}.</b> {favorite}{html_lib.escape(question)}",
+        ])
+
+        open_buttons.append(
             InlineKeyboardButton(
-                f"{prefix} {_faq_question_label(item)}",
+                f"Открыть {question_number}",
                 callback_data=f"help:faq:item:{faq_id}:{page}:{item_source}:0",
             )
-        ])
+        )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    # Две короткие кнопки в строке: удобно и на телефоне, и на десктопе.
+    for index in range(0, len(open_buttons), 2):
+        rows.append(open_buttons[index:index + 2])
 
     if total_pages > 1:
         nav_row: list[InlineKeyboardButton] = []
@@ -28912,7 +28934,6 @@ def build_help_faq_cards_page(
         InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")
     ])
     return "\n".join(text_lines), InlineKeyboardMarkup(rows)
-
 
 def build_help_faq_answers_page(
     page: int = 0,
