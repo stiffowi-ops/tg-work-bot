@@ -5176,6 +5176,7 @@ def kb_my_account(profile: dict):
             )
         ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+        [InlineKeyboardButton("⏰ Напоминалка", callback_data="help:reminder:list")],
     ])
 
 
@@ -5304,6 +5305,7 @@ def kb_no_profile_for_account(can_create: bool):
         rows.append([InlineKeyboardButton("➕ Создать мою анкету", callback_data="help:team:create_profile")])
     rows.append([InlineKeyboardButton("👥 Открыть команду", callback_data="help:team")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("⏰ Напоминалка", callback_data="help:reminder:list")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -19652,16 +19654,9 @@ def kb_help_main(is_admin_user: bool, unread_count: int = 0):
             callback_data="help:cases",
         )
     ]
-    reminder_row = [
-        InlineKeyboardButton(
-            "⏰ Напоминалка",
-            callback_data="help:reminder:list",
-        )
-    ]
 
-    # Ставим полноширинные кнопки «Отраслевое деление», «Кейсы» и
-    # «Напоминалка» непосредственно перед администраторской кнопкой
-    # «Управление ботом».
+    # Ставим полноширинные кнопки «Отраслевое деление» и «Кейсы»
+    # непосредственно перед администраторской кнопкой «Управление ботом».
     settings_row_index = next(
         (
             index
@@ -19675,7 +19670,7 @@ def kb_help_main(is_admin_user: bool, unread_count: int = 0):
     )
     rows = (
         legacy_rows[:settings_row_index]
-        + [industry_division_row, cases_row, reminder_row]
+        + [industry_division_row, cases_row]
         + legacy_rows[settings_row_index:]
     )
     return InlineKeyboardMarkup(rows)
