@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "UX-NAV-NOTIFICATIONS-2026-07-29-V23"
+BUILD_VERSION = "FAQ-UX-2026-07-29-V24"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -28763,6 +28763,565 @@ async def on_video(
     )
 
 # ==================== END VIDEO GUIDES + FINAL MAIN MENU V1 ====================
+
+
+# ===================== FAQ UX V6 =====================
+# Компактный пользовательский FAQ:
+# - вход сразу в список вопросов без промежуточного экрана;
+# - на странице отображаются только кнопки вопросов;
+# - ответ открывается отдельно и при необходимости разбивается на части;
+# - состояние поиска персональное (user_data), а результаты заменяют приглашение
+#   к поиску вместо создания цепочки новых сообщений.
+
+FAQ_LIST_PAGE_SIZE = 8
+FAQ_SEARCH_MESSAGE_ID = "faq_search_message_id"
+FAQ_SEARCH_CHAT_ID = "faq_search_chat_id"
+FAQ_ITEM_TEXT_LIMIT = 3400
+
+
+def clear_faq_search_flow(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    drop_query: bool = True,
+):
+    """Очищает только персональное состояние поиска FAQ.
+
+    Старые ключи chat_data тоже удаляются, чтобы обновление прошло безопасно
+    для пользователей, которые начали поиск до перезапуска бота.
+    """
+    context.user_data.pop(WAITING_FAQ_SEARCH, None)
+    context.chat_data.pop(WAITING_FAQ_SEARCH, None)
+
+    if drop_query:
+        context.user_data.pop(FAQ_SEARCH_QUERY, None)
+        context.user_data.pop(FAQ_SEARCH_MESSAGE_ID, None)
+        context.user_data.pop(FAQ_SEARCH_CHAT_ID, None)
+        context.chat_data.pop(FAQ_SEARCH_QUERY, None)
+
+
+def _faq_search_normalize(value: str | None) -> str:
+    plain = faq_plain_text(value).casefold().replace("ё", "е")
+    return " ".join(re.findall(r"[0-9a-zа-я]+", plain, flags=re.IGNORECASE))
+
+
+def faq_search_items(query: str) -> list[dict]:
+    """Ищет все слова запроса в вопросе и ответе без учёта регистра и знаков."""
+    tokens = [
+        token
+        for token in _faq_search_normalize(query).split()
+        if len(token) >= 2
+    ]
+    if not tokens:
+        return []
+
+    result: list[dict] = []
+    for item in db_faq_list_full():
+        haystack = _faq_search_normalize(
+            f"{faq_plain_text(item.get('question'))} "
+            f"{faq_plain_text(item.get('answer'))}"
+        )
+        if all(token in haystack for token in tokens):
+            result.append(item)
+    return result
+
+
+def _faq_question_label(item: dict, limit: int = 56) -> str:
+    question = faq_plain_text(item.get("question")) or "Без названия"
+    question = re.sub(r"\s+", " ", question).strip()
+    if len(question) > limit:
+        question = question[: limit - 1].rstrip() + "…"
+    return question
+
+
+def build_help_faq_cards_page(
+    items: list[dict],
+    page: int = 0,
+    *,
+    title: str = "❓ Частые вопросы",
+    subtitle: str | None = None,
+    callback_prefix: str = "help:faq:answers",
+    show_search: bool = True,
+    user_id: int | None = None,
+    item_source: str = "all",
+) -> tuple[str, InlineKeyboardMarkup]:
+    total_items = len(items)
+    total_pages = max(1, (total_items + FAQ_LIST_PAGE_SIZE - 1) // FAQ_LIST_PAGE_SIZE)
+    page = max(0, min(int(page), total_pages - 1))
+    start = page * FAQ_LIST_PAGE_SIZE
+    page_items = items[start:start + FAQ_LIST_PAGE_SIZE]
+
+    text_lines = [f"<b>{title}</b>"]
+    if subtitle:
+        text_lines.extend(["", subtitle])
+
+    if total_items:
+        text_lines.extend([
+            "",
+            f"Выберите вопрос · <b>{page + 1}/{total_pages}</b> · "
+            f"всего <b>{faq_question_count(total_items)}</b>",
+        ])
+    else:
+        text_lines.extend(["", "По вашему запросу ничего не найдено."])
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in page_items:
+        faq_id = int(item["id"])
+        prefix = "★" if db_faq_is_favorite(user_id, faq_id) else "❓"
+        rows.append([
+            InlineKeyboardButton(
+                f"{prefix} {_faq_question_label(item)}",
+                callback_data=f"help:faq:item:{faq_id}:{page}:{item_source}:0",
+            )
+        ])
+
+    if total_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(
+                "◀️", callback_data=f"{callback_prefix}:{page - 1}"
+            ))
+        nav_row.append(InlineKeyboardButton(
+            f"{page + 1}/{total_pages}", callback_data="noop"
+        ))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(
+                "▶️", callback_data=f"{callback_prefix}:{page + 1}"
+            ))
+        rows.append(nav_row)
+
+    if item_source == "all":
+        rows.append([
+            InlineKeyboardButton("🔎 Поиск", callback_data="help:faq:search"),
+            InlineKeyboardButton("⭐ Избранное", callback_data="help:faq:favorites:0"),
+        ])
+    elif item_source == "search":
+        rows.append([
+            InlineKeyboardButton("🔎 Новый поиск", callback_data="help:faq:search"),
+            InlineKeyboardButton("⭐ Избранное", callback_data="help:faq:favorites:0"),
+        ])
+        rows.append([
+            InlineKeyboardButton("📚 Все вопросы", callback_data="help:faq:answers:0")
+        ])
+    else:  # favorites
+        rows.append([
+            InlineKeyboardButton("🔎 Поиск", callback_data="help:faq:search"),
+            InlineKeyboardButton("📚 Все вопросы", callback_data="help:faq:answers:0"),
+        ])
+
+    rows.append([
+        InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")
+    ])
+    return "\n".join(text_lines), InlineKeyboardMarkup(rows)
+
+
+def build_help_faq_answers_page(
+    page: int = 0,
+    user_id: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    return build_help_faq_cards_page(
+        db_faq_list_full(),
+        page,
+        title="❓ Частые вопросы",
+        callback_prefix="help:faq:answers",
+        user_id=user_id,
+        item_source="all",
+    )
+
+
+def build_help_faq_search_page(
+    query: str,
+    page: int = 0,
+    user_id: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    return build_help_faq_cards_page(
+        faq_search_items(query),
+        page,
+        title="🔎 Результаты поиска",
+        subtitle=f"Запрос: <b>{html_lib.escape(query)}</b>",
+        callback_prefix="help:faq:search_results",
+        show_search=False,
+        user_id=user_id,
+        item_source="search",
+    )
+
+
+def build_help_faq_menu(
+    user_id: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Совместимость со старыми вызовами: FAQ сразу открывает список."""
+    return build_help_faq_answers_page(0, user_id)
+
+
+def _faq_item_parts(item: dict) -> list[str]:
+    """Готовит безопасные HTML-страницы отдельного ответа."""
+    question_plain = faq_plain_text(item.get("question")) or "Без названия"
+    answer_html = (item.get("answer") or "Ответ пока не указан.").strip()
+    answer_plain = faq_plain_text(answer_html) or "Ответ пока не указан."
+
+    normal = (
+        "❓ <b>Вопрос</b>\n"
+        f"<b>{html_lib.escape(question_plain)}</b>\n\n"
+        "💬 <b>Ответ</b>\n"
+        f"{answer_html}"
+    )
+    if len(faq_plain_text(normal)) <= FAQ_ITEM_TEXT_LIMIT:
+        return [normal]
+
+    prefix = (
+        "❓ <b>Вопрос</b>\n"
+        f"<b>{html_lib.escape(question_plain)}</b>\n\n"
+        "💬 <b>Ответ</b>\n"
+    )
+    first_budget = max(900, FAQ_ITEM_TEXT_LIMIT - len(faq_plain_text(prefix)) - 100)
+    answer_parts = faq_split_plain_text(answer_plain, first_budget)
+
+    pages = [prefix + html_lib.escape(answer_parts[0])]
+    remaining = "\n\n".join(answer_parts[1:])
+    if remaining:
+        continuation_budget = FAQ_ITEM_TEXT_LIMIT - 150
+        for part in faq_split_plain_text(remaining, continuation_budget):
+            pages.append(
+                "💬 <b>Продолжение ответа</b>\n\n"
+                f"{html_lib.escape(part)}"
+            )
+    return pages
+
+
+def _faq_back_callback(source: str, page: int) -> str:
+    if source == "favorites":
+        return f"help:faq:favorites:{max(0, int(page))}"
+    if source == "search":
+        return f"help:faq:search_results:{max(0, int(page))}"
+    return f"help:faq:answers:{max(0, int(page))}"
+
+
+def kb_faq_item(
+    faq_id: int,
+    page: int,
+    user_id: int | None,
+    back_callback: str,
+    source: str = "all",
+    answer_page: int = 0,
+    answer_pages: int = 1,
+):
+    marked = db_faq_is_favorite(user_id, int(faq_id))
+    rows: list[list[InlineKeyboardButton]] = [[
+        InlineKeyboardButton(
+            "★ Убрать из избранного" if marked else "☆ Добавить в избранное",
+            callback_data=(
+                f"help:faq:favorite:{int(faq_id)}:{int(page)}:"
+                f"{source}:{max(0, int(answer_page))}"
+            ),
+        )
+    ]]
+
+    if answer_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if answer_page > 0:
+            nav_row.append(InlineKeyboardButton(
+                "◀️",
+                callback_data=(
+                    f"help:faq:item:{int(faq_id)}:{int(page)}:"
+                    f"{source}:{answer_page - 1}"
+                ),
+            ))
+        nav_row.append(InlineKeyboardButton(
+            f"{answer_page + 1}/{answer_pages}", callback_data="noop"
+        ))
+        if answer_page < answer_pages - 1:
+            nav_row.append(InlineKeyboardButton(
+                "▶️",
+                callback_data=(
+                    f"help:faq:item:{int(faq_id)}:{int(page)}:"
+                    f"{source}:{answer_page + 1}"
+                ),
+            ))
+        rows.append(nav_row)
+
+    rows.append([
+        InlineKeyboardButton("⬅️ К списку вопросов", callback_data=back_callback)
+    ])
+    rows.append([
+        InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _faq_edit_search_result(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+):
+    chat_id = context.user_data.get(FAQ_SEARCH_CHAT_ID)
+    message_id = context.user_data.get(FAQ_SEARCH_MESSAGE_ID)
+
+    if chat_id and message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception as exc:
+            logger.info("FAQ search prompt edit failed, sending a new message: %s", exc)
+
+    sent = await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+    context.user_data[FAQ_SEARCH_CHAT_ID] = sent.chat_id
+    context.user_data[FAQ_SEARCH_MESSAGE_ID] = sent.message_id
+
+
+_faq_ux_previous_cb_help = cb_help
+
+
+async def cb_help(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+    if not data.startswith("help:faq"):
+        return await _faq_ux_previous_cb_help(update, context)
+
+    user_id = update.effective_user.id if update.effective_user else None
+
+    if data == "help:faq" or data == "help:faq:answers":
+        clear_faq_search_flow(context)
+        await query.answer()
+        text, keyboard = build_help_faq_answers_page(0, user_id)
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:faq:answers:") or data.startswith("help:faq:page:"):
+        clear_faq_search_flow(context)
+        try:
+            page = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            page = 0
+        await query.answer()
+        text, keyboard = build_help_faq_answers_page(page, user_id)
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:faq:favorites" or data.startswith("help:faq:favorites:"):
+        clear_faq_search_flow(context)
+        try:
+            page = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            page = 0
+        await query.answer()
+        text, keyboard = build_help_faq_cards_page(
+            db_faq_favorites(user_id),
+            page,
+            title="⭐ Избранные вопросы",
+            callback_prefix="help:faq:favorites",
+            show_search=False,
+            user_id=user_id,
+            item_source="favorites",
+        )
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:faq:search":
+        clear_faq_search_flow(context)
+        context.user_data[WAITING_FAQ_SEARCH] = True
+        context.user_data[FAQ_SEARCH_CHAT_ID] = query.message.chat_id
+        context.user_data[FAQ_SEARCH_MESSAGE_ID] = query.message.message_id
+        await query.answer()
+        await query.edit_message_text(
+            "🔎 <b>Поиск по FAQ</b>\n\n"
+            "Напишите слово или фразу. Поиск выполняется по вопросам и ответам.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="help:faq")
+            ]]),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:faq:search_results" or data.startswith("help:faq:search_results:"):
+        clear_faq_search_flow(context, drop_query=False)
+        query_text = (context.user_data.get(FAQ_SEARCH_QUERY) or "").strip()
+        if not query_text:
+            context.user_data[WAITING_FAQ_SEARCH] = True
+            context.user_data[FAQ_SEARCH_CHAT_ID] = query.message.chat_id
+            context.user_data[FAQ_SEARCH_MESSAGE_ID] = query.message.message_id
+            await query.answer()
+            await query.edit_message_text(
+                "🔎 <b>Поиск по FAQ</b>\n\nНапишите новый запрос.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="help:faq")
+                ]]),
+            )
+            return
+        try:
+            page = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            page = 0
+        await query.answer()
+        text, keyboard = build_help_faq_search_page(query_text, page, user_id)
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:faq:item:"):
+        parts = data.split(":")
+        try:
+            faq_id = int(parts[3])
+            list_page = max(0, int(parts[4]))
+            source = parts[5] if len(parts) > 5 else "all"
+            answer_page = max(0, int(parts[6])) if len(parts) > 6 else 0
+        except (IndexError, TypeError, ValueError):
+            await query.answer("Некорректный вопрос", show_alert=True)
+            return
+        if source not in {"all", "search", "favorites"}:
+            source = "all"
+
+        item = db_faq_get(faq_id)
+        if not item:
+            await query.answer("Вопрос уже удалён", show_alert=True)
+            text, keyboard = build_help_faq_answers_page(0, user_id)
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return
+
+        pages = _faq_item_parts(item)
+        answer_page = min(answer_page, len(pages) - 1)
+        await query.answer()
+        await query.edit_message_text(
+            pages[answer_page],
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_faq_item(
+                faq_id,
+                list_page,
+                user_id,
+                _faq_back_callback(source, list_page),
+                source,
+                answer_page,
+                len(pages),
+            ),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:faq:favorite:"):
+        parts = data.split(":")
+        try:
+            faq_id = int(parts[3])
+            list_page = max(0, int(parts[4]))
+            source = parts[5] if len(parts) > 5 else "all"
+            answer_page = max(0, int(parts[6])) if len(parts) > 6 else 0
+        except (IndexError, TypeError, ValueError):
+            await query.answer("Некорректный вопрос", show_alert=True)
+            return
+        if source not in {"all", "search", "favorites"}:
+            source = "all"
+
+        item = db_faq_get(faq_id)
+        if not item:
+            await query.answer("Вопрос уже удалён", show_alert=True)
+            return
+
+        enabled = db_faq_toggle_favorite(user_id, faq_id)
+        pages = _faq_item_parts(item)
+        answer_page = min(answer_page, len(pages) - 1)
+        await query.answer(
+            "Добавлено в избранное" if enabled else "Удалено из избранного"
+        )
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=kb_faq_item(
+                    faq_id,
+                    list_page,
+                    user_id,
+                    _faq_back_callback(source, list_page),
+                    source,
+                    answer_page,
+                    len(pages),
+                )
+            )
+        except Exception:
+            pass
+        return
+
+    return await _faq_ux_previous_cb_help(update, context)
+
+
+_faq_ux_previous_on_text = on_text
+
+
+async def on_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not context.user_data.get(WAITING_FAQ_SEARCH):
+        return await _faq_ux_previous_on_text(update, context)
+    if not update.message or not update.effective_user:
+        return
+
+    query_text = (update.message.text or "").strip()
+    if len(_faq_search_normalize(query_text)) < 2:
+        await _faq_edit_search_result(
+            update,
+            context,
+            "🔎 <b>Поиск по FAQ</b>\n\n"
+            "Введите минимум 2 символа. Попробуйте ещё раз.",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="help:faq")
+            ]]),
+        )
+        return
+
+    context.user_data.pop(WAITING_FAQ_SEARCH, None)
+    context.user_data[FAQ_SEARCH_QUERY] = query_text
+    user_id = update.effective_user.id
+    result_text, result_keyboard = build_help_faq_search_page(
+        query_text,
+        0,
+        user_id,
+    )
+    await _faq_edit_search_result(
+        update,
+        context,
+        result_text,
+        result_keyboard,
+    )
+
+# =================== END FAQ UX V6 ===================
+
 
 def main():
     ensure_db_path(DB_PATH)
