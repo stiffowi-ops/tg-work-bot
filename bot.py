@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "CASES-VIEW-MODES-2026-07-29-V20"
+BUILD_VERSION = "INDUSTRY-CARD-ALL-CASES-2026-07-29-V22"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -23649,6 +23649,25 @@ def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows.append(
         [InlineKeyboardButton("📚 Все кейсы", callback_data="help:cases:cat:all:0")]
     )
+
+    # Группируем кнопки по две в строке, сохраняя сортировку отраслей
+    # по длине названия.
+    category_buttons = [
+        InlineKeyboardButton(label, callback_data=f"help:cases:cat:{key}:0")
+        for key, label in _cases_category_options()
+    ]
+    for index in range(0, len(category_buttons), 2):
+        rows.append(category_buttons[index:index + 2])
+
+    rows.extend(
+        [
+            [InlineKeyboardButton("🔎 Поиск по кейсам", callback_data="help:cases:search")],
+            [InlineKeyboardButton("⭐ Избранные кейсы", callback_data="help:cases:favorites:0")],
+        ]
+    )
+
+    # Служебные переходы располагаются в самом низу. Кнопка проекта будет
+    # добавлена поздней обёрткой непосредственно перед выбором отраслей.
     rows.append(
         [
             InlineKeyboardButton(
@@ -23660,22 +23679,7 @@ def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
             )
         ]
     )
-
-    # Группируем кнопки по две в строке, сохраняя сортировку отраслей
-    # по длине названия.
-    category_buttons = [
-        InlineKeyboardButton(label, callback_data=f"help:cases:cat:{key}:0")
-        for key, label in _cases_category_options()
-    ]
-    for index in range(0, len(category_buttons), 2):
-        rows.append(category_buttons[index:index + 2])
-    rows.extend(
-        [
-            [InlineKeyboardButton("🔎 Поиск по кейсам", callback_data="help:cases:search")],
-            [InlineKeyboardButton("⭐ Избранные кейсы", callback_data="help:cases:favorites:0")],
-            [InlineKeyboardButton("⬅️ Главное меню", callback_data="help:main")],
-        ]
-    )
+    rows.append([InlineKeyboardButton("⬅️ Главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -25842,6 +25846,12 @@ def kb_industry_card_cases(
     rows.extend([
         [
             InlineKeyboardButton(
+                "📚 Все кейсы",
+                callback_data="help:cases:cat:all:0",
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 "⬅️ К карточке отрасли",
                 callback_data=f"help:idv:c:{industry_key}",
             )
@@ -27268,9 +27278,22 @@ def kb_cases_categories(
 ) -> InlineKeyboardMarkup:
     legacy = _calendar_cases_previous_kb_cases_categories(user_id)
     rows = [list(row) for row in legacy.inline_keyboard]
-    return InlineKeyboardMarkup(
-        _insert_calendar_project_button(rows, after_first=True)
+
+    # В главном меню кейсов проект и изменение отраслей должны стоять
+    # последовательно внизу, непосредственно перед «Главным меню».
+    industry_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if any(
+                (button.callback_data or "") == "help:industry_division"
+                for button in row
+            )
+        ),
+        len(rows),
     )
+    rows.insert(industry_index, _calendar_project_button_row())
+    return InlineKeyboardMarkup(rows)
 
 
 _calendar_cases_previous_kb_cases_industry_picker = (
