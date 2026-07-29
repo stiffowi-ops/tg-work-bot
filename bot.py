@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "PROFILE-INTERESTS-MATCHING-FILTERS-2026-07-28-V19"
+BUILD_VERSION = "CASES-VIEW-MODES-2026-07-29-V20"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -23632,18 +23632,35 @@ def _cases_selected_context(
 
 def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
     _category_keys, _labels, selected_count = _cases_selected_context(user_id)
-    rows = [[InlineKeyboardButton("📚 Все кейсы", callback_data="help:cases:cat:all:0")]]
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # Сохранённые отрасли — это отдельный режим просмотра, а не обязательный
+    # фильтр всего раздела «Кейсы».
+    if selected_count:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🎯 Кейсы моих отраслей · выбрано {selected_count}",
+                    callback_data="help:cases:my_cases:0",
+                )
+            ]
+        )
+
+    rows.append(
+        [InlineKeyboardButton("📚 Все кейсы", callback_data="help:cases:cat:all:0")]
+    )
     rows.append(
         [
             InlineKeyboardButton(
                 (
-                    f"🏭 В отраслевое деление · выбрано {selected_count}"
+                    "🏭 Изменить выбор отраслей"
                     if selected_count else "🏭 В отраслевое деление"
                 ),
                 callback_data="help:industry_division",
             )
         ]
     )
+
     # Группируем кнопки по две в строке, сохраняя сортировку отраслей
     # по длине названия.
     category_buttons = [
@@ -23665,20 +23682,19 @@ def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
 def cases_menu_text(user_id: int | None = None) -> str:
     _category_keys, selected_labels, selected_count = _cases_selected_context(user_id)
     industry_line = (
-        f"\n🎯 <b>Мои отрасли ({selected_count}/{INDUSTRY_DIVISION_MAX_SELECTIONS}):</b> "
+        f"🎯 <b>Мои отрасли ({selected_count}/{INDUSTRY_DIVISION_MAX_SELECTIONS}):</b> "
         f"{escape(', '.join(selected_labels))}\n"
-        "Изменить выбор можно в разделе «Отраслевое деление».\n"
+        "Можно посмотреть только подходящие кейсы или открыть полный каталог.\n"
         if selected_labels
         else (
-            f"\n🎯 В «Отраслевом делении» можно выбрать до "
-            f"{INDUSTRY_DIVISION_MAX_SELECTIONS} отраслей.\n"
+            f"🎯 В «Отраслевом делении» можно выбрать до "
+            f"{INDUSTRY_DIVISION_MAX_SELECTIONS} отраслей и получать отдельную подборку.\n"
         )
     )
     return (
         "📚 <b>Кейсы Яндекс Маршрутизации</b>\n\n"
         f"{industry_line}\n"
-        "Выберите отрасль или найдите кейс по названию компании, "
-        "отрасли и ключевым словам."
+        "Выберите режим просмотра, конкретную отрасль или воспользуйтесь поиском."
     )
 
 
@@ -23831,9 +23847,22 @@ def kb_cases_list(
             nav.append(InlineKeyboardButton("▶️", callback_data=callback))
         rows.append(nav)
     if industry:
+        # Быстрое переключение режима без сброса сохранённого выбора отраслей.
         rows.append([
             InlineKeyboardButton(
-                "🏭 В отраслевое деление",
+                "📚 Все кейсы",
+                callback_data="help:cases:cat:all:0",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "⬅️ К категориям кейсов",
+                callback_data="help:cases",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "🏭 Изменить выбор отраслей",
                 callback_data="help:industry_division",
             )
         ])
@@ -23943,16 +23972,9 @@ async def handle_cases_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "help:cases":
         context.user_data[CASES_WAITING_SEARCH] = False
         context.user_data.pop(CASES_SEARCH_QUERY, None)
-        my_industry = cases_my_industry_view(user_id)
-        if my_industry:
-            list_text, markup = my_industry
-            await query.edit_message_text(
-                list_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-            return
+
+        # Раздел «Кейсы» всегда открывает общее меню. Сохранённые отрасли
+        # доступны отдельной кнопкой и больше не применяются автоматически.
         await query.edit_message_text(
             cases_menu_text(user_id),
             parse_mode=ParseMode.HTML,
