@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "INDUSTRY-CARD-ALL-CASES-2026-07-29-V22"
+BUILD_VERSION = "UX-NAV-NOTIFICATIONS-2026-07-29-V23"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -3726,11 +3726,11 @@ def db_notifications_unread_count(user_id: int | None) -> int:
 
 def db_notifications_list(user_id: int, page: int = 0, page_size: int = 8) -> dict:
     """
-    Возвращает только непрочитанные уведомления.
+    Возвращает только новые (непрочитанные) уведомления.
 
-    Прочитанные записи остаются в БД как техническая история доставки, чтобы
-    одноразовые напоминания не создавались повторно, но в пользовательском
-    разделе «Уведомления» они больше не отображаются.
+    Открытие уведомления или действие «Отметить всё прочитанным» меняет
+    ``is_read`` на 1. Прочитанные записи остаются в БД как техническая история
+    доставки, но в пользовательском разделе «Новые уведомления» не показываются.
     """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -5095,7 +5095,7 @@ def help_text_main(
 
 
 def kb_help_main(is_admin_user: bool, unread_count: int = 0):
-    notification_label = "🔔 Уведомления"
+    notification_label = "🔔 Новые уведомления"
     if unread_count:
         notification_label += f" · {unread_count}"
     rows = [
@@ -5175,7 +5175,7 @@ def kb_my_account(profile: dict):
                 callback_data=f"help:team:person:{int(profile['id'])}:{page}",
             )
         ],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
         [InlineKeyboardButton("⏰ Напоминалка", callback_data="help:reminder:list")],
     ])
 
@@ -5304,7 +5304,7 @@ def kb_no_profile_for_account(can_create: bool):
     if can_create:
         rows.append([InlineKeyboardButton("➕ Создать мою анкету", callback_data="help:team:create_profile")])
     rows.append([InlineKeyboardButton("👥 Открыть команду", callback_data="help:team")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     rows.append([InlineKeyboardButton("⏰ Напоминалка", callback_data="help:reminder:list")])
     return InlineKeyboardMarkup(rows)
 
@@ -5315,7 +5315,7 @@ NOMINATION_PAGE_SIZE = 8
 def kb_nomination_intro():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🙌 Номинировать коллегу", callback_data="help:nomination:start")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
     ])
 
 
@@ -5395,7 +5395,7 @@ def kb_notifications(user_id: int, page: int = 0):
             )
         ])
     if not data["items"]:
-        rows.append([InlineKeyboardButton("— уведомлений пока нет —", callback_data="noop")])
+        rows.append([InlineKeyboardButton("— новых уведомлений нет —", callback_data="noop")])
     if data["total_pages"] > 1:
         nav = []
         if data["page"] > 0:
@@ -5405,8 +5405,8 @@ def kb_notifications(user_id: int, page: int = 0):
             nav.append(InlineKeyboardButton("▶️", callback_data=f"help:notifications:page:{data['page'] + 1}"))
         rows.append(nav)
     if db_notifications_unread_count(int(user_id)):
-        rows.append([InlineKeyboardButton("🧹 Прочитать и очистить все", callback_data="help:notifications:read_all")])
-    rows.append([InlineKeyboardButton("⬅️ Главное меню", callback_data="help:main")])
+        rows.append([InlineKeyboardButton("✓ Отметить всё прочитанным", callback_data="help:notifications:read_all")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -5521,13 +5521,13 @@ def kb_suggest_modes():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🕵️ Анонимно", callback_data="help:suggest:mode:anon")],
         [InlineKeyboardButton("🙋 Не анонимно", callback_data="help:suggest:mode:named")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
     ])
 
 def kb_suggest_cancel():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Отмена", callback_data="help:suggest:cancel")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
     ])
 
 
@@ -5833,7 +5833,7 @@ def build_help_faq_menu() -> tuple[str, InlineKeyboardMarkup]:
             "🔎 Найти ответ",
             callback_data="help:faq:search",
         )],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
     ])
     return text, keyboard
 
@@ -5902,7 +5902,7 @@ def build_help_faq_cards_page(
         )])
 
     rows.append([InlineKeyboardButton("⬅️ В FAQ", callback_data="help:faq")])
-    rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     return "\n".join(text_lines).rstrip(), InlineKeyboardMarkup(rows)
 
 
@@ -5948,7 +5948,7 @@ def kb_help_faq_item(page: int = 0):
             "⬅️ К ответам на вопросы",
             callback_data=f"help:faq:answers:{max(0, int(page))}",
         )],
-        [InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
     ])
 
 def kb_help_docs_files(category_id: int):
@@ -5959,8 +5959,8 @@ def kb_help_docs_files(category_id: int):
     else:
         for did, title in items[:40]:
             rows.append([InlineKeyboardButton(title, callback_data=f"help:docs:open:{did}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="help:docs")])
-    rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("⬅️ К категориям", callback_data="help:docs:categories")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -5982,7 +5982,7 @@ def kb_help_docs_main(is_admin_user: bool):
         [InlineKeyboardButton("🆕 Новые документы", callback_data="help:docs:new")],
         [InlineKeyboardButton("📂 Все документы", callback_data="help:docs:categories")],
         [InlineKeyboardButton("🎓 Подборки", callback_data="help:docs:collections")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
     ]
     if is_admin_user:
         rows.extend([
@@ -6499,7 +6499,7 @@ def kb_help_links_menu():
         if pending_row:
             rows.append(pending_row)
 
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
 def kb_help_link_card(url: str):
@@ -6786,7 +6786,7 @@ def kb_help_team_similar(
 
     rows.append([InlineKeyboardButton("✏️ Изменить мои интересы", callback_data="help:me:edit:interests")])
     rows.append([InlineKeyboardButton("⬅️ Ко всей команде", callback_data="help:team")])
-    rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -6874,7 +6874,7 @@ def kb_help_team(page: int = 0, can_create_profile: bool = False):
             callback_data="help:team:birthdays:0",
         )
     ])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -7005,7 +7005,7 @@ def kb_help_profile_card(
             callback_data=back_callback or f"help:team:page:{current_page}",
         )
     ])
-    rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
 def _truncate_profile_field(value: str | None, limit: int) -> str:
@@ -7342,7 +7342,7 @@ def kb_help_settings():
             InlineKeyboardButton("📣 Коммуникации", callback_data="help:settings:communications"),
             InlineKeyboardButton("🛠 Система", callback_data="help:settings:system"),
         ],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
     ])
 
 
@@ -10187,9 +10187,10 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 page = 0
         unread = db_notifications_unread_count(user_id)
         await q.edit_message_text(
-            "🔔 <b>Уведомления</b>\n\n"
+            "🔔 <b>Новые уведомления</b>\n\n"
             f"Непрочитанных: <b>{unread}</b>\n"
-            "После прочтения уведомление автоматически исчезнет из раздела.",
+            "Здесь показываются только непрочитанные уведомления. "
+            "После открытия уведомление отмечается прочитанным и исчезает из списка.",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_notifications(user_id, page),
         )
@@ -10230,7 +10231,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         if callback_data.startswith(("help:", "test:")) and len(callback_data.encode("utf-8")) <= 64:
             rows.append([InlineKeyboardButton("➡️ Перейти", callback_data=callback_data)])
-        rows.append([InlineKeyboardButton("⬅️ К уведомлениям", callback_data=f"help:notifications:page:{page}")])
+        rows.append([InlineKeyboardButton("⬅️ К новым уведомлениям", callback_data=f"help:notifications:page:{page}")])
         rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
         await q.edit_message_text(
             f"🔔 <b>{escape(item['title'])}</b>\n\n"
@@ -10246,9 +10247,9 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_id:
             return
         count = db_notifications_mark_all_read(user_id)
-        await q.answer(f"Прочитано и убрано: {count}")
+        await q.answer(f"Отмечено прочитанными: {count}")
         await q.edit_message_text(
-            "🔔 <b>Уведомления</b>\n\nРаздел очищен — непрочитанных уведомлений нет.",
+            "🔔 <b>Новые уведомления</b>\n\nНовых уведомлений нет.",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_notifications(user_id, 0),
         )
@@ -18880,7 +18881,7 @@ def kb_reminders_list(user_id: int) -> InlineKeyboardMarkup:
         rows.append([
             InlineKeyboardButton(label[:64], callback_data=f"help:reminder:open:{item['id']}")
         ])
-    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("⬅️ В мой кабинет", callback_data="help:me")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -19236,7 +19237,7 @@ def kb_industry_division(user_id: int | None = None) -> InlineKeyboardMarkup:
             )
         ])
     rows.append([
-        InlineKeyboardButton("⬅️ Главное меню", callback_data="help:main")
+        InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -22951,7 +22952,7 @@ def build_help_faq_menu(user_id: int | None = None) -> tuple[str, InlineKeyboard
         [InlineKeyboardButton("📚 Ответы на вопросы", callback_data="help:faq:answers:0")],
         [InlineKeyboardButton("⭐ Избранное", callback_data="help:faq:favorites:0")],
         [InlineKeyboardButton("🔎 Найти ответ", callback_data="help:faq:search")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="help:main")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
     ])
     return text, keyboard
 
@@ -23023,7 +23024,7 @@ def build_help_faq_cards_page(
         rows.append([InlineKeyboardButton("🔎 Новый поиск", callback_data="help:faq:search")])
     rows.append([InlineKeyboardButton("⭐ Избранное", callback_data="help:faq:favorites:0")])
     rows.append([InlineKeyboardButton("⬅️ В FAQ", callback_data="help:faq")])
-    rows.append([InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     return "\n".join(text_lines).rstrip(), InlineKeyboardMarkup(rows)
 
 
@@ -23063,7 +23064,7 @@ def kb_faq_item(
         )],
         [InlineKeyboardButton("⬅️ К списку вопросов", callback_data=back_callback)],
         [InlineKeyboardButton("⭐ Избранное", callback_data="help:faq:favorites:0")],
-        [InlineKeyboardButton("🏠 В главное меню", callback_data="help:main")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
     ])
 
 
@@ -23674,7 +23675,7 @@ def kb_cases_categories(user_id: int | None = None) -> InlineKeyboardMarkup:
             )
         ]
     )
-    rows.append([InlineKeyboardButton("⬅️ Главное меню", callback_data="help:main")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
 
