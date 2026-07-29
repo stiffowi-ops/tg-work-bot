@@ -5167,7 +5167,7 @@ def kb_my_account(profile: dict):
             InlineKeyboardButton("📝 Мои тесты", callback_data="help:me:tests"),
         ],
         [
-            InlineKeyboardButton("✏️ Редактировать мою анкету", callback_data="help:me:edit")
+            InlineKeyboardButton("✏️ Редактировать анкету", callback_data="help:me:edit")
         ],
         [
             InlineKeyboardButton(
@@ -5175,8 +5175,8 @@ def kb_my_account(profile: dict):
                 callback_data=f"help:team:person:{int(profile['id'])}:{page}",
             )
         ],
+        [InlineKeyboardButton("⏰ Напоминания", callback_data="help:reminder:list")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
-        [InlineKeyboardButton("⏰ Напоминалка", callback_data="help:reminder:list")],
     ])
 
 
@@ -5304,8 +5304,8 @@ def kb_no_profile_for_account(can_create: bool):
     if can_create:
         rows.append([InlineKeyboardButton("➕ Создать мою анкету", callback_data="help:team:create_profile")])
     rows.append([InlineKeyboardButton("👥 Открыть команду", callback_data="help:team")])
+    rows.append([InlineKeyboardButton("⏰ Напоминания", callback_data="help:reminder:list")])
     rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
-    rows.append([InlineKeyboardButton("⏰ Напоминалка", callback_data="help:reminder:list")])
     return InlineKeyboardMarkup(rows)
 
 
