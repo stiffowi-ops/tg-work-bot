@@ -27868,6 +27868,902 @@ async def cb_help(
 
 # ============ END PROJECT DOCUMENTS GREEN LAYOUT V1 ============
 
+
+# ====================== VIDEO GUIDES + FINAL MAIN MENU V1 ======================
+
+BUILD_VERSION = "VIDEO-GUIDES-MAIN-MENU-2026-07-29-V23"
+
+VIDEO_GUIDE_STATE = "video_guide_state"
+VIDEO_GUIDE_DRAFT = "video_guide_draft"
+VIDEO_GUIDE_TITLE_MAX = 80
+VIDEO_GUIDE_DESCRIPTION_MAX = 800
+
+
+def _video_guides_clear_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(VIDEO_GUIDE_STATE, None)
+    context.user_data.pop(VIDEO_GUIDE_DRAFT, None)
+
+
+_video_guides_previous_db_init = db_init
+
+
+def db_init():
+    """Инициализирует прежнюю схему и таблицу видео-инструкций."""
+    _video_guides_previous_db_init()
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS video_guides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                video_file_id TEXT NOT NULL,
+                video_file_unique_id TEXT,
+                duration_sec INTEGER,
+                position INTEGER NOT NULL DEFAULT 0,
+                is_published INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_video_guides_visible "
+            "ON video_guides(is_published, position, id)"
+        )
+        con.commit()
+
+
+def _video_guide_row(row) -> dict | None:
+    if not row:
+        return None
+    return {
+        "id": int(row[0]),
+        "title": row[1] or "",
+        "description": row[2] or "",
+        "video_file_id": row[3] or "",
+        "video_file_unique_id": row[4],
+        "duration_sec": int(row[5] or 0),
+        "position": int(row[6] or 0),
+        "is_published": bool(row[7]),
+        "created_by": row[8],
+        "created_at": row[9],
+        "updated_at": row[10],
+    }
+
+
+def db_video_guides_list(published_only: bool = False) -> list[dict]:
+    sql = (
+        "SELECT id, title, description, video_file_id, video_file_unique_id, "
+        "duration_sec, position, is_published, created_by, created_at, updated_at "
+        "FROM video_guides"
+    )
+    params: tuple = ()
+    if published_only:
+        sql += " WHERE is_published=1"
+    sql += " ORDER BY position ASC, id ASC"
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(sql, params).fetchall()
+    return [_video_guide_row(row) for row in rows]
+
+
+def db_video_guide_get(guide_id: int, published_only: bool = False) -> dict | None:
+    sql = (
+        "SELECT id, title, description, video_file_id, video_file_unique_id, "
+        "duration_sec, position, is_published, created_by, created_at, updated_at "
+        "FROM video_guides WHERE id=?"
+    )
+    params: list = [int(guide_id)]
+    if published_only:
+        sql += " AND is_published=1"
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(sql, tuple(params)).fetchone()
+    return _video_guide_row(row)
+
+
+def db_video_guide_add(
+    title: str,
+    description: str,
+    video_file_id: str,
+    video_file_unique_id: str | None,
+    duration_sec: int | None,
+    created_by: int | None,
+) -> int:
+    now = datetime.utcnow().isoformat()
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM video_guides"
+        ).fetchone()
+        position = int(row[0] or 0) + 10
+        cur = con.execute(
+            """
+            INSERT INTO video_guides(
+                title, description, video_file_id, video_file_unique_id,
+                duration_sec, position, is_published, created_by,
+                created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """,
+            (
+                title.strip(), description.strip(), video_file_id,
+                video_file_unique_id, int(duration_sec or 0), position,
+                int(created_by) if created_by else None, now, now,
+            ),
+        )
+        con.commit()
+        return int(cur.lastrowid)
+
+
+def db_video_guide_update_text(
+    guide_id: int,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+) -> bool:
+    fields: list[str] = []
+    values: list = []
+    if title is not None:
+        fields.append("title=?")
+        values.append(title.strip())
+    if description is not None:
+        fields.append("description=?")
+        values.append(description.strip())
+    if not fields:
+        return False
+    fields.append("updated_at=?")
+    values.append(datetime.utcnow().isoformat())
+    values.append(int(guide_id))
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            f"UPDATE video_guides SET {', '.join(fields)} WHERE id=?",
+            tuple(values),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+
+def db_video_guide_replace_video(
+    guide_id: int,
+    video_file_id: str,
+    video_file_unique_id: str | None,
+    duration_sec: int | None,
+) -> bool:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            """
+            UPDATE video_guides
+            SET video_file_id=?, video_file_unique_id=?, duration_sec=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                video_file_id,
+                video_file_unique_id,
+                int(duration_sec or 0),
+                datetime.utcnow().isoformat(),
+                int(guide_id),
+            ),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+
+def db_video_guide_toggle_published(guide_id: int) -> bool | None:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT is_published FROM video_guides WHERE id=?",
+            (int(guide_id),),
+        ).fetchone()
+        if not row:
+            return None
+        new_value = 0 if int(row[0] or 0) else 1
+        con.execute(
+            "UPDATE video_guides SET is_published=?, updated_at=? WHERE id=?",
+            (new_value, datetime.utcnow().isoformat(), int(guide_id)),
+        )
+        con.commit()
+        return bool(new_value)
+
+
+def db_video_guide_delete(guide_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("DELETE FROM video_guides WHERE id=?", (int(guide_id),))
+        con.commit()
+        return cur.rowcount > 0
+
+
+def db_video_guide_move(guide_id: int, direction: int) -> bool:
+    items = db_video_guides_list(published_only=False)
+    index = next((i for i, item in enumerate(items) if item["id"] == int(guide_id)), None)
+    if index is None:
+        return False
+    target_index = index - 1 if direction < 0 else index + 1
+    if target_index < 0 or target_index >= len(items):
+        return False
+    current = items[index]
+    target = items[target_index]
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "UPDATE video_guides SET position=?, updated_at=? WHERE id=?",
+            (target["position"], datetime.utcnow().isoformat(), current["id"]),
+        )
+        con.execute(
+            "UPDATE video_guides SET position=?, updated_at=? WHERE id=?",
+            (current["position"], datetime.utcnow().isoformat(), target["id"]),
+        )
+        con.commit()
+    return True
+
+
+def format_video_duration(duration_sec: int | None) -> str:
+    total = max(0, int(duration_sec or 0))
+    if not total:
+        return ""
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def video_guide_button_text(guide: dict) -> str:
+    title = re.sub(r"\s+", " ", guide.get("title") or "Видео-инструкция").strip()
+    duration = format_video_duration(guide.get("duration_sec"))
+    suffix = f" · {duration}" if duration else ""
+    max_title = max(20, 58 - len(suffix))
+    if len(title) > max_title:
+        title = title[: max_title - 1].rstrip() + "…"
+    return f"▶️ {title}{suffix}"
+
+
+def video_guides_text(items: list[dict]) -> str:
+    if not items:
+        return (
+            "🎬 <b>Видео-инструкции</b>\n\n"
+            "Опубликованных инструкций пока нет."
+        )
+    return (
+        "🎬 <b>Видео-инструкции</b>\n\n"
+        "Нажмите на название — бот отправит видео и описание одним сообщением."
+    )
+
+
+def kb_video_guides(items: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                video_guide_button_text(item),
+                callback_data=f"help:video:open:{int(item['id'])}",
+            )
+        ]
+        for item in items
+    ]
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_video_guide_view() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ К видео-инструкциям", callback_data="help:videos")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
+    ])
+
+
+def video_guide_caption(guide: dict) -> str:
+    title = (guide.get("title") or "Видео-инструкция").strip()
+    description = (guide.get("description") or "").strip()
+    caption = f"🎬 {title}"
+    if description:
+        caption += f"\n\n{description}"
+    return caption[:1024]
+
+
+async def _video_guides_replace_with_text(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    markup: InlineKeyboardMarkup,
+):
+    message = query.message
+    is_media = bool(
+        getattr(message, "video", None)
+        or getattr(message, "photo", None)
+        or getattr(message, "document", None)
+        or getattr(message, "animation", None)
+        or getattr(message, "audio", None)
+    )
+    if not is_media:
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+        return
+    chat_id = message.chat_id
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    )
+
+
+async def render_video_guides(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    if not query:
+        return
+    if await deny_no_access(update, context):
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    items = db_video_guides_list(published_only=True)
+    await _video_guides_replace_with_text(
+        query,
+        context,
+        video_guides_text(items),
+        kb_video_guides(items),
+    )
+
+
+async def open_video_guide(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    guide_id: int,
+    *,
+    admin_preview: bool = False,
+):
+    query = update.callback_query
+    if not query:
+        return
+    guide = db_video_guide_get(guide_id, published_only=not admin_preview)
+    if not guide:
+        await query.answer("Видео-инструкция не найдена.", show_alert=True)
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    chat_id = query.message.chat_id
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    if admin_preview:
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ К управлению инструкцией", callback_data=f"help:settings:videos:open:{guide_id}")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
+        ])
+    else:
+        markup = kb_video_guide_view()
+    await context.bot.send_video(
+        chat_id=chat_id,
+        video=guide["video_file_id"],
+        caption=video_guide_caption(guide),
+        supports_streaming=True,
+        reply_markup=markup,
+    )
+
+
+# Финальная структура главного меню.
+def kb_help_main(
+    is_admin_user: bool,
+    unread_count: int = 0,
+) -> InlineKeyboardMarkup:
+    notification_label = "🔔 Новые уведомления"
+    if unread_count:
+        notification_label += f" · {int(unread_count)}"
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("👤 Мой кабинет", callback_data="help:me"),
+            InlineKeyboardButton(notification_label, callback_data="help:notifications"),
+        ],
+        [
+            InlineKeyboardButton("👥 Наша команда", callback_data="help:team"),
+            InlineKeyboardButton("🎬 Видео-инструкции", callback_data="help:videos"),
+        ],
+        [
+            InlineKeyboardButton("📄 Документы", callback_data="help:docs"),
+            InlineKeyboardButton("🔗 Полезные ссылки", callback_data="help:links"),
+        ],
+        [
+            InlineKeyboardButton("❓ FAQ", callback_data="help:faq"),
+            InlineKeyboardButton("💡 Предложка", callback_data="help:suggest"),
+        ],
+        [
+            _green_inline_button(
+                "🗂 Наши проекты",
+                callback_data="help:projects",
+            )
+        ],
+        [InlineKeyboardButton("📚 Кейсы", callback_data="help:cases")],
+    ]
+    if is_admin_user:
+        rows.append([
+            InlineKeyboardButton("⚙️ Управление ботом", callback_data="help:settings")
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+# Номинация находится в личном кабинете непосредственно перед выходом.
+def kb_my_account(profile: dict):
+    page = _profile_team_page(int(profile["id"]))
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏆 Мои достижения", callback_data="help:me:achievements"),
+            InlineKeyboardButton("📝 Мои тесты", callback_data="help:me:tests"),
+        ],
+        [InlineKeyboardButton("✏️ Редактировать анкету", callback_data="help:me:edit")],
+        [
+            InlineKeyboardButton(
+                "👥 Моя карточка в команде",
+                callback_data=f"help:team:person:{int(profile['id'])}:{page}",
+            )
+        ],
+        [InlineKeyboardButton("⏰ Напоминания", callback_data="help:reminder:list")],
+        [InlineKeyboardButton("🙌 Номинация", callback_data="help:nomination")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
+    ])
+
+
+def kb_nomination_intro():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🙌 Номинировать коллегу", callback_data="help:nomination:start")],
+        [InlineKeyboardButton("⬅️ В мой кабинет", callback_data="help:me")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
+    ])
+
+
+# Управление видео-инструкциями располагается в административном блоке «Контент».
+def kb_settings_content():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 Открыть раздел «Документы»", callback_data="help:docs")],
+        [InlineKeyboardButton("🎬 Управление видео-инструкциями", callback_data="help:settings:videos")],
+        [InlineKeyboardButton("❓ Управление FAQ", callback_data="help:settings:faq")],
+        [InlineKeyboardButton("⬅️ К управлению ботом", callback_data="help:settings")],
+    ])
+
+
+def video_guides_admin_text(items: list[dict]) -> str:
+    published = sum(1 for item in items if item.get("is_published"))
+    hidden = len(items) - published
+    return (
+        "🎬 <b>Управление видео-инструкциями</b>\n\n"
+        "Каждая опубликованная запись автоматически становится кнопкой-заголовком "
+        "в пользовательском разделе. После нажатия видео и описание отправляются одним сообщением.\n\n"
+        f"Всего: <b>{len(items)}</b> · опубликовано: <b>{published}</b> · скрыто: <b>{hidden}</b>"
+    )
+
+
+def kb_video_guides_admin(items: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [_green_inline_button("➕ Добавить видео-инструкцию", callback_data="help:settings:videos:add")]
+    ]
+    for item in items:
+        status = "🟢" if item.get("is_published") else "⚪"
+        title = re.sub(r"\s+", " ", item.get("title") or "Без названия").strip()
+        if len(title) > 44:
+            title = title[:43].rstrip() + "…"
+        rows.append([
+            InlineKeyboardButton(
+                f"{status} {title}",
+                callback_data=f"help:settings:videos:open:{int(item['id'])}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("⬅️ К контенту", callback_data="help:settings:content")])
+    return InlineKeyboardMarkup(rows)
+
+
+def video_guide_admin_card_text(guide: dict) -> str:
+    status = "Опубликована" if guide.get("is_published") else "Скрыта"
+    duration = format_video_duration(guide.get("duration_sec")) or "не определена"
+    description = escape(guide.get("description") or "—")
+    return (
+        f"🎬 <b>{escape(guide.get('title') or 'Видео-инструкция')}</b>\n\n"
+        f"Статус: <b>{status}</b>\n"
+        f"Длительность: <b>{duration}</b>\n"
+        f"Позиция: <b>{int(guide.get('position') or 0)}</b>\n\n"
+        f"<b>Описание</b>\n{description}"
+    )
+
+
+def kb_video_guide_admin_card(guide: dict) -> InlineKeyboardMarkup:
+    guide_id = int(guide["id"])
+    toggle_label = "🙈 Скрыть" if guide.get("is_published") else "👁 Опубликовать"
+    return InlineKeyboardMarkup([
+        [_green_inline_button("▶️ Предпросмотр", callback_data=f"help:settings:videos:preview:{guide_id}")],
+        [
+            InlineKeyboardButton("✏️ Название", callback_data=f"help:settings:videos:edit_title:{guide_id}"),
+            InlineKeyboardButton("📝 Описание", callback_data=f"help:settings:videos:edit_desc:{guide_id}"),
+        ],
+        [InlineKeyboardButton("🔄 Заменить видео", callback_data=f"help:settings:videos:replace:{guide_id}")],
+        [
+            InlineKeyboardButton("⬆️ Выше", callback_data=f"help:settings:videos:move_up:{guide_id}"),
+            InlineKeyboardButton("⬇️ Ниже", callback_data=f"help:settings:videos:move_down:{guide_id}"),
+        ],
+        [InlineKeyboardButton(toggle_label, callback_data=f"help:settings:videos:toggle:{guide_id}")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f"help:settings:videos:delete_ask:{guide_id}")],
+        [InlineKeyboardButton("⬅️ К видео-инструкциям", callback_data="help:settings:videos")],
+    ])
+
+
+def kb_video_guide_cancel(back_callback: str = "help:settings:videos") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:videos:cancel")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
+    ])
+
+
+_video_guides_previous_cb_help = cb_help
+
+
+async def cb_help(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+
+    if data == "help:videos":
+        return await render_video_guides(update, context)
+
+    if data.startswith("help:video:open:"):
+        if await deny_no_access(update, context):
+            return
+        try:
+            guide_id = int(data.rsplit(":", 1)[-1])
+        except ValueError:
+            await query.answer("Некорректная видео-инструкция.", show_alert=True)
+            return
+        return await open_video_guide(update, context, guide_id)
+
+    if data.startswith("help:settings:videos"):
+        if not await is_admin_scoped(update, context):
+            await query.answer("Доступно только администраторам.", show_alert=True)
+            return
+
+        if data == "help:settings:videos":
+            _video_guides_clear_flow(context)
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            items = db_video_guides_list(published_only=False)
+            await _video_guides_replace_with_text(
+                query,
+                context,
+                video_guides_admin_text(items),
+                kb_video_guides_admin(items),
+            )
+            return
+
+        if data == "help:settings:videos:add":
+            _video_guides_clear_flow(context)
+            context.user_data[VIDEO_GUIDE_STATE] = "add_title"
+            context.user_data[VIDEO_GUIDE_DRAFT] = {}
+            await query.edit_message_text(
+                "🎬 <b>Новая видео-инструкция</b>\n\n"
+                "Шаг 1 из 3 — отправьте название будущей кнопки.\n\n"
+                f"До {VIDEO_GUIDE_TITLE_MAX} символов.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_video_guide_cancel(),
+            )
+            return
+
+        if data == "help:settings:videos:cancel":
+            _video_guides_clear_flow(context)
+            items = db_video_guides_list(published_only=False)
+            await _video_guides_replace_with_text(
+                query,
+                context,
+                video_guides_admin_text(items),
+                kb_video_guides_admin(items),
+            )
+            return
+
+        parts = data.split(":")
+        try:
+            guide_id = int(parts[-1])
+        except (ValueError, IndexError):
+            guide_id = 0
+
+        if data.startswith("help:settings:videos:open:"):
+            guide = db_video_guide_get(guide_id)
+            if not guide:
+                await query.answer("Видео-инструкция не найдена.", show_alert=True)
+                return
+            _video_guides_clear_flow(context)
+            await _video_guides_replace_with_text(
+                query,
+                context,
+                video_guide_admin_card_text(guide),
+                kb_video_guide_admin_card(guide),
+            )
+            return
+
+        if data.startswith("help:settings:videos:preview:"):
+            return await open_video_guide(update, context, guide_id, admin_preview=True)
+
+        if data.startswith("help:settings:videos:edit_title:"):
+            guide = db_video_guide_get(guide_id)
+            if not guide:
+                await query.answer("Видео-инструкция не найдена.", show_alert=True)
+                return
+            context.user_data[VIDEO_GUIDE_STATE] = "edit_title"
+            context.user_data[VIDEO_GUIDE_DRAFT] = {"guide_id": guide_id}
+            await query.edit_message_text(
+                f"✏️ <b>Новое название</b>\n\n"
+                f"Текущее: {escape(guide['title'])}\n\n"
+                f"Отправьте новый текст длиной до {VIDEO_GUIDE_TITLE_MAX} символов.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_video_guide_cancel(f"help:settings:videos:open:{guide_id}"),
+            )
+            return
+
+        if data.startswith("help:settings:videos:edit_desc:"):
+            guide = db_video_guide_get(guide_id)
+            if not guide:
+                await query.answer("Видео-инструкция не найдена.", show_alert=True)
+                return
+            context.user_data[VIDEO_GUIDE_STATE] = "edit_desc"
+            context.user_data[VIDEO_GUIDE_DRAFT] = {"guide_id": guide_id}
+            await query.edit_message_text(
+                "📝 <b>Новое описание</b>\n\n"
+                f"Отправьте описание длиной до {VIDEO_GUIDE_DESCRIPTION_MAX} символов. "
+                "Оно появится под видео в том же сообщении.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_video_guide_cancel(f"help:settings:videos:open:{guide_id}"),
+            )
+            return
+
+        if data.startswith("help:settings:videos:replace:"):
+            guide = db_video_guide_get(guide_id)
+            if not guide:
+                await query.answer("Видео-инструкция не найдена.", show_alert=True)
+                return
+            context.user_data[VIDEO_GUIDE_STATE] = "replace_video"
+            context.user_data[VIDEO_GUIDE_DRAFT] = {"guide_id": guide_id}
+            await query.edit_message_text(
+                "🔄 <b>Замена видео</b>\n\n"
+                "Отправьте новый видеофайл прямо в этот чат. Название и описание сохранятся.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_video_guide_cancel(f"help:settings:videos:open:{guide_id}"),
+            )
+            return
+
+        if data.startswith("help:settings:videos:toggle:"):
+            new_value = db_video_guide_toggle_published(guide_id)
+            if new_value is None:
+                await query.answer("Видео-инструкция не найдена.", show_alert=True)
+                return
+            guide = db_video_guide_get(guide_id)
+            await query.answer("Опубликована." if new_value else "Скрыта.")
+            await query.edit_message_text(
+                video_guide_admin_card_text(guide),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_video_guide_admin_card(guide),
+            )
+            return
+
+        if data.startswith("help:settings:videos:move_up:"):
+            moved = db_video_guide_move(guide_id, -1)
+            await query.answer("Перемещено выше." if moved else "Выше переместить нельзя.")
+            guide = db_video_guide_get(guide_id)
+            if guide:
+                await query.edit_message_text(
+                    video_guide_admin_card_text(guide),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_video_guide_admin_card(guide),
+                )
+            return
+
+        if data.startswith("help:settings:videos:move_down:"):
+            moved = db_video_guide_move(guide_id, 1)
+            await query.answer("Перемещено ниже." if moved else "Ниже переместить нельзя.")
+            guide = db_video_guide_get(guide_id)
+            if guide:
+                await query.edit_message_text(
+                    video_guide_admin_card_text(guide),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_video_guide_admin_card(guide),
+                )
+            return
+
+        if data.startswith("help:settings:videos:delete_ask:"):
+            guide = db_video_guide_get(guide_id)
+            if not guide:
+                await query.answer("Видео-инструкция не найдена.", show_alert=True)
+                return
+            await query.edit_message_text(
+                f"⚠️ Удалить видео-инструкцию <b>{escape(guide['title'])}</b>?\n\n"
+                "Кнопка сразу исчезнет из пользовательского раздела.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"help:settings:videos:delete:{guide_id}")],
+                    [InlineKeyboardButton("⬅️ Отмена", callback_data=f"help:settings:videos:open:{guide_id}")],
+                ]),
+            )
+            return
+
+        if data.startswith("help:settings:videos:delete:"):
+            deleted = db_video_guide_delete(guide_id)
+            _video_guides_clear_flow(context)
+            items = db_video_guides_list(published_only=False)
+            await query.answer("Удалено." if deleted else "Уже удалено.")
+            await query.edit_message_text(
+                video_guides_admin_text(items),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_video_guides_admin(items),
+            )
+            return
+
+    return await _video_guides_previous_cb_help(update, context)
+
+
+_video_guides_previous_on_text = on_text
+
+
+async def on_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    state = context.user_data.get(VIDEO_GUIDE_STATE)
+    if not state:
+        return await _video_guides_previous_on_text(update, context)
+    if not update.message or not update.effective_user:
+        return
+    if not await is_admin_scoped(update, context):
+        _video_guides_clear_flow(context)
+        return await _video_guides_previous_on_text(update, context)
+
+    raw_value = (update.message.text or "").strip()
+    value = re.sub(r"\s+", " ", raw_value)
+    draft = dict(context.user_data.get(VIDEO_GUIDE_DRAFT) or {})
+
+    if state in {"add_video", "replace_video"}:
+        await update.message.reply_text(
+            "Отправьте именно видеофайл. Для отмены используйте кнопку под предыдущим сообщением."
+        )
+        return
+
+    if state in {"add_title", "edit_title"}:
+        if len(value) < 3:
+            await update.message.reply_text("Название должно содержать не менее трёх символов.")
+            return
+        if len(value) > VIDEO_GUIDE_TITLE_MAX:
+            await update.message.reply_text(
+                f"Название слишком длинное. Максимум {VIDEO_GUIDE_TITLE_MAX} символов."
+            )
+            return
+        if state == "edit_title":
+            guide_id = int(draft.get("guide_id") or 0)
+            updated = db_video_guide_update_text(guide_id, title=value)
+            _video_guides_clear_flow(context)
+            guide = db_video_guide_get(guide_id)
+            await update.message.reply_text(
+                "✅ Название обновлено." if updated else "Видео-инструкция не найдена.",
+                reply_markup=(kb_video_guide_admin_card(guide) if guide else kb_video_guides_admin(db_video_guides_list())),
+            )
+            return
+        draft["title"] = value
+        context.user_data[VIDEO_GUIDE_DRAFT] = draft
+        context.user_data[VIDEO_GUIDE_STATE] = "add_description"
+        await update.message.reply_text(
+            "🎬 <b>Новая видео-инструкция</b>\n\n"
+            "Шаг 2 из 3 — отправьте описание, которое будет показано под видео.\n\n"
+            f"До {VIDEO_GUIDE_DESCRIPTION_MAX} символов.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_video_guide_cancel(),
+        )
+        return
+
+    if state in {"add_description", "edit_desc"}:
+        description_value = raw_value
+        if len(description_value) < 3:
+            await update.message.reply_text("Описание должно содержать не менее трёх символов.")
+            return
+        if len(description_value) > VIDEO_GUIDE_DESCRIPTION_MAX:
+            await update.message.reply_text(
+                f"Описание слишком длинное. Максимум {VIDEO_GUIDE_DESCRIPTION_MAX} символов."
+            )
+            return
+        if state == "edit_desc":
+            guide_id = int(draft.get("guide_id") or 0)
+            updated = db_video_guide_update_text(guide_id, description=description_value)
+            _video_guides_clear_flow(context)
+            guide = db_video_guide_get(guide_id)
+            await update.message.reply_text(
+                "✅ Описание обновлено." if updated else "Видео-инструкция не найдена.",
+                reply_markup=(kb_video_guide_admin_card(guide) if guide else kb_video_guides_admin(db_video_guides_list())),
+            )
+            return
+        draft["description"] = description_value
+        context.user_data[VIDEO_GUIDE_DRAFT] = draft
+        context.user_data[VIDEO_GUIDE_STATE] = "add_video"
+        await update.message.reply_text(
+            "🎬 <b>Новая видео-инструкция</b>\n\n"
+            "Шаг 3 из 3 — отправьте видео прямо в этот чат.\n\n"
+            "После загрузки инструкция будет сразу опубликована, а в разделе появится кнопка с её названием.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_video_guide_cancel(),
+        )
+        return
+
+    return await _video_guides_previous_on_text(update, context)
+
+
+_video_guides_previous_on_video = on_video
+
+
+async def on_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    state = context.user_data.get(VIDEO_GUIDE_STATE)
+    if state not in {"add_video", "replace_video"}:
+        return await _video_guides_previous_on_video(update, context)
+    if not update.message or not update.message.video or not update.effective_user:
+        return
+    if not await is_admin_scoped(update, context):
+        _video_guides_clear_flow(context)
+        return await _video_guides_previous_on_video(update, context)
+
+    video = update.message.video
+    draft = dict(context.user_data.get(VIDEO_GUIDE_DRAFT) or {})
+
+    if state == "replace_video":
+        guide_id = int(draft.get("guide_id") or 0)
+        updated = db_video_guide_replace_video(
+            guide_id,
+            video.file_id,
+            video.file_unique_id,
+            getattr(video, "duration", 0),
+        )
+        _video_guides_clear_flow(context)
+        guide = db_video_guide_get(guide_id)
+        await update.message.reply_text(
+            "✅ Видео заменено." if updated else "Видео-инструкция не найдена.",
+            reply_markup=(kb_video_guide_admin_card(guide) if guide else kb_video_guides_admin(db_video_guides_list())),
+        )
+        return
+
+    title = (draft.get("title") or "").strip()
+    description = (draft.get("description") or "").strip()
+    if not title or not description:
+        _video_guides_clear_flow(context)
+        await update.message.reply_text(
+            "Не удалось найти данные мастера. Начните создание инструкции заново.",
+            reply_markup=kb_video_guides_admin(db_video_guides_list()),
+        )
+        return
+
+    guide_id = db_video_guide_add(
+        title=title,
+        description=description,
+        video_file_id=video.file_id,
+        video_file_unique_id=video.file_unique_id,
+        duration_sec=getattr(video, "duration", 0),
+        created_by=update.effective_user.id,
+    )
+    _video_guides_clear_flow(context)
+    guide = db_video_guide_get(guide_id)
+    await update.message.reply_text(
+        "✅ Видео-инструкция опубликована.\n\n"
+        "Кнопка с её названием уже появилась в пользовательском разделе «Видео-инструкции».",
+        reply_markup=kb_video_guide_admin_card(guide),
+    )
+
+# ==================== END VIDEO GUIDES + FINAL MAIN MENU V1 ====================
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
