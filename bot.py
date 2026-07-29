@@ -27275,20 +27275,42 @@ def kb_cases_categories(
     legacy = _calendar_cases_previous_kb_cases_categories(user_id)
     rows = [list(row) for row in legacy.inline_keyboard]
 
-    # В главном меню кейсов проект и изменение отраслей должны стоять
-    # последовательно внизу, непосредственно перед «Главным меню».
-    industry_index = next(
+    # На главном экране кейсов два проекта идут подряд перед главным меню.
+    # Старую кнопку «Изменить выбор отраслей» удаляем: её callback полностью
+    # совпадает с новым входом в проект «Отраслевое отделение».
+    cleaned_rows: list[list[InlineKeyboardButton]] = []
+    for row in rows:
+        cleaned_row = [
+            button
+            for button in row
+            if (button.callback_data or "") != "help:industry_division"
+        ]
+        if cleaned_row:
+            cleaned_rows.append(cleaned_row)
+    rows = cleaned_rows
+
+    main_index = next(
         (
             index
             for index, row in enumerate(rows)
             if any(
-                (button.callback_data or "") == "help:industry_division"
+                (button.callback_data or "") == "help:main"
                 for button in row
             )
         ),
         len(rows),
     )
-    rows.insert(industry_index, _calendar_project_button_row())
+
+    rows.insert(
+        main_index,
+        [
+            _green_inline_button(
+                "🏭 Проект: Отраслевое отделение",
+                callback_data="help:industry_division",
+            )
+        ],
+    )
+    rows.insert(main_index + 1, _calendar_project_button_row())
     return InlineKeyboardMarkup(rows)
 
 
