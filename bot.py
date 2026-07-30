@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "PROFILE-CARDS-WEB-PHOTO-COMPAT-2026-07-30-V27"
+BUILD_VERSION = "RICH-PROFILE-CARDS-SEPARATE-PHOTO-2026-07-30-V27"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -985,6 +985,19 @@ def db_init():
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications(user_id, is_read, id DESC)")
+
+    # ------- PROFILE CARDS: связь Rich Message с отдельным фото -------
+    # Хранение в SQLite позволяет корректно удалить старое фото даже после
+    # перезапуска процесса бота.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS profile_card_message_pairs (
+            chat_id INTEGER NOT NULL,
+            rich_message_id INTEGER NOT NULL,
+            photo_message_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, rich_message_id)
+        )
+    """)
 
     # ------- ACHIEVEMENT REACTIONS: реакции на публичные благодарности -------
     cur.execute("""
@@ -7391,11 +7404,11 @@ def build_profile_input_rich_message(
     shared_interests: list[str] | None = None,
 ) -> dict:
     """
-    Формирует InputRichMessage через нативные InputRichBlock.
+    Формирует текстовую часть карточки через нативные InputRichBlock.
 
-    Фото передаётся отдельным блоком InputRichBlockPhoto. Это надёжнее, чем
-    ссылка ``tg://photo`` внутри HTML: Telegram получает file_id прямо в поле
-    ``photo`` и не должен повторно связывать HTML-ссылку с массивом media.
+    Фотография намеренно не включается в Rich Message: она отправляется рядом
+    отдельным стандартным sendPhoto, чтобы одинаково отображаться в Telegram
+    Web и мобильных клиентах. Скрывающиеся details-блоки остаются здесь.
     """
     full_name = _truncate_profile_field(profile.get("full_name"), 180)
     year_start = str(profile.get("year_start") or "—")
@@ -7414,16 +7427,9 @@ def build_profile_input_rich_message(
     profile_id = int(profile["id"])
     shared_keys = normalize_profile_interests(shared_interests)
 
+    # Rich Message содержит только текст и интерактивные details-блоки.
+    # Фото отправляется отдельным стандартным Telegram-сообщением.
     blocks: list[dict] = []
-    photo_file_id = str(profile.get("photo_file_id") or "").strip()
-    if photo_file_id:
-        blocks.append({
-            "type": "photo",
-            "photo": {
-                "type": "photo",
-                "media": photo_file_id,
-            },
-        })
 
     blocks.extend([
         {
@@ -7491,9 +7497,9 @@ def build_profile_input_rich_message(
     ])
 
     logger.info(
-        "Profile Rich Message blocks: profile_id=%s photo_file_id=%s blocks=%s",
+        "Profile Rich Message blocks: profile_id=%s separate_photo=%s blocks=%s",
         profile_id,
-        "yes" if photo_file_id else "no",
+        "yes" if str(profile.get("photo_file_id") or "").strip() else "no",
         len(blocks),
     )
     return {"blocks": blocks}
@@ -7573,9 +7579,9 @@ async def edit_profile_rich_message(
     )
 
 
-# Совместимость с предыдущей версией, где фото и текст карточки
-# отправлялись раздельно. После перехода на симметричную карточку
-# эта связь используется только для удаления старых отдельных фото.
+# Связь между Rich Message и отдельным фото карточки. Кнопки находятся на
+# Rich Message, поэтому его message_id используется как ключ. При переходе
+# назад, вперёд или в другой раздел связанное фото удаляется автоматически.
 PROFILE_CARD_PHOTO_MESSAGES = "profile_card_photo_messages"
 
 
@@ -7583,23 +7589,83 @@ def _profile_card_message_key(chat_id: int, text_message_id: int) -> str:
     return f"{int(chat_id)}:{int(text_message_id)}"
 
 
+def remember_profile_card_photo_for_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text_message_id: int,
+    photo_message_id: int,
+):
+    """Запоминает, какое отдельное фото принадлежит конкретному Rich Message."""
+    chat_id = int(chat_id)
+    text_message_id = int(text_message_id)
+    photo_message_id = int(photo_message_id)
+
+    # Быстрый кэш текущего процесса.
+    photo_messages = context.chat_data.setdefault(PROFILE_CARD_PHOTO_MESSAGES, {})
+    if not isinstance(photo_messages, dict):
+        photo_messages = {}
+        context.chat_data[PROFILE_CARD_PHOTO_MESSAGES] = photo_messages
+    key = _profile_card_message_key(chat_id, text_message_id)
+    photo_messages[key] = photo_message_id
+
+    # Постоянное хранение переживает перезапуск бота.
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO profile_card_message_pairs(
+            chat_id, rich_message_id, photo_message_id, created_at
+        ) VALUES(?, ?, ?, ?)
+        ON CONFLICT(chat_id, rich_message_id) DO UPDATE SET
+            photo_message_id=excluded.photo_message_id,
+            created_at=excluded.created_at
+        """,
+        (chat_id, text_message_id, photo_message_id, datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    con.close()
+
+
 async def delete_profile_card_photo_for_message(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     text_message_id: int,
 ):
-    photo_messages = context.chat_data.get(PROFILE_CARD_PHOTO_MESSAGES)
-    if not isinstance(photo_messages, dict):
-        return
-
+    chat_id = int(chat_id)
+    text_message_id = int(text_message_id)
     key = _profile_card_message_key(chat_id, text_message_id)
-    photo_message_id = photo_messages.pop(key, None)
+
+    photo_message_id = None
+    photo_messages = context.chat_data.get(PROFILE_CARD_PHOTO_MESSAGES)
+    if isinstance(photo_messages, dict):
+        photo_message_id = photo_messages.pop(key, None)
+
+    # После рестарта кэш пуст, поэтому при необходимости читаем связь из БД.
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    if not photo_message_id:
+        cur.execute(
+            "SELECT photo_message_id FROM profile_card_message_pairs "
+            "WHERE chat_id=? AND rich_message_id=?",
+            (chat_id, text_message_id),
+        )
+        row = cur.fetchone()
+        if row:
+            photo_message_id = int(row[0])
+    cur.execute(
+        "DELETE FROM profile_card_message_pairs "
+        "WHERE chat_id=? AND rich_message_id=?",
+        (chat_id, text_message_id),
+    )
+    con.commit()
+    con.close()
+
     if not photo_message_id:
         return
 
     try:
         await context.bot.delete_message(
-            chat_id=int(chat_id),
+            chat_id=chat_id,
             message_id=int(photo_message_id),
         )
     except Exception:
@@ -7658,11 +7724,12 @@ async def render_profile_card(
     show_carousel: bool = True,
 ):
     """
-    Показывает карточку сотрудника как Rich Message с тремя details-блоками.
+    Показывает карточку сотрудника двумя соседними сообщениями:
+    1. стандартное фото через sendPhoto — для совместимости с Telegram Web;
+    2. Rich Message — для details-блоков, текста, кнопок и навигации.
 
-    При переходе со старой фото-карточки отправляет новое rich-сообщение и
-    удаляет прежнее. Текстовые и уже rich-карточки редактируются на месте.
-    Если Rich Messages временно недоступны, используется прежний формат.
+    Фото отправляется первым, поэтому Rich Message всегда расположен сразу под
+    ним. При переходе между сотрудниками старая пара удаляется и создаётся новая.
     """
     # Всегда перечитываем полную карточку из БД. В списках и подборках могут
     # использоваться сокращённые словари без photo_file_id.
@@ -7698,59 +7765,36 @@ async def render_profile_card(
     current_is_photo = bool(getattr(query.message, "photo", None))
     message_thread_id = getattr(query.message, "message_thread_id", None)
 
-    # Удаляем отдельное фото, если карточка была открыта очень старой версией.
+    # Если callback пришёл от предыдущего Rich Message, сначала удаляем его
+    # связанное фото. Само текстовое сообщение удалим после отправки новой пары.
     await delete_profile_card_photo_for_message(
         context,
         chat_id=chat_id,
         text_message_id=current_message_id,
     )
 
-    # ВАЖНО: медиаблоки Rich Message появились недавно и могут
-    # отображаться не во всех версиях Telegram Web. API при этом возвращает
-    # успешный ответ, поэтому fallback по исключению не срабатывает.
-    # Для карточек с фото используем обычное медиасообщение sendPhoto —
-    # оно стабильно отображается во всех основных клиентах Telegram.
-    photo_file_id = (profile.get("photo_file_id") or "").strip()
+    separate_photo_message = None
+    photo_file_id = str(profile.get("photo_file_id") or "").strip()
     if photo_file_id:
-        caption = build_profile_card_caption(
-            profile,
-            shared_interests=shared_interests,
-        )
-
-        if current_is_photo:
-            await query.edit_message_media(
-                media=InputMediaPhoto(
-                    media=photo_file_id,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                ),
-                reply_markup=markup,
+        try:
+            photo_kwargs = {
+                "chat_id": chat_id,
+                "photo": photo_file_id,
+            }
+            if message_thread_id:
+                photo_kwargs["message_thread_id"] = int(message_thread_id)
+            separate_photo_message = await context.bot.send_photo(**photo_kwargs)
+        except Exception as photo_error:
+            # Ошибка фото не должна ломать саму карточку: Rich Message всё равно
+            # будет показан, просто временно без изображения.
+            logger.exception(
+                "Separate profile photo failed; sending Rich Message without photo: %s",
+                photo_error,
             )
-            return
-
-        sent = await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=photo_file_id,
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-            message_thread_id=message_thread_id,
-        )
-        if sent:
-            try:
-                await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=current_message_id,
-                )
-            except Exception:
-                pass
-        return
 
     try:
-        # Не преобразуем обычное текстовое меню в Rich Message через
-        # editMessageText: при такой конвертации Telegram-клиенты могут показать
-        # rich-текст, но не прикрепить новый медиаблок. Новую карточку всегда
-        # отправляем методом sendRichMessage, после чего удаляем старое сообщение.
+        # Отправляем Rich Message вторым: он оказывается сразу под фотографией,
+        # а все кнопки и скрывающиеся details-блоки остаются на нём.
         sent = await send_profile_rich_message(
             context,
             chat_id=chat_id,
@@ -7759,7 +7803,17 @@ async def render_profile_card(
             reply_markup=markup,
             message_thread_id=message_thread_id,
         )
+
         if sent:
+            rich_message_id = int(sent.get("message_id"))
+            if separate_photo_message:
+                remember_profile_card_photo_for_message(
+                    context,
+                    chat_id=chat_id,
+                    text_message_id=rich_message_id,
+                    photo_message_id=separate_photo_message.message_id,
+                )
+
             try:
                 await context.bot.delete_message(
                     chat_id=chat_id,
@@ -7770,12 +7824,21 @@ async def render_profile_card(
         return
 
     except Exception as rich_error:
+        # Не оставляем в чате одинокое фото, если Rich Message не отправился.
+        if separate_photo_message:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=separate_photo_message.message_id,
+                )
+            except Exception:
+                pass
+
         # Не оставляем раздел «Команда» неработоспособным, если Telegram
         # временно отклонит Rich Message или используется старый Bot API server.
         logger.exception("Rich profile card failed; using legacy card: %s", rich_error)
 
     # ---------------- legacy fallback ----------------
-    photo_file_id = (profile.get("photo_file_id") or "").strip()
     if photo_file_id:
         caption = build_profile_card_caption(
             profile,
@@ -7792,13 +7855,16 @@ async def render_profile_card(
             )
             return
 
-        sent = await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=photo_file_id,
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-        )
+        fallback_photo_kwargs = {
+            "chat_id": chat_id,
+            "photo": photo_file_id,
+            "caption": caption,
+            "parse_mode": ParseMode.HTML,
+            "reply_markup": markup,
+        }
+        if message_thread_id:
+            fallback_photo_kwargs["message_thread_id"] = int(message_thread_id)
+        sent = await context.bot.send_photo(**fallback_photo_kwargs)
         if sent:
             try:
                 await context.bot.delete_message(
