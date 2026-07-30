@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "RICH-PROFILE-CARDS-SEPARATE-PHOTO-2026-07-30-V27"
+BUILD_VERSION = "PROFILE-ABOUT-DETAILS-2026-07-30-V27"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -985,19 +985,6 @@ def db_init():
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications(user_id, is_read, id DESC)")
-
-    # ------- PROFILE CARDS: связь Rich Message с отдельным фото -------
-    # Хранение в SQLite позволяет корректно удалить старое фото даже после
-    # перезапуска процесса бота.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS profile_card_message_pairs (
-            chat_id INTEGER NOT NULL,
-            rich_message_id INTEGER NOT NULL,
-            photo_message_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (chat_id, rich_message_id)
-        )
-    """)
 
     # ------- ACHIEVEMENT REACTIONS: реакции на публичные благодарности -------
     cur.execute("""
@@ -7032,21 +7019,18 @@ def _build_profile_card_text(
     profile: dict,
     *,
     about_limit: int = 1200,
-    topics_limit: int = 1200,
     interests_limit: int = PROFILE_INTEREST_MAX,
     progress_limit: int = 8,
     achievements_limit: int = 5,
     name_limit: int = 180,
     city_limit: int = 120,
-    tg_limit: int = 120,
     shared_interests: list[str] | None = None,
 ) -> str:
-    """Собирает карточку в едином формате с настраиваемыми лимитами полей."""
+    """Собирает текстовую версию карточки сотрудника."""
     full_name = _truncate_profile_field(profile.get("full_name"), name_limit)
     year_start = str(profile.get("year_start") or "—")
     city = _truncate_profile_field(profile.get("city"), city_limit)
     bday = _truncate_profile_field(profile.get("birthday"), 30)
-    tg_link = _truncate_profile_field(profile.get("tg_link"), tg_limit)
 
     avg = profile.get("avg_test_score")
     avg_text = f"{avg}%" if avg is not None and str(avg).strip() else "—"
@@ -7059,7 +7043,6 @@ def _build_profile_card_text(
             f"✨ <b>У вас есть общие интересы</b>\n"
             f"{escape(format_profile_interests(shared_keys))}\n\n"
         )
-    topics = _truncate_profile_field(profile.get("topics"), topics_limit)
 
     progress_items = db_achievement_progress_summary(int(profile["id"]))
     progress_lines = []
@@ -7092,12 +7075,10 @@ def _build_profile_card_text(
         f"📝 <b>Кратко о себе</b>\n{escape(about)}\n\n"
         f"🎯 <b>Интересы</b>\n{escape(interests)}\n\n"
         f"{shared_block}"
-        f"❓ <b>По каким вопросам обращаться</b>\n{escape(topics)}\n\n"
-        f"🔗 <b>TG:</b> {escape(tg_link)}\n"
-        f"📈 <b>Средний балл тестирования:</b> <b>{escape(avg_text)}</b>\n\n"
         f"━━━━━━━━━━━━━━\n\n"
         f"🏆 <b>Прогресс уровней</b>\n{progress_text}\n\n"
-        f"🏅 <b>Последние ачивки</b>\n\n{achievements_text}"
+        f"🏅 <b>Последние ачивки</b>\n\n{achievements_text}\n\n"
+        f"📈 <b>Средний балл тестирования:</b> <b>{escape(avg_text)}</b>"
     )
 
 
@@ -7123,21 +7104,19 @@ def build_profile_card_caption(
     """
     variants = [
         # Обычная карточка: визуально совпадает с текстовой версией.
-        dict(about_limit=1200, topics_limit=1200, interests_limit=5, progress_limit=8, achievements_limit=5),
+        dict(about_limit=1200, interests_limit=5, progress_limit=8, achievements_limit=5),
         # Мягкое сокращение для насыщенных карточек.
-        dict(about_limit=360, topics_limit=360, interests_limit=5, progress_limit=5, achievements_limit=3),
-        dict(about_limit=240, topics_limit=240, interests_limit=4, progress_limit=4, achievements_limit=2),
-        dict(about_limit=160, topics_limit=160, interests_limit=3, progress_limit=3, achievements_limit=1),
+        dict(about_limit=360, interests_limit=5, progress_limit=5, achievements_limit=3),
+        dict(about_limit=240, interests_limit=4, progress_limit=4, achievements_limit=2),
+        dict(about_limit=160, interests_limit=3, progress_limit=3, achievements_limit=1),
         # Гарантированный компактный вариант с сохранением всех разделов.
         dict(
             about_limit=90,
-            topics_limit=90,
             interests_limit=2,
             progress_limit=1,
             achievements_limit=0,
             name_limit=90,
             city_limit=60,
-            tg_limit=70,
         ),
     ]
 
@@ -7150,13 +7129,11 @@ def build_profile_card_caption(
     return _build_profile_card_text(
         profile,
         about_limit=40,
-        topics_limit=40,
         interests_limit=1,
         progress_limit=0,
         achievements_limit=0,
         name_limit=50,
         city_limit=35,
-        tg_limit=40,
         shared_interests=shared_interests,
     )
 
@@ -7229,18 +7206,17 @@ def build_profile_rich_html(
     """
     Карточка сотрудника в формате Rich Message.
 
-    Свёрнуты три независимых раздела:
-    1) интересы;
-    2) прогресс уровней;
-    3) последние ачивки.
+    В сворачиваемые блоки вынесены:
+    1) кратко о себе;
+    2) интересы;
+    3) прогресс уровней;
+    4) последние ачивки.
     """
     full_name = _truncate_profile_field(profile.get("full_name"), 180)
     year_start = str(profile.get("year_start") or "—")
     city = _truncate_profile_field(profile.get("city"), 120)
     birthday = _truncate_profile_field(profile.get("birthday"), 30)
     about = _truncate_profile_field(profile.get("about"), 1200)
-    topics = _truncate_profile_field(profile.get("topics"), 1200)
-    tg_link = _truncate_profile_field(profile.get("tg_link"), 120)
     interests = format_profile_interests(
         profile.get("interests"),
         limit=PROFILE_INTEREST_MAX,
@@ -7250,9 +7226,7 @@ def build_profile_rich_html(
     avg_text = f"{avg}%" if avg is not None and str(avg).strip() else "—"
 
     shared_keys = normalize_profile_interests(shared_interests)
-    interest_blocks = [
-        f"<p><b>🎯 Интересы</b><br/>{_rich_html(interests)}</p>"
-    ]
+    interest_blocks = [f"<p>{_rich_html(interests)}</p>"]
     if shared_keys:
         interest_blocks.append(
             "<p><b>✨ У вас есть общие интересы</b><br/>"
@@ -7266,6 +7240,7 @@ def build_profile_rich_html(
     profile_id = int(profile["id"])
     return "".join([
         f"<h2>👤 {_rich_html(full_name)}</h2>",
+        "<p> </p>",
         (
             "<p>"
             f"📅 Работает с: <b>{_rich_html(year_start)}</b><br/>"
@@ -7273,15 +7248,13 @@ def build_profile_rich_html(
             f"🎂 День рождения: <b>{_rich_html(birthday)}</b>"
             "</p>"
         ),
-        f"<p><b>📝 Кратко о себе</b><br/>{_rich_html(about)}</p>",
-        f"<p><b>❓ По каким вопросам обращаться</b><br/>{_rich_html(topics)}</p>",
-        (
-            "<p>"
-            f"<b>🔗 TG:</b> {_rich_html(tg_link)}<br/>"
-            f"<b>📈 Средний балл тестирования:</b> <b>{_rich_html(avg_text)}</b>"
-            "</p>"
-        ),
         "<hr/>",
+        (
+            "<details>"
+            "<summary>📝 Кратко о себе</summary>"
+            f"<p>{_rich_html(about)}</p>"
+            "</details>"
+        ),
         (
             "<details>"
             "<summary>🎯 Интересы</summary>"
@@ -7299,6 +7272,12 @@ def build_profile_rich_html(
             "<summary>🏅 Последние ачивки</summary>"
             f"{_profile_achievements_rich_html(profile_id, limit=5)}"
             "</details>"
+        ),
+        "<hr/>",
+        (
+            "<p>"
+            f"<b>📈 Средний балл тестирования:</b> <b>{_rich_html(avg_text)}</b>"
+            "</p>"
         ),
     ])
 
@@ -7404,19 +7383,17 @@ def build_profile_input_rich_message(
     shared_interests: list[str] | None = None,
 ) -> dict:
     """
-    Формирует текстовую часть карточки через нативные InputRichBlock.
+    Формирует InputRichMessage через нативные InputRichBlock.
 
-    Фотография намеренно не включается в Rich Message: она отправляется рядом
-    отдельным стандартным sendPhoto, чтобы одинаково отображаться в Telegram
-    Web и мобильных клиентах. Скрывающиеся details-блоки остаются здесь.
+    Фото передаётся отдельным блоком InputRichBlockPhoto. Это надёжнее, чем
+    ссылка ``tg://photo`` внутри HTML: Telegram получает file_id прямо в поле
+    ``photo`` и не должен повторно связывать HTML-ссылку с массивом media.
     """
     full_name = _truncate_profile_field(profile.get("full_name"), 180)
     year_start = str(profile.get("year_start") or "—")
     city = _truncate_profile_field(profile.get("city"), 120)
     birthday = _truncate_profile_field(profile.get("birthday"), 30)
     about = _truncate_profile_field(profile.get("about"), 1200)
-    topics = _truncate_profile_field(profile.get("topics"), 1200)
-    tg_link = _truncate_profile_field(profile.get("tg_link"), 120)
     interests = format_profile_interests(
         profile.get("interests"),
         limit=PROFILE_INTEREST_MAX,
@@ -7427,9 +7404,16 @@ def build_profile_input_rich_message(
     profile_id = int(profile["id"])
     shared_keys = normalize_profile_interests(shared_interests)
 
-    # Rich Message содержит только текст и интерактивные details-блоки.
-    # Фото отправляется отдельным стандартным Telegram-сообщением.
     blocks: list[dict] = []
+    photo_file_id = str(profile.get("photo_file_id") or "").strip()
+    if photo_file_id:
+        blocks.append({
+            "type": "photo",
+            "photo": {
+                "type": "photo",
+                "media": photo_file_id,
+            },
+        })
 
     blocks.extend([
         {
@@ -7437,28 +7421,19 @@ def build_profile_input_rich_message(
             "text": f"👤 {full_name}",
             "size": 2,
         },
+        # Отдельный пустой абзац создаёт визуальный отступ после имени.
+        _rich_paragraph("\u00A0"),
         _rich_paragraph(
             "📅 Работает с: ", _rich_bold(year_start),
             "\n🏙️ Город: ", _rich_bold(city),
             "\n🎂 День рождения: ", _rich_bold(birthday),
         ),
-        _rich_paragraph(
-            _rich_bold("📝 Кратко о себе"),
-            "\n",
-            about,
-        ),
-        _rich_paragraph(
-            _rich_bold("❓ По каким вопросам обращаться"),
-            "\n",
-            topics,
-        ),
-        _rich_paragraph(
-            _rich_bold("🔗 TG: "), tg_link,
-            "\n",
-            _rich_bold("📈 Средний балл тестирования: "),
-            _rich_bold(avg_text),
-        ),
         {"type": "divider"},
+        {
+            "type": "details",
+            "summary": "📝 Кратко о себе",
+            "blocks": [_rich_paragraph(about)],
+        },
     ])
 
     interest_detail_blocks = [_rich_paragraph(interests)]
@@ -7494,15 +7469,21 @@ def build_profile_input_rich_message(
             "summary": "🏅 Последние ачивки",
             "blocks": _profile_achievements_rich_blocks(profile_id, limit=5),
         },
+        {"type": "divider"},
+        _rich_paragraph(
+            _rich_bold("📈 Средний балл тестирования: "),
+            _rich_bold(avg_text),
+        ),
     ])
 
     logger.info(
-        "Profile Rich Message blocks: profile_id=%s separate_photo=%s blocks=%s",
+        "Profile Rich Message blocks: profile_id=%s photo_file_id=%s blocks=%s",
         profile_id,
-        "yes" if str(profile.get("photo_file_id") or "").strip() else "no",
+        "yes" if photo_file_id else "no",
         len(blocks),
     )
     return {"blocks": blocks}
+
 
 
 async def _telegram_bot_api_json(method: str, payload: dict):
@@ -7579,9 +7560,9 @@ async def edit_profile_rich_message(
     )
 
 
-# Связь между Rich Message и отдельным фото карточки. Кнопки находятся на
-# Rich Message, поэтому его message_id используется как ключ. При переходе
-# назад, вперёд или в другой раздел связанное фото удаляется автоматически.
+# Совместимость с предыдущей версией, где фото и текст карточки
+# отправлялись раздельно. После перехода на симметричную карточку
+# эта связь используется только для удаления старых отдельных фото.
 PROFILE_CARD_PHOTO_MESSAGES = "profile_card_photo_messages"
 
 
@@ -7589,83 +7570,23 @@ def _profile_card_message_key(chat_id: int, text_message_id: int) -> str:
     return f"{int(chat_id)}:{int(text_message_id)}"
 
 
-def remember_profile_card_photo_for_message(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    text_message_id: int,
-    photo_message_id: int,
-):
-    """Запоминает, какое отдельное фото принадлежит конкретному Rich Message."""
-    chat_id = int(chat_id)
-    text_message_id = int(text_message_id)
-    photo_message_id = int(photo_message_id)
-
-    # Быстрый кэш текущего процесса.
-    photo_messages = context.chat_data.setdefault(PROFILE_CARD_PHOTO_MESSAGES, {})
-    if not isinstance(photo_messages, dict):
-        photo_messages = {}
-        context.chat_data[PROFILE_CARD_PHOTO_MESSAGES] = photo_messages
-    key = _profile_card_message_key(chat_id, text_message_id)
-    photo_messages[key] = photo_message_id
-
-    # Постоянное хранение переживает перезапуск бота.
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT INTO profile_card_message_pairs(
-            chat_id, rich_message_id, photo_message_id, created_at
-        ) VALUES(?, ?, ?, ?)
-        ON CONFLICT(chat_id, rich_message_id) DO UPDATE SET
-            photo_message_id=excluded.photo_message_id,
-            created_at=excluded.created_at
-        """,
-        (chat_id, text_message_id, photo_message_id, datetime.utcnow().isoformat()),
-    )
-    con.commit()
-    con.close()
-
-
 async def delete_profile_card_photo_for_message(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     text_message_id: int,
 ):
-    chat_id = int(chat_id)
-    text_message_id = int(text_message_id)
-    key = _profile_card_message_key(chat_id, text_message_id)
-
-    photo_message_id = None
     photo_messages = context.chat_data.get(PROFILE_CARD_PHOTO_MESSAGES)
-    if isinstance(photo_messages, dict):
-        photo_message_id = photo_messages.pop(key, None)
+    if not isinstance(photo_messages, dict):
+        return
 
-    # После рестарта кэш пуст, поэтому при необходимости читаем связь из БД.
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    if not photo_message_id:
-        cur.execute(
-            "SELECT photo_message_id FROM profile_card_message_pairs "
-            "WHERE chat_id=? AND rich_message_id=?",
-            (chat_id, text_message_id),
-        )
-        row = cur.fetchone()
-        if row:
-            photo_message_id = int(row[0])
-    cur.execute(
-        "DELETE FROM profile_card_message_pairs "
-        "WHERE chat_id=? AND rich_message_id=?",
-        (chat_id, text_message_id),
-    )
-    con.commit()
-    con.close()
-
+    key = _profile_card_message_key(chat_id, text_message_id)
+    photo_message_id = photo_messages.pop(key, None)
     if not photo_message_id:
         return
 
     try:
         await context.bot.delete_message(
-            chat_id=chat_id,
+            chat_id=int(chat_id),
             message_id=int(photo_message_id),
         )
     except Exception:
@@ -7724,12 +7645,11 @@ async def render_profile_card(
     show_carousel: bool = True,
 ):
     """
-    Показывает карточку сотрудника двумя соседними сообщениями:
-    1. стандартное фото через sendPhoto — для совместимости с Telegram Web;
-    2. Rich Message — для details-блоков, текста, кнопок и навигации.
+    Показывает карточку сотрудника как Rich Message с тремя details-блоками.
 
-    Фото отправляется первым, поэтому Rich Message всегда расположен сразу под
-    ним. При переходе между сотрудниками старая пара удаляется и создаётся новая.
+    При переходе со старой фото-карточки отправляет новое rich-сообщение и
+    удаляет прежнее. Текстовые и уже rich-карточки редактируются на месте.
+    Если Rich Messages временно недоступны, используется прежний формат.
     """
     # Всегда перечитываем полную карточку из БД. В списках и подборках могут
     # использоваться сокращённые словари без photo_file_id.
@@ -7765,36 +7685,18 @@ async def render_profile_card(
     current_is_photo = bool(getattr(query.message, "photo", None))
     message_thread_id = getattr(query.message, "message_thread_id", None)
 
-    # Если callback пришёл от предыдущего Rich Message, сначала удаляем его
-    # связанное фото. Само текстовое сообщение удалим после отправки новой пары.
+    # Удаляем отдельное фото, если карточка была открыта очень старой версией.
     await delete_profile_card_photo_for_message(
         context,
         chat_id=chat_id,
         text_message_id=current_message_id,
     )
 
-    separate_photo_message = None
-    photo_file_id = str(profile.get("photo_file_id") or "").strip()
-    if photo_file_id:
-        try:
-            photo_kwargs = {
-                "chat_id": chat_id,
-                "photo": photo_file_id,
-            }
-            if message_thread_id:
-                photo_kwargs["message_thread_id"] = int(message_thread_id)
-            separate_photo_message = await context.bot.send_photo(**photo_kwargs)
-        except Exception as photo_error:
-            # Ошибка фото не должна ломать саму карточку: Rich Message всё равно
-            # будет показан, просто временно без изображения.
-            logger.exception(
-                "Separate profile photo failed; sending Rich Message without photo: %s",
-                photo_error,
-            )
-
     try:
-        # Отправляем Rich Message вторым: он оказывается сразу под фотографией,
-        # а все кнопки и скрывающиеся details-блоки остаются на нём.
+        # Не преобразуем обычное текстовое меню в Rich Message через
+        # editMessageText: при такой конвертации Telegram-клиенты могут показать
+        # rich-текст, но не прикрепить новый медиаблок. Новую карточку всегда
+        # отправляем методом sendRichMessage, после чего удаляем старое сообщение.
         sent = await send_profile_rich_message(
             context,
             chat_id=chat_id,
@@ -7803,17 +7705,7 @@ async def render_profile_card(
             reply_markup=markup,
             message_thread_id=message_thread_id,
         )
-
         if sent:
-            rich_message_id = int(sent.get("message_id"))
-            if separate_photo_message:
-                remember_profile_card_photo_for_message(
-                    context,
-                    chat_id=chat_id,
-                    text_message_id=rich_message_id,
-                    photo_message_id=separate_photo_message.message_id,
-                )
-
             try:
                 await context.bot.delete_message(
                     chat_id=chat_id,
@@ -7824,21 +7716,12 @@ async def render_profile_card(
         return
 
     except Exception as rich_error:
-        # Не оставляем в чате одинокое фото, если Rich Message не отправился.
-        if separate_photo_message:
-            try:
-                await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=separate_photo_message.message_id,
-                )
-            except Exception:
-                pass
-
         # Не оставляем раздел «Команда» неработоспособным, если Telegram
         # временно отклонит Rich Message или используется старый Bot API server.
         logger.exception("Rich profile card failed; using legacy card: %s", rich_error)
 
     # ---------------- legacy fallback ----------------
+    photo_file_id = (profile.get("photo_file_id") or "").strip()
     if photo_file_id:
         caption = build_profile_card_caption(
             profile,
@@ -7855,16 +7738,13 @@ async def render_profile_card(
             )
             return
 
-        fallback_photo_kwargs = {
-            "chat_id": chat_id,
-            "photo": photo_file_id,
-            "caption": caption,
-            "parse_mode": ParseMode.HTML,
-            "reply_markup": markup,
-        }
-        if message_thread_id:
-            fallback_photo_kwargs["message_thread_id"] = int(message_thread_id)
-        sent = await context.bot.send_photo(**fallback_photo_kwargs)
+        sent = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=photo_file_id,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
         if sent:
             try:
                 await context.bot.delete_message(
