@@ -34907,6 +34907,513 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= END TEAM LEADERS / LEADERBOARDS V7 =================
 
+# ================= TEAM LEADERS / LEADERBOARDS V8 =================
+# Неполные и временно пустые рейтинги:
+# - можно сохранить только фактически занятые места (например, только первое);
+# - занятые места должны идти подряд, без пропусков;
+# - на каждом занятом месте может быть от одного до трёх сотрудников;
+# - «Очистить рейтинг» сохраняет актуальный период без участников, поэтому
+#   сотрудники видят сообщение, что рейтинг появится позже;
+# - единственного участника можно удалить с последнего занятого места.
+
+BUILD_VERSION = "TEAM-LEADERS-2026-07-30-V8-PARTIAL-EMPTY-RATINGS"
+LEADERBOARD_EMPTY_TEXT = "⏳ <b>Рейтинг будет опубликован позже.</b>"
+
+
+def _leaderboard_validate_result_flow(flow: dict):
+    entries = list(flow.get("entries") or [])
+    if flow.get("period_type") not in LEADERBOARD_PERIOD_TITLES:
+        raise ValueError("Некорректный период")
+    if flow.get("metric_type") not in LEADERBOARD_METRIC_TITLES:
+        raise ValueError("Некорректное направление")
+
+    # Пустой список — допустимое состояние после команды «Очистить рейтинг».
+    if not entries:
+        return
+
+    profile_ids: list[int] = []
+    counts = {place: 0 for place in range(1, 6)}
+    for entry in entries:
+        try:
+            profile_id = int(entry["profile_id"])
+            place = int(entry["place"])
+            value = int(entry.get("metric_value", -1))
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("В рейтинге обнаружена некорректная запись")
+        if place not in range(1, 6):
+            raise ValueError("Место должно быть от 1 до 5")
+        if value < 0:
+            raise ValueError("Показатель не может быть отрицательным")
+        profile_ids.append(profile_id)
+        counts[place] += 1
+
+    if len(profile_ids) != len(set(profile_ids)):
+        raise ValueError("Один сотрудник не может занимать несколько мест")
+
+    occupied = [place for place in range(1, 6) if counts[place] > 0]
+    if not occupied or occupied[0] != 1:
+        raise ValueError("Рейтинг должен начинаться с первого места")
+    expected = list(range(1, occupied[-1] + 1))
+    if occupied != expected:
+        raise ValueError("Места должны быть заполнены подряд, без пропусков")
+
+    for place in occupied:
+        if counts[place] > LEADERBOARD_PLACE_MAX:
+            raise ValueError(
+                f"На {place} месте может быть не более {LEADERBOARD_PLACE_MAX} сотрудников"
+            )
+
+    if len(entries) > 5 * LEADERBOARD_PLACE_MAX:
+        raise ValueError("В рейтинге может быть не более пятнадцати сотрудников")
+
+
+def _leaderboard_empty_html(item: dict) -> str:
+    period_type = item.get("period_type") or "week"
+    metric_type = item.get("metric_type") or "mrr"
+    title_emoji = "🔥" if period_type == "week" else "🏆"
+    metric_emoji = "💰" if metric_type == "mrr" else "📊"
+    lines = [
+        f"{title_emoji} <b>{_leaderboard_title(period_type)}</b>",
+        "",
+        f"{metric_emoji} <b>{escape(LEADERBOARD_METRIC_TITLES.get(metric_type, metric_type))}</b>",
+        f"📅 {_leaderboard_date_range(item.get('period_start', ''), item.get('period_end', ''))}",
+    ]
+    if metric_type == "mrr":
+        lines.extend(["", LEADERBOARD_MRR_NOTE_HTML])
+    lines.extend(["", LEADERBOARD_EMPTY_TEXT])
+    return "\n".join(lines).strip()
+
+
+_leaderboard_v8_previous_build_leaderboard_html = build_leaderboard_html
+
+
+def build_leaderboard_html(item: dict, *, include_congratulation: bool = False) -> str:
+    if not list(item.get("entries") or []):
+        return _leaderboard_empty_html(item)
+    return _leaderboard_v8_previous_build_leaderboard_html(
+        item,
+        include_congratulation=include_congratulation,
+    )
+
+
+def _leaderboard_combined_missing(pair: dict) -> list[str]:
+    missing: list[str] = []
+    mrr = pair.get("mrr")
+    leads = pair.get("leads")
+    if not mrr or not list(mrr.get("entries") or []):
+        missing.append("MRR")
+    if not leads or not list(leads.get("entries") or []):
+        missing.append("Количество")
+    return missing
+
+
+_leaderboard_v8_previous_combined_pair_from_flow = _leaderboard_combined_pair_from_flow
+
+
+def _leaderboard_combined_pair_from_flow(flow: dict) -> dict | None:
+    pair = _leaderboard_v8_previous_combined_pair_from_flow(flow)
+    if not pair or _leaderboard_combined_missing(pair):
+        return None
+    return pair
+
+
+_leaderboard_v8_previous_profile_picker = kb_leaderboard_profile_picker
+
+
+def kb_leaderboard_profile_picker(flow: dict, page: int = 0) -> InlineKeyboardMarkup:
+    markup = _leaderboard_v8_previous_profile_picker(flow, page)
+    rows = [list(row) for row in markup.inline_keyboard]
+    action_rows: list[list[InlineKeyboardButton]] = []
+    if flow.get("entries"):
+        action_rows.append([InlineKeyboardButton(
+            "✅ Завершить заполнение",
+            callback_data="help:settings:leaders:preview",
+        )])
+    action_rows.append([InlineKeyboardButton(
+        "🧹 Очистить рейтинг",
+        callback_data="help:settings:leaders:clear",
+    )])
+    insert_at = max(0, len(rows) - 1)
+    rows[insert_at:insert_at] = action_rows
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_leaderboard_place_next(place: int, count: int) -> InlineKeyboardMarkup:
+    place = max(1, min(5, int(place)))
+    count = max(0, int(count))
+    rows: list[list[InlineKeyboardButton]] = []
+    if count < LEADERBOARD_PLACE_MAX:
+        rows.append([InlineKeyboardButton(
+            f"➕ Добавить ещё на {place} место",
+            callback_data=f"help:settings:leaders:place_more:{place}",
+        )])
+    if place < 5:
+        rows.append([InlineKeyboardButton(
+            f"➡️ Перейти к {place + 1} месту",
+            callback_data=f"help:settings:leaders:place_done:{place}",
+        )])
+        rows.append([InlineKeyboardButton(
+            "✅ Завершить заполнение",
+            callback_data="help:settings:leaders:preview",
+        )])
+    else:
+        rows.append([InlineKeyboardButton(
+            "👀 Перейти к предпросмотру",
+            callback_data=f"help:settings:leaders:place_done:{place}",
+        )])
+    rows.append([InlineKeyboardButton(
+        "🧹 Очистить рейтинг",
+        callback_data="help:settings:leaders:clear",
+    )])
+    rows.append([InlineKeyboardButton(
+        "❌ Отмена",
+        callback_data="help:settings:leaders:cancel",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_leaderboard_first_place_next(count: int) -> InlineKeyboardMarkup:
+    return kb_leaderboard_place_next(1, count)
+
+
+def kb_leaderboard_preview() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "👥 Управлять составом мест",
+            callback_data="help:settings:leaders:edit_places",
+        )],
+        [InlineKeyboardButton(
+            "👤 Изменить сотрудника",
+            callback_data="help:settings:leaders:edit_people",
+        )],
+        [InlineKeyboardButton(
+            "🔄 Заполнить / заполнить заново",
+            callback_data="help:settings:leaders:reset_people",
+        )],
+        [InlineKeyboardButton(
+            "🧹 Очистить рейтинг",
+            callback_data="help:settings:leaders:clear",
+        )],
+        [InlineKeyboardButton(
+            "💾 Сохранить результаты",
+            callback_data="help:settings:leaders:ready",
+        )],
+        [InlineKeyboardButton(
+            "❌ Отмена",
+            callback_data="help:settings:leaders:cancel",
+        )],
+    ])
+
+
+def kb_leaderboard_place_members(flow: dict, place: int) -> InlineKeyboardMarkup:
+    place = int(place)
+    members = _leaderboard_place_entries(flow, place)
+    rows: list[list[InlineKeyboardButton]] = []
+    for entry in members:
+        rows.append([InlineKeyboardButton(
+            f"👤 {compact_team_name(entry['profile_name'], 30)} · {entry['metric_display']}",
+            callback_data=f"help:settings:leaders:edit_employee:{int(entry['profile_id'])}",
+        )])
+    if len(members) < LEADERBOARD_PLACE_MAX:
+        rows.append([InlineKeyboardButton(
+            "➕ Добавить сотрудника",
+            callback_data=f"help:settings:leaders:edit_place_add:{place}",
+        )])
+    if members:
+        rows.append([InlineKeyboardButton(
+            "➖ Убрать сотрудника",
+            callback_data=f"help:settings:leaders:edit_place_remove:{place}",
+        )])
+    rows.append([InlineKeyboardButton(
+        "⬅️ Ко всем местам",
+        callback_data="help:settings:leaders:edit_places",
+    )])
+    rows.append([InlineKeyboardButton(
+        "👀 К предпросмотру",
+        callback_data="help:settings:leaders:edit_done",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def _leaderboard_can_remove_profile(flow: dict, profile_id: int) -> tuple[bool, str]:
+    entry = _leaderboard_find_flow_entry(flow, int(profile_id))
+    if not entry:
+        return False, "Сотрудник не найден"
+    place = int(entry.get("place") or 0)
+    members = _leaderboard_place_entries(flow, place)
+    if len(members) > 1:
+        return True, ""
+
+    remaining = [
+        item for item in (flow.get("entries") or [])
+        if int(item.get("profile_id") or 0) != int(profile_id)
+    ]
+    if not remaining:
+        return False, "Чтобы убрать последнего участника рейтинга, используйте «Очистить рейтинг»"
+    occupied = sorted({int(item.get("place") or 0) for item in flow.get("entries") or []})
+    if place != occupied[-1]:
+        return False, "Единственного участника можно убрать только с последнего заполненного места"
+    return True, ""
+
+
+def _leaderboard_clear_result(flow: dict, saved_by: int | None) -> int:
+    _leaderboard_refresh_flow_period(flow)
+    flow["entries"] = []
+    flow.pop("pending_profile", None)
+    flow.pop("editing_profile_id", None)
+    flow.pop("replacement_source_profile_id", None)
+    flow.pop("pending_replacement", None)
+    flow["awaiting"] = "preview"
+    return db_leaderboard_save(flow, saved_by)
+
+
+_leaderboard_v8_previous_cb_help = cb_help
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+    v8_actions = (
+        data in {
+            "help:settings:leaders:clear",
+            "help:settings:leaders:clear_apply",
+            "help:settings:leaders:clear_back",
+        }
+        or data.startswith("help:ldr:delete:")
+        or data.startswith("help:ldr:dapply:")
+        or data.startswith("help:settings:leaders:edit_place_remove:")
+        or data.startswith("help:settings:leaders:edit_remove_confirm:")
+        or data.startswith("help:settings:leaders:edit_remove_apply:")
+    )
+    if not v8_actions:
+        return await _leaderboard_v8_previous_cb_help(update, context)
+
+    if await deny_no_access(update, context):
+        return
+    if not await is_admin_scoped(update, context):
+        await _leaderboard_answer(query, "Только для администратора", show_alert=True)
+        return
+    await _leaderboard_answer(query)
+
+    flow = _leaderboard_flow(context)
+    if not flow or flow.get("mode") != "results":
+        await _leaderboard_answer(
+            query,
+            "Редактируемый рейтинг не найден. Откройте его заново.",
+            show_alert=True,
+        )
+        return
+
+    if data == "help:settings:leaders:clear":
+        _leaderboard_refresh_flow_period(flow)
+        flow["clear_previous_awaiting"] = flow.get("awaiting")
+        period = "неделю" if flow.get("period_type") == "week" else "месяц"
+        metric = LEADERBOARD_METRIC_TITLES.get(flow.get("metric_type"), "Рейтинг")
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "⚠️ <b>Очистить рейтинг?</b>\n\n"
+            f"Период: <b>{period}</b>\n"
+            f"Даты: <b>{_leaderboard_date_range(flow['period_start'], flow['period_end'])}</b>\n"
+            f"Показатель: <b>{escape(metric)}</b>\n\n"
+            "Все сотрудники и показатели этого рейтинга будут удалены. "
+            "Сотрудники увидят сообщение, что рейтинг будет опубликован позже.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "✅ Очистить рейтинг",
+                    callback_data="help:settings:leaders:clear_apply",
+                )],
+                [InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data="help:settings:leaders:clear_back",
+                )],
+            ]),
+        )
+        return
+
+    if data == "help:settings:leaders:clear_back":
+        previous = flow.pop("clear_previous_awaiting", None)
+        if flow.get("leaderboard_id") or flow.get("entries"):
+            flow["awaiting"] = "preview"
+            await _leaderboard_send_admin_preview(
+                context, query.message.chat_id, flow, query.message
+            )
+        else:
+            flow["awaiting"] = previous or "profile"
+            await _leaderboard_prompt_profile(update, context, 0)
+        return
+
+    if data == "help:settings:leaders:clear_apply":
+        try:
+            item_id = _leaderboard_clear_result(
+                flow,
+                update.effective_user.id if update.effective_user else None,
+            )
+            item = db_leaderboard_get(item_id)
+        except Exception as exc:
+            logger.exception("Cannot clear team leaderboard: %s", exc)
+            await _leaderboard_answer(
+                query,
+                "Не удалось очистить рейтинг. Проверьте журнал ошибок.",
+                show_alert=True,
+            )
+            return
+        _leaderboard_clear_flow(context)
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "✅ <b>Рейтинг очищен</b>\n\n"
+            f"Период: <b>{_leaderboard_date_range(item['period_start'], item['period_end'])}</b>\n\n"
+            "Старые участники удалены. Сотрудникам уже показывается сообщение, "
+            "что рейтинг будет опубликован позже.",
+            kb_leaderboard_saved(item),
+        )
+        return
+
+    # Удаление через карточку конкретного участника (V7).
+    if data.startswith("help:ldr:delete:"):
+        try:
+            profile_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        entry = _leaderboard_find_flow_entry(flow, profile_id)
+        allowed, reason = _leaderboard_can_remove_profile(flow, profile_id)
+        if not entry or not allowed:
+            await _leaderboard_answer(query, reason or "Сотрудник не найден", show_alert=True)
+            return
+        place = int(entry["place"])
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "⚠️ <b>Удаление сотрудника с места</b>\n\n"
+            f"Удалить <b>{escape(entry['profile_name'])}</b> с <b>{place} места</b>?\n\n"
+            "Остальные сотрудники и показатели не изменятся.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "✅ Удалить с места",
+                    callback_data=f"help:ldr:dapply:{profile_id}",
+                )],
+                [InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"help:settings:leaders:edit_employee:{profile_id}",
+                )],
+            ]),
+        )
+        return
+
+    if data.startswith("help:ldr:dapply:"):
+        try:
+            profile_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        entry = _leaderboard_find_flow_entry(flow, profile_id)
+        allowed, reason = _leaderboard_can_remove_profile(flow, profile_id)
+        if not entry or not allowed:
+            await _leaderboard_answer(query, reason or "Сотрудник уже отсутствует", show_alert=True)
+            return
+        place = int(entry["place"])
+        flow["entries"] = [
+            item for item in flow.get("entries") or []
+            if int(item.get("profile_id") or 0) != profile_id
+        ]
+        _leaderboard_sort_flow_entries(flow)
+        flow["editing_place"] = place
+        flow["awaiting"] = "edit_place_members"
+        await _leaderboard_show_place_members(query, context, flow, place)
+        return
+
+    # Удаление через управление составом места (V6).
+    if data.startswith("help:settings:leaders:edit_place_remove:"):
+        try:
+            place = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректное место", show_alert=True)
+            return
+        members = _leaderboard_place_entries(flow, place)
+        removable = [
+            member for member in members
+            if _leaderboard_can_remove_profile(flow, int(member["profile_id"]))[0]
+        ]
+        if not removable:
+            reason = "На этом месте сейчас нельзя удалить участника"
+            if members:
+                reason = _leaderboard_can_remove_profile(
+                    flow, int(members[0]["profile_id"])
+                )[1] or reason
+            await _leaderboard_answer(query, reason, show_alert=True)
+            return
+        flow["editing_place"] = place
+        flow["awaiting"] = "edit_remove_member"
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            f"➖ <b>Убрать сотрудника с {place} места</b>\n\n"
+            "Выберите участника. Перед удалением бот попросит подтверждение.",
+            kb_leaderboard_remove_member_picker(flow, place),
+        )
+        return
+
+    if data.startswith("help:settings:leaders:edit_remove_confirm:"):
+        parts = data.split(":")
+        try:
+            place = int(parts[-2])
+            profile_id = int(parts[-1])
+        except (IndexError, TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        entry = _leaderboard_find_flow_entry(flow, profile_id)
+        allowed, reason = _leaderboard_can_remove_profile(flow, profile_id)
+        if not entry or int(entry.get("place") or 0) != place or not allowed:
+            await _leaderboard_answer(query, reason or "Сотрудник не найден", show_alert=True)
+            return
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "⚠️ <b>Подтвердите изменение состава</b>\n\n"
+            f"Убрать <b>{escape(entry['profile_name'])}</b> с <b>{place} места</b>?\n\n"
+            "Другие сотрудники и показатели останутся без изменений.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "✅ Убрать сотрудника",
+                    callback_data=f"help:settings:leaders:edit_remove_apply:{place}:{profile_id}",
+                )],
+                [InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"help:settings:leaders:edit_place_remove:{place}",
+                )],
+            ]),
+        )
+        return
+
+    if data.startswith("help:settings:leaders:edit_remove_apply:"):
+        parts = data.split(":")
+        try:
+            place = int(parts[-2])
+            profile_id = int(parts[-1])
+        except (IndexError, TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        entry = _leaderboard_find_flow_entry(flow, profile_id)
+        allowed, reason = _leaderboard_can_remove_profile(flow, profile_id)
+        if not entry or int(entry.get("place") or 0) != place or not allowed:
+            await _leaderboard_answer(query, reason or "Сотрудник уже отсутствует", show_alert=True)
+            return
+        flow["entries"] = [
+            item for item in flow.get("entries") or []
+            if int(item.get("profile_id") or 0) != profile_id
+        ]
+        _leaderboard_sort_flow_entries(flow)
+        flow["editing_place"] = place
+        flow["awaiting"] = "edit_place_members"
+        await _leaderboard_show_place_members(query, context, flow, place)
+        return
+
+    return await _leaderboard_v8_previous_cb_help(update, context)
+
+# ================= END TEAM LEADERS / LEADERBOARDS V8 =================
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
