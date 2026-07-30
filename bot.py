@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "RICH-PROFILE-CARDS-PHOTO-FIX-2026-07-30-V26"
+BUILD_VERSION = "PROFILE-CARDS-WEB-PHOTO-COMPAT-2026-07-30-V27"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -7704,6 +7704,47 @@ async def render_profile_card(
         chat_id=chat_id,
         text_message_id=current_message_id,
     )
+
+    # ВАЖНО: медиаблоки Rich Message появились недавно и могут
+    # отображаться не во всех версиях Telegram Web. API при этом возвращает
+    # успешный ответ, поэтому fallback по исключению не срабатывает.
+    # Для карточек с фото используем обычное медиасообщение sendPhoto —
+    # оно стабильно отображается во всех основных клиентах Telegram.
+    photo_file_id = (profile.get("photo_file_id") or "").strip()
+    if photo_file_id:
+        caption = build_profile_card_caption(
+            profile,
+            shared_interests=shared_interests,
+        )
+
+        if current_is_photo:
+            await query.edit_message_media(
+                media=InputMediaPhoto(
+                    media=photo_file_id,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                ),
+                reply_markup=markup,
+            )
+            return
+
+        sent = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=photo_file_id,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+            message_thread_id=message_thread_id,
+        )
+        if sent:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=current_message_id,
+                )
+            except Exception:
+                pass
+        return
 
     try:
         # Не преобразуем обычное текстовое меню в Rich Message через
