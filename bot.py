@@ -7290,28 +7290,213 @@ def build_profile_rich_html(
     ])
 
 
+def _rich_text_parts(*parts):
+    """Собирает RichText без HTML-парсера и лишней вложенности массивов."""
+    result: list = []
+
+    def append(value):
+        if value is None:
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                append(item)
+            return
+        if isinstance(value, str):
+            if value:
+                result.append(value)
+            return
+        result.append(value)
+
+    for part in parts:
+        append(part)
+
+    if not result:
+        return ""
+    if len(result) == 1:
+        return result[0]
+    return result
+
+
+def _rich_bold(value) -> dict:
+    return {
+        "type": "bold",
+        "text": str(value if value is not None else ""),
+    }
+
+
+def _rich_paragraph(*parts) -> dict:
+    return {
+        "type": "paragraph",
+        "text": _rich_text_parts(*parts),
+    }
+
+
+def _profile_progress_rich_blocks(profile_id: int, limit: int = 8) -> list[dict]:
+    items = db_achievement_progress_summary(int(profile_id))
+    blocks: list[dict] = []
+    for item in items[:max(0, int(limit))]:
+        level = achievement_level_label(item.get("level"))
+        progress = (
+            "максимальный уровень"
+            if item.get("next_threshold") is None
+            else str(item.get("label") or "—")
+        )
+        blocks.append(
+            _rich_paragraph(
+                str(item.get("emoji") or "🏆"),
+                " ",
+                _rich_bold(
+                    f"{item.get('title') or 'Ачивка'} · {level}"
+                ),
+                " — ",
+                progress,
+            )
+        )
+    return blocks or [_rich_paragraph("— Всё ещё впереди —")]
+
+
+def _profile_achievements_rich_blocks(profile_id: int, limit: int = 5) -> list[dict]:
+    items = db_achievements_list(int(profile_id))
+    if not items or int(limit) <= 0:
+        return [_rich_paragraph("— Всё ещё впереди —")]
+
+    blocks: list[dict] = []
+    for item in items[:max(1, int(limit))]:
+        level = achievement_level_label(item.get("level"))
+        counts = db_achievement_reaction_counts(int(item["id"]))
+        reactions = "  ".join(
+            f"{ACHIEVEMENT_REACTIONS[key]} {int(counts.get(key, 0))}"
+            for key in ACHIEVEMENT_REACTIONS
+            if counts.get(key, 0)
+        )
+        parts: list = [
+            str(item.get("emoji") or "🏆"),
+            " ",
+            _rich_bold(
+                f"{item.get('title') or 'Ачивка'} · уровень {level}"
+            ),
+            "\n",
+            str(item.get("description") or "—"),
+            "\n📅 ",
+            _format_short_date(item.get("awarded_at")),
+        ]
+        if reactions:
+            parts.extend(["\n", reactions])
+        blocks.append(_rich_paragraph(parts))
+    return blocks
+
+
 def build_profile_input_rich_message(
     profile: dict,
     shared_interests: list[str] | None = None,
 ) -> dict:
-    """Формирует InputRichMessage, при наличии добавляя фото по file_id."""
-    html = build_profile_rich_html(profile, shared_interests=shared_interests)
-    photo_file_id = (profile.get("photo_file_id") or "").strip()
-    rich_message: dict = {"html": html}
+    """
+    Формирует InputRichMessage через нативные InputRichBlock.
 
+    Фото передаётся отдельным блоком InputRichBlockPhoto. Это надёжнее, чем
+    ссылка ``tg://photo`` внутри HTML: Telegram получает file_id прямо в поле
+    ``photo`` и не должен повторно связывать HTML-ссылку с массивом media.
+    """
+    full_name = _truncate_profile_field(profile.get("full_name"), 180)
+    year_start = str(profile.get("year_start") or "—")
+    city = _truncate_profile_field(profile.get("city"), 120)
+    birthday = _truncate_profile_field(profile.get("birthday"), 30)
+    about = _truncate_profile_field(profile.get("about"), 1200)
+    topics = _truncate_profile_field(profile.get("topics"), 1200)
+    tg_link = _truncate_profile_field(profile.get("tg_link"), 120)
+    interests = format_profile_interests(
+        profile.get("interests"),
+        limit=PROFILE_INTEREST_MAX,
+    )
+
+    avg = profile.get("avg_test_score")
+    avg_text = f"{avg}%" if avg is not None and str(avg).strip() else "—"
+    profile_id = int(profile["id"])
+    shared_keys = normalize_profile_interests(shared_interests)
+
+    blocks: list[dict] = []
+    photo_file_id = str(profile.get("photo_file_id") or "").strip()
     if photo_file_id:
-        media_id = "profile_photo"
-        rich_message["html"] = f'<figure><img src="tg://photo?id={media_id}"/></figure>' + html
-        rich_message["media"] = [
-            {
-                "id": media_id,
-                "media": {
-                    "type": "photo",
-                    "media": photo_file_id,
-                },
-            }
-        ]
-    return rich_message
+        blocks.append({
+            "type": "photo",
+            "photo": {
+                "type": "photo",
+                "media": photo_file_id,
+            },
+        })
+
+    blocks.extend([
+        {
+            "type": "heading",
+            "text": f"👤 {full_name}",
+            "size": 2,
+        },
+        _rich_paragraph(
+            "📅 Работает с: ", _rich_bold(year_start),
+            "\n🏙️ Город: ", _rich_bold(city),
+            "\n🎂 День рождения: ", _rich_bold(birthday),
+        ),
+        _rich_paragraph(
+            _rich_bold("📝 Кратко о себе"),
+            "\n",
+            about,
+        ),
+        _rich_paragraph(
+            _rich_bold("❓ По каким вопросам обращаться"),
+            "\n",
+            topics,
+        ),
+        _rich_paragraph(
+            _rich_bold("🔗 TG: "), tg_link,
+            "\n",
+            _rich_bold("📈 Средний балл тестирования: "),
+            _rich_bold(avg_text),
+        ),
+        {"type": "divider"},
+    ])
+
+    interest_detail_blocks = [_rich_paragraph(interests)]
+    if shared_keys:
+        interest_detail_blocks.append(
+            _rich_paragraph(
+                _rich_bold("✨ У вас есть общие интересы"),
+                "\n",
+                format_profile_interests(shared_keys),
+            )
+        )
+    else:
+        interest_detail_blocks.append(
+            _rich_paragraph(
+                _rich_bold("✨ Общие интересы"),
+                "\n— Пока не найдены —",
+            )
+        )
+
+    blocks.extend([
+        {
+            "type": "details",
+            "summary": "🎯 Интересы",
+            "blocks": interest_detail_blocks,
+        },
+        {
+            "type": "details",
+            "summary": "🏆 Прогресс уровней",
+            "blocks": _profile_progress_rich_blocks(profile_id, limit=8),
+        },
+        {
+            "type": "details",
+            "summary": "🏅 Последние ачивки",
+            "blocks": _profile_achievements_rich_blocks(profile_id, limit=5),
+        },
+    ])
+
+    logger.info(
+        "Profile Rich Message blocks: profile_id=%s photo_file_id=%s blocks=%s",
+        profile_id,
+        "yes" if photo_file_id else "no",
+        len(blocks),
+    )
+    return {"blocks": blocks}
 
 
 async def _telegram_bot_api_json(method: str, payload: dict):
