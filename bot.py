@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "RICH-PROFILE-CARDS-2026-07-30-V25"
+BUILD_VERSION = "RICH-PROFILE-CARDS-PHOTO-FIX-2026-07-30-V26"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -7217,7 +7217,7 @@ def build_profile_rich_html(
     Карточка сотрудника в формате Rich Message.
 
     Свёрнуты три независимых раздела:
-    1) интересы и общие интересы;
+    1) интересы;
     2) прогресс уровней;
     3) последние ачивки.
     """
@@ -7261,12 +7261,6 @@ def build_profile_rich_html(
             "</p>"
         ),
         f"<p><b>📝 Кратко о себе</b><br/>{_rich_html(about)}</p>",
-        (
-            "<details>"
-            "<summary>🎯 Интересы и общие интересы</summary>"
-            f"{''.join(interest_blocks)}"
-            "</details>"
-        ),
         f"<p><b>❓ По каким вопросам обращаться</b><br/>{_rich_html(topics)}</p>",
         (
             "<p>"
@@ -7275,6 +7269,12 @@ def build_profile_rich_html(
             "</p>"
         ),
         "<hr/>",
+        (
+            "<details>"
+            "<summary>🎯 Интересы</summary>"
+            f"{''.join(interest_blocks)}"
+            "</details>"
+        ),
         (
             "<details>"
             "<summary>🏆 Прогресс уровней</summary>"
@@ -7301,7 +7301,7 @@ def build_profile_input_rich_message(
 
     if photo_file_id:
         media_id = "profile_photo"
-        rich_message["html"] = f'<img src="tg://photo?id={media_id}"/>' + html
+        rich_message["html"] = f'<figure><img src="tg://photo?id={media_id}"/></figure>' + html
         rich_message["media"] = [
             {
                 "id": media_id,
@@ -7479,6 +7479,17 @@ async def render_profile_card(
     удаляет прежнее. Текстовые и уже rich-карточки редактируются на месте.
     Если Rich Messages временно недоступны, используется прежний формат.
     """
+    # Всегда перечитываем полную карточку из БД. В списках и подборках могут
+    # использоваться сокращённые словари без photo_file_id.
+    try:
+        profile_id = int(profile.get("id"))
+    except (TypeError, ValueError, AttributeError):
+        profile_id = 0
+    if profile_id:
+        stored_profile = db_profiles_get(profile_id)
+        if stored_profile:
+            profile = stored_profile
+
     viewer_profile = None
     viewer = getattr(query, "from_user", None)
     if viewer:
@@ -7510,24 +7521,10 @@ async def render_profile_card(
     )
 
     try:
-        if not current_is_photo:
-            try:
-                await edit_profile_rich_message(
-                    chat_id=chat_id,
-                    message_id=current_message_id,
-                    profile=profile,
-                    shared_interests=shared_interests,
-                    reply_markup=markup,
-                )
-                return
-            except RuntimeError as edit_error:
-                # Некоторые старые типы сообщений нельзя преобразовать в rich
-                # редактированием. Тогда отправляем новую карточку.
-                logger.warning(
-                    "Rich profile edit failed; sending a new message: %s",
-                    edit_error,
-                )
-
+        # Не преобразуем обычное текстовое меню в Rich Message через
+        # editMessageText: при такой конвертации Telegram-клиенты могут показать
+        # rich-текст, но не прикрепить новый медиаблок. Новую карточку всегда
+        # отправляем методом sendRichMessage, после чего удаляем старое сообщение.
         sent = await send_profile_rich_message(
             context,
             chat_id=chat_id,
