@@ -29348,7 +29348,7 @@ async def on_text(
 # Изолированный модуль рейтингов. Он добавлен поверх существующих обработчиков,
 # чтобы не менять уже работающие сценарии большого монолитного файла.
 
-BUILD_VERSION = "TEAM-LEADERS-2026-07-30-V1"
+BUILD_VERSION = "TEAM-LEADERS-2026-07-30-MRR-DEMO-NOTE"
 
 LEADERBOARD_FLOW_KEY = "team_leaderboard_flow_v1"
 LEADERBOARD_PREVIEW_MEDIA_MESSAGE_ID = "team_leaderboard_preview_media_message_id"
@@ -29369,6 +29369,10 @@ LEADERBOARD_METRIC_TITLES = {
     "mrr": "MRR",
     "leads": "Лиды",
 }
+LEADERBOARD_MRR_NOTE_HTML = (
+    "❗ <b>Важно!</b> Учитывается значение MRR в DEMO, "
+    "а не общее количество."
+)
 LEADERBOARD_MONTHS_RU = (
     "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря",
@@ -29715,6 +29719,8 @@ def build_leaderboard_html(item: dict, *, include_congratulation: bool = True) -
         f"{metric_emoji} <b>Направление: {escape(LEADERBOARD_METRIC_TITLES.get(metric_type, metric_type))}</b>",
         f"📅 {_leaderboard_date_range(item.get('period_start', ''), item.get('period_end', ''))}",
     ]
+    if metric_type == "mrr":
+        lines.extend(["", LEADERBOARD_MRR_NOTE_HTML])
     congratulations = (item.get("congratulation_html") or "").strip()
     if include_congratulation and congratulations:
         lines.extend(["", congratulations])
@@ -32435,7 +32441,12 @@ def build_combined_leaderboard_html(
     if congratulations:
         lines.extend(["", congratulations])
 
-    lines.extend(["", "💰 <b>Лидеры по MRR</b>", ""])
+    lines.extend([
+        "",
+        "💰 <b>Лидеры по MRR</b>",
+        LEADERBOARD_MRR_NOTE_HTML,
+        "",
+    ])
     lines.extend(_leaderboard_combined_metric_lines(pair["mrr"], "mrr"))
     lines.extend(["", "📊 <b>Лидеры по количеству</b>", ""])
     lines.extend(_leaderboard_combined_metric_lines(pair["leads"], "leads"))
@@ -33369,12 +33380,18 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flow["editing_profile_id"] = profile_id
         flow["awaiting"] = "edit_metric_value"
         example = "850000" if flow.get("metric_type") == "mrr" else "48"
+        mrr_note = (
+            f"{LEADERBOARD_MRR_NOTE_HTML}\n\n"
+            if flow.get("metric_type") == "mrr"
+            else ""
+        )
         await _leaderboard_replace_with_text(
             query,
             context,
             "📊 <b>Изменение показателя</b>\n\n"
             f"Сотрудник: <b>{escape(entry['profile_name'])}</b>\n"
             f"Текущее значение: <b>{escape(entry['metric_display'])}</b>\n\n"
+            f"{mrr_note}"
             f"Отправьте новое число одним сообщением. Например: <code>{example}</code>",
             InlineKeyboardMarkup([[
                 InlineKeyboardButton(
@@ -33588,12 +33605,18 @@ async def _leaderboard_prompt_profile(update: Update, context, page: int = 0):
         return
     place = max(1, min(5, int(flow.get("current_place") or 1)))
     count = _leaderboard_result_counts(flow).get(place, 0)
+    mrr_note = (
+        f"{LEADERBOARD_MRR_NOTE_HTML}\n\n"
+        if flow.get("metric_type") == "mrr"
+        else ""
+    )
     text = (
         "👥 <b>Внесение результатов</b>\n\n"
         f"Сейчас заполняется: {LEADERBOARD_PLACE_EMOJIS.get(place, '⭐')} "
         f"<b>{place} место</b>.\n"
         f"На каждом месте можно указать от 1 до {LEADERBOARD_PLACE_MAX} сотрудников. "
         f"Сейчас выбрано: <b>{count}/{LEADERBOARD_PLACE_MAX}</b>.\n\n"
+        f"{mrr_note}"
         f"{_leaderboard_progress_text(flow)}\n\n"
         "Выберите сотрудника из списка:"
     )
@@ -33968,12 +33991,18 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         flow["awaiting"] = "metric_value"
         example = "850000" if flow["metric_type"] == "mrr" else "48"
+        mrr_note = (
+            f"{LEADERBOARD_MRR_NOTE_HTML}\n\n"
+            if flow.get("metric_type") == "mrr"
+            else ""
+        )
         await _leaderboard_replace_with_text(
             query,
             context,
             f"📊 <b>Результат для {escape(profile['full_name'])}</b>\n\n"
             f"Место: <b>{place}</b>\n"
             f"Показатель: <b>{escape(LEADERBOARD_METRIC_TITLES[flow['metric_type']])}</b>\n\n"
+            f"{mrr_note}"
             f"Введите число одним сообщением. Например: <code>{example}</code>",
             kb_leaderboard_cancel("help:settings:leaders:cancel"),
         )
@@ -34050,11 +34079,17 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{place} место: {counts[place]}"
             for place in range(1, 6)
         )
+        mrr_note = (
+            f"\n{LEADERBOARD_MRR_NOTE_HTML}\n"
+            if flow.get("metric_type") == "mrr"
+            else ""
+        )
         summary = (
             "💾 <b>Готово к сохранению</b>\n\n"
             f"Действие: <b>{action}</b>\n"
             f"Период: <b>{'Неделя' if flow['period_type'] == 'week' else 'Месяц'}</b>\n"
             f"Направление: <b>{escape(LEADERBOARD_METRIC_TITLES[flow['metric_type']])}</b>\n"
+            f"{mrr_note}"
             f"Состав: <b>{composition}</b>\n"
             f"Всего участников рейтинга: <b>{len(flow.get('entries') or [])}</b>\n\n"
             "После сохранения показатели сразу станут доступны сотрудникам. "
@@ -34180,12 +34215,18 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         flow["awaiting"] = "edit_add_metric_value"
         example = "850000" if flow["metric_type"] == "mrr" else "48"
+        mrr_note = (
+            f"{LEADERBOARD_MRR_NOTE_HTML}\n\n"
+            if flow.get("metric_type") == "mrr"
+            else ""
+        )
         await _leaderboard_replace_with_text(
             query,
             context,
             f"📊 <b>Показатель нового участника</b>\n\n"
             f"Сотрудник: <b>{escape(profile['full_name'])}</b>\n"
             f"Место: <b>{place}</b>\n\n"
+            f"{mrr_note}"
             f"Отправьте значение одним сообщением. Например: <code>{example}</code>",
             InlineKeyboardMarkup([[
                 InlineKeyboardButton(
@@ -34401,6 +34442,470 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ================= END TEAM LEADERS / LEADERBOARDS V6 =================
+
+# ================= TEAM LEADERS / LEADERBOARDS V7 =================
+# Точечная замена и удаление выбранного участника рейтинга:
+# - если на месте несколько сотрудников, администратор сначала выбирает
+#   конкретного участника, затем меняет его показатель, заменяет или удаляет;
+# - замена сохраняет место, но запрашивает показатель нового сотрудника;
+# - последнего сотрудника с места удалить нельзя.
+
+BUILD_VERSION = "TEAM-LEADERS-2026-07-30-V7-MEMBER-REMOVE-REPLACE"
+
+
+def kb_leaderboard_employee_actions(profile_id: int) -> InlineKeyboardMarkup:
+    """Действия над одним конкретным участником рейтинга."""
+    pid = int(profile_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "📊 Изменить показатель",
+            callback_data=f"help:settings:leaders:edit_metric:{pid}",
+        )],
+        [InlineKeyboardButton(
+            "🔁 Заменить сотрудника",
+            callback_data=f"help:ldr:replace:{pid}",
+        )],
+        [InlineKeyboardButton(
+            "🔀 Поменять место",
+            callback_data=f"help:settings:leaders:edit_place:{pid}",
+        )],
+        [InlineKeyboardButton(
+            "🗑 Удалить с места",
+            callback_data=f"help:ldr:delete:{pid}",
+        )],
+        [InlineKeyboardButton(
+            "👥 Управлять составом этого места",
+            callback_data=f"help:settings:leaders:edit_member_place:{pid}",
+        )],
+        [InlineKeyboardButton(
+            "⬅️ К списку сотрудников",
+            callback_data="help:settings:leaders:edit_people",
+        )],
+        [InlineKeyboardButton(
+            "👀 К предпросмотру",
+            callback_data="help:settings:leaders:edit_done",
+        )],
+    ])
+
+
+def kb_leaderboard_replacement_picker(
+    flow: dict,
+    source_profile_id: int,
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    """Выбор нового сотрудника для точечной замены участника рейтинга."""
+    source_id = int(source_profile_id)
+    people = db_profiles_list()
+    used = {int(item["profile_id"]) for item in flow.get("entries") or []}
+    available = [
+        (int(profile_id), name)
+        for profile_id, name in people
+        if int(profile_id) not in used
+    ]
+    total_pages = max(
+        1,
+        (len(available) + LEADERBOARD_PROFILE_PAGE_SIZE - 1)
+        // LEADERBOARD_PROFILE_PAGE_SIZE,
+    )
+    page = max(0, min(int(page), total_pages - 1))
+    start = page * LEADERBOARD_PROFILE_PAGE_SIZE
+    chunk = available[start:start + LEADERBOARD_PROFILE_PAGE_SIZE]
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for profile_id, name in chunk:
+        rows.append([InlineKeyboardButton(
+            compact_team_name(name, 32),
+            callback_data=f"help:ldr:rpick:{source_id}:{profile_id}:{page}",
+        )])
+
+    if not chunk:
+        rows.append([InlineKeyboardButton(
+            "Нет доступных сотрудников",
+            callback_data="noop",
+        )])
+
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                "◀️",
+                callback_data=f"help:ldr:rpage:{source_id}:{page - 1}",
+            ))
+        nav.append(InlineKeyboardButton(
+            f"{page + 1}/{total_pages}",
+            callback_data="noop",
+        ))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(
+                "▶️",
+                callback_data=f"help:ldr:rpage:{source_id}:{page + 1}",
+            ))
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(
+        "⬅️ К сотруднику",
+        callback_data=f"help:settings:leaders:edit_employee:{source_id}",
+    )])
+    rows.append([InlineKeyboardButton(
+        "👀 К предпросмотру",
+        callback_data="help:settings:leaders:edit_done",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _leaderboard_show_employee_picker(query, context, flow: dict):
+    """Список участников для точечного изменения, замены или удаления."""
+    _leaderboard_refresh_flow_period(flow)
+    period_title = "неделю" if flow.get("period_type") == "week" else "месяц"
+    metric_title = LEADERBOARD_METRIC_TITLES.get(
+        flow.get("metric_type"), flow.get("metric_type") or "—"
+    )
+    text = (
+        "👤 <b>Выберите сотрудника</b>\n\n"
+        f"Период: <b>{period_title}</b>\n"
+        f"Даты: <b>{_leaderboard_date_range(flow['period_start'], flow['period_end'])}</b>\n"
+        f"Показатель: <b>{escape(metric_title)}</b>\n\n"
+        "Выберите конкретного участника. Можно изменить его показатель, "
+        "поменять место, заменить другим сотрудником или удалить с места. "
+        "Остальные данные рейтинга останутся без изменений."
+    )
+    await _leaderboard_replace_with_text(
+        query, context, text, kb_leaderboard_employee_picker(flow)
+    )
+
+
+async def _leaderboard_show_place_members(query, context, flow: dict, place: int):
+    """Карточка места со списком конкретных участников."""
+    members = _leaderboard_place_entries(flow, place)
+    lines = [
+        f"{LEADERBOARD_PLACE_EMOJIS[int(place)]} <b>{int(place)} место</b>",
+        "",
+        f"Участников: <b>{len(members)}/{LEADERBOARD_PLACE_MAX}</b>",
+        "",
+    ]
+    for entry in members:
+        lines.append(
+            f"• <b>{escape(entry['profile_name'])}</b> — "
+            f"{escape(entry['metric_display'])}"
+        )
+    lines.extend([
+        "",
+        "Нажмите на конкретного сотрудника, чтобы изменить показатель, "
+        "заменить его или удалить. Также можно добавить нового участника "
+        "на это место.",
+    ])
+    await _leaderboard_replace_with_text(
+        query,
+        context,
+        "\n".join(lines),
+        kb_leaderboard_place_members(flow, place),
+    )
+
+
+async def _leaderboard_reply_place_members(message, flow: dict, place: int):
+    members = _leaderboard_place_entries(flow, place)
+    lines = [
+        f"{LEADERBOARD_PLACE_EMOJIS[int(place)]} <b>{int(place)} место обновлено</b>",
+        "",
+        f"Участников: <b>{len(members)}/{LEADERBOARD_PLACE_MAX}</b>",
+    ]
+    for entry in members:
+        lines.append(
+            f"• <b>{escape(entry['profile_name'])}</b> — "
+            f"{escape(entry['metric_display'])}"
+        )
+    lines.extend([
+        "",
+        "Выберите конкретного участника для следующего изменения.",
+    ])
+    await message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_leaderboard_place_members(flow, place),
+    )
+
+
+_leaderboard_v7_previous_cb_help = cb_help
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+    v7_action = (
+        data.startswith("help:ldr:replace:")
+        or data.startswith("help:ldr:rpage:")
+        or data.startswith("help:ldr:rpick:")
+        or data.startswith("help:ldr:delete:")
+        or data.startswith("help:ldr:dapply:")
+    )
+    if not v7_action:
+        return await _leaderboard_v7_previous_cb_help(update, context)
+
+    if await deny_no_access(update, context):
+        return
+    if not await is_admin_scoped(update, context):
+        await _leaderboard_answer(query, "Только для администратора", show_alert=True)
+        return
+    await _leaderboard_answer(query)
+
+    flow = _leaderboard_flow(context)
+    if not flow or flow.get("mode") != "results" or not flow.get("entries"):
+        await _leaderboard_answer(
+            query,
+            "Редактируемый рейтинг не найден. Откройте его заново.",
+            show_alert=True,
+        )
+        return
+
+    if data.startswith("help:ldr:replace:"):
+        try:
+            source_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        source = _leaderboard_find_flow_entry(flow, source_id)
+        if not source:
+            await _leaderboard_answer(query, "Сотрудник не найден", show_alert=True)
+            return
+        flow["replacement_source_profile_id"] = source_id
+        flow.pop("pending_replacement", None)
+        flow["awaiting"] = "edit_replace_profile"
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "🔁 <b>Замена сотрудника</b>\n\n"
+            f"Сейчас на {int(source['place'])} месте: "
+            f"<b>{escape(source['profile_name'])}</b> — "
+            f"{escape(source['metric_display'])}.\n\n"
+            "Выберите сотрудника, который займёт это место. "
+            "После выбора бот запросит его новый показатель.",
+            kb_leaderboard_replacement_picker(flow, source_id, 0),
+        )
+        return
+
+    if data.startswith("help:ldr:rpage:"):
+        parts = data.split(":")
+        try:
+            source_id = int(parts[-2])
+            page = int(parts[-1])
+        except (IndexError, TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректная страница", show_alert=True)
+            return
+        source = _leaderboard_find_flow_entry(flow, source_id)
+        if not source:
+            await _leaderboard_answer(query, "Сотрудник не найден", show_alert=True)
+            return
+        flow["replacement_source_profile_id"] = source_id
+        flow["awaiting"] = "edit_replace_profile"
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "🔁 <b>Замена сотрудника</b>\n\n"
+            f"Выберите замену для <b>{escape(source['profile_name'])}</b>.",
+            kb_leaderboard_replacement_picker(flow, source_id, page),
+        )
+        return
+
+    if data.startswith("help:ldr:rpick:"):
+        parts = data.split(":")
+        try:
+            source_id = int(parts[-3])
+            replacement_id = int(parts[-2])
+        except (IndexError, TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        source = _leaderboard_find_flow_entry(flow, source_id)
+        replacement = db_profiles_get(replacement_id)
+        used = {int(item["profile_id"]) for item in flow.get("entries") or []}
+        if not source:
+            await _leaderboard_answer(query, "Заменяемый сотрудник не найден", show_alert=True)
+            return
+        if not replacement or replacement_id in used:
+            await _leaderboard_answer(
+                query,
+                "Этот сотрудник уже участвует в рейтинге или недоступен",
+                show_alert=True,
+            )
+            return
+        flow["replacement_source_profile_id"] = source_id
+        flow["pending_replacement"] = {
+            "profile_id": replacement_id,
+            "profile_name": replacement["full_name"],
+            "place": int(source["place"]),
+        }
+        flow["awaiting"] = "edit_replace_metric_value"
+        example = "850000" if flow.get("metric_type") == "mrr" else "48"
+        mrr_note = (
+            f"{LEADERBOARD_MRR_NOTE_HTML}\n\n"
+            if flow.get("metric_type") == "mrr"
+            else ""
+        )
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "📊 <b>Показатель нового сотрудника</b>\n\n"
+            f"Заменяем: <b>{escape(source['profile_name'])}</b>\n"
+            f"Новый сотрудник: <b>{escape(replacement['full_name'])}</b>\n"
+            f"Место: <b>{int(source['place'])}</b>\n\n"
+            f"{mrr_note}"
+            f"Отправьте значение одним сообщением. Например: <code>{example}</code>",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"help:ldr:replace:{source_id}",
+                )
+            ]]),
+        )
+        return
+
+    if data.startswith("help:ldr:delete:"):
+        try:
+            profile_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        entry = _leaderboard_find_flow_entry(flow, profile_id)
+        if not entry:
+            await _leaderboard_answer(query, "Сотрудник не найден", show_alert=True)
+            return
+        place = int(entry["place"])
+        members = _leaderboard_place_entries(flow, place)
+        if len(members) <= 1:
+            await _leaderboard_answer(
+                query,
+                "Нельзя удалить единственного сотрудника с места. Используйте замену.",
+                show_alert=True,
+            )
+            return
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "⚠️ <b>Удаление сотрудника с места</b>\n\n"
+            f"Удалить <b>{escape(entry['profile_name'])}</b> "
+            f"с <b>{place} места</b>?\n\n"
+            f"После удаления на месте останется сотрудников: <b>{len(members) - 1}</b>. "
+            "Остальные результаты не изменятся.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "✅ Удалить с места",
+                    callback_data=f"help:ldr:dapply:{profile_id}",
+                )],
+                [InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"help:settings:leaders:edit_employee:{profile_id}",
+                )],
+            ]),
+        )
+        return
+
+    if data.startswith("help:ldr:dapply:"):
+        try:
+            profile_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        entry = _leaderboard_find_flow_entry(flow, profile_id)
+        if not entry:
+            await _leaderboard_answer(query, "Сотрудник уже отсутствует", show_alert=True)
+            return
+        place = int(entry["place"])
+        if len(_leaderboard_place_entries(flow, place)) <= 1:
+            await _leaderboard_answer(
+                query,
+                "Нельзя удалить единственного сотрудника с места",
+                show_alert=True,
+            )
+            return
+        removed_name = entry["profile_name"]
+        flow["entries"] = [
+            item for item in flow.get("entries") or []
+            if int(item.get("profile_id") or 0) != profile_id
+        ]
+        _leaderboard_sort_flow_entries(flow)
+        flow.pop("editing_profile_id", None)
+        flow.pop("replacement_source_profile_id", None)
+        flow.pop("pending_replacement", None)
+        flow["editing_place"] = place
+        flow["awaiting"] = "edit_place_members"
+        await _leaderboard_show_place_members(query, context, flow, place)
+        return
+
+    return await _leaderboard_v7_previous_cb_help(update, context)
+
+
+_leaderboard_v7_previous_on_text = on_text
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    flow = _leaderboard_flow(context)
+    if (
+        not flow
+        or flow.get("mode") != "results"
+        or flow.get("awaiting") != "edit_replace_metric_value"
+    ):
+        return await _leaderboard_v7_previous_on_text(update, context)
+    if not update.message or not update.effective_user:
+        return
+    if not await is_admin_scoped(update, context):
+        return await _leaderboard_v7_previous_on_text(update, context)
+
+    try:
+        source_id = int(flow.get("replacement_source_profile_id") or 0)
+    except (TypeError, ValueError):
+        source_id = 0
+    source = _leaderboard_find_flow_entry(flow, source_id)
+    pending = flow.get("pending_replacement") or {}
+    try:
+        replacement_id = int(pending.get("profile_id") or 0)
+    except (TypeError, ValueError):
+        replacement_id = 0
+
+    used_except_source = {
+        int(item["profile_id"])
+        for item in flow.get("entries") or []
+        if int(item.get("profile_id") or 0) != source_id
+    }
+    if not source or not replacement_id or replacement_id in used_except_source:
+        flow.pop("replacement_source_profile_id", None)
+        flow.pop("pending_replacement", None)
+        flow["awaiting"] = "preview"
+        await update.message.reply_text(
+            "Не удалось выполнить замену: состав рейтинга изменился. "
+            "Откройте сотрудника и повторите действие."
+        )
+        await _leaderboard_send_admin_preview(context, update.message.chat_id, flow)
+        return
+
+    value = _leaderboard_parse_value(flow["metric_type"], update.message.text or "")
+    if value is None:
+        example = "850000" if flow.get("metric_type") == "mrr" else "48"
+        await update.message.reply_text(
+            f"Введите целое неотрицательное число. Например: {example}"
+        )
+        return
+
+    old_name = source["profile_name"]
+    place = int(source["place"])
+    source["profile_id"] = replacement_id
+    source["profile_name"] = pending.get("profile_name") or "Сотрудник"
+    source["metric_value"] = int(value)
+    source["metric_display"] = _leaderboard_metric_display(
+        flow["metric_type"], int(value)
+    )
+    _leaderboard_sort_flow_entries(flow)
+
+    new_name = source["profile_name"]
+    flow.pop("editing_profile_id", None)
+    flow.pop("replacement_source_profile_id", None)
+    flow.pop("pending_replacement", None)
+    flow["editing_place"] = place
+    flow["awaiting"] = "edit_place_members"
+    await update.message.reply_text(
+        f"✅ {old_name} заменён на {new_name} на {place} месте."
+    )
+    await _leaderboard_reply_place_members(update.message, flow, place)
+
+# ================= END TEAM LEADERS / LEADERBOARDS V7 =================
 
 def main():
     ensure_db_path(DB_PATH)
