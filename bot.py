@@ -30165,7 +30165,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = (
                 "🏆 <b>Результаты скоро появятся</b>\n\n"
-                "Администратор ещё не опубликовал рейтинг за выбранный период."
+                "Администратор ещё не сохранил рейтинг за выбранный период."
             )
         await _leaderboard_replace_with_text(
             query,
@@ -30553,6 +30553,577 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ================= END TEAM LEADERS / LEADERBOARDS V1 =================
+
+# =================== TEAM LEADERS / LEADERBOARDS V2 ===================
+# Сохранение результатов и рассылка разделены:
+# - «Сохранить» сразу делает результат доступным сотрудникам;
+# - сохранённый результат можно повторно открыть и отредактировать;
+# - рассылка запускается отдельной кнопкой в любой удобный момент.
+
+BUILD_VERSION = "TEAM-LEADERS-2026-07-30-V2-SAVE-SEPARATE"
+
+
+# ---------- DB migrations and delivery history ----------
+_leaderboard_v2_previous_db_init = db_init
+
+
+def db_init():
+    _leaderboard_v2_previous_db_init()
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS leaderboard_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                leaderboard_id INTEGER NOT NULL,
+                sent_by INTEGER,
+                sent_at TEXT NOT NULL,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(leaderboard_id) REFERENCES leaderboards(id) ON DELETE CASCADE
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_leaderboard_deliveries_board_time "
+            "ON leaderboard_deliveries(leaderboard_id, sent_at DESC, id DESC)"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _leaderboard_validate_flow(flow: dict):
+    entries = list(flow.get("entries") or [])
+    if len(entries) != 5:
+        raise ValueError("Для сохранения требуется ровно пять сотрудников")
+    profile_ids = [int(item["profile_id"]) for item in entries]
+    if len(set(profile_ids)) != 5:
+        raise ValueError("Сотрудники в рейтинге не должны повторяться")
+    if flow.get("period_type") not in LEADERBOARD_PERIOD_TITLES:
+        raise ValueError("Некорректный период")
+    if flow.get("metric_type") not in LEADERBOARD_METRIC_TITLES:
+        raise ValueError("Некорректное направление")
+    if not (flow.get("congratulation_html") or "").strip():
+        raise ValueError("Поздравительный текст не заполнен")
+
+
+def db_leaderboard_save(flow: dict, saved_by: int | None) -> int:
+    """Создаёт результат или обновляет ранее сохранённый без выполнения рассылки."""
+    _leaderboard_validate_flow(flow)
+    entries = list(flow.get("entries") or [])
+    media = flow.get("media") or {}
+    leaderboard_id = flow.get("leaderboard_id")
+    now = datetime.utcnow().isoformat()
+
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("PRAGMA foreign_keys=ON")
+        cur = con.cursor()
+        cur.execute("BEGIN")
+
+        if leaderboard_id:
+            cur.execute("SELECT 1 FROM leaderboards WHERE id=?", (int(leaderboard_id),))
+            if not cur.fetchone():
+                raise ValueError("Сохраняемый результат не найден")
+            cur.execute(
+                """
+                UPDATE leaderboards
+                SET period_type=?, period_start=?, period_end=?, metric_type=?,
+                    congratulation_html=?, media_type=?, media_file_id=?, media_file_name=?,
+                    status='published', published_at=?
+                WHERE id=?
+                """,
+                (
+                    flow["period_type"],
+                    flow["period_start"],
+                    flow["period_end"],
+                    flow["metric_type"],
+                    flow["congratulation_html"],
+                    media.get("kind"),
+                    media.get("file_id"),
+                    media.get("file_name"),
+                    now,
+                    int(leaderboard_id),
+                ),
+            )
+            cur.execute(
+                "DELETE FROM leaderboard_entries WHERE leaderboard_id=?",
+                (int(leaderboard_id),),
+            )
+            result_id = int(leaderboard_id)
+        else:
+            cur.execute(
+                """
+                INSERT INTO leaderboards(
+                    period_type, period_start, period_end, metric_type,
+                    congratulation_html, media_type, media_file_id, media_file_name,
+                    status, created_by, created_at, published_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'published', ?, ?, ?)
+                """,
+                (
+                    flow["period_type"],
+                    flow["period_start"],
+                    flow["period_end"],
+                    flow["metric_type"],
+                    flow["congratulation_html"],
+                    media.get("kind"),
+                    media.get("file_id"),
+                    media.get("file_name"),
+                    int(saved_by) if saved_by else None,
+                    now,
+                    now,
+                ),
+            )
+            result_id = int(cur.lastrowid)
+
+        for place, entry in enumerate(entries, start=1):
+            value = int(entry["metric_value"])
+            cur.execute(
+                """
+                INSERT INTO leaderboard_entries(
+                    leaderboard_id, profile_id, profile_name, place,
+                    metric_value, metric_display
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result_id,
+                    int(entry["profile_id"]),
+                    entry["profile_name"],
+                    place,
+                    value,
+                    _leaderboard_metric_display(flow["metric_type"], value),
+                ),
+            )
+
+        con.commit()
+        return result_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def db_leaderboard_record_delivery(
+    leaderboard_id: int,
+    sent_by: int | None,
+    success_count: int,
+    failure_count: int,
+):
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute(
+            """
+            INSERT INTO leaderboard_deliveries(
+                leaderboard_id, sent_by, sent_at, success_count, failure_count
+            ) VALUES(?, ?, ?, ?, ?)
+            """,
+            (
+                int(leaderboard_id),
+                int(sent_by) if sent_by else None,
+                datetime.utcnow().isoformat(),
+                max(0, int(success_count)),
+                max(0, int(failure_count)),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def db_leaderboard_last_delivery(leaderboard_id: int) -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT sent_at, success_count, failure_count
+            FROM leaderboard_deliveries
+            WHERE leaderboard_id=?
+            ORDER BY sent_at DESC, id DESC
+            LIMIT 1
+            """,
+            (int(leaderboard_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "sent_at": row[0],
+            "success_count": int(row[1]),
+            "failure_count": int(row[2]),
+        }
+    finally:
+        con.close()
+
+
+def _leaderboard_item_to_flow(item: dict) -> dict:
+    return {
+        "leaderboard_id": int(item["id"]),
+        "period_type": item["period_type"],
+        "period_start": item["period_start"],
+        "period_end": item["period_end"],
+        "metric_type": item["metric_type"],
+        "congratulation_html": item.get("congratulation_html") or "",
+        "entries": [
+            {
+                "profile_id": int(entry["profile_id"]),
+                "profile_name": entry["profile_name"],
+                "metric_value": int(entry["metric_value"]),
+                "metric_display": _leaderboard_metric_display(
+                    item["metric_type"], int(entry["metric_value"])
+                ),
+            }
+            for entry in sorted(item.get("entries") or [], key=lambda value: int(value.get("place") or 0))
+        ],
+        "media": (
+            {
+                "kind": item.get("media_type"),
+                "file_id": item.get("media_file_id"),
+                "file_name": item.get("media_file_name"),
+            }
+            if item.get("media_file_id")
+            else None
+        ),
+        "awaiting": "preview",
+        "after_text": "preview",
+    }
+
+
+def _leaderboard_item_files(item: dict) -> list[dict]:
+    if not item.get("media_file_id"):
+        return []
+    return [{
+        "kind": item.get("media_type") or "document",
+        "file_id": item["media_file_id"],
+        "file_name": item.get("media_file_name"),
+    }]
+
+
+def _leaderboard_delivery_text(leaderboard_id: int) -> str:
+    delivery = db_leaderboard_last_delivery(leaderboard_id)
+    if not delivery:
+        return "Рассылка: <b>ещё не выполнялась</b>"
+    try:
+        sent_at = datetime.fromisoformat(delivery["sent_at"]).strftime("%d.%m.%Y %H:%M")
+    except (TypeError, ValueError):
+        sent_at = delivery["sent_at"]
+    return (
+        f"Последняя рассылка: <b>{escape(sent_at)}</b>\n"
+        f"Доставлено: <b>{delivery['success_count']}</b> · "
+        f"Ошибок: <b>{delivery['failure_count']}</b>"
+    )
+
+
+# ---------- Updated keyboards ----------
+def kb_leaderboard_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚡ Неделя · MRR", callback_data="help:settings:leaders:new:w:mrr"),
+            InlineKeyboardButton("🎯 Неделя · Лиды", callback_data="help:settings:leaders:new:w:leads"),
+        ],
+        [
+            InlineKeyboardButton("💰 Месяц · MRR", callback_data="help:settings:leaders:new:m:mrr"),
+            InlineKeyboardButton("📈 Месяц · Лиды", callback_data="help:settings:leaders:new:m:leads"),
+        ],
+        [InlineKeyboardButton("🗂 Сохранённые результаты", callback_data="help:settings:leaders:history")],
+        [InlineKeyboardButton("⬅️ Управление ботом", callback_data="help:settings")],
+    ])
+
+
+def kb_leaderboard_preview() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Изменить текст", callback_data="help:settings:leaders:edit_text"),
+            InlineKeyboardButton("👥 Изменить лидеров", callback_data="help:settings:leaders:edit_people"),
+        ],
+        [
+            InlineKeyboardButton("📎 Заменить вложение", callback_data="help:settings:leaders:replace_media"),
+            InlineKeyboardButton("🗑 Убрать вложение", callback_data="help:settings:leaders:remove_media"),
+        ],
+        [InlineKeyboardButton("💾 Сохранить результаты", callback_data="help:settings:leaders:ready")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:leaders:cancel")],
+    ])
+
+
+def kb_leaderboard_final_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💾 Сохранить результаты", callback_data="help:settings:leaders:send")],
+        [InlineKeyboardButton("⬅️ Вернуться к проверке", callback_data="help:settings:leaders:preview")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:leaders:cancel")],
+    ])
+
+
+def kb_leaderboard_history(items: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for item in items:
+        period = "Неделя" if item["period_type"] == "week" else "Месяц"
+        metric = LEADERBOARD_METRIC_TITLES.get(item["metric_type"], item["metric_type"])
+        rows.append([InlineKeyboardButton(
+            f"🏆 {period} · {metric} · {_leaderboard_date_range(item['period_start'], item['period_end'])}",
+            callback_data=f"help:settings:leaders:history_open:{int(item['id'])}",
+        )])
+    rows.append([InlineKeyboardButton("⬅️ К результатам команды", callback_data="help:settings:leaders")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_leaderboard_saved(item: dict) -> InlineKeyboardMarkup:
+    item_id = int(item["id"])
+    period_short = "w" if item["period_type"] == "week" else "m"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🏆 Открыть для сотрудников",
+            callback_data=f"help:team:leaders:{period_short}:{item['metric_type']}",
+        )],
+        [
+            InlineKeyboardButton("✏️ Редактировать", callback_data=f"help:settings:leaders:edit:{item_id}"),
+            InlineKeyboardButton("📣 Выполнить рассылку", callback_data=f"help:settings:leaders:broadcast_confirm:{item_id}"),
+        ],
+        [InlineKeyboardButton("🗂 Сохранённые результаты", callback_data="help:settings:leaders:history")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
+    ])
+
+
+def kb_leaderboard_history_item(item: dict) -> InlineKeyboardMarkup:
+    item_id = int(item["id"])
+    rows = []
+    if item.get("media_file_id"):
+        rows.append([InlineKeyboardButton(
+            "📎 Открыть вложение",
+            callback_data=f"help:team:leaders:file:{item_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton("✏️ Редактировать", callback_data=f"help:settings:leaders:edit:{item_id}"),
+        InlineKeyboardButton("📣 Рассылка", callback_data=f"help:settings:leaders:broadcast_confirm:{item_id}"),
+    ])
+    rows.append([InlineKeyboardButton("⬅️ К сохранённым", callback_data="help:settings:leaders:history")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_leaderboard_broadcast_confirm(item_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "📣 Отправить во все рабочие чаты",
+            callback_data=f"help:settings:leaders:broadcast_send:{int(item_id)}",
+        )],
+        [InlineKeyboardButton(
+            "⬅️ К результату",
+            callback_data=f"help:settings:leaders:history_open:{int(item_id)}",
+        )],
+    ])
+
+
+# ---------- Callback override ----------
+_leaderboard_v2_previous_cb_help = cb_help
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+
+    intercepted = (
+        data == "help:settings:leaders"
+        or data == "help:settings:leaders:history"
+        or data == "help:settings:leaders:ready"
+        or data == "help:settings:leaders:send"
+        or data.startswith("help:settings:leaders:history_open:")
+        or data.startswith("help:settings:leaders:edit:")
+        or data.startswith("help:settings:leaders:broadcast_confirm:")
+        or data.startswith("help:settings:leaders:broadcast_send:")
+    )
+    if not intercepted:
+        return await _leaderboard_v2_previous_cb_help(update, context)
+
+    if await deny_no_access(update, context):
+        return
+    if not await is_admin_scoped(update, context):
+        await _leaderboard_answer(query, "Только для администратора", show_alert=True)
+        return
+    await _leaderboard_answer(query)
+
+    if data == "help:settings:leaders":
+        _leaderboard_clear_flow(context)
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "🏆 <b>Результаты команды</b>\n\n"
+            "Создайте или откройте сохранённый результат. После сохранения он сразу "
+            "появится у сотрудников в разделе «Наша команда → Лидеры команды».\n\n"
+            "Рассылка выполняется отдельно — только когда администратор нажмёт соответствующую кнопку.",
+            kb_leaderboard_admin_menu(),
+        )
+        return
+
+    if data == "help:settings:leaders:history":
+        items = db_leaderboards_history(30)
+        text = (
+            "🗂 <b>Сохранённые результаты</b>\n\n"
+            "Откройте результат, чтобы посмотреть, отредактировать или выполнить рассылку."
+            if items else
+            "🗂 <b>Сохранённые результаты</b>\n\nРезультатов пока нет."
+        )
+        await _leaderboard_replace_with_text(query, context, text, kb_leaderboard_history(items))
+        return
+
+    if data.startswith("help:settings:leaders:history_open:"):
+        try:
+            item_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный результат", show_alert=True)
+            return
+        item = db_leaderboard_get(item_id)
+        if not item:
+            await _leaderboard_answer(query, "Результат не найден", show_alert=True)
+            return
+        text = (
+            f"{build_leaderboard_html(item)}\n\n"
+            f"<blockquote>{_leaderboard_delivery_text(item_id)}</blockquote>"
+        )
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            text,
+            kb_leaderboard_history_item(item),
+        )
+        return
+
+    if data.startswith("help:settings:leaders:edit:"):
+        try:
+            item_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный результат", show_alert=True)
+            return
+        item = db_leaderboard_get(item_id)
+        if not item:
+            await _leaderboard_answer(query, "Результат не найден", show_alert=True)
+            return
+        context.user_data[LEADERBOARD_FLOW_KEY] = _leaderboard_item_to_flow(item)
+        await _leaderboard_send_admin_preview(context, query.message.chat_id, context.user_data[LEADERBOARD_FLOW_KEY], query.message)
+        return
+
+    if data == "help:settings:leaders:ready":
+        flow = _leaderboard_flow(context)
+        if not flow or len(flow.get("entries") or []) != 5 or not flow.get("congratulation_html"):
+            await _leaderboard_answer(query, "Результат заполнен не полностью", show_alert=True)
+            return
+        await _leaderboard_delete_preview_media(context, query.message.chat_id)
+        media_label = "Без вложения"
+        if flow.get("media"):
+            media_label = "Фото" if flow["media"].get("kind") == "photo" else "Файл"
+        action = "Обновление" if flow.get("leaderboard_id") else "Новый результат"
+        summary = (
+            "💾 <b>Готово к сохранению</b>\n\n"
+            f"Действие: <b>{action}</b>\n"
+            f"Период: <b>{'Неделя' if flow['period_type'] == 'week' else 'Месяц'}</b>\n"
+            f"Направление: <b>{escape(LEADERBOARD_METRIC_TITLES[flow['metric_type']])}</b>\n"
+            "Лидеров: <b>5</b>\n"
+            f"Вложение: <b>{media_label}</b>\n\n"
+            "После сохранения результат сразу станет доступен сотрудникам. "
+            "Сообщения в рабочие чаты отправлены не будут."
+        )
+        await _leaderboard_replace_with_text(query, context, summary, kb_leaderboard_final_confirm())
+        return
+
+    if data == "help:settings:leaders:send":
+        flow = _leaderboard_flow(context)
+        if not flow or len(flow.get("entries") or []) != 5 or not flow.get("congratulation_html"):
+            await _leaderboard_answer(query, "Результат заполнен не полностью", show_alert=True)
+            return
+        final_html = build_leaderboard_html(_leaderboard_flow_as_item(flow))
+        if len(_html_plain_text(final_html)) > 4000:
+            await _leaderboard_answer(query, "Итоговый текст слишком длинный. Сократите поздравление.", show_alert=True)
+            return
+        try:
+            item_id = db_leaderboard_save(
+                flow,
+                update.effective_user.id if update.effective_user else None,
+            )
+            item = db_leaderboard_get(item_id)
+        except Exception as exc:
+            logger.exception("Cannot save team leaderboard: %s", exc)
+            await _leaderboard_answer(query, "Не удалось сохранить результаты. Проверьте журнал ошибок.", show_alert=True)
+            return
+        _leaderboard_clear_flow(context)
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "✅ <b>Результаты сохранены</b>\n\n"
+            f"Номер результата: <b>#{item_id}</b>\n\n"
+            "Результат уже доступен сотрудникам. Рассылка не выполнялась.",
+            kb_leaderboard_saved(item),
+        )
+        return
+
+    if data.startswith("help:settings:leaders:broadcast_confirm:"):
+        try:
+            item_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный результат", show_alert=True)
+            return
+        item = db_leaderboard_get(item_id)
+        if not item:
+            await _leaderboard_answer(query, "Результат не найден", show_alert=True)
+            return
+        chats_count = len(db_list_chats())
+        text = (
+            "📣 <b>Подтверждение рассылки</b>\n\n"
+            f"Результат: <b>#{item_id}</b>\n"
+            f"Период: <b>{'Неделя' if item['period_type'] == 'week' else 'Месяц'}</b>\n"
+            f"Направление: <b>{escape(LEADERBOARD_METRIC_TITLES[item['metric_type']])}</b>\n"
+            f"Рабочих чатов: <b>{chats_count}</b>\n\n"
+            "Сохранённые данные изменены не будут. Будет выполнена только рассылка текущей версии результата."
+        )
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            text,
+            kb_leaderboard_broadcast_confirm(item_id),
+        )
+        return
+
+    if data.startswith("help:settings:leaders:broadcast_send:"):
+        try:
+            item_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный результат", show_alert=True)
+            return
+        item = db_leaderboard_get(item_id)
+        if not item:
+            await _leaderboard_answer(query, "Результат не найден", show_alert=True)
+            return
+        message_html = build_leaderboard_html(item)
+        if len(_html_plain_text(message_html)) > 4000:
+            await _leaderboard_answer(query, "Итоговый текст слишком длинный для рассылки.", show_alert=True)
+            return
+        try:
+            ok, fail = await broadcast_to_chats(context, message_html, _leaderboard_item_files(item))
+            db_leaderboard_record_delivery(
+                item_id,
+                update.effective_user.id if update.effective_user else None,
+                ok,
+                fail,
+            )
+        except Exception as exc:
+            logger.exception("Cannot broadcast saved team leaderboard: %s", exc)
+            await _leaderboard_answer(query, "Не удалось выполнить рассылку. Проверьте журнал ошибок.", show_alert=True)
+            return
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "✅ <b>Рассылка завершена</b>\n\n"
+            f"Успешно отправлено: <b>{ok}</b>\n"
+            f"Ошибок: <b>{fail}</b>\n"
+            f"Результат: <b>#{item_id}</b>\n\n"
+            "Сохранённый результат остался доступен сотрудникам и может быть отредактирован или отправлен повторно.",
+            kb_leaderboard_saved(item),
+        )
+        return
+
+    return await _leaderboard_v2_previous_cb_help(update, context)
+
+# ================= END TEAM LEADERS / LEADERBOARDS V2 =================
 
 def main():
     ensure_db_path(DB_PATH)
