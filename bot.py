@@ -9315,7 +9315,107 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def _delete_help_command_immediately(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """
+    Сразу удаляет /help из группы.
+
+    Обычная команда удаляется через deleteMessage, а ephemeral-команда —
+    через новый метод deleteEphemeralMessage. В личном чате команда остаётся.
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.effective_message
+    if not chat or chat.type not in ("group", "supergroup"):
+        return False
+
+    ephemeral_message_id = _incoming_ephemeral_message_id(update)
+    if ephemeral_message_id:
+        # Для команды user -> bot полем receiver_user обычно является сам бот.
+        # Новая версия Bot API может оказаться новее установленного PTB,
+        # поэтому извлекаем receiver_user и из обычного атрибута, и из api_kwargs.
+        receiver_ids: list[int] = []
+        receiver_user = getattr(message, "receiver_user", None) if message else None
+        receiver_id = getattr(receiver_user, "id", None)
+        if receiver_id:
+            receiver_ids.append(int(receiver_id))
+
+        api_kwargs = getattr(message, "api_kwargs", None) or {} if message else {}
+        raw_receiver = api_kwargs.get("receiver_user")
+        if isinstance(raw_receiver, dict) and raw_receiver.get("id"):
+            receiver_ids.append(int(raw_receiver["id"]))
+
+        # Основной резерв для входящей ephemeral-команды — Telegram ID бота.
+        if getattr(context.bot, "id", None):
+            receiver_ids.append(int(context.bot.id))
+        # Некоторые реализации API адресуют удаление клиенту отправителя.
+        if user:
+            receiver_ids.append(int(user.id))
+
+        seen: set[int] = set()
+        for receiver_user_id in receiver_ids:
+            if receiver_user_id in seen:
+                continue
+            seen.add(receiver_user_id)
+            try:
+                await _telegram_bot_api_json(
+                    "deleteEphemeralMessage",
+                    {
+                        "chat_id": int(chat.id),
+                        "receiver_user_id": int(receiver_user_id),
+                        "ephemeral_message_id": int(ephemeral_message_id),
+                    },
+                )
+                logger.info(
+                    "Deleted ephemeral /help command: chat_id=%s sender_user_id=%s receiver_user_id=%s ephemeral_message_id=%s",
+                    chat.id,
+                    getattr(user, "id", None),
+                    receiver_user_id,
+                    ephemeral_message_id,
+                )
+                return True
+            except Exception:
+                logger.warning(
+                    "deleteEphemeralMessage failed: chat_id=%s receiver_user_id=%s ephemeral_message_id=%s",
+                    chat.id,
+                    receiver_user_id,
+                    ephemeral_message_id,
+                    exc_info=True,
+                )
+
+        # На случай клиента/прокси, который передал оба идентификатора,
+        # ниже пробуем стандартное удаление по message_id.
+
+    message_id = getattr(message, "message_id", None) if message else None
+    if message_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=int(chat.id),
+                message_id=int(message_id),
+            )
+            logger.info(
+                "Deleted regular /help command: chat_id=%s user_id=%s message_id=%s",
+                chat.id,
+                getattr(user, "id", None),
+                message_id,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Could not delete /help command: chat_id=%s message_id=%s",
+                chat.id,
+                message_id,
+            )
+    return False
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Удаляем команду до проверок доступа и построения меню, чтобы она не
+    # успела остаться в истории чата ни в обычном, ни в ephemeral-режиме.
+    await _delete_help_command_immediately(update, context)
+
     logger.info(
         "Received /help: chat_id=%s user_id=%s ephemeral_message_id=%s",
         getattr(update.effective_chat, "id", None),
@@ -36453,7 +36553,7 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= END TEAM LEADERS / LEADERBOARDS V8 =================
 
-BUILD_VERSION = "HELP-DM-ONLY-ONBOARDING-2026-07-30-V30"
+BUILD_VERSION = "HELP-DM-DELETE-COMMAND-2026-07-30-V31"
 
 def main():
     ensure_db_path(DB_PATH)
