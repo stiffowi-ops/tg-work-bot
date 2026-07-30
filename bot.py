@@ -7516,6 +7516,396 @@ async def _telegram_bot_api_json(method: str, payload: dict):
     return data.get("result")
 
 
+
+
+def _telegram_parse_mode_value(parse_mode) -> str | None:
+    """Возвращает строковое значение parse_mode для прямого Bot API."""
+    if parse_mode is None:
+        return None
+    return str(getattr(parse_mode, "value", parse_mode))
+
+
+def _telegram_markup_dict(reply_markup) -> dict | None:
+    if reply_markup is None:
+        return None
+    if hasattr(reply_markup, "to_dict"):
+        return reply_markup.to_dict()
+    return reply_markup
+
+
+def _is_group_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(chat and chat.type in ("group", "supergroup"))
+
+
+def _incoming_ephemeral_message_id(update: Update) -> int | None:
+    """
+    Возвращает ephemeral_message_id входящей приватной команды.
+
+    python-telegram-bot может ещё не иметь отдельного атрибута для поля из
+    нового Bot API, поэтому дополнительно читаем ``api_kwargs``.
+    """
+    message = update.effective_message
+    if not message:
+        return None
+
+    raw = getattr(message, "ephemeral_message_id", None)
+    if raw is None:
+        api_kwargs = getattr(message, "api_kwargs", None) or {}
+        raw = api_kwargs.get("ephemeral_message_id")
+
+    if raw is None:
+        # Последний совместимый резерв для версий PTB, которые сохраняют
+        # неизвестное поле только при сериализации объекта.
+        try:
+            raw = (message.to_dict() or {}).get("ephemeral_message_id")
+        except Exception:
+            raw = None
+
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _apply_ephemeral_trigger(
+    payload: dict,
+    update: Update,
+    receiver_user_id: int,
+) -> bool:
+    """Привязывает ответ к входящей ephemeral-команде или callback query."""
+    query = update.callback_query
+    if query and query.id and query.from_user and int(query.from_user.id) == int(receiver_user_id):
+        payload["callback_query_id"] = str(query.id)
+        return True
+
+    user = update.effective_user
+    ephemeral_message_id = _incoming_ephemeral_message_id(update)
+    if user and int(user.id) == int(receiver_user_id) and ephemeral_message_id:
+        payload["reply_parameters"] = {
+            "ephemeral_message_id": int(ephemeral_message_id),
+        }
+        return True
+    return False
+
+
+async def _send_ephemeral_api(
+    method: str,
+    payload: dict,
+    *,
+    trigger_attached: bool,
+):
+    """
+    Сначала отвечает на конкретную ephemeral-команду. Если окно ответа уже
+    закрылось, повторяет отправку без trigger-поля — это разрешено боту-админу.
+    """
+    try:
+        return await _telegram_bot_api_json(method, payload)
+    except Exception:
+        if not trigger_attached:
+            raise
+        retry_payload = dict(payload)
+        retry_payload.pop("callback_query_id", None)
+        retry_payload.pop("reply_parameters", None)
+        logger.warning(
+            "Retrying %s ephemeral response without trigger; bot must be chat admin",
+            method,
+            exc_info=True,
+        )
+        return await _telegram_bot_api_json(method, retry_payload)
+
+
+def bot_private_deep_link(context: ContextTypes.DEFAULT_TYPE, parameter: str) -> str:
+    """Формирует deep-link в личный чат с ботом."""
+    username = (context.bot.username or "blablabird_bot").lstrip("@")
+    safe_parameter = re.sub(r"[^A-Za-z0-9_-]", "_", parameter or "")[:64]
+    return f"https://t.me/{username}?start={safe_parameter}"
+
+
+async def send_ephemeral_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    parse_mode=ParseMode.HTML,
+    reply_markup=None,
+    disable_web_page_preview: bool = True,
+    receiver_user_id: int | None = None,
+):
+    """Отправляет сообщение в группе только одному пользователю."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return None
+
+    payload: dict = {
+        "chat_id": int(chat.id),
+        "receiver_user_id": int(receiver_user_id or user.id),
+        "text": text,
+    }
+    mode = _telegram_parse_mode_value(parse_mode)
+    if mode:
+        payload["parse_mode"] = mode
+    if disable_web_page_preview:
+        payload["link_preview_options"] = {"is_disabled": True}
+    markup = _telegram_markup_dict(reply_markup)
+    if markup:
+        payload["reply_markup"] = markup
+
+    message = update.effective_message
+    thread_id = getattr(message, "message_thread_id", None) if message else None
+    if thread_id:
+        payload["message_thread_id"] = int(thread_id)
+
+    trigger_attached = _apply_ephemeral_trigger(
+        payload,
+        update,
+        int(receiver_user_id or user.id),
+    )
+    return await _send_ephemeral_api(
+        "sendMessage",
+        payload,
+        trigger_attached=trigger_attached,
+    )
+
+
+async def send_ephemeral_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    photo_file_id: str,
+    caption: str,
+    *,
+    parse_mode=ParseMode.HTML,
+):
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return None
+    payload: dict = {
+        "chat_id": int(chat.id),
+        "receiver_user_id": int(user.id),
+        "photo": photo_file_id,
+        "caption": caption,
+    }
+    mode = _telegram_parse_mode_value(parse_mode)
+    if mode:
+        payload["parse_mode"] = mode
+    message = update.effective_message
+    thread_id = getattr(message, "message_thread_id", None) if message else None
+    if thread_id:
+        payload["message_thread_id"] = int(thread_id)
+    trigger_attached = _apply_ephemeral_trigger(payload, update, int(user.id))
+    return await _send_ephemeral_api(
+        "sendPhoto",
+        payload,
+        trigger_attached=trigger_attached,
+    )
+
+
+async def send_ephemeral_document(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    document_file_id: str,
+    caption: str,
+    *,
+    parse_mode=ParseMode.HTML,
+):
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return None
+    payload: dict = {
+        "chat_id": int(chat.id),
+        "receiver_user_id": int(user.id),
+        "document": document_file_id,
+        "caption": caption,
+    }
+    mode = _telegram_parse_mode_value(parse_mode)
+    if mode:
+        payload["parse_mode"] = mode
+    message = update.effective_message
+    thread_id = getattr(message, "message_thread_id", None) if message else None
+    if thread_id:
+        payload["message_thread_id"] = int(thread_id)
+    trigger_attached = _apply_ephemeral_trigger(payload, update, int(user.id))
+    return await _send_ephemeral_api(
+        "sendDocument",
+        payload,
+        trigger_attached=trigger_attached,
+    )
+
+
+
+
+async def deny_no_access_for_private_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Проверяет доступ, не публикуя отказ в общем чате."""
+    user = update.effective_user
+    if not user:
+        return True
+    if await is_member_of_access_chat(int(user.id), context):
+        return False
+    try:
+        if _is_group_chat(update):
+            await send_ephemeral_text(
+                update,
+                context,
+                NO_ACCESS_TEXT,
+                parse_mode=None,
+            )
+        elif update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=NO_ACCESS_TEXT,
+            )
+    except Exception:
+        logger.exception("Could not send private access denial")
+    return True
+
+async def send_private_or_ephemeral_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    parse_mode=ParseMode.HTML,
+    reply_markup=None,
+    disable_web_page_preview: bool = True,
+):
+    """В группе отвечает приватно, в личке — обычным сообщением."""
+    if _is_group_chat(update):
+        return await send_ephemeral_text(
+            update,
+            context,
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview,
+        )
+    if not update.effective_chat:
+        return None
+    return await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_web_page_preview=disable_web_page_preview,
+    )
+
+
+def profile_needs_onboarding(profile: dict | None) -> bool:
+    if not profile:
+        return True
+    required = (
+        profile.get("full_name"),
+        profile.get("year_start"),
+        profile.get("city"),
+        profile.get("about"),
+        profile.get("topics"),
+        profile.get("tg_link"),
+    )
+    return not all(required)
+
+
+async def configure_ephemeral_commands(application: Application):
+    """
+    В рабочем чате оставляет только приватную команду /help.
+
+    /profile и /docs продолжают работать в личной переписке с ботом, но больше
+    не публикуются в меню команд рабочего чата и не объявляются ephemeral.
+    """
+    commands = [
+        {
+            "command": "help",
+            "description": "Открыть Помогатор в ЛС",
+            "is_ephemeral": True,
+        },
+    ]
+    try:
+        await _telegram_bot_api_json(
+            "setMyCommands",
+            {
+                "commands": commands,
+                "scope": {"type": "chat", "chat_id": int(ACCESS_CHAT_ID)},
+            },
+        )
+        logger.info(
+            "Private /help command configured for chat_id=%s",
+            ACCESS_CHAT_ID,
+        )
+    except Exception:
+        # Ошибка настройки меню не должна мешать запуску самого бота.
+        logger.exception("Could not configure private /help command")
+
+
+async def send_onboarding_invite(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    member,
+):
+    """Показывает новому сотруднику персональную кнопку перехода в ЛС."""
+    deep_link = bot_private_deep_link(context, f"onboarding_{int(member.id)}")
+    name = escape((member.first_name or member.full_name or "коллега").strip())
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Заполнить анкету", url=deep_link)]
+    ])
+    await send_ephemeral_text(
+        update,
+        context,
+        (
+            f"👋 <b>{name}, добро пожаловать!</b>\n\n"
+            "Заполните карточку сотрудника. Кнопка откроет личный чат с ботом; "
+            "ответы на анкету не появятся в рабочей группе."
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+        receiver_user_id=int(member.id),
+    )
+
+
+async def start_onboarding_wizard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    invited_user_id: int,
+):
+    """Запускает существующий мастер анкеты после перехода по deep-link."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+    if chat.type != "private":
+        await send_ephemeral_text(
+            update,
+            context,
+            "Откройте кнопку «Заполнить анкету» — форма запускается в личном чате с ботом.",
+            parse_mode=None,
+        )
+        return
+    if int(invited_user_id) != int(user.id):
+        await update.message.reply_text("❌ Эта ссылка предназначена другому сотруднику.")
+        return
+
+    context.user_data[HELP_SCOPE_CHAT_ID] = ACCESS_CHAT_ID
+    profile_id, _created = db_profiles_ensure_from_tg_user(user)
+    profile = db_profiles_get(profile_id)
+    start_profile_wizard(
+        context,
+        int(user.id),
+        mode="self_edit",
+        initial_data=profile or {},
+        edit_pid=profile_id,
+    )
+    await update.message.reply_text(
+        "👋 <b>Добро пожаловать в команду!</b>\n\n"
+        "Заполним вашу карточку. Ответы останутся в личной переписке с ботом.\n\n"
+        "Шаг 1/9: отправьте <b>имя и фамилию</b>.\n"
+        "Пример: <code>Иван Петров</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_cancel_wizard_settings(),
+    )
+
 async def send_profile_rich_message(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -8892,6 +9282,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await deny_no_access(update, context):
         return
 
+    start_parameter = context.args[0] if context.args else ""
+    if start_parameter.startswith("onboarding_"):
+        try:
+            invited_user_id = int(start_parameter.split("_", 1)[1])
+        except (TypeError, ValueError):
+            await update.message.reply_text("❌ Некорректная ссылка на анкету.")
+            return
+        await start_onboarding_wizard(update, context, invited_user_id)
+        return
+
+    if start_parameter == "help":
+        await cmd_help(update, context)
+        return
+
+    if start_parameter == "profile":
+        await cmd_profile(update, context)
+        return
+
     name = update.effective_user.first_name if update.effective_user else "коллеги"
     text = (
         f"Привет, {name}! 👋\n\n"
@@ -8900,115 +9308,278 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "А если появятся идеи или предложения — ты всегда можешь прислать их в разделе 💡 «Предложка» 💡, анонимно или нет.\n\n"
         "Вот команды, которые вызывают меня:\n"
         "• /help — меню «Помогатор»\n"
+        "• /profile — моя карточка\n"
+        "• /docs — документы и поиск\n"
         "• /horo — твой ежедневный гороскоп\n"
-
     )
     await update.message.reply_text(text)
 
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await deny_no_access(update, context):
+    logger.info(
+        "Received /help: chat_id=%s user_id=%s ephemeral_message_id=%s",
+        getattr(update.effective_chat, "id", None),
+        getattr(update.effective_user, "id", None),
+        _incoming_ephemeral_message_id(update),
+    )
+    if await deny_no_access_for_private_command(update, context):
         return
 
     await sync_profile_user_id_from_update(update)
-    bot_username = (context.bot.username or "blablabird_bot")
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+
+    bot_username = context.bot.username or "blablabird_bot"
     is_adm = await is_admin_scoped(update, context)
     profile = get_profile_for_user(update)
-    unread_count = db_notifications_unread_count(update.effective_user.id if update.effective_user else None)
+    unread_count = db_notifications_unread_count(int(user.id))
     text = help_text_main(
         bot_username,
         profile=profile,
         unread_count=unread_count,
         is_admin_user=is_adm,
-        user_full_name=(update.effective_user.full_name if update.effective_user else None),
+        user_full_name=user.full_name,
+    )
+    markup = kb_help_main(
+        is_admin_user=is_adm,
+        unread_count=unread_count,
     )
 
-    orig_msg = update.message  # чтобы (по возможности) удалить /help в группе
-
-    # 1) если команда в личке — просто показываем меню тут
-    if update.effective_chat and update.effective_chat.type == "private":
+    # В личном чате /help работает как раньше.
+    if chat.type == "private":
         await update.message.reply_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_help_main(is_admin_user=is_adm, unread_count=unread_count),
+            reply_markup=markup,
             disable_web_page_preview=True,
         )
         return
 
-    # 2) если команда в группе — пробуем прислать меню в ЛС пользователю
-    if update.effective_user:
-        context.user_data[HELP_SCOPE_CHAT_ID] = update.effective_chat.id
+    # Команда /help в рабочей группе является ephemeral, поэтому её не видят
+    # остальные сотрудники. Сам бот не отвечает в группу, если ЛС уже открыт:
+    # полное меню сразу отправляется пользователю напрямую.
+    context.user_data[HELP_SCOPE_CHAT_ID] = int(chat.id)
+    try:
+        await context.bot.send_message(
+            chat_id=int(user.id),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+        logger.info(
+            "Private /help menu delivered: source_chat_id=%s user_id=%s",
+            chat.id,
+            user.id,
+        )
+        return
+    except Forbidden:
+        # Пользователь ещё не запускал бота или заблокировал его.
+        logger.info(
+            "Private chat is not active for /help: source_chat_id=%s user_id=%s",
+            chat.id,
+            user.id,
+        )
+    except Exception:
+        # Некоторые версии API возвращают не Forbidden, а chat not found.
+        # В этом случае также показываем персональную кнопку перехода в ЛС.
+        logger.exception(
+            "Could not deliver /help in private chat; showing open-bot button"
+        )
 
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id:
+    open_bot_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "Открыть бота",
+            url=bot_private_deep_link(context, "help"),
+        )]
+    ])
+    try:
+        await send_ephemeral_text(
+            update,
+            context,
+            "Чтобы открыть Помогатор, сначала запустите личный чат с ботом.",
+            parse_mode=None,
+            reply_markup=open_bot_markup,
+        )
+    except Exception:
+        # Публичного резерва намеренно нет: ничего не отправляем всей группе.
+        logger.exception("Could not send private open-bot button for /help")
+
+
+def _docs_overview_text() -> str:
+    categories = db_docs_list_categories()
+    lines = [
+        "📄 <b>Документы</b>",
+        "",
+        "Введите <code>/docs запрос</code>, чтобы найти документ.",
+        "Получить найденный файл: <code>/docs ID</code>.",
+        "",
+        "<b>Разделы:</b>",
+    ]
+    if not categories:
+        lines.append("— документов пока нет —")
+        return "\n".join(lines)
+    for category_id, title in categories[:30]:
+        count = len(db_docs_list_by_category(int(category_id)))
+        lines.append(f"• {escape(title)} — <b>{count}</b>")
+    if len(categories) > 30:
+        lines.append(f"… и ещё {len(categories) - 30}")
+    return "\n".join(lines)
+
+
+def _docs_search_text(query: str, items: list[dict]) -> str:
+    lines = [
+        f"🔎 <b>Поиск документов:</b> {escape(query)}",
+        "",
+    ]
+    if not items:
+        lines.append("Ничего не найдено.")
+        return "\n".join(lines)
+    lines.append("Чтобы получить файл, отправьте <code>/docs ID</code>.")
+    lines.append("")
+    for item in items[:12]:
+        title = escape(_truncate_profile_field(item.get("title") or "Документ", 140))
+        category = escape(_truncate_profile_field(item.get("category_title") or "Без раздела", 80))
+        lines.append(f"• <code>{int(item['id'])}</code> — {title} · {category}")
+    return "\n".join(lines)
+
+
+async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # В рабочей группе оставлена только приватная команда /help.
+    if _is_group_chat(update):
+        return
+    if await deny_no_access_for_private_command(update, context):
+        return
+    await sync_profile_user_id_from_update(update)
+    profile = get_profile_for_user(update)
+    user = update.effective_user
+
+    if profile_needs_onboarding(profile):
+        parameter = f"onboarding_{int(user.id)}" if user else "profile"
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "📝 Заполнить анкету",
+                url=bot_private_deep_link(context, parameter),
+            )]
+        ])
+        await send_private_or_ephemeral_text(
+            update,
+            context,
+            "👤 <b>Карточка ещё не заполнена</b>\n\n"
+            "Откройте личный чат с ботом и заполните анкету по шагам.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+        return
+
+    if _is_group_chat(update):
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb_help_main(is_admin_user=is_adm, unread_count=unread_count),
-                disable_web_page_preview=True,
-            )
+            if profile.get("photo_file_id"):
+                await send_ephemeral_photo(
+                    update,
+                    context,
+                    profile["photo_file_id"],
+                    build_profile_card_caption(profile),
+                )
+            else:
+                await send_ephemeral_text(
+                    update,
+                    context,
+                    build_profile_card_text(profile),
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception:
+            logger.exception("Could not send ephemeral /profile response")
+        return
 
-            # успех -> удаляем /help в чате (если есть права)
-            if orig_msg and update.effective_chat and update.effective_chat.type != "private":
-                try:
-                    await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
-                except Exception:
-                    pass
+    if profile.get("photo_file_id"):
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=profile["photo_file_id"],
+            caption=build_profile_card_caption(profile),
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            build_profile_card_text(profile),
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def cmd_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # В рабочей группе оставлена только приватная команда /help.
+    if _is_group_chat(update):
+        return
+    if await deny_no_access_for_private_command(update, context):
+        return
+    user_id = update.effective_user.id if update.effective_user else None
+    raw_query = " ".join(context.args or []).strip()
+
+    # /docs 123 — сразу выдаём файл.
+    if raw_query.isdigit():
+        doc = db_docs_get(int(raw_query))
+        if not doc:
+            await send_private_or_ephemeral_text(
+                update,
+                context,
+                "❌ Документ с таким ID не найден.",
+                parse_mode=None,
+            )
             return
-
-        except Forbidden:
-            warn_text = (
-                "⚠️ Я не могу написать вам в ЛС.\n"
-                f"Откройте личку: перейдите к боту @{bot_username} и отправьте /start,\n"
-                "после этого снова нажмите /help в чате."
+        category = db_docs_get_category(int(doc["category_id"]))
+        caption = (
+            f"📄 <b>{escape(doc.get('title') or 'Документ')}</b>\n"
+            f"Раздел: <b>{escape((category or {}).get('title') or 'Без раздела')}</b>"
+        )
+        description = (doc.get("description") or "").strip()
+        if description:
+            caption += f"\n\n{escape(description[:700])}"
+        try:
+            if _is_group_chat(update):
+                await send_ephemeral_document(
+                    update,
+                    context,
+                    doc["file_id"],
+                    caption,
+                )
+            else:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=doc["file_id"],
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            db_doc_record_view(user_id, int(doc["id"]))
+        except Exception:
+            logger.exception("Could not send document id=%s", doc.get("id"))
+            await send_private_or_ephemeral_text(
+                update,
+                context,
+                "❌ Не удалось отправить файл. Попробуйте открыть его через полное меню в ЛС.",
+                parse_mode=None,
             )
+        return
 
-            if orig_msg and update.effective_chat and update.effective_chat.type != "private":
-                try:
-                    await context.bot.delete_message(chat_id=orig_msg.chat_id, message_id=orig_msg.message_id)
-                except Exception:
-                    pass
+    if raw_query:
+        items = db_docs_search(raw_query, limit=12)
+        text = _docs_search_text(raw_query, items)
+    else:
+        text = _docs_overview_text()
 
-            msg = await update.message.reply_text(
-                warn_text,
-                reply_to_message_id=update.message.message_id,
-                disable_web_page_preview=True,
-            )
-            context.job_queue.run_once(
-                job_delete_message,
-                when=15,
-                data={"chat_id": msg.chat_id, "message_id": msg.message_id},
-                name=f"del_help_warn_{msg.chat_id}_{msg.message_id}",
-            )
-            return
+    try:
+        await send_private_or_ephemeral_text(
+            update,
+            context,
+            text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("Could not send /docs response")
 
-        except Exception as e:
-            logger.exception("Failed to DM /help: %s", e)
 
-    msg = await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_help_main(is_admin_user=is_adm, unread_count=unread_count),
-        disable_web_page_preview=True,
-        reply_to_message_id=update.message.message_id,
-    )
 
-    if update.effective_chat and update.effective_chat.type != "private":
-        if orig_msg:
-            context.job_queue.run_once(
-                job_delete_message,
-                when=15,
-                data={"chat_id": orig_msg.chat_id, "message_id": orig_msg.message_id},
-                name=f"del_help_cmd_{orig_msg.chat_id}_{orig_msg.message_id}",
-            )
-        if msg:
-            context.job_queue.run_once(
-                job_delete_message,
-                when=15,
-                data={"chat_id": msg.chat_id, "message_id": msg.message_id},
-                name=f"del_help_fallback_{msg.chat_id}_{msg.message_id}",
-            )
 async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFAULT_TYPE):
     today_iso = datetime.now(MOSCOW_TZ).date().isoformat()
 
@@ -9048,7 +9619,6 @@ async def _send_horo_dm(user_id: int, sign_slug: str, context: ContextTypes.DEFA
     )
 
     db_set_horo_last_date(user_id, today_iso)
-
 
 async def cmd_horo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await deny_no_access(update, context):
@@ -14463,6 +15033,17 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Ошибка карточки не должна ломать приветственное сообщение.
                 logger.exception(
                     "Could not create/activate employee profile: chat_id=%s user_id=%s",
+                    update.effective_chat.id,
+                    member.id,
+                )
+
+            try:
+                await send_onboarding_invite(update, context, member)
+            except Exception:
+                # Персональное ephemeral-сообщение может не дойти офлайн-пользователю;
+                # публично анкету и ссылку не дублируем.
+                logger.exception(
+                    "Could not send onboarding invite: chat_id=%s user_id=%s",
                     update.effective_chat.id,
                     member.id,
                 )
@@ -35374,7 +35955,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   сотрудники видят сообщение, что рейтинг появится позже;
 # - единственного участника можно удалить с последнего занятого места.
 
-BUILD_VERSION = "TEAM-LEADERS-2026-07-30-V8-RICH-PROFILE-CARDS"
+BUILD_VERSION = "EPHEMERAL-COMMAND-REPLY-FIX-2026-07-30-V29"
 LEADERBOARD_EMPTY_TEXT = "⏳ <b>Рейтинг будет опубликован позже.</b>"
 
 
@@ -35872,6 +36453,8 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= END TEAM LEADERS / LEADERBOARDS V8 =================
 
+BUILD_VERSION = "HELP-DM-ONLY-ONBOARDING-2026-07-30-V30"
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
@@ -35879,7 +36462,13 @@ def main():
 
     request = HTTPXRequest(connect_timeout=15, read_timeout=30, write_timeout=30, pool_timeout=30)
 
-    app = Application.builder().token(BOT_TOKEN).request(request).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .post_init(configure_ephemeral_commands)
+        .build()
+    )
 
     # log errors
     app.add_error_handler(error_handler)
@@ -35887,6 +36476,8 @@ def main():
     # commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("docs", cmd_docs))
     app.add_handler(CommandHandler("horo", cmd_horo))
     app.add_handler(CommandHandler("setchat", cmd_setchat))
     app.add_handler(CommandHandler("unsetchat", cmd_unsetchat))
