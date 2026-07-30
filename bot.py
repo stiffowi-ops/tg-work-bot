@@ -157,7 +157,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("meetings-bot")
-BUILD_VERSION = "FAQ-UX-2026-07-29-V24"
+BUILD_VERSION = "RICH-PROFILE-CARDS-2026-07-30-V25"
 
 PROFILE_INTEREST_MAX = 5
 PROFILE_INTERESTS = [
@@ -7148,6 +7148,246 @@ def build_profile_card_caption(
     )
 
 
+
+# ---------------- RICH PROFILE CARDS (Bot API 10.2+) ----------------
+
+def _rich_html(value) -> str:
+    """Экранирует произвольное значение для Rich Message HTML."""
+    return html_lib.escape(str(value if value is not None else "—"), quote=True)
+
+
+def _rich_html_lines(lines: list[str]) -> str:
+    """Собирает строки в один абзац Rich HTML."""
+    clean = [line for line in lines if line]
+    return "<br/>".join(clean) if clean else "— Всё ещё впереди —"
+
+
+def _profile_progress_rich_html(profile_id: int, limit: int = 8) -> str:
+    items = db_achievement_progress_summary(int(profile_id))
+    lines: list[str] = []
+    for item in items[:max(0, int(limit))]:
+        level = achievement_level_label(item.get("level"))
+        progress = (
+            "максимальный уровень"
+            if item.get("next_threshold") is None
+            else str(item.get("label") or "—")
+        )
+        lines.append(
+            f"{_rich_html(item.get('emoji') or '🏆')} "
+            f"<b>{_rich_html(item.get('title') or 'Ачивка')} · { _rich_html(level) }</b> — "
+            f"{_rich_html(progress)}"
+        )
+    return f"<p>{_rich_html_lines(lines)}</p>"
+
+
+def _profile_achievements_rich_html(profile_id: int, limit: int = 5) -> str:
+    items = db_achievements_list(int(profile_id))
+    if not items or int(limit) <= 0:
+        return "<p>— Всё ещё впереди —</p>"
+
+    blocks: list[str] = []
+    for item in items[:max(1, int(limit))]:
+        level = achievement_level_label(item.get("level"))
+        counts = db_achievement_reaction_counts(int(item["id"]))
+        reactions = "  ".join(
+            f"{ACHIEVEMENT_REACTIONS[key]} {int(counts.get(key, 0))}"
+            for key in ACHIEVEMENT_REACTIONS
+            if counts.get(key, 0)
+        )
+        lines = [
+            (
+                f"{_rich_html(item.get('emoji') or '🏆')} "
+                f"<b>{_rich_html(item.get('title') or 'Ачивка')} · "
+                f"уровень {_rich_html(level)}</b>"
+            ),
+            _rich_html(item.get("description") or "—"),
+            f"📅 {_rich_html(_format_short_date(item.get('awarded_at')))}",
+        ]
+        if reactions:
+            lines.append(_rich_html(reactions))
+        blocks.append(f"<p>{'<br/>'.join(lines)}</p>")
+    return "".join(blocks)
+
+
+def build_profile_rich_html(
+    profile: dict,
+    shared_interests: list[str] | None = None,
+) -> str:
+    """
+    Карточка сотрудника в формате Rich Message.
+
+    Свёрнуты три независимых раздела:
+    1) интересы и общие интересы;
+    2) прогресс уровней;
+    3) последние ачивки.
+    """
+    full_name = _truncate_profile_field(profile.get("full_name"), 180)
+    year_start = str(profile.get("year_start") or "—")
+    city = _truncate_profile_field(profile.get("city"), 120)
+    birthday = _truncate_profile_field(profile.get("birthday"), 30)
+    about = _truncate_profile_field(profile.get("about"), 1200)
+    topics = _truncate_profile_field(profile.get("topics"), 1200)
+    tg_link = _truncate_profile_field(profile.get("tg_link"), 120)
+    interests = format_profile_interests(
+        profile.get("interests"),
+        limit=PROFILE_INTEREST_MAX,
+    )
+
+    avg = profile.get("avg_test_score")
+    avg_text = f"{avg}%" if avg is not None and str(avg).strip() else "—"
+
+    shared_keys = normalize_profile_interests(shared_interests)
+    interest_blocks = [
+        f"<p><b>🎯 Интересы</b><br/>{_rich_html(interests)}</p>"
+    ]
+    if shared_keys:
+        interest_blocks.append(
+            "<p><b>✨ У вас есть общие интересы</b><br/>"
+            f"{_rich_html(format_profile_interests(shared_keys))}</p>"
+        )
+    else:
+        interest_blocks.append(
+            "<p><b>✨ Общие интересы</b><br/>— Пока не найдены —</p>"
+        )
+
+    profile_id = int(profile["id"])
+    return "".join([
+        f"<h2>👤 {_rich_html(full_name)}</h2>",
+        (
+            "<p>"
+            f"📅 Работает с: <b>{_rich_html(year_start)}</b><br/>"
+            f"🏙️ Город: <b>{_rich_html(city)}</b><br/>"
+            f"🎂 День рождения: <b>{_rich_html(birthday)}</b>"
+            "</p>"
+        ),
+        f"<p><b>📝 Кратко о себе</b><br/>{_rich_html(about)}</p>",
+        (
+            "<details>"
+            "<summary>🎯 Интересы и общие интересы</summary>"
+            f"{''.join(interest_blocks)}"
+            "</details>"
+        ),
+        f"<p><b>❓ По каким вопросам обращаться</b><br/>{_rich_html(topics)}</p>",
+        (
+            "<p>"
+            f"<b>🔗 TG:</b> {_rich_html(tg_link)}<br/>"
+            f"<b>📈 Средний балл тестирования:</b> <b>{_rich_html(avg_text)}</b>"
+            "</p>"
+        ),
+        "<hr/>",
+        (
+            "<details>"
+            "<summary>🏆 Прогресс уровней</summary>"
+            f"{_profile_progress_rich_html(profile_id, limit=8)}"
+            "</details>"
+        ),
+        (
+            "<details>"
+            "<summary>🏅 Последние ачивки</summary>"
+            f"{_profile_achievements_rich_html(profile_id, limit=5)}"
+            "</details>"
+        ),
+    ])
+
+
+def build_profile_input_rich_message(
+    profile: dict,
+    shared_interests: list[str] | None = None,
+) -> dict:
+    """Формирует InputRichMessage, при наличии добавляя фото по file_id."""
+    html = build_profile_rich_html(profile, shared_interests=shared_interests)
+    photo_file_id = (profile.get("photo_file_id") or "").strip()
+    rich_message: dict = {"html": html}
+
+    if photo_file_id:
+        media_id = "profile_photo"
+        rich_message["html"] = f'<img src="tg://photo?id={media_id}"/>' + html
+        rich_message["media"] = [
+            {
+                "id": media_id,
+                "media": {
+                    "type": "photo",
+                    "media": photo_file_id,
+                },
+            }
+        ]
+    return rich_message
+
+
+async def _telegram_bot_api_json(method: str, payload: dict):
+    """
+    Вызывает свежий метод Bot API напрямую.
+
+    Это позволяет использовать sendRichMessage/editMessageText даже до того,
+    как установленная версия python-telegram-bot добавит соответствующие классы.
+    """
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post(url, json=payload)
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Telegram Bot API {method}: ошибка соединения") from exc
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Telegram Bot API {method}: некорректный ответ HTTP {response.status_code}"
+        ) from exc
+
+    if not data.get("ok"):
+        description = str(data.get("description") or f"HTTP {response.status_code}")
+        # Повторное нажатие на уже открытую карточку не является ошибкой UX.
+        if method == "editMessageText" and "message is not modified" in description.lower():
+            return True
+        raise RuntimeError(f"Telegram Bot API {method}: {description}")
+    return data.get("result")
+
+
+async def send_profile_rich_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    profile: dict,
+    shared_interests: list[str] | None,
+    reply_markup: InlineKeyboardMarkup,
+    message_thread_id: int | None = None,
+):
+    payload: dict = {
+        "chat_id": int(chat_id),
+        "rich_message": build_profile_input_rich_message(
+            profile,
+            shared_interests=shared_interests,
+        ),
+        "reply_markup": reply_markup.to_dict(),
+    }
+    if message_thread_id:
+        payload["message_thread_id"] = int(message_thread_id)
+    return await _telegram_bot_api_json("sendRichMessage", payload)
+
+
+async def edit_profile_rich_message(
+    *,
+    chat_id: int,
+    message_id: int,
+    profile: dict,
+    shared_interests: list[str] | None,
+    reply_markup: InlineKeyboardMarkup,
+):
+    return await _telegram_bot_api_json(
+        "editMessageText",
+        {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "rich_message": build_profile_input_rich_message(
+                profile,
+                shared_interests=shared_interests,
+            ),
+            "reply_markup": reply_markup.to_dict(),
+        },
+    )
+
+
 # Совместимость с предыдущей версией, где фото и текст карточки
 # отправлялись раздельно. После перехода на симметричную карточку
 # эта связь используется только для удаления старых отдельных фото.
@@ -7233,11 +7473,11 @@ async def render_profile_card(
     show_carousel: bool = True,
 ):
     """
-    Показывает симметричную карточку:
-    - с фотографией: фото и полный текст находятся в одном медиасообщении;
-    - без фотографии: используется обычное текстовое сообщение.
+    Показывает карточку сотрудника как Rich Message с тремя details-блоками.
 
-    За счёт caption ширина описания всегда совпадает с шириной фотографии.
+    При переходе со старой фото-карточки отправляет новое rich-сообщение и
+    удаляет прежнее. Текстовые и уже rich-карточки редактируются на месте.
+    Если Rich Messages временно недоступны, используется прежний формат.
     """
     viewer_profile = None
     viewer = getattr(query, "from_user", None)
@@ -7259,19 +7499,65 @@ async def render_profile_card(
     )
     chat_id = int(query.message.chat_id)
     current_message_id = int(query.message.message_id)
-    photo_file_id = (profile.get("photo_file_id") or "").strip()
     current_is_photo = bool(getattr(query.message, "photo", None))
+    message_thread_id = getattr(query.message, "message_thread_id", None)
 
-    # Удаляем отдельное фото, если карточка была открыта старой версией кода.
+    # Удаляем отдельное фото, если карточка была открыта очень старой версией.
     await delete_profile_card_photo_for_message(
         context,
         chat_id=chat_id,
         text_message_id=current_message_id,
     )
 
-    if photo_file_id:
-        caption = build_profile_card_caption(profile, shared_interests=shared_interests)
+    try:
+        if not current_is_photo:
+            try:
+                await edit_profile_rich_message(
+                    chat_id=chat_id,
+                    message_id=current_message_id,
+                    profile=profile,
+                    shared_interests=shared_interests,
+                    reply_markup=markup,
+                )
+                return
+            except RuntimeError as edit_error:
+                # Некоторые старые типы сообщений нельзя преобразовать в rich
+                # редактированием. Тогда отправляем новую карточку.
+                logger.warning(
+                    "Rich profile edit failed; sending a new message: %s",
+                    edit_error,
+                )
 
+        sent = await send_profile_rich_message(
+            context,
+            chat_id=chat_id,
+            profile=profile,
+            shared_interests=shared_interests,
+            reply_markup=markup,
+            message_thread_id=message_thread_id,
+        )
+        if sent:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=current_message_id,
+                )
+            except Exception:
+                pass
+        return
+
+    except Exception as rich_error:
+        # Не оставляем раздел «Команда» неработоспособным, если Telegram
+        # временно отклонит Rich Message или используется старый Bot API server.
+        logger.exception("Rich profile card failed; using legacy card: %s", rich_error)
+
+    # ---------------- legacy fallback ----------------
+    photo_file_id = (profile.get("photo_file_id") or "").strip()
+    if photo_file_id:
+        caption = build_profile_card_caption(
+            profile,
+            shared_interests=shared_interests,
+        )
         if current_is_photo:
             await query.edit_message_media(
                 media=InputMediaPhoto(
@@ -7300,8 +7586,11 @@ async def render_profile_card(
                 pass
         return
 
-    text = build_profile_card_text(profile, compact=False, shared_interests=shared_interests)
-
+    text = build_profile_card_text(
+        profile,
+        compact=False,
+        shared_interests=shared_interests,
+    )
     if current_is_photo:
         sent = await context.bot.send_message(
             chat_id=chat_id,
@@ -34916,7 +35205,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #   сотрудники видят сообщение, что рейтинг появится позже;
 # - единственного участника можно удалить с последнего занятого места.
 
-BUILD_VERSION = "TEAM-LEADERS-2026-07-30-V8-PARTIAL-EMPTY-RATINGS"
+BUILD_VERSION = "TEAM-LEADERS-2026-07-30-V8-RICH-PROFILE-CARDS"
 LEADERBOARD_EMPTY_TEXT = "⏳ <b>Рейтинг будет опубликован позже.</b>"
 
 
