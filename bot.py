@@ -33027,6 +33027,475 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= END TEAM LEADERS / LEADERBOARDS V4 =================
 
+
+# ================= TEAM LEADERS / LEADERBOARDS V5 =================
+# Точечное редактирование сохранённых результатов:
+# - администратор выбирает конкретного сотрудника;
+# - можно изменить только его показатель;
+# - место меняется безопасным обменом с другим участником;
+# - при редактировании период автоматически становится текущей неделей/месяцем;
+# - для каждой пары период + показатель хранится только один актуальный результат.
+
+BUILD_VERSION = "TEAM-LEADERS-2026-07-30-V5-PARTIAL-EDIT"
+
+
+def _leaderboard_refresh_flow_period(flow: dict):
+    """Подставляет границы текущей недели или месяца в редактируемый результат."""
+    period_type = flow.get("period_type")
+    if period_type not in LEADERBOARD_PERIOD_TITLES:
+        return
+    start, end = _leaderboard_period_bounds(period_type)
+    flow["period_start"] = start.isoformat()
+    flow["period_end"] = end.isoformat()
+
+
+def _leaderboard_find_flow_entry(flow: dict, profile_id: int) -> dict | None:
+    target = int(profile_id)
+    for entry in flow.get("entries") or []:
+        try:
+            if int(entry.get("profile_id")) == target:
+                return entry
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _leaderboard_sort_flow_entries(flow: dict):
+    flow["entries"] = sorted(
+        list(flow.get("entries") or []),
+        key=lambda item: (
+            int(item.get("place") or 0),
+            str(item.get("profile_name") or "").casefold(),
+        ),
+    )
+
+
+def kb_leaderboard_preview() -> InlineKeyboardMarkup:
+    """Предпросмотр с точечным редактированием вместо обязательного полного ввода."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "👤 Изменить сотрудника",
+            callback_data="help:settings:leaders:edit_people",
+        )],
+        [InlineKeyboardButton(
+            "🔄 Заполнить рейтинг заново",
+            callback_data="help:settings:leaders:reset_people",
+        )],
+        [InlineKeyboardButton(
+            "💾 Сохранить результаты",
+            callback_data="help:settings:leaders:ready",
+        )],
+        [InlineKeyboardButton(
+            "❌ Отмена",
+            callback_data="help:settings:leaders:cancel",
+        )],
+    ])
+
+
+def kb_leaderboard_employee_picker(flow: dict) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    entries = sorted(
+        list(flow.get("entries") or []),
+        key=lambda item: (
+            int(item.get("place") or 0),
+            str(item.get("profile_name") or "").casefold(),
+        ),
+    )
+    for entry in entries:
+        profile_id = int(entry["profile_id"])
+        place = int(entry["place"])
+        icon = LEADERBOARD_PLACE_EMOJIS.get(place, "⭐")
+        rows.append([InlineKeyboardButton(
+            f"{icon} {place}. {compact_team_name(entry['profile_name'], 28)}",
+            callback_data=f"help:settings:leaders:edit_employee:{profile_id}",
+        )])
+    rows.append([InlineKeyboardButton(
+        "⬅️ К предпросмотру",
+        callback_data="help:settings:leaders:edit_done",
+    )])
+    rows.append([InlineKeyboardButton(
+        "❌ Отмена",
+        callback_data="help:settings:leaders:cancel",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_leaderboard_employee_actions(profile_id: int) -> InlineKeyboardMarkup:
+    pid = int(profile_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "📊 Изменить показатель",
+            callback_data=f"help:settings:leaders:edit_metric:{pid}",
+        )],
+        [InlineKeyboardButton(
+            "🔀 Поменять место",
+            callback_data=f"help:settings:leaders:edit_place:{pid}",
+        )],
+        [InlineKeyboardButton(
+            "⬅️ К списку сотрудников",
+            callback_data="help:settings:leaders:edit_people",
+        )],
+        [InlineKeyboardButton(
+            "👀 К предпросмотру",
+            callback_data="help:settings:leaders:edit_done",
+        )],
+    ])
+
+
+def kb_leaderboard_swap_picker(flow: dict, source_profile_id: int) -> InlineKeyboardMarkup:
+    source = _leaderboard_find_flow_entry(flow, source_profile_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    if source:
+        source_place = int(source.get("place") or 0)
+        candidates = sorted(
+            list(flow.get("entries") or []),
+            key=lambda item: (
+                int(item.get("place") or 0),
+                str(item.get("profile_name") or "").casefold(),
+            ),
+        )
+        for target in candidates:
+            target_id = int(target["profile_id"])
+            target_place = int(target["place"])
+            if target_id == int(source_profile_id) or target_place == source_place:
+                continue
+            icon = LEADERBOARD_PLACE_EMOJIS.get(target_place, "⭐")
+            rows.append([InlineKeyboardButton(
+                f"{icon} {target_place}. {compact_team_name(target['profile_name'], 27)}",
+                callback_data=(
+                    f"help:settings:leaders:edit_swap:"
+                    f"{int(source_profile_id)}:{target_id}"
+                ),
+            )])
+    rows.append([InlineKeyboardButton(
+        "⬅️ К сотруднику",
+        callback_data=f"help:settings:leaders:edit_employee:{int(source_profile_id)}",
+    )])
+    rows.append([InlineKeyboardButton(
+        "👀 К предпросмотру",
+        callback_data="help:settings:leaders:edit_done",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _leaderboard_show_employee_picker(query, context, flow: dict):
+    _leaderboard_refresh_flow_period(flow)
+    period_title = "неделю" if flow.get("period_type") == "week" else "месяц"
+    metric_title = LEADERBOARD_METRIC_TITLES.get(
+        flow.get("metric_type"), flow.get("metric_type") or "—"
+    )
+    text = (
+        "👤 <b>Выберите сотрудника</b>\n\n"
+        f"Период: <b>{period_title}</b>\n"
+        f"Даты: <b>{_leaderboard_date_range(flow['period_start'], flow['period_end'])}</b>\n"
+        f"Показатель: <b>{escape(metric_title)}</b>\n\n"
+        "Можно изменить только показатель выбранного сотрудника либо "
+        "поменять его местами с другим участником. Остальные данные сохранятся."
+    )
+    await _leaderboard_replace_with_text(
+        query, context, text, kb_leaderboard_employee_picker(flow)
+    )
+
+
+async def _leaderboard_show_employee_editor(query, context, flow: dict, profile_id: int):
+    entry = _leaderboard_find_flow_entry(flow, profile_id)
+    if not entry:
+        await _leaderboard_answer(query, "Сотрудник не найден в рейтинге", show_alert=True)
+        return
+    place = int(entry["place"])
+    text = (
+        "✏️ <b>Редактирование сотрудника</b>\n\n"
+        f"Сотрудник: <b>{escape(entry['profile_name'])}</b>\n"
+        f"Место: <b>{place}</b>\n"
+        f"Результат: <b>{escape(entry['metric_display'])}</b>\n\n"
+        "Что нужно изменить?"
+    )
+    await _leaderboard_replace_with_text(
+        query, context, text, kb_leaderboard_employee_actions(profile_id)
+    )
+
+
+# Оставляем только один актуальный результат для каждой пары период + показатель.
+_leaderboard_v5_previous_db_leaderboard_save = db_leaderboard_save
+
+
+def db_leaderboard_save(flow: dict, saved_by: int | None) -> int:
+    result_id = _leaderboard_v5_previous_db_leaderboard_save(flow, saved_by)
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute(
+            """
+            DELETE FROM leaderboards
+            WHERE period_type=? AND metric_type=? AND id<>?
+            """,
+            (
+                flow["period_type"],
+                flow["metric_type"],
+                int(result_id),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return int(result_id)
+
+
+_leaderboard_v5_previous_cb_help = cb_help
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+
+    # Кнопки периода теперь открывают уже сохранённый актуальный рейтинг,
+    # а не заставляют заполнять его заново.
+    if data.startswith("help:settings:leaders:new:"):
+        parts = data.split(":")
+        if len(parts) == 6:
+            period_type = (
+                "week" if parts[4] == "w"
+                else "month" if parts[4] == "m"
+                else ""
+            )
+            metric_type = parts[5]
+            if period_type and metric_type in LEADERBOARD_METRIC_TITLES:
+                existing = db_leaderboard_latest(period_type, metric_type)
+                if existing:
+                    if await deny_no_access(update, context):
+                        return
+                    if not await is_admin_scoped(update, context):
+                        await _leaderboard_answer(
+                            query, "Только для администратора", show_alert=True
+                        )
+                        return
+                    await _leaderboard_answer(query)
+                    flow = _leaderboard_item_to_result_flow(existing)
+                    _leaderboard_refresh_flow_period(flow)
+                    context.user_data[LEADERBOARD_FLOW_KEY] = flow
+                    await _leaderboard_send_admin_preview(
+                        context, query.message.chat_id, flow, query.message
+                    )
+                    return
+        return await _leaderboard_v5_previous_cb_help(update, context)
+
+    # При открытии сохранённого результата даты переводятся на актуальный период.
+    if data.startswith("help:settings:leaders:edit:"):
+        try:
+            item_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            return await _leaderboard_v5_previous_cb_help(update, context)
+        item = db_leaderboard_get(item_id)
+        if not item:
+            return await _leaderboard_v5_previous_cb_help(update, context)
+        if await deny_no_access(update, context):
+            return
+        if not await is_admin_scoped(update, context):
+            await _leaderboard_answer(query, "Только для администратора", show_alert=True)
+            return
+        await _leaderboard_answer(query)
+        flow = _leaderboard_item_to_result_flow(item)
+        _leaderboard_refresh_flow_period(flow)
+        context.user_data[LEADERBOARD_FLOW_KEY] = flow
+        await _leaderboard_send_admin_preview(
+            context, query.message.chat_id, flow, query.message
+        )
+        return
+
+    partial_actions = (
+        data == "help:settings:leaders:edit_people"
+        or data == "help:settings:leaders:edit_done"
+        or data.startswith("help:settings:leaders:edit_employee:")
+        or data.startswith("help:settings:leaders:edit_metric:")
+        or data.startswith("help:settings:leaders:edit_place:")
+        or data.startswith("help:settings:leaders:edit_swap:")
+    )
+    if not partial_actions:
+        return await _leaderboard_v5_previous_cb_help(update, context)
+
+    if await deny_no_access(update, context):
+        return
+    if not await is_admin_scoped(update, context):
+        await _leaderboard_answer(query, "Только для администратора", show_alert=True)
+        return
+    await _leaderboard_answer(query)
+
+    flow = _leaderboard_flow(context)
+    if not flow or flow.get("mode") != "results" or not flow.get("entries"):
+        await _leaderboard_answer(
+            query,
+            "В рейтинге пока нет сотрудников для точечного редактирования.",
+            show_alert=True,
+        )
+        return
+
+    if data == "help:settings:leaders:edit_people":
+        flow.pop("editing_profile_id", None)
+        flow.pop("swap_source_profile_id", None)
+        flow["awaiting"] = "employee_edit_pick"
+        await _leaderboard_show_employee_picker(query, context, flow)
+        return
+
+    if data == "help:settings:leaders:edit_done":
+        flow.pop("editing_profile_id", None)
+        flow.pop("swap_source_profile_id", None)
+        flow["awaiting"] = "preview"
+        await _leaderboard_send_admin_preview(
+            context, query.message.chat_id, flow, query.message
+        )
+        return
+
+    if data.startswith("help:settings:leaders:edit_employee:"):
+        try:
+            profile_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        flow["editing_profile_id"] = profile_id
+        flow["awaiting"] = "employee_edit_action"
+        await _leaderboard_show_employee_editor(query, context, flow, profile_id)
+        return
+
+    if data.startswith("help:settings:leaders:edit_metric:"):
+        try:
+            profile_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        entry = _leaderboard_find_flow_entry(flow, profile_id)
+        if not entry:
+            await _leaderboard_answer(query, "Сотрудник не найден", show_alert=True)
+            return
+        flow["editing_profile_id"] = profile_id
+        flow["awaiting"] = "edit_metric_value"
+        example = "850000" if flow.get("metric_type") == "mrr" else "48"
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "📊 <b>Изменение показателя</b>\n\n"
+            f"Сотрудник: <b>{escape(entry['profile_name'])}</b>\n"
+            f"Текущее значение: <b>{escape(entry['metric_display'])}</b>\n\n"
+            f"Отправьте новое число одним сообщением. Например: <code>{example}</code>",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"help:settings:leaders:edit_employee:{profile_id}",
+                )
+            ]]),
+        )
+        return
+
+    if data.startswith("help:settings:leaders:edit_place:"):
+        try:
+            profile_id = int(data.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный сотрудник", show_alert=True)
+            return
+        entry = _leaderboard_find_flow_entry(flow, profile_id)
+        if not entry:
+            await _leaderboard_answer(query, "Сотрудник не найден", show_alert=True)
+            return
+        flow["swap_source_profile_id"] = profile_id
+        flow["awaiting"] = "edit_place_target"
+        await _leaderboard_replace_with_text(
+            query,
+            context,
+            "🔀 <b>Изменение места</b>\n\n"
+            f"Сотрудник: <b>{escape(entry['profile_name'])}</b>\n"
+            f"Текущее место: <b>{int(entry['place'])}</b>\n\n"
+            "Выберите сотрудника, с которым нужно поменяться местами. "
+            "Показатели обоих сотрудников сохранятся без изменений.",
+            kb_leaderboard_swap_picker(flow, profile_id),
+        )
+        return
+
+    if data.startswith("help:settings:leaders:edit_swap:"):
+        parts = data.split(":")
+        try:
+            source_id = int(parts[-2])
+            target_id = int(parts[-1])
+        except (IndexError, TypeError, ValueError):
+            await _leaderboard_answer(query, "Некорректный обмен местами", show_alert=True)
+            return
+        source = _leaderboard_find_flow_entry(flow, source_id)
+        target = _leaderboard_find_flow_entry(flow, target_id)
+        if not source or not target:
+            await _leaderboard_answer(query, "Участник рейтинга не найден", show_alert=True)
+            return
+        source_place = int(source["place"])
+        target_place = int(target["place"])
+        if source_place == target_place:
+            await _leaderboard_answer(
+                query, "Сотрудники уже находятся на одном месте", show_alert=True
+            )
+            return
+        source["place"], target["place"] = target_place, source_place
+        _leaderboard_sort_flow_entries(flow)
+        flow.pop("editing_profile_id", None)
+        flow.pop("swap_source_profile_id", None)
+        flow["awaiting"] = "preview"
+        try:
+            _leaderboard_validate_result_flow(flow)
+        except ValueError as exc:
+            source["place"], target["place"] = source_place, target_place
+            _leaderboard_sort_flow_entries(flow)
+            await _leaderboard_answer(query, str(exc), show_alert=True)
+            return
+        await _leaderboard_send_admin_preview(
+            context, query.message.chat_id, flow, query.message
+        )
+        return
+
+
+_leaderboard_v5_previous_on_text = on_text
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    flow = _leaderboard_flow(context)
+    if (
+        not flow
+        or flow.get("mode") != "results"
+        or flow.get("awaiting") != "edit_metric_value"
+    ):
+        return await _leaderboard_v5_previous_on_text(update, context)
+    if not update.message or not update.effective_user:
+        return
+    if not await is_admin_scoped(update, context):
+        return await _leaderboard_v5_previous_on_text(update, context)
+
+    profile_id = flow.get("editing_profile_id")
+    entry = _leaderboard_find_flow_entry(flow, int(profile_id or 0))
+    if not entry:
+        flow["awaiting"] = "preview"
+        flow.pop("editing_profile_id", None)
+        await update.message.reply_text(
+            "Сотрудник не найден в редактируемом рейтинге. Откройте редактирование ещё раз."
+        )
+        return
+
+    value = _leaderboard_parse_value(flow["metric_type"], update.message.text or "")
+    if value is None:
+        example = "850000" if flow.get("metric_type") == "mrr" else "48"
+        await update.message.reply_text(
+            f"Введите целое неотрицательное число. Например: {example}"
+        )
+        return
+
+    entry["metric_value"] = int(value)
+    entry["metric_display"] = _leaderboard_metric_display(
+        flow["metric_type"], int(value)
+    )
+    flow.pop("editing_profile_id", None)
+    flow["awaiting"] = "preview"
+    await update.message.reply_text(
+        f"✅ Показатель сотрудника {entry['profile_name']} обновлён."
+    )
+    await _leaderboard_send_admin_preview(
+        context, update.message.chat_id, flow
+    )
+
+# ================= END TEAM LEADERS / LEADERBOARDS V5 =================
+
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
