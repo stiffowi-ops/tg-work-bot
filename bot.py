@@ -36553,7 +36553,1025 @@ async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= END TEAM LEADERS / LEADERBOARDS V8 =================
 
-BUILD_VERSION = "HELP-DM-DELETE-COMMAND-2026-07-30-V31"
+# ================= DOCUMENT PLACEMENT IN SECTIONS V2 =================
+# Один документ хранится в docs один раз и может быть показан в нескольких
+# продуктовых разделах. Для каждой привязки сохраняется собственный текст
+# inline-кнопки, который администратор вводит при добавлении документа.
+
+DOCUMENT_SECTION_INDUSTRY = "industry"
+DOCUMENT_SECTION_CALENDAR = "calendar"
+DOCUMENT_SECTION_KEYS = {
+    DOCUMENT_SECTION_INDUSTRY,
+    DOCUMENT_SECTION_CALENDAR,
+}
+DOCUMENT_SECTION_CONFIG = {
+    DOCUMENT_SECTION_INDUSTRY: {
+        "title": "Отраслевое деление",
+        "icon": "🏭",
+        "open_callback": "help:industry_division:documents",
+    },
+    DOCUMENT_SECTION_CALENDAR: {
+        "title": "Проект Календарного планирования",
+        "icon": "📅",
+        "open_callback": "help:caldocs",
+    },
+}
+DOCUMENT_SECTION_PAGE_SIZE = 10
+DOCUMENT_SECTION_BUTTON_MAX_LENGTH = 64
+DOCUMENT_SECTION_BUTTON_FLOW_KEY = "document_section_button_flow"
+
+
+def _document_section_key(value: str | None) -> str | None:
+    key = str(value or "").strip().casefold()
+    return key if key in DOCUMENT_SECTION_KEYS else None
+
+
+def _clean_document_button_label(value: str | None) -> str:
+    """Нормализует подпись кнопки, сохраняя эмодзи и обычную пунктуацию."""
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _document_default_button_label(document: dict | None) -> str:
+    """Предлагает читаемую подпись, но администратор может заменить её любой."""
+    title = str((document or {}).get("title") or "Документ").strip()
+    # Для названий-файлов скрываем расширение и заменяем подчёркивания пробелами.
+    try:
+        suffix = Path(title).suffix
+        if suffix and len(suffix) <= 8:
+            title = title[:-len(suffix)]
+    except Exception:
+        pass
+    title = re.sub(r"[_\s]+", " ", title).strip() or "Документ"
+    label = f"📄 {title}"
+    return label[:DOCUMENT_SECTION_BUTTON_MAX_LENGTH]
+
+
+def _db_document_section_row(row) -> dict:
+    return {
+        "id": int(row[0]),
+        "category_id": int(row[1]),
+        "title": row[2] or "Документ",
+        "description": row[3] or "",
+        "file_id": row[4],
+        "file_unique_id": row[5],
+        "mime": row[6],
+        "local_path": row[7],
+        "uploaded_at": row[8],
+        "updated_at": row[9] or row[8],
+        "category_title": row[10] or "Без категории",
+        "position": int(row[11] or 0),
+        "linked_at": row[12],
+        "button_label": _clean_document_button_label(row[13])
+        or f"📄 {row[2] or 'Документ'}",
+    }
+
+
+def db_document_section_list(section_key: str) -> list[dict]:
+    key = _document_section_key(section_key)
+    if not key:
+        return []
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            """
+            SELECT d.id, d.category_id, d.title, d.description, d.file_id,
+                   d.file_unique_id, d.mime_type, d.local_path, d.uploaded_at,
+                   COALESCE(d.updated_at, d.uploaded_at), c.title,
+                   l.position, l.added_at, l.button_label
+            FROM document_section_links l
+            JOIN docs d ON d.id=l.doc_id
+            JOIN doc_categories c ON c.id=d.category_id
+            WHERE l.section_key=?
+            ORDER BY l.position ASC, l.added_at ASC, d.id ASC
+            """,
+            (key,),
+        ).fetchall()
+    return [_db_document_section_row(row) for row in rows]
+
+
+def db_document_section_get(section_key: str, doc_id: int) -> dict | None:
+    did = int(doc_id)
+    return next(
+        (
+            item
+            for item in db_document_section_list(section_key)
+            if int(item["id"]) == did
+        ),
+        None,
+    )
+
+
+def db_document_section_ids(section_key: str) -> set[int]:
+    return {int(item["id"]) for item in db_document_section_list(section_key)}
+
+
+def db_document_section_add(
+    section_key: str,
+    doc_id: int,
+    added_by: int | None = None,
+    button_label: str | None = None,
+) -> bool:
+    key = _document_section_key(section_key)
+    if not key:
+        return False
+    did = int(doc_id)
+    now = datetime.utcnow().isoformat()
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT id, title FROM docs WHERE id=?",
+            (did,),
+        ).fetchone()
+        if not row:
+            return False
+        clean_label = _clean_document_button_label(button_label)
+        if not clean_label:
+            clean_label = _document_default_button_label({"title": row[1]})
+        if len(clean_label) > DOCUMENT_SECTION_BUTTON_MAX_LENGTH:
+            return False
+        next_position = int(
+            con.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 "
+                "FROM document_section_links WHERE section_key=?",
+                (key,),
+            ).fetchone()[0]
+        )
+        cur = con.execute(
+            """
+            INSERT INTO document_section_links(
+                section_key, doc_id, position, added_by, added_at, button_label
+            ) VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(section_key, doc_id) DO UPDATE SET
+                button_label=excluded.button_label
+            """,
+            (
+                key,
+                did,
+                next_position,
+                int(added_by) if added_by else None,
+                now,
+                clean_label,
+            ),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+
+def db_document_section_set_button_label(
+    section_key: str,
+    doc_id: int,
+    button_label: str,
+) -> bool:
+    key = _document_section_key(section_key)
+    clean_label = _clean_document_button_label(button_label)
+    if (
+        not key
+        or not clean_label
+        or len(clean_label) > DOCUMENT_SECTION_BUTTON_MAX_LENGTH
+    ):
+        return False
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            """
+            UPDATE document_section_links
+            SET button_label=?
+            WHERE section_key=? AND doc_id=?
+            """,
+            (clean_label, key, int(doc_id)),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+
+def db_document_section_remove(section_key: str, doc_id: int) -> bool:
+    key = _document_section_key(section_key)
+    if not key:
+        return False
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            "DELETE FROM document_section_links WHERE section_key=? AND doc_id=?",
+            (key, int(doc_id)),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+
+def db_document_section_toggle(
+    section_key: str,
+    doc_id: int,
+    added_by: int | None = None,
+) -> bool | None:
+    """Оставлено для совместимости со старыми callback-кнопками."""
+    key = _document_section_key(section_key)
+    if not key:
+        return None
+    did = int(doc_id)
+    if db_document_section_get(key, did):
+        db_document_section_remove(key, did)
+        return False
+    if db_document_section_add(key, did, added_by):
+        return True
+    return None
+
+
+def _seed_legacy_document_sections():
+    """Переносит старые автоматически найденные документы с прежними подписями."""
+    legacy_sources = (
+        (DOCUMENT_SECTION_INDUSTRY, INDUSTRY_DOCUMENT_SLOTS),
+        (DOCUMENT_SECTION_CALENDAR, CALENDAR_PLANNING_DOCUMENT_SLOTS),
+    )
+    for section_key, slots in legacy_sources:
+        for slot in slots:
+            document = db_industry_document_find(tuple(slot.get("aliases") or ()))
+            if not document:
+                continue
+            with sqlite3.connect(DB_PATH) as con:
+                existing_row = con.execute(
+                    "SELECT button_label FROM document_section_links "
+                    "WHERE section_key=? AND doc_id=?",
+                    (section_key, int(document["id"])),
+                ).fetchone()
+            if existing_row:
+                # Для записей, созданных первой версией без подписи, восстанавливаем
+                # точные исторические названия. Уже заданное администратором имя
+                # не перезаписываем при следующих запусках.
+                if not _clean_document_button_label(existing_row[0]):
+                    db_document_section_set_button_label(
+                        section_key,
+                        int(document["id"]),
+                        slot.get("label") or _document_default_button_label(document),
+                    )
+                continue
+            db_document_section_add(
+                section_key,
+                int(document["id"]),
+                button_label=slot.get("label"),
+            )
+
+
+def _backfill_document_section_button_labels():
+    # Сначала проставляем известные точные подписи старых кнопок.
+    _seed_legacy_document_sections()
+    # Остальным связям даём безопасную универсальную подпись.
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            UPDATE document_section_links
+            SET button_label='📄 ' || COALESCE(
+                (SELECT title FROM docs WHERE docs.id=document_section_links.doc_id),
+                'Документ'
+            )
+            WHERE button_label IS NULL OR TRIM(button_label)=''
+            """
+        )
+        con.commit()
+
+
+_document_sections_previous_db_init = db_init
+
+
+def db_init():
+    _document_sections_previous_db_init()
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_section_links (
+                section_key TEXT NOT NULL,
+                doc_id INTEGER NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                added_by INTEGER,
+                added_at TEXT NOT NULL,
+                button_label TEXT,
+                PRIMARY KEY (section_key, doc_id),
+                FOREIGN KEY(doc_id) REFERENCES docs(id) ON DELETE CASCADE
+            )
+            """
+        )
+        try:
+            con.execute(
+                "ALTER TABLE document_section_links ADD COLUMN button_label TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_document_section_links_order "
+            "ON document_section_links(section_key, position, added_at)"
+        )
+        con.commit()
+    _backfill_document_section_button_labels()
+
+
+_document_sections_previous_db_docs_delete_doc = db_docs_delete_doc
+
+
+def db_docs_delete_doc(doc_id: int) -> bool:
+    # В проекте не на всех соединениях включён PRAGMA foreign_keys, поэтому
+    # удаляем связи явно до удаления основной записи документа.
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "DELETE FROM document_section_links WHERE doc_id=?",
+            (int(doc_id),),
+        )
+        con.commit()
+    return _document_sections_previous_db_docs_delete_doc(int(doc_id))
+
+
+def _document_section_items(section_key: str) -> list[dict]:
+    return [
+        {
+            "key": f"doc_{int(document['id'])}",
+            "label": document["button_label"],
+            "title": document["title"],
+            "document": document,
+        }
+        for document in db_document_section_list(section_key)
+    ]
+
+
+def industry_division_documents_items() -> list[dict]:
+    """Документы, явно добавленные в раздел «Отраслевое деление»."""
+    return _document_section_items(DOCUMENT_SECTION_INDUSTRY)
+
+
+def calendar_planning_documents_items() -> list[dict]:
+    """Документы, явно добавленные в проект Календарного планирования."""
+    return _document_section_items(DOCUMENT_SECTION_CALENDAR)
+
+
+def calendar_planning_documents_count() -> int:
+    return len(db_document_section_list(DOCUMENT_SECTION_CALENDAR))
+
+
+def _document_section_empty_row() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton("— документов пока нет —", callback_data="noop")]
+
+
+def kb_industry_division_documents(
+    items: list[dict] | None = None,
+) -> InlineKeyboardMarkup:
+    items = items if items is not None else industry_division_documents_items()
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in items:
+        document = item.get("document")
+        if not document:
+            continue
+        rows.append([
+            InlineKeyboardButton(
+                item["label"][:DOCUMENT_SECTION_BUTTON_MAX_LENGTH],
+                callback_data=f"help:docs:open:{int(document['id'])}",
+            )
+        ])
+    if not rows:
+        rows.append(_document_section_empty_row())
+    rows.extend([
+        [InlineKeyboardButton("📚 Все документы", callback_data="help:docs")],
+        [InlineKeyboardButton(
+            "⬅️ К инструментам",
+            callback_data="help:industry_division:tools",
+        )],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="help:main")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_calendar_planning_documents(
+    items: list[dict] | None = None,
+) -> InlineKeyboardMarkup:
+    items = items if items is not None else calendar_planning_documents_items()
+    rows: list[list[InlineKeyboardButton]] = [[
+        _green_inline_button("📚 Все документы", callback_data="help:docs")
+    ]]
+    document_rows: list[list[InlineKeyboardButton]] = []
+    for item in items:
+        document = item.get("document")
+        if not document:
+            continue
+        document_rows.append([
+            InlineKeyboardButton(
+                item["label"][:DOCUMENT_SECTION_BUTTON_MAX_LENGTH],
+                callback_data=f"help:docs:open:{int(document['id'])}",
+            )
+        ])
+    rows.extend(document_rows or [_document_section_empty_row()])
+    rows.extend([
+        [InlineKeyboardButton(
+            "⬅️ К Календарному планированию",
+            callback_data="help:projects:calendar",
+        )],
+        [InlineKeyboardButton("🗂️ К проектам", callback_data="help:projects")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def document_sections_admin_text() -> str:
+    industry_count = len(db_document_section_list(DOCUMENT_SECTION_INDUSTRY))
+    calendar_count = len(db_document_section_list(DOCUMENT_SECTION_CALENDAR))
+    return (
+        "📌 <b>Размещение документов</b>\n\n"
+        "Выберите раздел. Один документ можно добавить сразу в оба раздела. "
+        "При добавлении бот отдельно запросит точное название создаваемой кнопки.\n\n"
+        f"🏭 Отраслевое деление: <b>{industry_count}</b>\n"
+        f"📅 Проект Календарного планирования: <b>{calendar_count}</b>"
+    )
+
+
+def kb_document_sections_admin() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🏭 Отраслевое деление — {len(db_document_section_list(DOCUMENT_SECTION_INDUSTRY))}",
+            callback_data=f"help:docs:sections:{DOCUMENT_SECTION_INDUSTRY}",
+        )],
+        [InlineKeyboardButton(
+            f"📅 Проект Календарного планирования — {len(db_document_section_list(DOCUMENT_SECTION_CALENDAR))}",
+            callback_data=f"help:docs:sections:{DOCUMENT_SECTION_CALENDAR}",
+        )],
+        [InlineKeyboardButton("⬅️ В документы", callback_data="help:docs")],
+    ])
+
+
+def document_section_manage_text(section_key: str) -> str:
+    key = _document_section_key(section_key)
+    config = DOCUMENT_SECTION_CONFIG.get(key or "", {})
+    documents = db_document_section_list(key or "")
+    lines = [
+        f"{config.get('icon', '📄')} <b>{escape(config.get('title', 'Раздел'))}</b>",
+        "",
+        f"Добавлено документов: <b>{len(documents)}</b>",
+    ]
+    if documents:
+        lines.extend(["", *[
+            f"• {escape(item['button_label'])} → {escape(item['title'])}"
+            for item in documents
+        ]])
+    else:
+        lines.extend(["", "— документы пока не добавлены —"])
+    return "\n".join(lines)
+
+
+def kb_document_section_manage(section_key: str) -> InlineKeyboardMarkup:
+    key = _document_section_key(section_key)
+    if not key:
+        return kb_document_sections_admin()
+    config = DOCUMENT_SECTION_CONFIG[key]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "➕➖ Изменить состав и названия кнопок",
+            callback_data=f"help:docs:sections:pick:{key}:0",
+        )],
+        [InlineKeyboardButton(
+            "👁 Открыть пользовательский раздел",
+            callback_data=config["open_callback"],
+        )],
+        [InlineKeyboardButton(
+            "⬅️ К размещению документов",
+            callback_data="help:docs:sections",
+        )],
+    ])
+
+
+def _document_section_picker_page(
+    section_key: str,
+    page: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
+    key = _document_section_key(section_key)
+    if not key:
+        return document_sections_admin_text(), kb_document_sections_admin()
+
+    all_documents = db_docs_list_all(limit=10_000)
+    linked = {
+        int(item["id"]): item
+        for item in db_document_section_list(key)
+    }
+    total_pages = max(
+        1,
+        (len(all_documents) + DOCUMENT_SECTION_PAGE_SIZE - 1)
+        // DOCUMENT_SECTION_PAGE_SIZE,
+    )
+    safe_page = min(max(0, int(page)), total_pages - 1)
+    start = safe_page * DOCUMENT_SECTION_PAGE_SIZE
+    page_items = all_documents[start:start + DOCUMENT_SECTION_PAGE_SIZE]
+
+    config = DOCUMENT_SECTION_CONFIG[key]
+    text = (
+        f"{config['icon']} <b>{escape(config['title'])}</b>\n\n"
+        "➕ Нажмите на новый документ — бот запросит название кнопки.\n"
+        "✅ Нажмите на уже добавленный — можно переименовать кнопку или убрать документ.\n\n"
+        f"Добавлено: <b>{len(linked)}</b> · "
+        f"Страница: <b>{safe_page + 1}/{total_pages}</b>"
+    )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for document in page_items:
+        doc_id = int(document["id"])
+        linked_item = linked.get(doc_id)
+        if linked_item:
+            label = f"✅ {linked_item['button_label']}"
+            callback_data = (
+                f"help:docs:sections:item:{key}:{doc_id}:{safe_page}"
+            )
+        else:
+            label = f"➕ {document['title']} · {document['category_title']}"
+            callback_data = (
+                f"help:docs:sections:add:{key}:{doc_id}:{safe_page}"
+            )
+        if len(label) > 60:
+            label = label[:57] + "…"
+        rows.append([
+            InlineKeyboardButton(label, callback_data=callback_data)
+        ])
+
+    if not rows:
+        rows.append([InlineKeyboardButton("— документов нет —", callback_data="noop")])
+
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if safe_page > 0:
+            nav.append(InlineKeyboardButton(
+                "◀️",
+                callback_data=f"help:docs:sections:pick:{key}:{safe_page - 1}",
+            ))
+        nav.append(InlineKeyboardButton(
+            f"{safe_page + 1}/{total_pages}",
+            callback_data="noop",
+        ))
+        if safe_page + 1 < total_pages:
+            nav.append(InlineKeyboardButton(
+                "▶️",
+                callback_data=f"help:docs:sections:pick:{key}:{safe_page + 1}",
+            ))
+        rows.append(nav)
+
+    rows.extend([
+        [InlineKeyboardButton(
+            "✅ Готово",
+            callback_data=f"help:docs:sections:{key}",
+        )],
+        [InlineKeyboardButton(
+            "⬅️ К разделам",
+            callback_data="help:docs:sections",
+        )],
+    ])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _document_section_item_text(section_key: str, item: dict) -> str:
+    config = DOCUMENT_SECTION_CONFIG[section_key]
+    return (
+        f"{config['icon']} <b>{escape(config['title'])}</b>\n\n"
+        f"Документ: <b>{escape(item['title'])}</b>\n"
+        f"Категория: {escape(item['category_title'])}\n\n"
+        "Текущая кнопка:\n"
+        f"<code>{escape(item['button_label'])}</code>"
+    )
+
+
+def _kb_document_section_item(
+    section_key: str,
+    doc_id: int,
+    page: int,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "✏️ Изменить название кнопки",
+            callback_data=(
+                f"help:docs:sections:rename:{section_key}:{int(doc_id)}:{int(page)}"
+            ),
+        )],
+        [InlineKeyboardButton(
+            "🗑 Убрать документ из раздела",
+            callback_data=(
+                f"help:docs:sections:remove:{section_key}:{int(doc_id)}:{int(page)}"
+            ),
+        )],
+        [InlineKeyboardButton(
+            "⬅️ К списку документов",
+            callback_data=f"help:docs:sections:pick:{section_key}:{int(page)}",
+        )],
+    ])
+
+
+def _document_section_button_prompt(
+    section_key: str,
+    document: dict,
+    mode: str,
+    current_label: str | None = None,
+) -> str:
+    config = DOCUMENT_SECTION_CONFIG[section_key]
+    suggestion = current_label or _document_default_button_label(document)
+    action = "новое" if mode == "add" else "новое название"
+    return (
+        f"{config['icon']} <b>{escape(config['title'])}</b>\n\n"
+        f"Документ: <b>{escape(document.get('title') or 'Документ')}</b>\n\n"
+        f"Отправьте {action} кнопки одним сообщением — вместе с нужным эмодзи.\n"
+        f"Максимум: <b>{DOCUMENT_SECTION_BUTTON_MAX_LENGTH}</b> символа.\n\n"
+        "Например:\n"
+        "<code>📊 Календарное планирование презентация</code>\n"
+        "<code>✉️ Календарка письмо</code>\n"
+        "<code>📝 Скрипт Календарка</code>\n\n"
+        f"Предложенный вариант: <code>{escape(suggestion)}</code>"
+    )
+
+
+def _document_section_flow_clear(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(DOCUMENT_SECTION_BUTTON_FLOW_KEY, None)
+
+
+def _document_section_flow_set(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    mode: str,
+    section_key: str,
+    doc_id: int,
+    page: int,
+    user_id: int | None,
+):
+    context.user_data[DOCUMENT_SECTION_BUTTON_FLOW_KEY] = {
+        "mode": mode,
+        "section_key": section_key,
+        "doc_id": int(doc_id),
+        "page": max(0, int(page)),
+        "user_id": int(user_id) if user_id else None,
+    }
+
+
+_document_sections_previous_kb_help_docs_main = kb_help_docs_main
+
+
+def kb_help_docs_main(is_admin_user: bool):
+    legacy = _document_sections_previous_kb_help_docs_main(is_admin_user)
+    if not is_admin_user:
+        return legacy
+    rows = [list(row) for row in legacy.inline_keyboard]
+    placement_row = [InlineKeyboardButton(
+        "📌 Размещение по разделам",
+        callback_data="help:docs:sections",
+    )]
+    insert_at = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if any(
+                (button.callback_data or "").startswith("help:settings:add_doc")
+                or (button.callback_data or "").startswith("help:docs:admin:")
+                for button in row
+            )
+        ),
+        len(rows),
+    )
+    rows.insert(insert_at, placement_row)
+    return InlineKeyboardMarkup(rows)
+
+
+_document_sections_previous_cb_help = cb_help
+
+
+async def cb_help(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+
+    if data == "help:docs:sections" or data.startswith("help:docs:sections:"):
+        if not await is_admin_scoped(update, context):
+            try:
+                await query.answer("Доступно администраторам.", show_alert=True)
+            except Exception:
+                pass
+            return
+
+        if data == "help:docs:sections":
+            _document_section_flow_clear(context)
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            await query.edit_message_text(
+                document_sections_admin_text(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_document_sections_admin(),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("help:docs:sections:pick:"):
+            parts = data.split(":")
+            try:
+                section_key = parts[-2]
+                page = int(parts[-1])
+            except (IndexError, TypeError, ValueError):
+                await query.answer("Некорректный раздел.", show_alert=True)
+                return
+            _document_section_flow_clear(context)
+            text, keyboard = _document_section_picker_page(section_key, page)
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("help:docs:sections:add:"):
+            parts = data.split(":")
+            try:
+                section_key = _document_section_key(parts[-3])
+                doc_id = int(parts[-2])
+                page = int(parts[-1])
+            except (IndexError, TypeError, ValueError):
+                section_key = None
+            document = db_docs_get(doc_id) if section_key else None
+            if not section_key or not document:
+                await query.answer("Документ не найден.", show_alert=True)
+                return
+            _document_section_flow_set(
+                context,
+                mode="add",
+                section_key=section_key,
+                doc_id=doc_id,
+                page=page,
+                user_id=update.effective_user.id if update.effective_user else None,
+            )
+            await query.answer()
+            await query.edit_message_text(
+                _document_section_button_prompt(
+                    section_key,
+                    document,
+                    "add",
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "❌ Отмена",
+                        callback_data=(
+                            f"help:docs:sections:cancel:{section_key}:{page}"
+                        ),
+                    )
+                ]]),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("help:docs:sections:item:"):
+            parts = data.split(":")
+            try:
+                section_key = _document_section_key(parts[-3])
+                doc_id = int(parts[-2])
+                page = int(parts[-1])
+            except (IndexError, TypeError, ValueError):
+                section_key = None
+            item = db_document_section_get(section_key or "", doc_id) if section_key else None
+            if not section_key or not item:
+                await query.answer("Привязка документа не найдена.", show_alert=True)
+                return
+            _document_section_flow_clear(context)
+            await query.answer()
+            await query.edit_message_text(
+                _document_section_item_text(section_key, item),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_kb_document_section_item(section_key, doc_id, page),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("help:docs:sections:rename:"):
+            parts = data.split(":")
+            try:
+                section_key = _document_section_key(parts[-3])
+                doc_id = int(parts[-2])
+                page = int(parts[-1])
+            except (IndexError, TypeError, ValueError):
+                section_key = None
+            item = db_document_section_get(section_key or "", doc_id) if section_key else None
+            document = db_docs_get(doc_id) if item else None
+            if not section_key or not item or not document:
+                await query.answer("Привязка документа не найдена.", show_alert=True)
+                return
+            _document_section_flow_set(
+                context,
+                mode="edit",
+                section_key=section_key,
+                doc_id=doc_id,
+                page=page,
+                user_id=update.effective_user.id if update.effective_user else None,
+            )
+            await query.answer()
+            await query.edit_message_text(
+                _document_section_button_prompt(
+                    section_key,
+                    document,
+                    "edit",
+                    current_label=item["button_label"],
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "❌ Отмена",
+                        callback_data=(
+                            f"help:docs:sections:cancel:{section_key}:{page}"
+                        ),
+                    )
+                ]]),
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("help:docs:sections:remove:"):
+            parts = data.split(":")
+            try:
+                section_key = _document_section_key(parts[-3])
+                doc_id = int(parts[-2])
+                page = int(parts[-1])
+            except (IndexError, TypeError, ValueError):
+                section_key = None
+            if not section_key:
+                await query.answer("Некорректный раздел.", show_alert=True)
+                return
+            removed = db_document_section_remove(section_key, doc_id)
+            await query.answer(
+                "Документ убран из раздела."
+                if removed
+                else "Документ уже отсутствует.",
+                show_alert=not removed,
+            )
+            text, keyboard = _document_section_picker_page(section_key, page)
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return
+
+        if data.startswith("help:docs:sections:cancel:"):
+            parts = data.split(":")
+            try:
+                section_key = _document_section_key(parts[-2])
+                page = int(parts[-1])
+            except (IndexError, TypeError, ValueError):
+                section_key = None
+            _document_section_flow_clear(context)
+            if not section_key:
+                await query.answer("Некорректный раздел.", show_alert=True)
+                return
+            await query.answer("Отменено.")
+            text, keyboard = _document_section_picker_page(section_key, page)
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return
+
+        # Совместимость с кнопками, созданными первой версией патча.
+        if data.startswith("help:docs:sections:toggle:"):
+            parts = data.split(":")
+            try:
+                section_key = parts[-3]
+                doc_id = int(parts[-2])
+                page = int(parts[-1])
+            except (IndexError, TypeError, ValueError):
+                await query.answer("Некорректный документ.", show_alert=True)
+                return
+            enabled = db_document_section_toggle(
+                section_key,
+                doc_id,
+                update.effective_user.id if update.effective_user else None,
+            )
+            if enabled is None:
+                await query.answer("Документ не найден.", show_alert=True)
+                return
+            await query.answer(
+                "Документ добавлен с универсальным названием кнопки."
+                if enabled
+                else "Документ убран из раздела."
+            )
+            text, keyboard = _document_section_picker_page(section_key, page)
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            return
+
+        section_key = data.rsplit(":", 1)[-1]
+        if _document_section_key(section_key):
+            _document_section_flow_clear(context)
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            await query.edit_message_text(
+                document_section_manage_text(section_key),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_document_section_manage(section_key),
+                disable_web_page_preview=True,
+            )
+            return
+
+    return await _document_sections_previous_cb_help(update, context)
+
+
+_document_sections_previous_on_text = on_text
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    flow = context.user_data.get(DOCUMENT_SECTION_BUTTON_FLOW_KEY)
+    if not flow:
+        return await _document_sections_previous_on_text(update, context)
+    if not update.message or not update.effective_user:
+        return
+    if flow.get("user_id") and int(flow["user_id"]) != int(update.effective_user.id):
+        return await _document_sections_previous_on_text(update, context)
+    if not await is_admin_scoped(update, context):
+        _document_section_flow_clear(context)
+        return await _document_sections_previous_on_text(update, context)
+
+    label = _clean_document_button_label(update.message.text)
+    if not label:
+        await update.message.reply_text(
+            "Название кнопки не может быть пустым. Отправьте текст вместе с эмодзи."
+        )
+        return
+    if len(label) > DOCUMENT_SECTION_BUTTON_MAX_LENGTH:
+        await update.message.reply_text(
+            "Название слишком длинное: "
+            f"{len(label)} символов. Максимум — "
+            f"{DOCUMENT_SECTION_BUTTON_MAX_LENGTH}."
+        )
+        return
+
+    section_key = _document_section_key(flow.get("section_key"))
+    try:
+        doc_id = int(flow.get("doc_id"))
+        page = max(0, int(flow.get("page") or 0))
+    except (TypeError, ValueError):
+        section_key = None
+        doc_id = 0
+        page = 0
+    mode = flow.get("mode")
+    document = db_docs_get(doc_id) if section_key and doc_id else None
+    if not section_key or not document or mode not in {"add", "edit"}:
+        _document_section_flow_clear(context)
+        await update.message.reply_text(
+            "Не удалось сохранить кнопку: документ или раздел больше не существует."
+        )
+        return
+
+    if mode == "add":
+        saved = db_document_section_add(
+            section_key,
+            doc_id,
+            update.effective_user.id,
+            button_label=label,
+        )
+        action_text = "создана"
+    else:
+        saved = db_document_section_set_button_label(
+            section_key,
+            doc_id,
+            label,
+        )
+        action_text = "переименована"
+
+    if not saved:
+        await update.message.reply_text(
+            "Не удалось сохранить название кнопки. Попробуйте ещё раз."
+        )
+        return
+
+    _document_section_flow_clear(context)
+    config = DOCUMENT_SECTION_CONFIG[section_key]
+    await update.message.reply_text(
+        f"✅ Кнопка {action_text}.\n\n"
+        f"Раздел: <b>{escape(config['title'])}</b>\n"
+        f"Документ: <b>{escape(document.get('title') or 'Документ')}</b>\n"
+        f"Кнопка: <code>{escape(label)}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "👁 Открыть пользовательский раздел",
+                callback_data=config["open_callback"],
+            )],
+            [InlineKeyboardButton(
+                "➕ Добавить или изменить ещё",
+                callback_data=f"help:docs:sections:pick:{section_key}:{page}",
+            )],
+            [InlineKeyboardButton(
+                "⬅️ К управлению разделом",
+                callback_data=f"help:docs:sections:{section_key}",
+            )],
+        ]),
+    )
+
+# =============== END DOCUMENT PLACEMENT IN SECTIONS V2 ===============
+
+
+BUILD_VERSION = "DOCUMENT-BUTTON-LABELS-2026-07-31-V32"
 
 def main():
     ensure_db_path(DB_PATH)
