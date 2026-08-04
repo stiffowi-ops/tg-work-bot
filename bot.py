@@ -270,12 +270,9 @@ DOC_INDEX_SEMAPHORE = asyncio.Semaphore(DOC_INDEX_CONCURRENCY)
 # -------- ACCESS CONTROL --------
 ACCESS_CHAT_ID = -1003399576556
 
-# Пользователи из этого списка получают доступ к обычным функциям бота,
-# даже если не состоят в ACCESS_CHAT_ID. Администраторские права им
-# принудительно не выдаются.
-NON_ADMIN_ACCESS_USER_IDS = {
-    458562748,
-}
+# Старый статический белый список отключён. Внешние доступы хранятся в SQLite
+# и управляются администраторами через раздел «Управление ботом».
+NON_ADMIN_ACCESS_USER_IDS = set()
 
 NO_ACCESS_TEXT = (
     "🕵️♂️ Еще никогда Штирлиц не был так близок к провалу!\n\n"
@@ -37571,7 +37568,1020 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============== END DOCUMENT PLACEMENT IN SECTIONS V2 ===============
 
 
-BUILD_VERSION = "DOCUMENT-BUTTON-LABELS-2026-07-31-V32"
+# =============== EXTERNAL ACCESS MANAGEMENT V1 ===============
+
+EXTERNAL_ACCESS_FLOW_KEY = "external_access_admin_flow"
+EXTERNAL_ACCESS_PAGE_SIZE = 8
+
+
+def _normalize_external_username(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    raw = re.sub(r"^https?://t\.me/", "", raw, flags=re.IGNORECASE)
+    raw = raw.split("?", 1)[0].split("/", 1)[0].strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", raw):
+        return None
+    return raw.lower()
+
+
+def _external_access_now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat()
+
+
+def _external_access_is_expired(expires_at: str | None) -> bool:
+    if not expires_at:
+        return False
+    try:
+        return datetime.fromisoformat(expires_at) <= datetime.utcnow()
+    except (TypeError, ValueError):
+        return True
+
+
+def _external_access_parse_manual_expiry(value: str) -> str | None:
+    raw = re.sub(r"\s+", " ", (value or "").strip())
+    if not raw:
+        return None
+    parsed = None
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            if fmt == "%d.%m.%Y":
+                parsed = parsed.replace(hour=23, minute=59)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
+    try:
+        localized = MOSCOW_TZ.localize(parsed, is_dst=None)
+    except Exception:
+        return None
+    utc_value = localized.astimezone(pytz.UTC).replace(tzinfo=None, microsecond=0)
+    if utc_value <= datetime.utcnow():
+        return None
+    return utc_value.isoformat()
+
+
+def _external_access_format_expiry(expires_at: str | None) -> str:
+    if not expires_at:
+        return "бессрочно"
+    try:
+        utc_dt = pytz.UTC.localize(datetime.fromisoformat(expires_at))
+        local_dt = utc_dt.astimezone(MOSCOW_TZ)
+        return local_dt.strftime("%d.%m.%Y %H:%M МСК")
+    except (TypeError, ValueError):
+        return "некорректная дата"
+
+
+def _external_access_identity_label(item: dict) -> str:
+    username = item.get("username")
+    user_id = item.get("tg_user_id")
+    if username and user_id:
+        return f"@{username} · {user_id}"
+    if username:
+        return f"@{username}"
+    if user_id:
+        return str(user_id)
+    return "неизвестный пользователь"
+
+
+def db_external_access_list(include_expired: bool = True) -> list[dict]:
+    now_iso = _external_access_now_iso()
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        if include_expired:
+            cur.execute(
+                """
+                SELECT id, tg_user_id, username, display_name, is_admin,
+                       expires_at, created_by, created_at, updated_at, last_seen_at
+                FROM external_access
+                ORDER BY CASE WHEN expires_at IS NULL OR expires_at>? THEN 0 ELSE 1 END,
+                         is_admin DESC, COALESCE(username, ''), COALESCE(tg_user_id, 0)
+                """,
+                (now_iso,),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, tg_user_id, username, display_name, is_admin,
+                       expires_at, created_by, created_at, updated_at, last_seen_at
+                FROM external_access
+                WHERE expires_at IS NULL OR expires_at>?
+                ORDER BY is_admin DESC, COALESCE(username, ''), COALESCE(tg_user_id, 0)
+                """,
+                (now_iso,),
+            )
+        rows = cur.fetchall()
+    return [
+        {
+            "id": int(row[0]),
+            "tg_user_id": int(row[1]) if row[1] is not None else None,
+            "username": row[2],
+            "display_name": row[3] or "",
+            "is_admin": bool(row[4]),
+            "expires_at": row[5],
+            "created_by": int(row[6]) if row[6] is not None else None,
+            "created_at": row[7],
+            "updated_at": row[8],
+            "last_seen_at": row[9],
+            "is_expired": _external_access_is_expired(row[5]),
+        }
+        for row in rows
+    ]
+
+
+def db_external_access_get(access_id: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            """
+            SELECT id, tg_user_id, username, display_name, is_admin,
+                   expires_at, created_by, created_at, updated_at, last_seen_at
+            FROM external_access WHERE id=?
+            """,
+            (int(access_id),),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": int(row[0]),
+        "tg_user_id": int(row[1]) if row[1] is not None else None,
+        "username": row[2],
+        "display_name": row[3] or "",
+        "is_admin": bool(row[4]),
+        "expires_at": row[5],
+        "created_by": int(row[6]) if row[6] is not None else None,
+        "created_at": row[7],
+        "updated_at": row[8],
+        "last_seen_at": row[9],
+        "is_expired": _external_access_is_expired(row[5]),
+    }
+
+
+def db_external_access_find_active(
+    user_id: int,
+    username: str | None = None,
+    display_name: str | None = None,
+    *,
+    bind_username: bool = True,
+) -> dict | None:
+    uid = int(user_id)
+    uname = _normalize_external_username(username)
+    now_iso = _external_access_now_iso()
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT id, tg_user_id, username, display_name, is_admin,
+                   expires_at, created_by, created_at, updated_at, last_seen_at
+            FROM external_access
+            WHERE tg_user_id=? AND (expires_at IS NULL OR expires_at>?)
+            ORDER BY is_admin DESC, id DESC
+            LIMIT 1
+            """,
+            (uid, now_iso),
+        )
+        row = cur.fetchone()
+        if not row and uname:
+            cur.execute(
+                """
+                SELECT id, tg_user_id, username, display_name, is_admin,
+                       expires_at, created_by, created_at, updated_at, last_seen_at
+                FROM external_access
+                WHERE tg_user_id IS NULL AND username=? COLLATE NOCASE
+                  AND (expires_at IS NULL OR expires_at>?)
+                ORDER BY is_admin DESC, id DESC
+                LIMIT 1
+                """,
+                (uname, now_iso),
+            )
+            row = cur.fetchone()
+            if row and bind_username:
+                cur.execute(
+                    """
+                    UPDATE external_access
+                    SET tg_user_id=?, username=?, display_name=COALESCE(NULLIF(?, ''), display_name),
+                        last_seen_at=?, updated_at=?
+                    WHERE id=? AND tg_user_id IS NULL
+                    """,
+                    (uid, uname, (display_name or "").strip(), now_iso, now_iso, int(row[0])),
+                )
+                con.commit()
+                cur.execute(
+                    """
+                    SELECT id, tg_user_id, username, display_name, is_admin,
+                           expires_at, created_by, created_at, updated_at, last_seen_at
+                    FROM external_access WHERE id=?
+                    """,
+                    (int(row[0]),),
+                )
+                row = cur.fetchone()
+        elif row:
+            current_username = row[2]
+            current_name = row[3] or ""
+            if (uname and uname != current_username) or ((display_name or "").strip() and (display_name or "").strip() != current_name):
+                cur.execute(
+                    """
+                    UPDATE external_access
+                    SET username=COALESCE(?, username),
+                        display_name=COALESCE(NULLIF(?, ''), display_name),
+                        last_seen_at=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (uname, (display_name or "").strip(), now_iso, now_iso, int(row[0])),
+                )
+                con.commit()
+                cur.execute(
+                    """
+                    SELECT id, tg_user_id, username, display_name, is_admin,
+                           expires_at, created_by, created_at, updated_at, last_seen_at
+                    FROM external_access WHERE id=?
+                    """,
+                    (int(row[0]),),
+                )
+                row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": int(row[0]),
+        "tg_user_id": int(row[1]) if row[1] is not None else None,
+        "username": row[2],
+        "display_name": row[3] or "",
+        "is_admin": bool(row[4]),
+        "expires_at": row[5],
+        "created_by": int(row[6]) if row[6] is not None else None,
+        "created_at": row[7],
+        "updated_at": row[8],
+        "last_seen_at": row[9],
+        "is_expired": False,
+    }
+
+
+def db_external_access_upsert(
+    *,
+    tg_user_id: int | None,
+    username: str | None,
+    display_name: str | None,
+    is_admin: bool,
+    expires_at: str | None,
+    created_by: int | None,
+) -> int:
+    uid = int(tg_user_id) if tg_user_id is not None else None
+    uname = _normalize_external_username(username)
+    if uid is None and not uname:
+        raise ValueError("Telegram ID or username is required")
+    now_iso = _external_access_now_iso()
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        row = None
+        if uid is not None:
+            row = cur.execute(
+                "SELECT id FROM external_access WHERE tg_user_id=? ORDER BY id LIMIT 1",
+                (uid,),
+            ).fetchone()
+        if not row and uname:
+            row = cur.execute(
+                "SELECT id FROM external_access WHERE username=? COLLATE NOCASE ORDER BY id LIMIT 1",
+                (uname,),
+            ).fetchone()
+        if row:
+            access_id = int(row[0])
+            cur.execute(
+                """
+                UPDATE external_access
+                SET tg_user_id=COALESCE(?, tg_user_id), username=COALESCE(?, username),
+                    display_name=COALESCE(NULLIF(?, ''), display_name),
+                    is_admin=?, expires_at=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    uid,
+                    uname,
+                    (display_name or "").strip(),
+                    1 if is_admin else 0,
+                    expires_at,
+                    now_iso,
+                    access_id,
+                ),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO external_access(
+                    tg_user_id, username, display_name, is_admin, expires_at,
+                    created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uid,
+                    uname,
+                    (display_name or "").strip() or None,
+                    1 if is_admin else 0,
+                    expires_at,
+                    int(created_by) if created_by else None,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            access_id = int(cur.lastrowid)
+        con.commit()
+    return access_id
+
+
+def db_external_access_delete(access_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("DELETE FROM external_access WHERE id=?", (int(access_id),))
+        con.commit()
+        return cur.rowcount > 0
+
+
+def db_external_access_delete_expired() -> int:
+    now_iso = _external_access_now_iso()
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            "DELETE FROM external_access WHERE expires_at IS NOT NULL AND expires_at<=?",
+            (now_iso,),
+        )
+        con.commit()
+        return int(cur.rowcount)
+
+
+def _external_access_resolve_identifier(value: str) -> dict | None:
+    raw = (value or "").strip()
+    if re.fullmatch(r"\d{5,20}", raw):
+        user_id = int(raw)
+        if user_id <= 0:
+            return None
+        profile = db_profiles_get_by_tg_user_id(user_id)
+        return {
+            "tg_user_id": user_id,
+            "username": _normalize_external_username((profile or {}).get("tg_link")),
+            "display_name": (profile or {}).get("full_name") or "",
+        }
+    username = _normalize_external_username(raw)
+    if not username:
+        return None
+    profile = db_profiles_get_by_tg_link("@" + username)
+    return {
+        "tg_user_id": int(profile["tg_user_id"]) if profile and profile.get("tg_user_id") else None,
+        "username": username,
+        "display_name": (profile or {}).get("full_name") or "",
+    }
+
+
+def _external_access_bootstrap_from_env():
+    raw = (os.getenv("EXTERNAL_ACCESS_BOOTSTRAP") or "").strip()
+    if not raw:
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        already_done = con.execute(
+            "SELECT value FROM meta WHERE key='external_access_bootstrap_done_v1'"
+        ).fetchone()
+    if already_done:
+        return
+    for token in re.split(r"[,;\n]+", raw):
+        token = token.strip()
+        if not token:
+            continue
+        parts = [part.strip() for part in token.split(":")]
+        identity = parts[0]
+        role = (parts[1] if len(parts) > 1 else "user").lower()
+        term = (parts[2] if len(parts) > 2 else "never").lower()
+        resolved = _external_access_resolve_identifier(identity)
+        if not resolved:
+            logger.warning("Invalid EXTERNAL_ACCESS_BOOTSTRAP entry: %s", token)
+            continue
+        expires_at = None
+        if term not in {"never", "forever", "none", ""}:
+            try:
+                days = max(1, int(term))
+                expires_at = (datetime.utcnow() + timedelta(days=days)).replace(microsecond=0).isoformat()
+            except ValueError:
+                logger.warning("Invalid bootstrap term in entry: %s", token)
+                continue
+        db_external_access_upsert(
+            tg_user_id=resolved["tg_user_id"],
+            username=resolved["username"],
+            display_name=resolved["display_name"],
+            is_admin=role in {"admin", "administrator", "1", "true"},
+            expires_at=expires_at,
+            created_by=None,
+        )
+    db_set_meta("external_access_bootstrap_done_v1", _external_access_now_iso())
+
+
+_external_access_previous_db_init = db_init
+
+
+def db_init():
+    _external_access_previous_db_init()
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_access (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_user_id INTEGER,
+                username TEXT COLLATE NOCASE,
+                display_name TEXT,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_seen_at TEXT
+            )
+            """
+        )
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_access_user_id "
+            "ON external_access(tg_user_id) WHERE tg_user_id IS NOT NULL"
+        )
+        con.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_access_pending_username "
+            "ON external_access(username COLLATE NOCASE) "
+            "WHERE tg_user_id IS NULL AND username IS NOT NULL"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_access_expiry "
+            "ON external_access(expires_at)"
+        )
+        con.commit()
+    _external_access_bootstrap_from_env()
+
+
+async def is_member_of_access_chat(
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str | None = None,
+    display_name: str | None = None,
+) -> bool:
+    if db_external_access_find_active(
+        int(user_id),
+        username=username,
+        display_name=display_name,
+        bind_username=True,
+    ):
+        return True
+    try:
+        member = await context.bot.get_chat_member(ACCESS_CHAT_ID, int(user_id))
+        return member.status in ("member", "administrator", "creator")
+    except Forbidden:
+        logger.warning(
+            "Forbidden while checking ACCESS_CHAT_ID. "
+            "Bot must be member of the chat and have rights."
+        )
+        return False
+    except Exception as exc:
+        logger.exception("Error checking access chat membership: %s", exc)
+        return False
+
+
+async def is_admin_in_chat(
+    chat_id: int,
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str | None = None,
+    display_name: str | None = None,
+) -> bool:
+    external = db_external_access_find_active(
+        int(user_id),
+        username=username,
+        display_name=display_name,
+        bind_username=True,
+    )
+    if external and external.get("is_admin"):
+        return True
+    try:
+        member = await context.bot.get_chat_member(int(chat_id), int(user_id))
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def is_admin_scoped(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    external = db_external_access_find_active(
+        int(user.id),
+        username=getattr(user, "username", None),
+        display_name=getattr(user, "full_name", None),
+        bind_username=True,
+    )
+    if external and external.get("is_admin"):
+        return True
+    scope_chat_id = get_scope_chat_id(update, context) or ACCESS_CHAT_ID
+    return await is_admin_in_chat(
+        int(scope_chat_id),
+        int(user.id),
+        context,
+        username=getattr(user, "username", None),
+        display_name=getattr(user, "full_name", None),
+    )
+
+
+async def deny_no_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return True
+    has_access = await is_member_of_access_chat(
+        int(user.id),
+        context,
+        username=getattr(user, "username", None),
+        display_name=getattr(user, "full_name", None),
+    )
+    if has_access:
+        return False
+    try:
+        if update.message:
+            await update.message.reply_text(NO_ACCESS_TEXT)
+        elif update.callback_query:
+            await update.callback_query.answer("Нет доступа", show_alert=True)
+            await update.callback_query.message.reply_text(NO_ACCESS_TEXT)
+        elif update.effective_chat:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=NO_ACCESS_TEXT)
+    except Exception:
+        pass
+    return True
+
+
+async def deny_no_access_for_private_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    user = update.effective_user
+    if not user:
+        return True
+    if await is_member_of_access_chat(
+        int(user.id),
+        context,
+        username=getattr(user, "username", None),
+        display_name=getattr(user, "full_name", None),
+    ):
+        return False
+    try:
+        if _is_group_chat(update):
+            await send_ephemeral_text(update, context, NO_ACCESS_TEXT, parse_mode=None)
+        elif update.effective_chat:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=NO_ACCESS_TEXT)
+    except Exception:
+        logger.exception("Could not send private access denial")
+    return True
+
+
+def external_access_admin_text() -> str:
+    items = db_external_access_list(include_expired=True)
+    active = sum(1 for item in items if not item["is_expired"])
+    admins = sum(1 for item in items if not item["is_expired"] and item["is_admin"])
+    expired = sum(1 for item in items if item["is_expired"])
+    return (
+        "🔐 <b>Внешний доступ</b>\n\n"
+        "Здесь можно дать доступ пользователю, который не состоит в рабочем чате. "
+        "Доступ может быть обычным или администраторским, срочным или бессрочным.\n\n"
+        f"Активных доступов: <b>{active}</b>\n"
+        f"Из них с правами администратора: <b>{admins}</b>\n"
+        f"Истёкших записей: <b>{expired}</b>"
+    )
+
+
+def kb_external_access_list(page: int = 0) -> InlineKeyboardMarkup:
+    items = db_external_access_list(include_expired=True)
+    pages = max(1, (len(items) + EXTERNAL_ACCESS_PAGE_SIZE - 1) // EXTERNAL_ACCESS_PAGE_SIZE)
+    page = max(0, min(int(page), pages - 1))
+    start = page * EXTERNAL_ACCESS_PAGE_SIZE
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in items[start:start + EXTERNAL_ACCESS_PAGE_SIZE]:
+        status = "⚫" if item["is_expired"] else "🟢"
+        role = "👑" if item["is_admin"] else "👤"
+        identity = _external_access_identity_label(item)
+        rows.append([
+            InlineKeyboardButton(
+                f"{status} {role} {identity}"[:60],
+                callback_data=f"help:settings:access:item:{item['id']}:{page}",
+            )
+        ])
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"help:settings:access:page:{page-1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"help:settings:access:page:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("➕ Выдать доступ", callback_data="help:settings:access:add")])
+    if any(item["is_expired"] for item in items):
+        rows.append([InlineKeyboardButton("🧹 Удалить истёкшие", callback_data="help:settings:access:cleanup")])
+    rows.append([InlineKeyboardButton("⬅️ Управление ботом", callback_data="help:settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def external_access_item_text(item: dict) -> str:
+    status = "истёк" if item["is_expired"] else "активен"
+    role = "администратор" if item["is_admin"] else "обычный пользователь"
+    username_note = ""
+    if item.get("username") and not item.get("tg_user_id"):
+        username_note = (
+            "\n\n⚠️ Доступ пока ожидает привязки к Telegram ID. "
+            "Пользователь должен открыть бота под указанным ником и отправить /start."
+        )
+    return (
+        "🔐 <b>Внешний доступ</b>\n\n"
+        f"Пользователь: <b>{escape(_external_access_identity_label(item))}</b>\n"
+        f"Имя: <b>{escape(item.get('display_name') or '—')}</b>\n"
+        f"Роль: <b>{role}</b>\n"
+        f"Срок: <b>{escape(_external_access_format_expiry(item.get('expires_at')))}</b>\n"
+        f"Статус: <b>{status}</b>"
+        f"{username_note}"
+    )
+
+
+def kb_external_access_item(access_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🗑 Удалить доступ",
+            callback_data=f"help:settings:access:delete:{int(access_id)}:{int(page)}",
+        )],
+        [InlineKeyboardButton("⬅️ К списку", callback_data=f"help:settings:access:page:{int(page)}")],
+    ])
+
+
+def kb_external_access_delete_confirm(access_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🗑 Да, удалить",
+            callback_data=f"help:settings:access:delete_yes:{int(access_id)}:{int(page)}",
+        )],
+        [InlineKeyboardButton(
+            "⬅️ Отмена",
+            callback_data=f"help:settings:access:item:{int(access_id)}:{int(page)}",
+        )],
+    ])
+
+
+def kb_external_access_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Отмена", callback_data="help:settings:access:cancel")
+    ]])
+
+
+def kb_external_access_role() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Без админских прав", callback_data="help:settings:access:role:user")],
+        [InlineKeyboardButton("👑 С админскими правами", callback_data="help:settings:access:role:admin")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:access:cancel")],
+    ])
+
+
+def kb_external_access_term() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1 день", callback_data="help:settings:access:term:1"),
+            InlineKeyboardButton("7 дней", callback_data="help:settings:access:term:7"),
+        ],
+        [
+            InlineKeyboardButton("30 дней", callback_data="help:settings:access:term:30"),
+            InlineKeyboardButton("90 дней", callback_data="help:settings:access:term:90"),
+        ],
+        [InlineKeyboardButton("📅 Ввести дату", callback_data="help:settings:access:term:manual")],
+        [InlineKeyboardButton("♾️ Бессрочно", callback_data="help:settings:access:term:forever")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:access:cancel")],
+    ])
+
+
+def _external_access_flow_clear(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(EXTERNAL_ACCESS_FLOW_KEY, None)
+
+
+def _external_access_flow(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    flow = context.user_data.get(EXTERNAL_ACCESS_FLOW_KEY)
+    return flow if isinstance(flow, dict) else {}
+
+
+def _external_access_confirmation_text(flow: dict) -> str:
+    role = "с админскими правами" if flow.get("is_admin") else "без админских прав"
+    identity = flow.get("identity_label") or "—"
+    expires = _external_access_format_expiry(flow.get("expires_at"))
+    pending_note = ""
+    if flow.get("username") and not flow.get("tg_user_id"):
+        pending_note = (
+            "\n\n⚠️ Ник пока не связан с известным Telegram ID. "
+            "Доступ активируется и привяжется к ID, когда пользователь откроет бота и отправит /start."
+        )
+    return (
+        "✅ <b>Проверьте внешний доступ</b>\n\n"
+        f"Пользователь: <b>{escape(identity)}</b>\n"
+        f"Роль: <b>{role}</b>\n"
+        f"Срок: <b>{escape(expires)}</b>"
+        f"{pending_note}"
+    )
+
+
+def kb_external_access_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Выдать доступ", callback_data="help:settings:access:confirm")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="help:settings:access:cancel")],
+    ])
+
+
+_external_access_previous_kb_help_settings = kb_help_settings
+
+
+def kb_help_settings():
+    legacy = _external_access_previous_kb_help_settings()
+    rows = [list(row) for row in legacy.inline_keyboard]
+    insert_at = max(0, len(rows) - 1)
+    rows.insert(insert_at, [
+        InlineKeyboardButton("🔐 Внешний доступ", callback_data="help:settings:access")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+_external_access_previous_cb_help = cb_help
+
+
+async def cb_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = (query.data or "") if query else ""
+    if not data.startswith("help:settings:access"):
+        return await _external_access_previous_cb_help(update, context)
+    if not query or not update.effective_user:
+        return
+    if await deny_no_access(update, context):
+        return
+    if not await is_admin_scoped(update, context):
+        try:
+            await query.answer("Доступно администраторам.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    if data in {"help:settings:access", "help:settings:access:cancel"}:
+        _external_access_flow_clear(context)
+        await query.edit_message_text(
+            external_access_admin_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_list(0),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:settings:access:page:"):
+        try:
+            page = max(0, int(data.rsplit(":", 1)[-1]))
+        except ValueError:
+            page = 0
+        _external_access_flow_clear(context)
+        await query.edit_message_text(
+            external_access_admin_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_list(page),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:settings:access:add":
+        context.user_data[EXTERNAL_ACCESS_FLOW_KEY] = {
+            "step": "identifier",
+            "owner_user_id": int(update.effective_user.id),
+        }
+        await query.edit_message_text(
+            "➕ <b>Новый внешний доступ</b>\n\n"
+            "Отправьте Telegram ID или ник пользователя.\n\n"
+            "Примеры: <code>123456789</code>, <code>@username</code> или "
+            "<code>https://t.me/username</code>.\n\n"
+            "При добавлении только по нику пользователь должен затем открыть бота и отправить /start, "
+            "чтобы доступ закрепился за его неизменяемым Telegram ID.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_cancel(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:settings:access:role:"):
+        flow = _external_access_flow(context)
+        if flow.get("step") != "role" or flow.get("owner_user_id") != int(update.effective_user.id):
+            await query.answer("Мастер уже завершён или отменён.", show_alert=True)
+            return
+        flow["is_admin"] = data.endswith(":admin")
+        flow["step"] = "term"
+        context.user_data[EXTERNAL_ACCESS_FLOW_KEY] = flow
+        await query.edit_message_text(
+            "⏳ <b>Срок доступа</b>\n\nВыберите срок или выдайте доступ бессрочно.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_term(),
+        )
+        return
+
+    if data.startswith("help:settings:access:term:"):
+        flow = _external_access_flow(context)
+        if flow.get("step") != "term" or flow.get("owner_user_id") != int(update.effective_user.id):
+            await query.answer("Мастер уже завершён или отменён.", show_alert=True)
+            return
+        term = data.rsplit(":", 1)[-1]
+        if term == "manual":
+            flow["step"] = "expiry_manual"
+            context.user_data[EXTERNAL_ACCESS_FLOW_KEY] = flow
+            await query.edit_message_text(
+                "📅 <b>Дата окончания</b>\n\n"
+                "Отправьте дату по московскому времени:\n"
+                "<code>ДД.ММ.ГГГГ</code> или <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>.\n\n"
+                "Если время не указано, доступ завершится в 23:59 выбранного дня.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_external_access_cancel(),
+            )
+            return
+        if term == "forever":
+            flow["expires_at"] = None
+        else:
+            try:
+                days = max(1, int(term))
+            except ValueError:
+                await query.answer("Некорректный срок.", show_alert=True)
+                return
+            flow["expires_at"] = (
+                datetime.utcnow() + timedelta(days=days)
+            ).replace(microsecond=0).isoformat()
+        flow["step"] = "confirm"
+        context.user_data[EXTERNAL_ACCESS_FLOW_KEY] = flow
+        await query.edit_message_text(
+            _external_access_confirmation_text(flow),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_confirm(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data == "help:settings:access:confirm":
+        flow = _external_access_flow(context)
+        if flow.get("step") != "confirm" or flow.get("owner_user_id") != int(update.effective_user.id):
+            await query.answer("Мастер уже завершён или отменён.", show_alert=True)
+            return
+        try:
+            access_id = db_external_access_upsert(
+                tg_user_id=flow.get("tg_user_id"),
+                username=flow.get("username"),
+                display_name=flow.get("display_name"),
+                is_admin=bool(flow.get("is_admin")),
+                expires_at=flow.get("expires_at"),
+                created_by=int(update.effective_user.id),
+            )
+        except Exception as exc:
+            logger.exception("Cannot save external access: %s", exc)
+            await query.answer("Не удалось сохранить доступ.", show_alert=True)
+            return
+        _external_access_flow_clear(context)
+        item = db_external_access_get(access_id)
+        await query.edit_message_text(
+            "✅ <b>Доступ сохранён</b>\n\n" + external_access_item_text(item),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_item(access_id, 0),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:settings:access:item:"):
+        parts = data.split(":")
+        try:
+            access_id = int(parts[-2])
+            page = int(parts[-1])
+        except (ValueError, IndexError):
+            await query.answer("Запись не найдена.", show_alert=True)
+            return
+        item = db_external_access_get(access_id)
+        if not item:
+            await query.answer("Запись не найдена.", show_alert=True)
+            return
+        _external_access_flow_clear(context)
+        await query.edit_message_text(
+            external_access_item_text(item),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_item(access_id, page),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:settings:access:delete_yes:"):
+        parts = data.split(":")
+        try:
+            access_id = int(parts[-2])
+            page = int(parts[-1])
+        except (ValueError, IndexError):
+            await query.answer("Запись не найдена.", show_alert=True)
+            return
+        deleted = db_external_access_delete(access_id)
+        await query.answer("Доступ удалён." if deleted else "Запись уже удалена.")
+        await query.edit_message_text(
+            external_access_admin_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_list(page),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if data.startswith("help:settings:access:delete:"):
+        parts = data.split(":")
+        try:
+            access_id = int(parts[-2])
+            page = int(parts[-1])
+        except (ValueError, IndexError):
+            await query.answer("Запись не найдена.", show_alert=True)
+            return
+        item = db_external_access_get(access_id)
+        if not item:
+            await query.answer("Запись не найдена.", show_alert=True)
+            return
+        await query.edit_message_text(
+            "⚠️ <b>Удалить внешний доступ?</b>\n\n"
+            f"Пользователь: <b>{escape(_external_access_identity_label(item))}</b>\n\n"
+            "После удаления пользователь сразу потеряет выданные этой записью права.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_delete_confirm(access_id, page),
+        )
+        return
+
+    if data == "help:settings:access:cleanup":
+        deleted = db_external_access_delete_expired()
+        await query.answer(f"Удалено истёкших записей: {deleted}")
+        await query.edit_message_text(
+            external_access_admin_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_list(0),
+            disable_web_page_preview=True,
+        )
+        return
+
+    await query.answer("Неизвестное действие.", show_alert=True)
+
+
+_external_access_previous_on_text = on_text
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    flow = _external_access_flow(context)
+    if not flow:
+        return await _external_access_previous_on_text(update, context)
+    if not update.message or not update.effective_user:
+        return
+    if flow.get("owner_user_id") != int(update.effective_user.id):
+        return await _external_access_previous_on_text(update, context)
+    if not await is_admin_scoped(update, context):
+        _external_access_flow_clear(context)
+        return await _external_access_previous_on_text(update, context)
+
+    if flow.get("step") == "identifier":
+        resolved = _external_access_resolve_identifier(update.message.text or "")
+        if not resolved:
+            await update.message.reply_text(
+                "Не удалось распознать пользователя. Отправьте числовой Telegram ID "
+                "или корректный ник вида @username."
+            )
+            return
+        flow.update(resolved)
+        flow["identity_label"] = (
+            f"@{resolved['username']} · {resolved['tg_user_id']}"
+            if resolved.get("username") and resolved.get("tg_user_id")
+            else f"@{resolved['username']}"
+            if resolved.get("username")
+            else str(resolved.get("tg_user_id"))
+        )
+        flow["step"] = "role"
+        context.user_data[EXTERNAL_ACCESS_FLOW_KEY] = flow
+        await update.message.reply_text(
+            "🛡 <b>Права пользователя</b>\n\nВыберите уровень доступа.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_role(),
+        )
+        return
+
+    if flow.get("step") == "expiry_manual":
+        expires_at = _external_access_parse_manual_expiry(update.message.text or "")
+        if not expires_at:
+            await update.message.reply_text(
+                "Не удалось распознать будущую дату. Используйте формат "
+                "ДД.ММ.ГГГГ или ДД.ММ.ГГГГ ЧЧ:ММ по московскому времени."
+            )
+            return
+        flow["expires_at"] = expires_at
+        flow["step"] = "confirm"
+        context.user_data[EXTERNAL_ACCESS_FLOW_KEY] = flow
+        await update.message.reply_text(
+            _external_access_confirmation_text(flow),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_external_access_confirm(),
+            disable_web_page_preview=True,
+        )
+        return
+
+    return await _external_access_previous_on_text(update, context)
+
+# =============== END EXTERNAL ACCESS MANAGEMENT V1 ===============
+
+
+BUILD_VERSION = "EXTERNAL-ACCESS-2026-08-04-V33"
 
 def main():
     ensure_db_path(DB_PATH)
