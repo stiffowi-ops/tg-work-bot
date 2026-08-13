@@ -27487,10 +27487,9 @@ def projects_menu_text() -> str:
     )
 
 
-def kb_projects_menu(
-    is_private_chat: bool = True,
-) -> InlineKeyboardMarkup:
-    rows = [
+def kb_projects_menu() -> InlineKeyboardMarkup:
+    """Меню проектов не содержит WebApp-кнопок, поэтому открывается в любом чате."""
+    return InlineKeyboardMarkup([
         [
             _green_inline_button(
                 "🏭 Отраслевое деление",
@@ -27503,29 +27502,73 @@ def kb_projects_menu(
                 callback_data="help:projects:calendar",
             )
         ],
-    ]
+        [
+            InlineKeyboardButton(
+                "⚔️ Сравнение с конкурентами",
+                callback_data="help:projects:radar",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Главное меню",
+                callback_data="help:main",
+            )
+        ],
+    ])
+
+
+def competitive_radar_text(is_private_chat: bool) -> str:
+    if not COMPETITIVE_RADAR_URL:
+        return (
+            "⚔️ <b>Сравнение с конкурентами</b>\n\n"
+            "Mini App пока не настроен: на сервере отсутствует "
+            "<code>COMPETITIVE_RADAR_URL</code>."
+        )
+    if is_private_chat:
+        return (
+            "⚔️ <b>Сравнение с конкурентами</b>\n\n"
+            "Нажмите кнопку ниже — конкурентный радар откроется "
+            "как Telegram Mini App."
+        )
+    return (
+        "⚔️ <b>Сравнение с конкурентами</b>\n\n"
+        "Telegram разрешает Web App-кнопку в личном чате с ботом. "
+        "Из группы можно открыть веб-версию по кнопке ниже."
+    )
+
+
+def kb_competitive_radar(is_private_chat: bool) -> InlineKeyboardMarkup:
+    rows = []
 
     if COMPETITIVE_RADAR_URL:
-        # Настоящая Telegram Mini App-кнопка поддерживается в личном чате с ботом.
         if is_private_chat:
-            radar_button = InlineKeyboardButton(
-                "⚔️ Сравнение с конкурентами",
-                web_app=WebAppInfo(url=COMPETITIVE_RADAR_URL),
-            )
+            rows.append([
+                InlineKeyboardButton(
+                    "🚀 Открыть конкурентный радар",
+                    web_app=WebAppInfo(url=COMPETITIVE_RADAR_URL),
+                )
+            ])
         else:
-            # В группах WebAppInfo у inline-кнопки не поддерживается.
-            # Оставляем безопасный HTTPS fallback, чтобы меню не ломалось.
-            radar_button = InlineKeyboardButton(
-                "⚔️ Сравнение с конкурентами",
-                url=COMPETITIVE_RADAR_URL,
-            )
-        rows.append([radar_button])
+            rows.append([
+                InlineKeyboardButton(
+                    "🌐 Открыть конкурентный радар",
+                    url=COMPETITIVE_RADAR_URL,
+                )
+            ])
 
-    rows.append([
-        InlineKeyboardButton(
-            "🏠 Главное меню",
-            callback_data="help:main",
-        )
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                "⬅️ К проектам",
+                callback_data="help:projects",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Главное меню",
+                callback_data="help:main",
+            )
+        ],
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -27660,12 +27703,35 @@ async def render_projects_menu(
     await query.edit_message_text(
         projects_menu_text(),
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_projects_menu(
-            is_private_chat=bool(
-                update.effective_chat
-                and update.effective_chat.type == "private"
-            )
-        ),
+        reply_markup=kb_projects_menu(),
+        disable_web_page_preview=True,
+    )
+
+
+async def render_competitive_radar(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    if not query:
+        return
+    if await deny_no_access(update, context):
+        return
+
+    is_private_chat = bool(
+        update.effective_chat
+        and update.effective_chat.type == "private"
+    )
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    await query.edit_message_text(
+        competitive_radar_text(is_private_chat),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_competitive_radar(is_private_chat),
         disable_web_page_preview=True,
     )
 
@@ -27708,6 +27774,9 @@ async def cb_help(
 
     if data == "help:projects":
         return await render_projects_menu(update, context)
+
+    if data == "help:projects:radar":
+        return await render_competitive_radar(update, context)
 
     if data == "help:projects:calendar":
         return await render_calendar_planning_project(update, context)
@@ -38758,7 +38827,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============== END EXTERNAL ACCESS MANAGEMENT V1 ===============
 
 
-BUILD_VERSION = "BOTHOST-MINIAPP-RADAR-2026-08-13-V34"
+BUILD_VERSION = "BOTHOST-MINIAPP-RADAR-2026-08-13-V35"
 
 def main():
     ensure_db_path(DB_PATH)
