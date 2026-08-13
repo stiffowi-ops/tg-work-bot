@@ -6,8 +6,6 @@ import random
 import sqlite3
 import logging
 import time
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import csv
 import io
 import zipfile
@@ -27,7 +25,6 @@ from telegram import (
     InlineQueryResultCachedDocument,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    WebAppInfo,
 )
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TimedOut, NetworkError
@@ -311,17 +308,6 @@ LITE_FORM_URL = os.getenv("LITE_FORM_URL", "")
 LEAD_CRM_URL = os.getenv("LEAD_CRM_URL", "")
 REANIMATION_REQUEST_URL = os.getenv("REANIMATION_REQUEST_URL", "")
 HELPY_BOT_URL = os.getenv("HELPY_BOT_URL", "")
-COMPETITIVE_RADAR_URL = os.getenv("COMPETITIVE_RADAR_URL", "").strip()
-
-# Telegram Mini App: HTML хранится локально рядом с ботом.
-# По умолчанию ожидается файл data/radar.html.
-_RADAR_HTML_ENV = (os.getenv("RADAR_HTML_PATH", "data/radar.html") or "data/radar.html").strip()
-RADAR_HTML_PATH = Path(_RADAR_HTML_ENV)
-if not RADAR_HTML_PATH.is_absolute():
-    RADAR_HTML_PATH = Path(__file__).resolve().parent / RADAR_HTML_PATH
-
-# Bothost передаёт порт веб-приложения через PORT.
-WEBAPP_PORT = int(os.getenv("PORT") or "8080")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -329,144 +315,6 @@ if not ZOOM_URL:
     raise RuntimeError("ZOOM_URL is not set")
 if not INDUSTRY_ZOOM_URL:
     raise RuntimeError("INDUSTRY_ZOOM_URL is not set")
-
-
-# ---------------- TELEGRAM MINI APP HTTP SERVER ----------------
-class CompetitiveRadarHandler(BaseHTTPRequestHandler):
-    """Отдаёт наружу только HTML конкурентного радара."""
-
-    server_version = "CompetitiveRadar/1.0"
-
-    def _send_bytes(
-        self,
-        status: int,
-        body: bytes,
-        content_type: str,
-        *,
-        cache_control: str = "no-store",
-    ) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", cache_control)
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_HEAD(self):
-        path = self.path.split("?", 1)[0].rstrip("/") or "/"
-        if path in {"/", "/radar", "/radar.html"} and RADAR_HTML_PATH.is_file():
-            size = RADAR_HTML_PATH.stat().st_size
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(size))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            return
-
-        if path == "/health":
-            body = b"ok"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            return
-
-        self.send_response(404)
-        self.end_headers()
-
-    def do_GET(self):
-        path = self.path.split("?", 1)[0].rstrip("/") or "/"
-
-        if path == "/health":
-            self._send_bytes(
-                200,
-                b"ok",
-                "text/plain; charset=utf-8",
-            )
-            return
-
-        if path not in {"/", "/radar", "/radar.html"}:
-            self._send_bytes(
-                404,
-                b"Not found",
-                "text/plain; charset=utf-8",
-            )
-            return
-
-        try:
-            html_bytes = RADAR_HTML_PATH.read_bytes()
-        except FileNotFoundError:
-            message = (
-                "radar.html not found. "
-                f"Expected file: {RADAR_HTML_PATH}"
-            ).encode("utf-8")
-            self._send_bytes(
-                404,
-                message,
-                "text/plain; charset=utf-8",
-            )
-            return
-        except Exception as exc:
-            logger.exception("Cannot read Mini App HTML: %s", exc)
-            self._send_bytes(
-                500,
-                b"Internal server error",
-                "text/plain; charset=utf-8",
-            )
-            return
-
-        self._send_bytes(
-            200,
-            html_bytes,
-            "text/html; charset=utf-8",
-            cache_control="no-cache",
-        )
-
-    def log_message(self, format, *args):
-        # Не засоряем лог каждым GET от WebView.
-        logger.debug("MiniApp HTTP: " + format, *args)
-
-
-_miniapp_http_server = None
-
-
-def start_miniapp_server():
-    """Запускает HTTP-сервер в отдельном daemon-потоке."""
-    global _miniapp_http_server
-
-    if _miniapp_http_server is not None:
-        return _miniapp_http_server
-
-    if not RADAR_HTML_PATH.is_file():
-        logger.warning(
-            "Mini App HTML пока не найден: %s. "
-            "Сервер всё равно будет запущен и начнёт отдавать файл после его появления.",
-            RADAR_HTML_PATH,
-        )
-
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", WEBAPP_PORT),
-        CompetitiveRadarHandler,
-    )
-    server.daemon_threads = True
-
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="competitive-radar-http",
-        daemon=True,
-    )
-    thread.start()
-
-    _miniapp_http_server = server
-    logger.warning(
-        "Mini App HTTP server started: 0.0.0.0:%s | HTML: %s",
-        WEBAPP_PORT,
-        RADAR_HTML_PATH,
-    )
-    return server
-
 
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
@@ -27488,7 +27336,6 @@ def projects_menu_text() -> str:
 
 
 def kb_projects_menu() -> InlineKeyboardMarkup:
-    """Меню проектов не содержит WebApp-кнопок, поэтому открывается в любом чате."""
     return InlineKeyboardMarkup([
         [
             _green_inline_button(
@@ -27504,73 +27351,11 @@ def kb_projects_menu() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
-                "⚔️ Сравнение с конкурентами",
-                callback_data="help:projects:radar",
-            )
-        ],
-        [
-            InlineKeyboardButton(
                 "🏠 Главное меню",
                 callback_data="help:main",
             )
         ],
     ])
-
-
-def competitive_radar_text(is_private_chat: bool) -> str:
-    if not COMPETITIVE_RADAR_URL:
-        return (
-            "⚔️ <b>Сравнение с конкурентами</b>\n\n"
-            "Mini App пока не настроен: на сервере отсутствует "
-            "<code>COMPETITIVE_RADAR_URL</code>."
-        )
-    if is_private_chat:
-        return (
-            "⚔️ <b>Сравнение с конкурентами</b>\n\n"
-            "Нажмите кнопку ниже — конкурентный радар откроется "
-            "как Telegram Mini App."
-        )
-    return (
-        "⚔️ <b>Сравнение с конкурентами</b>\n\n"
-        "Telegram разрешает Web App-кнопку в личном чате с ботом. "
-        "Из группы можно открыть веб-версию по кнопке ниже."
-    )
-
-
-def kb_competitive_radar(is_private_chat: bool) -> InlineKeyboardMarkup:
-    rows = []
-
-    if COMPETITIVE_RADAR_URL:
-        if is_private_chat:
-            rows.append([
-                InlineKeyboardButton(
-                    "🚀 Открыть конкурентный радар",
-                    web_app=WebAppInfo(url=COMPETITIVE_RADAR_URL),
-                )
-            ])
-        else:
-            rows.append([
-                InlineKeyboardButton(
-                    "🌐 Открыть конкурентный радар",
-                    url=COMPETITIVE_RADAR_URL,
-                )
-            ])
-
-    rows.extend([
-        [
-            InlineKeyboardButton(
-                "⬅️ К проектам",
-                callback_data="help:projects",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🏠 Главное меню",
-                callback_data="help:main",
-            )
-        ],
-    ])
-    return InlineKeyboardMarkup(rows)
 
 
 def calendar_planning_project_text() -> str:
@@ -27708,34 +27493,6 @@ async def render_projects_menu(
     )
 
 
-async def render_competitive_radar(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    if not query:
-        return
-    if await deny_no_access(update, context):
-        return
-
-    is_private_chat = bool(
-        update.effective_chat
-        and update.effective_chat.type == "private"
-    )
-
-    try:
-        await query.answer()
-    except Exception:
-        pass
-
-    await query.edit_message_text(
-        competitive_radar_text(is_private_chat),
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_competitive_radar(is_private_chat),
-        disable_web_page_preview=True,
-    )
-
-
 async def render_calendar_planning_project(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -27774,9 +27531,6 @@ async def cb_help(
 
     if data == "help:projects":
         return await render_projects_menu(update, context)
-
-    if data == "help:projects:radar":
-        return await render_competitive_radar(update, context)
 
     if data == "help:projects:calendar":
         return await render_calendar_planning_project(update, context)
@@ -38827,21 +38581,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============== END EXTERNAL ACCESS MANAGEMENT V1 ===============
 
 
-BUILD_VERSION = "BOTHOST-MINIAPP-RADAR-2026-08-13-V35"
+BUILD_VERSION = "EXTERNAL-ACCESS-2026-08-04-V33"
 
 def main():
     ensure_db_path(DB_PATH)
     ensure_storage_dir(STORAGE_DIR)
     db_init()
-
-    # Bothost проксирует внешний HTTPS-домен на этот локальный PORT.
-    start_miniapp_server()
-
-    if COMPETITIVE_RADAR_URL and not COMPETITIVE_RADAR_URL.lower().startswith("https://"):
-        logger.warning(
-            "COMPETITIVE_RADAR_URL должен быть HTTPS для Telegram Mini App: %s",
-            COMPETITIVE_RADAR_URL,
-        )
 
     request = HTTPXRequest(connect_timeout=15, read_timeout=30, write_timeout=30, pool_timeout=30)
 
