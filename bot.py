@@ -308,6 +308,7 @@ LITE_FORM_URL = os.getenv("LITE_FORM_URL", "")
 LEAD_CRM_URL = os.getenv("LEAD_CRM_URL", "")
 REANIMATION_REQUEST_URL = os.getenv("REANIMATION_REQUEST_URL", "")
 HELPY_BOT_URL = os.getenv("HELPY_BOT_URL", "")
+COMPETITIVE_RADAR_URL = os.getenv("COMPETITIVE_RADAR_URL", "").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -27336,7 +27337,7 @@ def projects_menu_text() -> str:
 
 
 def kb_projects_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    rows = [
         [
             _green_inline_button(
                 "🏭 Отраслевое деление",
@@ -27349,13 +27350,25 @@ def kb_projects_menu() -> InlineKeyboardMarkup:
                 callback_data="help:projects:calendar",
             )
         ],
-        [
+    ]
+
+    # Внешний конкурентный радар. URL хранится в .env,
+    # поэтому ссылку можно менять без правок кода бота.
+    if COMPETITIVE_RADAR_URL:
+        rows.append([
             InlineKeyboardButton(
-                "🏠 Главное меню",
-                callback_data="help:main",
+                "⚔️ Сравнение с конкурентами",
+                url=COMPETITIVE_RADAR_URL,
             )
-        ],
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "🏠 Главное меню",
+            callback_data="help:main",
+        )
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 def calendar_planning_project_text() -> str:
