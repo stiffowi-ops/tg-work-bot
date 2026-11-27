@@ -50,6 +50,12 @@ func TestCMSFileLifecycle(t *testing.T){
  w=request("GET","/api/content/calendar",4,nil,"",nil,"");cookies:=w.Result().Cookies();if w.Code!=200||len(cookies)!=1||!cookies[0].HttpOnly||!cookies[0].Secure{t.Fatal("session cookie invalid")}
  if w=request("GET",path,0,nil,"",cookies[0],"bytes=0-4");w.Code!=206||w.Body.String()!="%PDF-"{t.Fatal("range",w.Code,w.Body.String())}
  if w=request("GET",path,99,nil,"",nil,"");w.Code!=403{t.Fatal("former member",w.Code)}
+ for _,id:=range []int64{0,99,4,42}{
+  w=request("POST","/api/content/media-session",id,nil,"",nil,"")
+  want:=200;if id==0{want=401}else if id==99{want=403}
+  if w.Code!=want{t.Fatal("media renewal authorization",id,w.Code,w.Body.String())}
+  ck:=w.Result().Cookies();if want==200{if len(ck)!=1||!ck[0].Secure||!ck[0].HttpOnly{t.Fatal("renewal cookie invalid")}}else if len(ck)!=0{t.Fatal("unauthorized renewal")}
+ }
  if w=request("GET",path,4,nil,"",nil,"");w.Code!=200||!bytes.Equal(w.Body.Bytes(),payload){t.Fatal("download",w.Code)}
  c2:=&cms{auth:a,root:c.root};q,e:=c2.load("calendar");if e!=nil||q.Blocks[0].ID!=b.ID{t.Fatal("order not persisted",e)}
  q.Blocks=q.Blocks[1:];raw,_=json.Marshal(q)

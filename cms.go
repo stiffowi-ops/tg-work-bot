@@ -118,6 +118,10 @@ func (c *cms) index(w http.ResponseWriter,r *http.Request){
  for _,id:=range []string{"calendar","industry"}{p,err:=c.load(id);if err!=nil{apiError(w,500,"Не удалось загрузить проекты.");return};p.Blocks=nil;list=append(list,p)}
  writeJSON(w,200,map[string]any{"admin":isAdmin(u.ID),"projects":list})
 }
+func (c *cms) refreshMediaSession(w http.ResponseWriter,r *http.Request){
+ u,ok:=c.auth.authorize(w,r);if !ok{return}
+ c.setMediaCookie(w,u.ID);writeJSON(w,200,map[string]bool{"ok":true})
+}
 func (c *cms) get(w http.ResponseWriter,r *http.Request){
  u,ok:=c.auth.authorize(w,r);if !ok{return}
  id:=r.PathValue("project");if _,ok:=projectSeed(id);!ok{apiError(w,404,"Проект не найден.");return}
@@ -213,6 +217,7 @@ func (c *cms) media(w http.ResponseWriter,r *http.Request){
 func (c *cms) register(mux *http.ServeMux){
  mux.HandleFunc("GET /api/admin/chat-diagnostic",c.chatDiagnostic)
  mux.HandleFunc("GET /api/content",c.index)
+ mux.HandleFunc("POST /api/content/media-session",c.refreshMediaSession)
  mux.HandleFunc("GET /api/content/{project}",c.get)
  mux.HandleFunc("PUT /api/content/{project}",c.update)
  mux.HandleFunc("POST /api/content/{project}/blocks",c.add)

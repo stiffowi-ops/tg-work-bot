@@ -34,6 +34,10 @@ jobs:
         run: |
           pip install playwright==1.51.0
           python -m playwright install --with-deps chromium
+          command -v google-chrome >/dev/null || python -m playwright install chrome
+          google-chrome --version
+          command -v ffprobe >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          ffprobe -v error -show_entries stream=codec_name,profile,pix_fmt,width,height -show_entries format=duration,size -of json demo/overview.mp4
       - name: Browser integration tests
         run: |
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" -keyout /tmp/fixture.key -out /tmp/fixture.crt

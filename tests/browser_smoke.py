@@ -1,5 +1,5 @@
 from pathlib import Path
-from playwright.sync_api import sync_playwright, expect
+from playwright.sync_api import sync_playwright, expect, TimeoutError as PlaywrightTimeout
 import urllib.request, json, os, ssl
 ssl_context=ssl._create_unverified_context()  # local test-only certificate
 base="https://127.0.0.1:18080"
@@ -38,8 +38,35 @@ def project(p):
 def shot(p,name):
     assert p.evaluate("document.documentElement.scrollWidth <= innerWidth+1"), name+" overflow"
     p.screenshot(path=str(out/(name+".png")),full_page=False,animations="disabled")
+def playback(p,ctx,label):
+    player=p.locator(".routing-player")
+    v=player.locator("video")
+    launch=player.locator(".player-launch")
+    launch.scroll_into_view_if_needed()
+    box=player.bounding_box()
+    print(label,"codec support",v.evaluate("""v=>({mp4:v.canPlayType('video/mp4'),h264:v.canPlayType('video/mp4; codecs="avc1.42E01E"')})"""),flush=True)
+    media=v.get_attribute("data-video-src")
+    response=ctx.request.get(base+media,headers={"Range":"bytes=0-31"})
+    assert response.status==206 and response.headers.get("content-type","").startswith("video/mp4"),f"{label} video range {response.status} {response.headers}"
+    assert len(response.body())==32,"wrong range bytes"
+    launch.click()
+    try:
+        p.wait_for_function("document.querySelector('video').currentTime > 0.1",timeout=20000)
+    except PlaywrightTimeout:
+        print(label,"video diagnostic",v.evaluate("""v=>({error:v.error?.code||0,message:v.error?.message||'',readyState:v.readyState,networkState:v.networkState,paused:v.paused,duration:Number.isFinite(v.duration)?v.duration:null,currentTime:v.currentTime,buffered:v.buffered.length})"""),flush=True)
+        shot(p,label+"-playback-error")
+        raise
+    after=player.bounding_box()
+    assert all(abs(box[k]-after[k])<1 for k in ("width","height")),"player layout shifted"
+    shot(p,label+"-playing")
+    duration=v.evaluate("v=>{v.pause();return v.duration}")
+    assert duration>0.4,"invalid fixture duration"
+    target=duration*0.6
+    v.evaluate("(v,t)=>{v.currentTime=t}",target)
+    p.wait_for_function("t=>{const v=document.querySelector('video');return !v.seeking&&Math.abs(v.currentTime-t)<0.25}",arg=target,timeout=15000)
+    print(label,"playback and seek passed",flush=True)
 with sync_playwright() as pw:
-    b=pw.chromium.launch(headless=True,channel="chromium")
+    b=pw.chromium.launch(headless=True,channel="chrome")
     ctx,p,errors=session(b,42,1440,940)
     shot(p,"desktop-profile")
     admin(p)
@@ -88,25 +115,18 @@ with sync_playwright() as pw:
     ctx,p,errors=session(b,99,390,844)
     expect(p.locator(".access-panel")).to_contain_text("только участникам рабочего чата")
     assert not errors,errors;ctx.close()
-    # Capture all screens before playback assertions, so a media failure cannot hide mobile screenshots.
-    ctx,p,errors=session(b,4,390,844)
-    project(p)
-    p.locator(".player-launch").scroll_into_view_if_needed()
-    box=p.locator(".routing-player").bounding_box()
-    p.locator(".player-launch").click();p.wait_for_function("document.querySelector('video').currentTime > 0.1",timeout=20000)
-    after=p.locator(".routing-player").bounding_box()
-    assert abs(box["width"]-after["width"])<1 and abs(box["height"]-after["height"])<1
-    assert not errors,errors;ctx.close()
-    ctx,p,errors=session(b,42,1440,940)
-    project(p)
-    v=p.locator(".routing-player video")
-    p.locator(".player-launch").scroll_into_view_if_needed()
-    box=p.locator(".routing-player").bounding_box()
-    p.locator(".player-launch").click()
-    p.wait_for_function("document.querySelector('video').currentTime > 0.1",timeout=20000)
-    after=p.locator(".routing-player").bounding_box()
-    assert all(abs(box[k]-after[k])<1 for k in ("width","height")),"player layout shifted"
-    v.evaluate("(v)=>v.pause()")
-    assert not errors,errors;ctx.close()
+    # Keep both playback checks independent; a failure on one viewport does not mask the other.
+    playback_failures=[]
+    for uid,width,height,label in [(4,390,844,"mobile"),(42,1440,940,"desktop")]:
+        ctx,p,errors=session(b,uid,width,height)
+        try:
+            project(p)
+            playback(p,ctx,label)
+            assert not errors,errors
+        except Exception as e:
+            playback_failures.append(f"{label}: {e}")
+        finally:
+            ctx.close()
+    assert not playback_failures,playback_failures
     b.close()
 print("Browser checks passed: real API, admin upload, draft visibility, download, desktop/mobile layout and playback.")
