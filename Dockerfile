@@ -1,6 +1,7 @@
 FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod main.go main_test.go ./
+COPY web ./web
 RUN go test ./... && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /workhub .
 
 FROM alpine:3.22
