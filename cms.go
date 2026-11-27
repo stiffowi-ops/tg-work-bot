@@ -211,6 +211,7 @@ func (c *cms) media(w http.ResponseWriter,r *http.Request){
  http.ServeContent(w,r,b.Filename,st.ModTime(),f)
 }
 func (c *cms) register(mux *http.ServeMux){
+ mux.HandleFunc("GET /api/admin/chat-diagnostic",c.chatDiagnostic)
  mux.HandleFunc("GET /api/content",c.index)
  mux.HandleFunc("GET /api/content/{project}",c.get)
  mux.HandleFunc("PUT /api/content/{project}",c.update)

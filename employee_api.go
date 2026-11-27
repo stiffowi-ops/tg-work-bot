@@ -129,15 +129,18 @@ func(a *employeeAPI)call(ctx context.Context,method string,params url.Values,out
  if err!=nil{return errors.New("Telegram request failed")}
  req.Header.Set("Content-Type","application/x-www-form-urlencoded")
  res,err:=a.client.Do(req);if err!=nil{return errors.New("Telegram unavailable")};defer res.Body.Close()
- var envelope struct{OK bool;Result json.RawMessage}
- if res.StatusCode!=200||json.NewDecoder(io.LimitReader(res.Body,2<<20)).Decode(&envelope)!=nil||!envelope.OK{return errors.New("Telegram request failed")}
+ var envelope struct{OK bool;Result json.RawMessage;ErrorCode int `json:"error_code"`;Parameters struct{MigrateTo int64 `json:"migrate_to_chat_id"`;RetryAfter int `json:"retry_after"`} `json:"parameters"`}
+ if err:=json.NewDecoder(io.LimitReader(res.Body,2<<20)).Decode(&envelope);err!=nil{return &telegramAPIError{HTTPStatus:res.StatusCode}}
+ if res.StatusCode!=200||!envelope.OK{return &telegramAPIError{HTTPStatus:res.StatusCode,Code:envelope.ErrorCode,MigrateTo:envelope.Parameters.MigrateTo,RetryAfter:envelope.Parameters.RetryAfter}}
  return json.Unmarshal(envelope.Result,out)
 }
+type telegramAPIError struct{HTTPStatus,Code,RetryAfter int;MigrateTo int64}
+func(e *telegramAPIError)Error()string{return "Telegram API request failed (HTTP "+strconv.Itoa(e.HTTPStatus)+", code "+strconv.Itoa(e.Code)+")"}
 func(a *employeeAPI)member(ctx context.Context,id int64)(bool,error){
  if a.chat>=0{return false,errors.New("WORK_CHAT_ID missing or invalid")}
  var m struct{Status string;IsMember bool `json:"is_member"`}
  if err:=a.call(ctx,"getChatMember",url.Values{"chat_id":{strconv.FormatInt(a.chat,10)},"user_id":{strconv.FormatInt(id,10)}},&m);err!=nil{return false,err}
- return m.Status=="creator"||m.Status=="administrator"||m.Status=="member"||m.Status=="restricted"&&m.IsMember,nil
+ switch m.Status{case "creator","administrator","member":return true,nil;case "restricted":return m.IsMember,nil;case "left","kicked":return false,nil;default:return false,errors.New("Telegram returned unknown membership status")}
 }
 func photoData(raw []byte)(string,error){
  cfg,kind,err:=image.DecodeConfig(bytes.NewReader(raw));if err!=nil||kind!="jpeg"||cfg.Width<1||cfg.Height<1||cfg.Width>1200||cfg.Height>1200{return "",errors.New("invalid photo")}
@@ -168,7 +171,7 @@ func(a *employeeAPI)authorize(w http.ResponseWriter,r *http.Request)(tgUser,bool
  u,err:=verifyInitData(strings.TrimPrefix(raw,"tma "),a.token,time.Now());if err!=nil{apiError(w,401,"Сессия Telegram недействительна. Откройте приложение заново.");return tgUser{},false}
  if isAdmin(u.ID){return u,true}
  if a.chat>=0{apiError(w,503,"Рабочая группа не настроена: проверьте WORK_CHAT_ID.");return u,false}
- member,err:=a.member(r.Context(),u.ID);if err!=nil{log.Print("access check: getChatMember failed; verify bot permissions and WORK_CHAT_ID");apiError(w,503,"Не удалось проверить доступ к рабочему чату.");return u,false}
+ member,err:=a.member(r.Context(),u.ID);if err!=nil{log.Printf("access check: getChatMember failed: %v",err);var te *telegramAPIError;if errors.As(err,&te)&&te.MigrateTo<0{log.Printf("access check: group migrated; update WORK_CHAT_ID to %d",te.MigrateTo)};apiError(w,503,"Не удалось проверить доступ к рабочему чату.");return u,false}
  if !member{apiError(w,403,"Приложение доступно только участникам рабочего чата.");return u,false}
  return u,true
 }
@@ -237,8 +240,9 @@ func(a *employeeAPI)team(w http.ResponseWriter,r *http.Request){
  }}()}
  go func(){defer close(jobs);for _,p:=range people{select{case jobs<-p:case <-ctx.Done():return}}}()
  go func(){wg.Wait();close(checks)}()
- for c:=range checks{if c.err!=nil||!c.allowed{continue};p:=c.p;result=append(result,colleague{p.ID,p.Username,p.Name,p.Role,p.Bio,p.Status,p.Until,p.Photo,p.Project})}
- if ctx.Err()!=nil{apiError(w,503,"Не удалось обновить состав команды.");return}
+ failed:=0
+ for c:=range checks{if c.err!=nil{failed++;continue};if !c.allowed{continue};p:=c.p;result=append(result,colleague{p.ID,p.Username,p.Name,p.Role,p.Bio,p.Status,p.Until,p.Photo,p.Project})}
+ if ctx.Err()!=nil||failed>0{apiError(w,503,"Не удалось подтвердить полный состав зарегистрированных сотрудников. Повторите проверку.");return}
  sort.Slice(result,func(i,j int)bool{return result[i].Name<result[j].Name})
  writeJSON(w,200,result)
 }
