@@ -12,6 +12,7 @@ import (
  "image"
  "image/jpeg"
  "io"
+ "log"
  "net/http"
  "net/url"
  "os"
@@ -100,14 +101,28 @@ type employeeAPI struct{
  chat int64
  store *employeeStore
  client *http.Client
+ setupError string
 }
 func newEmployeeAPI()*employeeAPI{
+ a:=&employeeAPI{}
+ a.token=strings.TrimSpace(os.Getenv("BOT_TOKEN"))
+ if a.token==""{a.setupError="Не настроен BOT_TOKEN. Проверьте переменные контейнера.";log.Print("access configuration: BOT_TOKEN missing");return a}
  chat,err:=strconv.ParseInt(strings.TrimSpace(os.Getenv("WORK_CHAT_ID")),10,64)
- if err!=nil||chat>=0{return &employeeAPI{}}
- token:=strings.TrimSpace(os.Getenv("BOT_TOKEN"));if token==""{return &employeeAPI{}}
- dir:=os.Getenv("DATA_DIR");if dir==""{dir="/app/runtime"}
- store,err:=openStore(filepath.Join(dir,"employees.json"));if err!=nil{return &employeeAPI{}}
- return &employeeAPI{token:token,chat:chat,store:store,client:&http.Client{Timeout:5*time.Second,CheckRedirect:func(*http.Request,[]*http.Request)error{return http.ErrUseLastResponse}}}
+ if err!=nil||chat>=0{log.Print("access configuration: WORK_CHAT_ID missing or invalid; group access disabled")}else{a.chat=chat}
+ dir:=strings.TrimSpace(os.Getenv("DATA_DIR"));if dir==""{dir="/app/runtime"}
+ if err=os.MkdirAll(dir,0700);err!=nil{a.setupError="Хранилище профилей недоступно. Проверьте DATA_DIR и права записи.";log.Printf("access configuration: cannot create DATA_DIR: %v",err);return a}
+ store,err:=openStore(filepath.Join(dir,"employees.json"))
+ if err!=nil{a.setupError="Не удалось прочитать хранилище профилей. Проверьте DATA_DIR и employees.json.";log.Printf("access configuration: profile store open failed: %v",err);return a}
+ probe,err:=os.CreateTemp(dir,".access-check-*")
+ if err!=nil{a.setupError="Нет прав записи в хранилище профилей. Проверьте DATA_DIR.";log.Printf("access configuration: DATA_DIR not writable: %v",err);return a}
+ probePath:=probe.Name();closeErr:=probe.Close();removeErr:=os.Remove(probePath)
+ if closeErr!=nil||removeErr!=nil{a.setupError="Ошибка проверки хранилища профилей.";log.Print("access configuration: storage probe cleanup failed");return a}
+ a.store=store
+ a.client=&http.Client{Timeout:5*time.Second,CheckRedirect:func(*http.Request,[]*http.Request)error{return http.ErrUseLastResponse}}
+ adminCount:=0
+ for _,s:=range strings.Split(os.Getenv("ADMIN_USER_IDS"),","){s=strings.TrimSpace(s);if s==""{continue};id,err:=strconv.ParseInt(s,10,64);if err!=nil||id<=0||s!=strconv.FormatInt(id,10){log.Print("access configuration: invalid entry in ADMIN_USER_IDS");continue};adminCount++}
+ log.Printf("access configuration: storage ready; group configured=%t; admin IDs configured=%d",a.chat<0,adminCount)
+ return a
 }
 func(a *employeeAPI)call(ctx context.Context,method string,params url.Values,out any)error{
  req,err:=http.NewRequestWithContext(ctx,"POST","https://api.telegram.org/bot"+a.token+"/"+method,strings.NewReader(params.Encode()))
@@ -119,6 +134,7 @@ func(a *employeeAPI)call(ctx context.Context,method string,params url.Values,out
  return json.Unmarshal(envelope.Result,out)
 }
 func(a *employeeAPI)member(ctx context.Context,id int64)(bool,error){
+ if a.chat>=0{return false,errors.New("WORK_CHAT_ID missing or invalid")}
  var m struct{Status string;IsMember bool `json:"is_member"`}
  if err:=a.call(ctx,"getChatMember",url.Values{"chat_id":{strconv.FormatInt(a.chat,10)},"user_id":{strconv.FormatInt(id,10)}},&m);err!=nil{return false,err}
  return m.Status=="creator"||m.Status=="administrator"||m.Status=="member"||m.Status=="restricted"&&m.IsMember,nil
@@ -147,10 +163,12 @@ func(a *employeeAPI)telegramPhoto(ctx context.Context,id int64)string{
 func writeJSON(w http.ResponseWriter,status int,v any){w.Header().Set("Content-Type","application/json; charset=utf-8");w.Header().Set("Cache-Control","no-store");w.WriteHeader(status);_ = json.NewEncoder(w).Encode(v)}
 func apiError(w http.ResponseWriter,status int,msg string){writeJSON(w,status,map[string]string{"error":msg})}
 func(a *employeeAPI)authorize(w http.ResponseWriter,r *http.Request)(tgUser,bool){
- if a.store==nil{apiError(w,503,"Доступ пока не настроен. Обратитесь к администратору.");return tgUser{},false}
+ if a.store==nil{msg:=a.setupError;if msg==""{msg="Доступ пока не настроен. Обратитесь к администратору."};apiError(w,503,msg);return tgUser{},false}
  raw:=r.Header.Get("Authorization");if !strings.HasPrefix(raw,"tma "){apiError(w,401,"Откройте приложение через Telegram.");return tgUser{},false}
  u,err:=verifyInitData(strings.TrimPrefix(raw,"tma "),a.token,time.Now());if err!=nil{apiError(w,401,"Сессия Telegram недействительна. Откройте приложение заново.");return tgUser{},false}
- member,err:=a.member(r.Context(),u.ID);if err!=nil{apiError(w,503,"Не удалось проверить доступ к рабочему чату.");return u,false}
+ if isAdmin(u.ID){return u,true}
+ if a.chat>=0{apiError(w,503,"Рабочая группа не настроена: проверьте WORK_CHAT_ID.");return u,false}
+ member,err:=a.member(r.Context(),u.ID);if err!=nil{log.Print("access check: getChatMember failed; verify bot permissions and WORK_CHAT_ID");apiError(w,503,"Не удалось проверить доступ к рабочему чату.");return u,false}
  if !member{apiError(w,403,"Приложение доступно только участникам рабочего чата.");return u,false}
  return u,true
 }
@@ -214,7 +232,7 @@ func(a *employeeAPI)team(w http.ResponseWriter,r *http.Request){
  ctx,cancel:=context.WithTimeout(r.Context(),10*time.Second);defer cancel()
  for i:=0;i<4;i++{wg.Add(1);go func(){defer wg.Done();for p:=range jobs{
   id,err:=strconv.ParseInt(p.ID,10,64);if err!=nil{continue}
-  allowed:=id==u.ID;if !allowed{allowed,err=a.member(ctx,id)}
+  allowed:=id==u.ID||isAdmin(id);if !allowed{allowed,err=a.member(ctx,id)}
   checks<-check{p,allowed,err}
  }}()}
  go func(){defer close(jobs);for _,p:=range people{select{case jobs<-p:case <-ctx.Done():return}}}()

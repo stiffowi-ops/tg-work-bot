@@ -105,6 +105,8 @@ func (c *cms) mediaUser(w http.ResponseWriter,r *http.Request)(tgUser,bool){
  sig,err:=hex.DecodeString(p[2]);if err!=nil||!hmac.Equal(sig,hmac256([]byte(c.auth.token),[]byte("media-v1:"+p[0]+"."+p[1]))){return deny()}
  id,e1:=strconv.ParseInt(p[0],10,64);exp,e2:=strconv.ParseInt(p[1],10,64)
  if e1!=nil||e2!=nil||id<=0||exp<time.Now().Unix(){return deny()}
+ if isAdmin(id){return tgUser{ID:id},true}
+ if c.auth.chat>=0{apiError(w,503,"Рабочая группа не настроена: проверьте WORK_CHAT_ID.");return tgUser{},false}
  member,err:=c.auth.member(r.Context(),id);if err!=nil{apiError(w,503,"Не удалось проверить доступ.");return tgUser{},false}
  if !member{apiError(w,403,"Доступ закрыт.");return tgUser{},false}
  return tgUser{ID:id},true
