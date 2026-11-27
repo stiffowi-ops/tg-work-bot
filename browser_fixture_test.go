@@ -63,5 +63,5 @@ func TestBrowserFixture(t *testing.T){
  m.Handle("/",http.FileServer(http.FS(static)))
  // Local test-only signed identities. No production route or bypass is added.
  m.HandleFunc("GET /test-init/{id}",func(w http.ResponseWriter,r *http.Request){id,e:=strconv.ParseInt(r.PathValue("id"),10,64);if e!=nil||id<1{http.Error(w,"bad id",400);return};_,_=w.Write([]byte(signedInit(id,time.Now(),a.token)))})
- t.Fatal(http.ListenAndServe("127.0.0.1:18080",m))
+ t.Fatal(http.ListenAndServeTLS("127.0.0.1:18080",os.Getenv("FIXTURE_CERT"),os.Getenv("FIXTURE_KEY"),m))
 }

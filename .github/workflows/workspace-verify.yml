@@ -36,9 +36,10 @@ jobs:
           python -m playwright install --with-deps chromium
       - name: Browser integration tests
         run: |
-          RUN_BROWSER_FIXTURE=1 go test -run '^TestBrowserFixture$' -timeout 8m . > /tmp/fixture.log 2>&1 &
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" -keyout /tmp/fixture.key -out /tmp/fixture.crt
+          FIXTURE_CERT=/tmp/fixture.crt FIXTURE_KEY=/tmp/fixture.key RUN_BROWSER_FIXTURE=1 go test -run '^TestBrowserFixture$' -timeout 8m . > /tmp/fixture.log 2>&1 &
           trap 'cat /tmp/fixture.log' EXIT
-          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:18080/ >/dev/null && break; sleep 1; done
+          for i in $(seq 1 60); do curl -kfsS https://127.0.0.1:18080/ >/dev/null && break; sleep 1; done
           python tests/browser_smoke.py
       - uses: actions/upload-artifact@v4
         if: always()

@@ -9,3 +9,5 @@
  body>#mobile.hidden{display:none!important}
  #overlay:empty{display:none}
 }
+
+@media(max-width:760px){.routing-view .topbar{background:#141719;backdrop-filter:none}.project-tile-main{background:linear-gradient(90deg,#181c1ee8,#181c1e80 65%,transparent)}.material-cover .cover-art{aspect-ratio:16/6.5}.cms-grid[aria-busy=true]{opacity:.8}.cms-grid[aria-busy=true] #cms-message{color:#edbd79;opacity:1}.cms-order-row button{min-height:44px}}

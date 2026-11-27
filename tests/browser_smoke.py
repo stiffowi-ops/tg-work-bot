@@ -1,15 +1,17 @@
 from pathlib import Path
 from playwright.sync_api import sync_playwright, expect
-import urllib.request, json, os
-base="http://127.0.0.1:18080"
+import urllib.request, json, os, ssl
+ssl_context=ssl._create_unverified_context()  # local test-only certificate
+base="https://127.0.0.1:18080"
 out=Path("test-screenshots");out.mkdir(exist_ok=True)
 root=Path(__file__).resolve().parents[1]
 def init(id):
-    return urllib.request.urlopen(f"{base}/test-init/{id}").read().decode()
+    return urllib.request.urlopen(f"{base}/test-init/{id}",context=ssl_context).read().decode()
 def session(b,id,w,h):
-    ctx=b.new_context(viewport={"width":w,"height":h},device_scale_factor=1,is_mobile=w<600,has_touch=w<600,accept_downloads=True)
+    ctx=b.new_context(viewport={"width":w,"height":h},device_scale_factor=1,is_mobile=w<600,has_touch=w<600,accept_downloads=True,ignore_https_errors=True)
     p=ctx.new_page();errors=[]
     p.on("pageerror",lambda e: errors.append(str(e)))
+    p.on("response",lambda r: print("media response",r.status,r.url.split("?")[0]) if "/file/" in r.url else None)
     p.route("https://telegram.org/js/telegram-web-app.js",lambda r:r.fulfill(content_type="application/javascript",body="window.Telegram={WebApp:{initData:"+json.dumps(init(id))+",ready(){},expand(){}}};"))
     p.goto(base)
     if id!=99: expect(p.locator(".employee-card")).to_be_visible(timeout=15000)
@@ -72,12 +74,17 @@ with sync_playwright() as pw:
     check_nav();shot(p,"mobile-documents")
     p.evaluate("document.querySelector('.shell').scrollTop=document.querySelector('.shell').scrollHeight")
     check_nav();shot(p,"mobile-feed-bottom")
+    media=p.locator(".material-cover").first.get_attribute("href")
+    assert any(c["name"]=="__Host-routing-media" for c in ctx.cookies()),"Secure media cookie absent"
+    response=ctx.request.get(base+media,headers={"Range":"bytes=0-3"})
+    assert response.status==206, f"media range failed: {response.status} {response.text()[:300]}"
     with p.expect_download(timeout=15000) as dl:p.locator(".material-cover").first.click()
     assert dl.value.failure() is None
+    assert dl.value.path().read_bytes()==b"Demo presentation"
     assert not errors,errors
     ctx.close()
     ctx,p,errors=session(b,42,390,844)
-    admin(p);shot(p,"mobile-admin");assert not errors,errors;ctx.close()
+    admin(p);shot(p,"mobile-admin");p.locator("#cms-title").fill("Unsaved edit");p.once("dialog",lambda d:d.dismiss());nav(p,"projects");expect(p.locator("#cms-title")).to_have_value("Unsaved edit");p.once("dialog",lambda d:d.accept());nav(p,"projects");expect(p.locator(".project-tile").first).to_be_visible();assert not errors,errors;ctx.close()
     ctx,p,errors=session(b,99,390,844)
     expect(p.locator(".access-panel")).to_contain_text("только участникам рабочего чата")
     assert not errors,errors;ctx.close()
