@@ -10,7 +10,7 @@ async function employeeRequest(path,method='GET',body){
  return data;
 }
 function accessScreen(message, retry=false){
- accessReady=false;state={name:'',role:'',bio:'',photo:'',status:'away',project:'',saved:[],read:[],progress:0};teamRecords=[];
+ accessReady=false;cmsAdmin=false;cmsProject=null;cmsDraft=null;cmsTicket++;state={name:'',role:'',bio:'',photo:'',status:'away',project:'',saved:[],read:[],progress:0};teamRecords=[];
  document.body.classList.remove('team-view','projects-view','project-industry');document.body.classList.add('routing-view');document.getElementById('sidebar').innerHTML='';document.getElementById('top').innerHTML='<div class="v4-top-inner"><div class="v4-brand">'+brand()+'</div></div>';document.getElementById('mobile').classList.add('hidden');
  document.getElementById('overlay').innerHTML='';profileDraft=null;
  document.getElementById('content').innerHTML='<div class="panel access-panel"><h1>Рабочее пространство</h1><p>'+esc(message)+'</p>'+(retry?'<button class="secondary" id="access-retry">Повторить</button>':'')+'</div>';
@@ -23,7 +23,7 @@ function reportAccessError(error){
 async function bootEmployee(){
  telegram()?.ready();telegram()?.expand();
  accessScreen('Проверяем доступ к рабочему чату…');
- try{state=await employeeRequest('/api/me');accessReady=true;document.getElementById('mobile').classList.remove('hidden');page='profile';render()}
+ try{state=await employeeRequest('/api/me');accessReady=true;document.getElementById('mobile').classList.remove('hidden');page='profile';render();void cmsInit()}
  catch(error){accessScreen(error.message,error.status!==401&&error.status!==403)}
 }
 async function saveState(next){
