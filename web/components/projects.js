@@ -1,1 +1,13 @@
-function projectPage(){return `<h1>Проекты</h1><p class="muted">Закрепите проект, чтобы его материалы отображались первыми.</p><div class="projectlist">${projects.map(p=>`<div class="project-hero project-list-card ${p.id==='industry'?'industry':'calendar'} ${state.project===p.id?'is-pinned':''}"><button class="project-main" data-action="projectdocs:${p.id}"><h2>${esc(p.name)}</h2><small>${state.project===p.id?'Закреплённый проект':esc(p.desc)}</small></button><button class="project-switch ${state.project===p.id?'on':''}" data-action="pin:${p.id}" aria-label="${state.project===p.id?'Открепить проект':'Закрепить проект'}" aria-pressed="${state.project===p.id}">${I('saved')}</button></div>`).join('')}</div>${section('Материалы в приоритете')}${collections(sorted(docs))}`}
+
+let openedProject='',projectMaterialFilter='all';
+const projectById=id=>projects.find(p=>p.id===id);
+const projectMaterials=id=>docs.filter(d=>d.p===id);
+const orderedProjects=()=>[...projects].sort((a,b)=>Number(b.id===state.project)-Number(a.id===state.project));
+function projectPage(){return `<section class="projects-page"><header class="projects-heading"><h1>Проекты</h1><p>Выберите направление своей работы</p></header><div class="projects-grid">${orderedProjects().map(renderProjectCard).join('')}</div></section>`}
+function openProject(id){if(!projectById(id))return;openedProject=id;projectMaterialFilter='all';go('project-detail')}
+function projectAction(a){
+ if(a.startsWith('projectdocs:')){openProject(a.slice(12));return true}
+ if(a.startsWith('projectkind:')){projectMaterialFilter=a.slice(12);render();return true}
+ if(a.startsWith('projectteam:')){const id=a.slice(12);if(projectById(id)){teamProjectFilter=id;teamFilter='all';teamQuery='';go('team')}return true}
+ return false
+}

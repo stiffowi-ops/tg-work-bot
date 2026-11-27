@@ -1,0 +1,6 @@
+
+function projectDetailPage(){
+ const p=projectById(openedProject);if(!p)return projectPage();
+ const all=projectMaterials(p.id),kinds=[...new Set(all.map(d=>d.kind))],visible=projectMaterialFilter==='all'?all:all.filter(d=>d.kind===projectMaterialFilter),pinned=state.project===p.id;
+ return `<section class="projects-page project-detail-page"><button class="team-back" data-go="projects">‹ Все проекты</button><header class="projects-heading"><h1>${esc(p.name)}</h1><p>${esc(p.desc)}</p></header><div class="project-detail-actions"><button class="secondary project-detail-pin ${pinned?'on':''}" data-action="pin:${esc(p.id)}" aria-pressed="${pinned}">${I('saved')}${pinned?'Проект закреплён':'Закрепить проект'}</button><button class="secondary" data-action="projectteam:${esc(p.id)}">${I('users')} Участники проекта ${I('arrow')}</button></div><section class="project-materials"><div class="sectionhead"><h2>Материалы проекта</h2><small>${all.length} мат.</small></div><div class="chips project-kind-filters">${[['all','Все'],...kinds.map(k=>[k,k])].map(([v,t])=>`<button class="chip ${projectMaterialFilter===v?'active':''}" data-action="projectkind:${esc(v)}" aria-pressed="${projectMaterialFilter===v}">${esc(t)}</button>`).join('')}</div>${paneldocs(visible)}</section><p class="notice">Материалы пока демонстрационные.</p></section>`
+}

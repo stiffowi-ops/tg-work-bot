@@ -1,0 +1,26 @@
+
+/* Projects use the same shell and alignment as the employee profile. */
+body.projects-view{isolation:isolate}
+body.projects-view::before{background:linear-gradient(90deg,#121618f2 0%,#121618c0 45%,#12161865 100%),linear-gradient(0deg,#121618 0%,#12161860 55%,transparent 100%),var(--visual-2) right top/cover no-repeat;background-color:#121618}
+body.projects-view.project-industry::before{background-image:linear-gradient(90deg,#121618f2 0%,#121618c0 45%,#12161865 100%),linear-gradient(0deg,#121618 0%,#12161860 55%,transparent 100%),var(--visual-3)}
+.projects-page{display:grid;gap:22px;min-width:0}
+.projects-heading h1{font-size:clamp(34px,4vw,48px);font-weight:650;line-height:1.13;letter-spacing:-1.3px;color:#edbd79;overflow-wrap:anywhere}
+.projects-heading p{color:#c3c6c1;font-size:15px;margin-top:8px;max-width:620px}
+.projects-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+.project-tile{position:relative;min-width:0;min-height:242px;display:flex;border:1px solid #ffffff30;border-radius:22px;overflow:hidden;background:linear-gradient(90deg,#202426fa 0%,#202426dc 45%,#20242630 100%),var(--visual-2) right center/cover no-repeat;box-shadow:0 12px 40px #0003}
+.project-tile.industry{background-image:linear-gradient(90deg,#202426fa 0%,#202426dc 45%,#20242630 100%),var(--visual-3)}
+.project-tile.is-pinned{border-color:#d9b77d99}
+.project-tile-main{width:100%;padding:26px 56px 26px 26px;color:var(--text);min-width:0;display:flex;align-items:stretch}
+.project-tile-main:hover{background:#ffffff07}.project-tile-main:focus-visible{outline-offset:-4px}
+.project-tile-copy{display:flex;flex-direction:column;align-items:flex-start;gap:10px;justify-content:center;min-width:0;width:100%}
+.project-tile h2{font-size:clamp(21px,2.2vw,28px);line-height:1.15;letter-spacing:-.4px;max-width:100%;overflow-wrap:anywhere}
+.project-description{font-size:14px;color:#d0d1cb;max-width:270px;line-height:1.5}
+.project-pinned-label{font-size:11px;letter-spacing:.5px;color:#f0c484;background:#d9b77d20;border:1px solid #d9b77d50;border-radius:20px;padding:4px 10px}
+.project-open{margin-top:13px;font-size:13px;color:#edbd79;display:flex;align-items:center;gap:7px}.project-open svg{width:15px;height:15px}
+.project-pin{position:absolute;top:15px;right:15px;width:44px;height:44px;display:grid;place-items:center;border:1px solid #ffffff35;background:#202426aa;border-radius:12px;color:#d3d4ce}
+.project-pin.on,.project-detail-pin.on{color:#edbd79;border-color:#d9b77d70}.project-pin.on svg,.project-detail-pin.on svg{fill:#d9b77d45}
+.project-detail-page .team-back{justify-self:start}.project-detail-actions{display:flex;flex-wrap:wrap;gap:10px}.project-detail-actions button{background:#24282bdc;min-height:44px}
+.project-materials{padding:22px;border:1px solid #ffffff30;border-radius:22px;background:linear-gradient(105deg,#24282bed,#272929c9);box-shadow:0 12px 40px #0003}
+.project-materials .sectionhead{margin:0 0 12px}.project-kind-filters{margin:0 0 14px}.project-kind-filters .chip{min-height:36px;border-radius:20px}.project-materials .materialpanel{background:#14171950;border-color:#ffffff20}
+.project-detail-page>.notice{margin:0}
+@media(max-width:760px){body.projects-view::before{background-size:cover;background-position:right top;background-image:linear-gradient(0deg,#121618 8%,#121618d8 53%,#12161865 100%),var(--visual-2)}body.projects-view.project-industry::before{background-image:linear-gradient(0deg,#121618 8%,#121618d8 53%,#12161865 100%),var(--visual-3)}.projects-page{gap:16px}.projects-heading h1{font-size:30px;letter-spacing:-.7px}.projects-heading p{font-size:13px}.projects-grid{grid-template-columns:1fr;gap:12px}.project-tile{min-height:185px;border-radius:18px}.project-tile-main{padding:20px 52px 20px 18px}.project-tile h2{font-size:22px}.project-description{font-size:12px}.project-open{margin-top:8px}.project-pin{top:12px;right:12px}.project-materials{padding:14px;border-radius:18px}.project-detail-actions{display:grid;grid-template-columns:1fr}.project-detail-actions button{justify-content:flex-start}.project-kind-filters{gap:5px}}
