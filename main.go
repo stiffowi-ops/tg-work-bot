@@ -2,6 +2,8 @@ package main
 
 import (
  "context"
+ "embed"
+ "io/fs"
  "encoding/json"
  "errors"
  "log"
@@ -12,6 +14,9 @@ import (
  "time"
 )
 
+//go:embed web
+var webFiles embed.FS
+
 func routes() http.Handler {
  mux := http.NewServeMux()
  mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -19,11 +24,9 @@ func routes() http.Handler {
   w.Header().Set("Cache-Control", "no-store")
   _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "workhub", "stage": "bootstrap"})
  })
- mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-  w.Header().Set("Content-Type", "text/html; charset=utf-8")
-  w.Header().Set("Cache-Control", "no-store")
-  _, _ = w.Write([]byte("<!doctype html><html lang='ru'><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>WorkHub</title><h1>WorkHub</h1><p>Тестовый сервер запущен. Интерфейс и Telegram будут подключены отдельно.</p><a href='/api/health'>Проверка сервера</a></html>"))
- })
+ static, err := fs.Sub(webFiles, "web")
+ if err != nil { panic(err) }
+ mux.Handle("GET /", http.FileServer(http.FS(static)))
  return mux
 }
 
