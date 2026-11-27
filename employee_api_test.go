@@ -62,8 +62,8 @@ func TestConfiguredAdminAccessWithoutGroup(t *testing.T){
  t.Setenv("BOT_TOKEN","test-token")
  t.Setenv("WORK_CHAT_ID","not-configured")
  t.Setenv("ADMIN_USER_IDS","42, 77")
- t.Setenv("DATA_DIR",t.TempDir())
- a:=newEmployeeAPI()
+ dir:=t.TempDir()
+ a:=newEmployeeAPI(dir)
  if a.store==nil||a.chat!=0{t.Fatal("invalid group must not disable configured admin access")}
  calls:=0
  a.client=&http.Client{Transport:telegramMock(func(r *http.Request)(*http.Response,error){
@@ -95,5 +95,5 @@ func TestConfiguredAdminAccessWithoutGroup(t *testing.T){
  if w:=call("GET","/api/me",admin);w.Code!=200{t.Fatal("admin blocked by unavailable Telegram membership check",w.Code)}
  if w:=call("GET","/api/me",other);w.Code!=503{t.Fatal("ordinary employee admitted on Telegram failure",w.Code)}
  t.Setenv("BOT_TOKEN","")
- if a:=newEmployeeAPI();a.store!=nil||a.setupError==""{t.Fatal("missing token not rejected")}
+ if a:=newEmployeeAPI(dir);a.store!=nil||a.setupError==""{t.Fatal("missing token not rejected")}
 }
