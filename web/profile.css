@@ -1,0 +1,12 @@
+/* Personal cabinet: shared design tokens, no global styling changes. */
+.profile-summary{display:grid;gap:18px}
+.profile-detail{display:grid;gap:6px;min-width:0}
+.profile-detail p{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55}
+.profile-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.profile-actions button{min-height:44px}
+.profile-photo-row{align-items:flex-start}
+.profile-photo-row .profile-actions{margin:8px 0}
+#bio-count{text-align:right;font-size:11px;color:var(--muted)}
+#profileform{gap:16px}
+.profilehero h1{overflow-wrap:anywhere}
+@media(max-width:760px){.profile-layout .profile-actions .primary{flex:1}.profile-photo-row .avatar.big{width:62px;height:62px}.profile-actions button{font-size:12px;padding:10px 12px}}

@@ -1,0 +1,233 @@
+package main
+
+import (
+ "bytes"
+ "context"
+ "crypto/hmac"
+ "crypto/sha256"
+ "encoding/base64"
+ "encoding/hex"
+ "encoding/json"
+ "errors"
+ "image"
+ "image/jpeg"
+ "io"
+ "net/http"
+ "net/url"
+ "os"
+ "path/filepath"
+ "sort"
+ "strconv"
+ "strings"
+ "sync"
+ "time"
+ "unicode/utf8"
+)
+
+type tgUser struct {
+ ID int64 `json:"id"`
+ First string `json:"first_name"`
+ Last string `json:"last_name"`
+ Username string `json:"username"`
+ Bot bool `json:"is_bot"`
+}
+type employee struct {
+ ID string `json:"id"`
+ Username string `json:"username,omitempty"`
+ Name string `json:"name"`
+ Role string `json:"role"`
+ Bio string `json:"bio"`
+ Status string `json:"status"`
+ Until string `json:"until"`
+ Photo string `json:"photo"`
+ Project string `json:"project"`
+ Saved []int `json:"saved"`
+ Read []int `json:"read"`
+ Progress int `json:"progress"`
+}
+var errUnauthorized=errors.New("invalid Telegram session")
+func hmac256(key, value []byte) []byte {
+ h:=hmac.New(sha256.New,key); h.Write(value); return h.Sum(nil)
+}
+func verifyInitData(raw,token string,now time.Time)(tgUser,error){
+ var u tgUser
+ if token==""||len(raw)==0||len(raw)>16384{return u,errUnauthorized}
+ q,err:=url.ParseQuery(raw);if err!=nil{return u,errUnauthorized}
+ pairs:=make([]string,0,len(q));for k,v:=range q{
+  if len(v)!=1{return u,errUnauthorized}
+  if k!="hash"{pairs=append(pairs,k+"="+v[0])}
+ }
+ sort.Strings(pairs)
+ hash,err:=hex.DecodeString(q.Get("hash"));if err!=nil||len(hash)!=32{return u,errUnauthorized}
+ key:=hmac256([]byte("WebAppData"),[]byte(token))
+ if !hmac.Equal(hash,hmac256(key,[]byte(strings.Join(pairs,"\n")))){return u,errUnauthorized}
+ stamp,err:=strconv.ParseInt(q.Get("auth_date"),10,64)
+ if err!=nil||stamp>now.Unix()+60||stamp<now.Add(-12*time.Hour).Unix(){return u,errUnauthorized}
+ if json.Unmarshal([]byte(q.Get("user")),&u)!=nil||u.ID<=0||u.Bot{return u,errUnauthorized}
+ return u,nil
+}
+type employeeStore struct{
+ mu sync.Mutex
+ path string
+ people map[string]employee
+}
+func openStore(path string)(*employeeStore,error){
+ s:=&employeeStore{path:path,people:map[string]employee{}}
+ raw,err:=os.ReadFile(path)
+ if errors.Is(err,os.ErrNotExist){return s,nil}
+ if err!=nil{return nil,err}
+ if err=json.Unmarshal(raw,&s.people);err!=nil||s.people==nil{return nil,errors.New("invalid profile store")}
+ return s,nil
+}
+func(s *employeeStore)get(id string)(employee,bool){s.mu.Lock();defer s.mu.Unlock();p,ok:=s.people[id];return p,ok}
+func(s *employeeStore)all()[]employee{s.mu.Lock();defer s.mu.Unlock();out:=make([]employee,0,len(s.people));for _,p:=range s.people{out=append(out,p)};return out}
+func(s *employeeStore)put(p employee,createOnly bool)(employee,error){
+ s.mu.Lock();defer s.mu.Unlock()
+ if old,ok:=s.people[p.ID];ok&&createOnly{return old,nil}
+ next:=make(map[string]employee,len(s.people)+1);for k,v:=range s.people{next[k]=v};next[p.ID]=p
+ raw,err:=json.Marshal(next);if err!=nil{return p,err}
+ dir:=filepath.Dir(s.path);if err=os.MkdirAll(dir,0700);err!=nil{return p,err}
+ f,err:=os.CreateTemp(dir,".profiles-*");if err!=nil{return p,err}
+ defer os.Remove(f.Name())
+ if _,err=f.Write(raw);err!=nil{f.Close();return p,err}
+ if err=f.Sync();err!=nil{f.Close();return p,err}
+ if err=f.Close();err!=nil{return p,err}
+ if err=os.Rename(f.Name(),s.path);err!=nil{return p,err}
+ s.people=next;return p,nil
+}
+type employeeAPI struct{
+ token string
+ chat int64
+ store *employeeStore
+ client *http.Client
+}
+func newEmployeeAPI()*employeeAPI{
+ chat,err:=strconv.ParseInt(strings.TrimSpace(os.Getenv("WORK_CHAT_ID")),10,64)
+ if err!=nil||chat>=0{return &employeeAPI{}}
+ token:=strings.TrimSpace(os.Getenv("BOT_TOKEN"));if token==""{return &employeeAPI{}}
+ dir:=os.Getenv("DATA_DIR");if dir==""{dir="/app/runtime"}
+ store,err:=openStore(filepath.Join(dir,"employees.json"));if err!=nil{return &employeeAPI{}}
+ return &employeeAPI{token:token,chat:chat,store:store,client:&http.Client{Timeout:5*time.Second,CheckRedirect:func(*http.Request,[]*http.Request)error{return http.ErrUseLastResponse}}}
+}
+func(a *employeeAPI)call(ctx context.Context,method string,params url.Values,out any)error{
+ req,err:=http.NewRequestWithContext(ctx,"POST","https://api.telegram.org/bot"+a.token+"/"+method,strings.NewReader(params.Encode()))
+ if err!=nil{return errors.New("Telegram request failed")}
+ req.Header.Set("Content-Type","application/x-www-form-urlencoded")
+ res,err:=a.client.Do(req);if err!=nil{return errors.New("Telegram unavailable")};defer res.Body.Close()
+ var envelope struct{OK bool;Result json.RawMessage}
+ if res.StatusCode!=200||json.NewDecoder(io.LimitReader(res.Body,2<<20)).Decode(&envelope)!=nil||!envelope.OK{return errors.New("Telegram request failed")}
+ return json.Unmarshal(envelope.Result,out)
+}
+func(a *employeeAPI)member(ctx context.Context,id int64)(bool,error){
+ var m struct{Status string;IsMember bool `json:"is_member"`}
+ if err:=a.call(ctx,"getChatMember",url.Values{"chat_id":{strconv.FormatInt(a.chat,10)},"user_id":{strconv.FormatInt(id,10)}},&m);err!=nil{return false,err}
+ return m.Status=="creator"||m.Status=="administrator"||m.Status=="member"||m.Status=="restricted"&&m.IsMember,nil
+}
+func photoData(raw []byte)(string,error){
+ cfg,kind,err:=image.DecodeConfig(bytes.NewReader(raw));if err!=nil||kind!="jpeg"||cfg.Width<1||cfg.Height<1||cfg.Width>1200||cfg.Height>1200{return "",errors.New("invalid photo")}
+ im,err:=jpeg.Decode(bytes.NewReader(raw));if err!=nil{return "",err}
+ var buf bytes.Buffer;if err=jpeg.Encode(&buf,im,&jpeg.Options{Quality:90});err!=nil{return "",err}
+ if buf.Len()>600000{return "",errors.New("photo too large")}
+ return "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(buf.Bytes()),nil
+}
+func(a *employeeAPI)telegramPhoto(ctx context.Context,id int64)string{
+ var p struct{Photos [][]struct{FileID string `json:"file_id"`;Width int;Height int}}
+ if a.call(ctx,"getUserProfilePhotos",url.Values{"user_id":{strconv.FormatInt(id,10)},"limit":{"1"}},&p)!=nil||len(p.Photos)==0{return ""}
+ var selected string;best:=0
+ for _,f:=range p.Photos[0]{if f.Width<=1200&&f.Height<=1200&&f.Width*f.Height>best{selected=f.FileID;best=f.Width*f.Height}}
+ if selected==""{return ""}
+ var file struct{Path string `json:"file_path"`}
+ if a.call(ctx,"getFile",url.Values{"file_id":{selected}},&file)!=nil||file.Path==""||strings.ContainsAny(file.Path,"?#\\")||strings.Contains(file.Path,"..")||strings.HasPrefix(file.Path,"/"){return ""}
+ req,err:=http.NewRequestWithContext(ctx,"GET","https://api.telegram.org/file/bot"+a.token+"/"+file.Path,nil);if err!=nil{return ""}
+ res,err:=a.client.Do(req);if err!=nil{return ""};defer res.Body.Close()
+ if res.StatusCode!=200{return ""}
+ raw,err:=io.ReadAll(io.LimitReader(res.Body,1000001));if err!=nil||len(raw)>1000000{return ""}
+ photo,_:=photoData(raw);return photo
+}
+func writeJSON(w http.ResponseWriter,status int,v any){w.Header().Set("Content-Type","application/json; charset=utf-8");w.Header().Set("Cache-Control","no-store");w.WriteHeader(status);_ = json.NewEncoder(w).Encode(v)}
+func apiError(w http.ResponseWriter,status int,msg string){writeJSON(w,status,map[string]string{"error":msg})}
+func(a *employeeAPI)authorize(w http.ResponseWriter,r *http.Request)(tgUser,bool){
+ if a.store==nil{apiError(w,503,"Доступ пока не настроен. Обратитесь к администратору.");return tgUser{},false}
+ raw:=r.Header.Get("Authorization");if !strings.HasPrefix(raw,"tma "){apiError(w,401,"Откройте приложение через Telegram.");return tgUser{},false}
+ u,err:=verifyInitData(strings.TrimPrefix(raw,"tma "),a.token,time.Now());if err!=nil{apiError(w,401,"Сессия Telegram недействительна. Откройте приложение заново.");return tgUser{},false}
+ member,err:=a.member(r.Context(),u.ID);if err!=nil{apiError(w,503,"Не удалось проверить доступ к рабочему чату.");return u,false}
+ if !member{apiError(w,403,"Приложение доступно только участникам рабочего чата.");return u,false}
+ return u,true
+}
+func initialName(u tgUser)string{
+ name:=strings.TrimSpace(u.First+" "+u.Last);if name==""{name="Сотрудник"}
+ runes:=[]rune(name);if len(runes)>80{name=string(runes[:80])};return name
+}
+func (a *employeeAPI)me(w http.ResponseWriter,r *http.Request){
+ u,ok:=a.authorize(w,r);if !ok{return};id:=strconv.FormatInt(u.ID,10)
+ p,exists:=a.store.get(id)
+ if !exists{
+  p=employee{ID:id,Username:u.Username,Name:initialName(u),Role:"Сотрудник команды",Status:"work",Photo:a.telegramPhoto(r.Context(),u.ID),Saved:[]int{},Read:[]int{}}
+  var err error;p,err=a.store.put(p,true);if err!=nil{apiError(w,500,"Не удалось создать профиль.");return}
+ }
+ writeJSON(w,200,p)
+}
+func normalizeEmployee(p *employee)error{
+ p.Name=strings.TrimSpace(p.Name);p.Role=strings.TrimSpace(p.Role);p.Bio=strings.TrimSpace(p.Bio)
+ if p.Name==""||utf8.RuneCountInString(p.Name)>80||utf8.RuneCountInString(p.Role)>100||utf8.RuneCountInString(p.Bio)>600{return errors.New("Проверьте длину полей профиля.")}
+ if p.Status!="work"&&p.Status!="vacation"&&p.Status!="away"{return errors.New("Некорректный статус.")}
+ if p.Status!="vacation"{p.Until=""}
+ if p.Until!=""{if _,err:=time.Parse("2006-01-02",p.Until);err!=nil{return errors.New("Некорректная дата отпуска.")}}
+ if p.Project!=""&&p.Project!="calendar"&&p.Project!="industry"{return errors.New("Неизвестный проект.")}
+ if p.Photo!=""{
+  if !strings.HasPrefix(p.Photo,"data:image/jpeg;base64,")||len(p.Photo)>800100{return errors.New("Некорректное фото.")}
+  raw,err:=base64.StdEncoding.DecodeString(strings.TrimPrefix(p.Photo,"data:image/jpeg;base64,"));if err!=nil{return errors.New("Некорректное фото.")}
+  p.Photo,err=photoData(raw);if err!=nil{return errors.New("Некорректное фото.")}
+ }
+ if p.Progress<0||p.Progress>100||p.Progress%10!=0{return errors.New("Некорректный прогресс.")}
+ p.Saved=validIDs(p.Saved,8);p.Read=validIDs(p.Read,3);return nil
+}
+func validIDs(ids []int,max int)[]int{out:=[]int{};seen:=map[int]bool{};for _,id:=range ids{if id>=1&&id<=max&&!seen[id]{out=append(out,id);seen[id]=true}};return out}
+func(a *employeeAPI)save(w http.ResponseWriter,r *http.Request){
+ u,ok:=a.authorize(w,r);if !ok{return}
+ var p employee;dec:=json.NewDecoder(http.MaxBytesReader(w,r.Body,1<<20))
+ if dec.Decode(&p)!=nil||dec.Decode(new(any))!=io.EOF{apiError(w,400,"Некорректные данные.");return}
+ p.ID=strconv.FormatInt(u.ID,10);p.Username=u.Username
+ if _,exists:=a.store.get(p.ID);!exists{apiError(w,409,"Сначала откройте профиль.");return}
+ if err:=normalizeEmployee(&p);err!=nil{apiError(w,400,err.Error());return}
+ saved,err:=a.store.put(p,false);if err!=nil{apiError(w,500,"Не удалось сохранить профиль.");return}
+ writeJSON(w,200,saved)
+}
+type colleague struct{
+ ID string `json:"id"`
+ Username string `json:"username,omitempty"`
+ Name string `json:"name"`
+ Role string `json:"role"`
+ Bio string `json:"bio"`
+ Status string `json:"status"`
+ Until string `json:"until"`
+ Photo string `json:"photo"`
+ Project string `json:"project"`
+}
+func(a *employeeAPI)team(w http.ResponseWriter,r *http.Request){
+ u,ok:=a.authorize(w,r);if !ok{return}
+ people:=a.store.all();sort.Slice(people,func(i,j int)bool{return people[i].Name<people[j].Name})
+ result:=make([]colleague,0,len(people))
+ // A bounded worker pool avoids an unbounded burst of Telegram requests.
+ type check struct{p employee;allowed bool;err error}
+ jobs:=make(chan employee);checks:=make(chan check,len(people));var wg sync.WaitGroup
+ ctx,cancel:=context.WithTimeout(r.Context(),10*time.Second);defer cancel()
+ for i:=0;i<4;i++{wg.Add(1);go func(){defer wg.Done();for p:=range jobs{
+  id,err:=strconv.ParseInt(p.ID,10,64);if err!=nil{continue}
+  allowed:=id==u.ID;if !allowed{allowed,err=a.member(ctx,id)}
+  checks<-check{p,allowed,err}
+ }}()}
+ go func(){defer close(jobs);for _,p:=range people{select{case jobs<-p:case <-ctx.Done():return}}}()
+ go func(){wg.Wait();close(checks)}()
+ for c:=range checks{if c.err!=nil||!c.allowed{continue};p:=c.p;result=append(result,colleague{p.ID,p.Username,p.Name,p.Role,p.Bio,p.Status,p.Until,p.Photo,p.Project})}
+ if ctx.Err()!=nil{apiError(w,503,"Не удалось обновить состав команды.");return}
+ sort.Slice(result,func(i,j int)bool{return result[i].Name<result[j].Name})
+ writeJSON(w,200,result)
+}
+func(a *employeeAPI)register(mux *http.ServeMux){
+ mux.HandleFunc("GET /api/me",a.me)
+ mux.HandleFunc("PUT /api/me",a.save)
+ mux.HandleFunc("GET /api/team",a.team)
+ // Unknown API paths do not expose the static handler.
+ mux.HandleFunc("/api/",func(w http.ResponseWriter,r *http.Request){apiError(w,404,"Не найдено.")})
+}
