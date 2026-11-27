@@ -1,0 +1,46 @@
+name: Workspace release verification
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: Go tests and race detector
+        run: go test -race -v ./...
+      - name: Go vet and release binary
+        run: |
+          go vet ./...
+          CGO_ENABLED=0 go build -trimpath -o /tmp/workhub .
+      - name: Docker build
+        run: docker build -t workhub-verification .
+      - name: JavaScript syntax
+        run: for f in web/components/*.js; do node --check "$f"; done
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Chromium test runner
+        run: |
+          pip install playwright==1.51.0
+          python -m playwright install --with-deps chromium
+      - name: Browser integration tests
+        run: |
+          RUN_BROWSER_FIXTURE=1 go test -run '^TestBrowserFixture$' -timeout 8m . > /tmp/fixture.log 2>&1 &
+          trap 'cat /tmp/fixture.log' EXIT
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:18080/ >/dev/null && break; sleep 1; done
+          python tests/browser_smoke.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: workspace-browser-screenshots
+          path: test-screenshots/
+          if-no-files-found: warn
