@@ -60,7 +60,7 @@ func TestBrowserFixture(t *testing.T){
  if os.Getenv("RUN_BROWSER_FIXTURE")!="1"{t.Skip("browser fixture only")}
  dir:=t.TempDir();a:=testCMSAuth(t,dir);m:=http.NewServeMux();a.register(m);(&cms{auth:a,root:filepath.Join(dir,"projects")}).register(m)
  static,e:=fs.Sub(webFiles,"web");if e!=nil{t.Fatal(e)}
- m.Handle("GET /",http.FileServer(http.FS(static)))
+ m.Handle("/",http.FileServer(http.FS(static)))
  // Local test-only signed identities. No production route or bypass is added.
  m.HandleFunc("GET /test-init/{id}",func(w http.ResponseWriter,r *http.Request){id,e:=strconv.ParseInt(r.PathValue("id"),10,64);if e!=nil||id<1{http.Error(w,"bad id",400);return};_,_=w.Write([]byte(signedInit(id,time.Now(),a.token)))})
  t.Fatal(http.ListenAndServe("127.0.0.1:18080",m))

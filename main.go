@@ -31,7 +31,7 @@ func routes() http.Handler {
  (&cms{auth:employee,root:filepath.Join(dir,"data","projects")}).register(mux)
  static, err := fs.Sub(webFiles, "web")
  if err != nil { panic(err) }
- mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){w.Header().Set("Cache-Control","no-cache");w.Header().Set("X-Content-Type-Options","nosniff");http.FileServer(http.FS(static)).ServeHTTP(w,r)}))
+ mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){if r.Method!="GET"&&r.Method!="HEAD"{w.Header().Set("Allow","GET, HEAD");http.Error(w,"Method Not Allowed",405);return};w.Header().Set("Cache-Control","no-cache");w.Header().Set("X-Content-Type-Options","nosniff");http.FileServer(http.FS(static)).ServeHTTP(w,r)}))
  return mux
 }
 
