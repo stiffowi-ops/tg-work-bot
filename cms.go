@@ -111,12 +111,35 @@ func (c *cms) mediaUser(w http.ResponseWriter,r *http.Request)(tgUser,bool){
  if !member{apiError(w,403,"Доступ закрыт.");return tgUser{},false}
  return tgUser{ID:id},true
 }
+type materialSummary struct{
+ ID string `json:"id"`
+ Project string `json:"project"`
+ Title string `json:"title"`
+ Kind string `json:"kind"`
+}
+func (c *cms) setSavedMaterial(w http.ResponseWriter,r *http.Request){
+ u,ok:=c.auth.authorize(w,r);if !ok{return}
+ var body struct{Project string;ID string;Saved *bool}
+ dec:=json.NewDecoder(http.MaxBytesReader(w,r.Body,4096))
+ if dec.Decode(&body)!=nil||dec.Decode(new(any))!=io.EOF||body.Saved==nil||body.ID==""||len(body.ID)>80||strings.ContainsAny(body.ID,":/"){apiError(w,400,"Некорректный материал.");return}
+ if _,ok:=projectSeed(body.Project);!ok{apiError(w,404,"Проект не найден.");return}
+ if *body.Saved{
+  c.mu.Lock();p,err:=c.load(body.Project);found:=false
+  if err==nil{for _,b:=range p.Blocks{if b.ID==body.ID&&b.Published{found=true;break}}}
+  c.mu.Unlock()
+  if err!=nil{apiError(w,500,"Не удалось загрузить проект.");return}
+  if !found{apiError(w,404,"Материал не опубликован или удалён.");return}
+ }
+ refs,err:=c.auth.store.setSavedMaterial(strconv.FormatInt(u.ID,10),body.Project+":"+body.ID,*body.Saved)
+ if err!=nil{apiError(w,409,"Не удалось изменить сохранённые материалы. Проверьте профиль и лимит 500 материалов.");return}
+ writeJSON(w,200,map[string]any{"savedMaterials":refs})
+}
 func (c *cms) index(w http.ResponseWriter,r *http.Request){
  u,ok:=c.auth.authorize(w,r);if !ok{return}
  c.mu.Lock();defer c.mu.Unlock()
- list:=[]projectContent{}
- for _,id:=range []string{"calendar","industry"}{p,err:=c.load(id);if err!=nil{apiError(w,500,"Не удалось загрузить проекты.");return};p.Blocks=nil;list=append(list,p)}
- writeJSON(w,200,map[string]any{"admin":isAdmin(u.ID),"projects":list})
+ list:=[]projectContent{};materials:=[]materialSummary{}
+ for _,id:=range []string{"calendar","industry"}{p,err:=c.load(id);if err!=nil{apiError(w,500,"Не удалось загрузить проекты.");return};for _,b:=range p.Blocks{if b.Published{materials=append(materials,materialSummary{b.ID,id,b.Title,b.Kind})}};p.Blocks=nil;list=append(list,p)}
+ writeJSON(w,200,map[string]any{"admin":isAdmin(u.ID),"projects":list,"materials":materials})
 }
 func (c *cms) refreshMediaSession(w http.ResponseWriter,r *http.Request){
  u,ok:=c.auth.authorize(w,r);if !ok{return}
@@ -217,6 +240,7 @@ func (c *cms) media(w http.ResponseWriter,r *http.Request){
 func (c *cms) register(mux *http.ServeMux){
  mux.HandleFunc("GET /api/admin/chat-diagnostic",c.chatDiagnostic)
  mux.HandleFunc("GET /api/content",c.index)
+ mux.HandleFunc("PUT /api/me/materials",c.setSavedMaterial)
  mux.HandleFunc("POST /api/content/media-session",c.refreshMediaSession)
  mux.HandleFunc("GET /api/content/{project}",c.get)
  mux.HandleFunc("PUT /api/content/{project}",c.update)

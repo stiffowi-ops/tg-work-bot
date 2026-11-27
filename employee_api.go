@@ -43,6 +43,7 @@ type employee struct {
  Photo string `json:"photo"`
  Project string `json:"project"`
  Saved []int `json:"saved"`
+ SavedMaterials []string `json:"savedMaterials"`
  Read []int `json:"read"`
  Progress int `json:"progress"`
 }
@@ -84,7 +85,10 @@ func(s *employeeStore)get(id string)(employee,bool){s.mu.Lock();defer s.mu.Unloc
 func(s *employeeStore)all()[]employee{s.mu.Lock();defer s.mu.Unlock();out:=make([]employee,0,len(s.people));for _,p:=range s.people{out=append(out,p)};return out}
 func(s *employeeStore)put(p employee,createOnly bool)(employee,error){
  s.mu.Lock();defer s.mu.Unlock()
- if old,ok:=s.people[p.ID];ok&&createOnly{return old,nil}
+ if old,ok:=s.people[p.ID];ok{if createOnly{return old,nil};p.SavedMaterials=old.SavedMaterials}
+ return s.putLocked(p)
+}
+func(s *employeeStore)putLocked(p employee)(employee,error){
  next:=make(map[string]employee,len(s.people)+1);for k,v:=range s.people{next[k]=v};next[p.ID]=p
  raw,err:=json.Marshal(next);if err!=nil{return p,err}
  dir:=filepath.Dir(s.path);if err=os.MkdirAll(dir,0700);err!=nil{return p,err}
@@ -95,6 +99,15 @@ func(s *employeeStore)put(p employee,createOnly bool)(employee,error){
  if err=f.Close();err!=nil{return p,err}
  if err=os.Rename(f.Name(),s.path);err!=nil{return p,err}
  s.people=next;return p,nil
+}
+func(s *employeeStore)setSavedMaterial(id,ref string,saved bool)([]string,error){
+ s.mu.Lock();defer s.mu.Unlock()
+ p,ok:=s.people[id];if !ok{return nil,errors.New("profile not found")}
+ next:=make([]string,0,len(p.SavedMaterials)+1)
+ for _,v:=range p.SavedMaterials{if v!=ref{next=append(next,v)}}
+ if saved{if len(next)>=500{return nil,errors.New("saved material limit")};next=append(next,ref)}
+ p.SavedMaterials=next
+ _,err:=s.putLocked(p);return next,err
 }
 type employeeAPI struct{
  token string
@@ -183,9 +196,10 @@ func (a *employeeAPI)me(w http.ResponseWriter,r *http.Request){
  u,ok:=a.authorize(w,r);if !ok{return};id:=strconv.FormatInt(u.ID,10)
  p,exists:=a.store.get(id)
  if !exists{
-  p=employee{ID:id,Username:u.Username,Name:initialName(u),Role:"Сотрудник команды",Status:"work",Photo:a.telegramPhoto(r.Context(),u.ID),Saved:[]int{},Read:[]int{}}
+  p=employee{ID:id,Username:u.Username,Name:initialName(u),Role:"Сотрудник команды",Status:"work",Photo:a.telegramPhoto(r.Context(),u.ID),Saved:[]int{},Read:[]int{},SavedMaterials:[]string{}}
   var err error;p,err=a.store.put(p,true);if err!=nil{apiError(w,500,"Не удалось создать профиль.");return}
  }
+ if p.SavedMaterials==nil{p.SavedMaterials=[]string{}}
  writeJSON(w,200,p)
 }
 func normalizeEmployee(p *employee)error{

@@ -57,6 +57,17 @@ func TestCMSFileLifecycle(t *testing.T){
   ck:=w.Result().Cookies();if want==200{if len(ck)!=1||!ck[0].Secure||!ck[0].HttpOnly{t.Fatal("renewal cookie invalid")}}else if len(ck)!=0{t.Fatal("unauthorized renewal")}
  }
  if w=request("GET",path,4,nil,"",nil,"");w.Code!=200||!bytes.Equal(w.Body.Bytes(),payload){t.Fatal("download",w.Code)}
+ a.register(m)
+ if w=request("GET","/api/me",4,nil,"",nil,"");w.Code!=200{t.Fatal(w.Code)}
+ favoriteBody,_:=json.Marshal(map[string]any{"project":"calendar","id":b.ID,"saved":true})
+ if w=request("PUT","/api/me/materials",0,favoriteBody,"application/json",nil,"");w.Code!=401{t.Fatal("anonymous favorite",w.Code)}
+ if w=request("PUT","/api/me/materials",99,favoriteBody,"application/json",nil,"");w.Code!=403{t.Fatal("former member favorite",w.Code)}
+ if w=request("PUT","/api/me/materials",4,favoriteBody,"application/json",nil,"");w.Code!=200{t.Fatal("favorite failed",w.Code,w.Body.String())}
+ if w=request("GET","/api/me",4,nil,"",nil,"");w.Code!=200||!strings.Contains(w.Body.String(),"calendar:"+b.ID){t.Fatal("favorite not persisted",w.Code,w.Body.String())}
+ if w=request("GET","/api/content",4,nil,"",nil,"");w.Code!=200||!strings.Contains(w.Body.String(),b.ID){t.Fatal("published index missing",w.Code)}
+ p4,_:=a.store.get("4");p4.Name="Updated";p4.SavedMaterials=nil;if _,err:=a.store.put(p4,false);err!=nil{t.Fatal(err)}
+ restored,err:=openStore(a.store.path);if err!=nil{t.Fatal(err)};saved4,_:=restored.get("4");if len(saved4.SavedMaterials)!=1||saved4.SavedMaterials[0]!="calendar:"+b.ID{t.Fatal("profile edit erased saved materials")}
+
  c2:=&cms{auth:a,root:c.root};q,e:=c2.load("calendar");if e!=nil||q.Blocks[0].ID!=b.ID{t.Fatal("order not persisted",e)}
  q.Blocks=q.Blocks[1:];raw,_=json.Marshal(q)
  if w=request("PUT","/api/content/calendar",42,raw,"application/json",nil,"");w.Code!=200{t.Fatal(w.Code,w.Body.String())}
