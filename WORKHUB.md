@@ -14,7 +14,7 @@ Set ADMIN_USER_IDS to comma-separated numeric Telegram user IDs. Explicitly conf
 
 Group diagnostics: in Admin, open the Telegram connection check. It uses getMe, getChat, getChatMember and getChatMemberCount; the admin's own membership is checked independently of their app-admin exception. Existing group members can sign in on first launch without any prior join event. The directory is registered profiles only, not a full Telegram roster. Unknown membership states and Telegram errors do not grant employee access. Migration IDs are reported, not automatically adopted. No polling, history scraping or additional token needed.
 
-Deployment verification: GET /api/health returns the embedded release version (V9.6.1-cabinet). The same version is logged on startup, before access configuration. If it is absent after deployment, verify the host's checked-out branch and source revision; restarting the old image does not update the source.
+Deployment verification: GET /api/health returns the embedded release version (V9.7-profile). The same version is logged on startup, before access configuration. If it is absent after deployment, verify the host's checked-out branch and source revision; restarting the old image does not update the source.
 
 Mobile layout: the scrollable shell and the bottom navigation occupy separate rows; the navigation no longer overlays the feed. Phone screenshots are viewport captures, not full-page composites. Use PORT supplied by the host if automatic, otherwise 8080, matching the proxy target. Preserve the existing persistent volume before deleting an old service.
 
@@ -23,3 +23,5 @@ Stability pass: mobile navigation and header are isolated from scrollable conten
 Media stability: recommend MP4 H.264 (AAC if audio), keep WebM support when the client supports it. Player displays network/decoder/format errors; the private media cookie renews on active project pages after 35 minutes through a signed, membership-checked POST. Browser tests use installed Google Chrome and inspect the existing MP4 codec, actual download bytes, HTTP range, playback and seeking. No authorization exception is introduced. Test success does not replace real-device acceptance.
 
 Cabinet V9.6.1: existing editable profile and pinned project retained. Personal project folders and bookmarks use the published CMS material index, not demo files. Bookmarks persist per verified user in employees.json, without modifying legacy demo bookmarks. The authenticated bookmark endpoint validates published materials on add; deleted/unpublished items are omitted from the personal view. Training and notifications remain explicitly labeled demos. No additional environment variables.
+
+Profile V9.7: the compact profile shows one project shortcut and the shared saved collection. Both the profile and the information system show published CMS bookmarks and saved information-system cards, including existing selections.
