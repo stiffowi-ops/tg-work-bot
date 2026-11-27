@@ -10,7 +10,7 @@ function profilePreview(photo,name){
 }
 function openProfileEdit(statusOnly=false){
  profileDraft={photo:state.photo,busy:false};
- modal(statusOnly?'Рабочий статус':'Редактировать профиль',`<form id="profileform" class="formgrid" data-mode="${statusOnly?'status':'full'}">${statusOnly?'':`<div class="row profile-photo-row"><div id="profile-photo-preview">${profilePreview(state.photo,state.name)}</div><div class="grow"><h3>Фотография профиля</h3><small>JPG, PNG, WebP · до 8 МБ</small><div class="profile-actions">${btn('Загрузить','upload')}${btn('Удалить','removephoto')}</div><small>Импорт из Telegram появится после авторизации.</small><input id="photofile" type="file" accept="image/jpeg,image/png,image/webp" class="hidden"></div></div><label class="field">Имя и фамилия<input name="name" value="${esc(state.name)}" required maxlength="80" autocomplete="name"></label><label class="field">Должность<input name="role" maxlength="100" value="${esc(state.role||'')}"></label><label class="field">О себе <small>Будет видно коллегам в разделе «Моя команда».</small><textarea name="bio" maxlength="600">${esc(state.bio)}</textarea><span id="bio-count">${state.bio.length} / 600</span></label>`}<label class="field">Рабочий статус<select name="status">${profileOptions(state.status)}</select></label><label class="field ${state.status==='vacation'?'':'hidden'}" id="untilfield">Отпуск до (необязательно)<input type="date" name="until" value="${esc(state.until)}"></label><p class="muted">Изменения пока сохраняются только в этом браузере.</p><div class="profile-actions"><button class="primary" type="submit">${I('check')} Сохранить</button>${btn('Отмена','close')}</div></form>`);
+ modal(statusOnly?'Рабочий статус':'Редактировать профиль',`<form id="profileform" class="formgrid" data-mode="${statusOnly?'status':'full'}">${statusOnly?'':`<div class="row profile-photo-row"><div id="profile-photo-preview">${profilePreview(state.photo,state.name)}</div><div class="grow"><h3>Фотография профиля</h3><small>JPG, PNG, WebP · до 8 МБ</small><div class="profile-actions">${btn('Загрузить','upload')}${btn('Удалить','removephoto')}</div><small>При первом входе используется доступная фотография Telegram.</small><input id="photofile" type="file" accept="image/jpeg,image/png,image/webp" class="hidden"></div></div><label class="field">Имя и фамилия<input name="name" value="${esc(state.name)}" required maxlength="80" autocomplete="name"></label><label class="field">Должность<input name="role" maxlength="100" value="${esc(state.role||'')}"></label><label class="field">О себе <small>Будет видно коллегам в разделе «Моя команда».</small><textarea name="bio" maxlength="600">${esc(state.bio)}</textarea><span id="bio-count">${state.bio.length} / 600</span></label>`}<label class="field">Рабочий статус<select name="status">${profileOptions(state.status)}</select></label><label class="field ${state.status==='vacation'?'':'hidden'}" id="untilfield">Отпуск до (необязательно)<input type="date" name="until" value="${esc(state.until)}"></label><p class="muted">Изменения сохраняются в вашем профиле. Описание и рабочий статус видны коллегам.</p><div class="profile-actions"><button class="primary" type="submit">${I('check')} Сохранить</button>${btn('Отмена','close')}</div></form>`);
  document.querySelector('#profileform [name="'+(statusOnly?'status':'name')+'"]')?.focus();
 }
 function handleProfileAction(a){
@@ -31,15 +31,16 @@ document.addEventListener('input',e=>{
  if(e.target.name==='name')updatePhotoPreview(form);
  if(e.target.name==='bio')form.querySelector('#bio-count').textContent=e.target.value.length+' / 600';
 });
-document.addEventListener('submit',e=>{
+document.addEventListener('submit',async e=>{
  const form=e.target;if(form.id!=='profileform')return;e.preventDefault();
- if(!profileDraft||profileDraft.busy)return;
+ if(!accessReady||mutationBusy||!profileDraft||profileDraft.busy)return;
  const f=new FormData(form),mode=form.dataset.mode,next={...state};
  if(mode==='full'){next.name=String(f.get('name')||'').trim();if(!next.name){notify('Введите имя');form.elements.name.focus();return}next.role=String(f.get('role')||'').trim();next.bio=String(f.get('bio')||'');next.photo=profileDraft.photo}
  next.status=String(f.get('status'));if(!['work','vacation','away'].includes(next.status))return;
  next.until=next.status==='vacation'?String(f.get('until')||''):'';
- try{localStorage.setItem('workhub-demo-v1',JSON.stringify(next))}catch{notify('Не удалось сохранить профиль. Проверьте доступ к хранилищу.');return}
- state=next;profileDraft=null;close();render();notify('Профиль сохранён');
+ const submit=form.querySelector('[type=submit]');submit.disabled=true;
+ const saved=await saveState(next);submit.disabled=false;if(!saved)return;
+ profileDraft=null;close();render();notify('Профиль сохранён');
 });
 document.addEventListener('change',e=>{
  const input=e.target;if(input.id!=='photofile')return;
@@ -49,6 +50,6 @@ document.addEventListener('change',e=>{
  const img=new Image(),url=URL.createObjectURL(file),submit=form.querySelector('[type=submit]');
  draft.busy=true;submit.disabled=true;
  const finish=()=>{URL.revokeObjectURL(url);draft.busy=false;submit.disabled=false};
- img.onload=()=>{try{if(!form.isConnected||profileDraft!==draft)return;const canvas=document.createElement('canvas'),s=Math.min(1,360/Math.max(img.naturalWidth,img.naturalHeight));canvas.width=Math.max(1,Math.round(img.naturalWidth*s));canvas.height=Math.max(1,Math.round(img.naturalHeight*s));canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);draft.photo=canvas.toDataURL('image/jpeg',.85);updatePhotoPreview(form);notify('Фото готово. Нажмите «Сохранить».')}catch{notify('Не удалось обработать фото')}finally{finish()}};
+ img.onload=()=>{try{if(!form.isConnected||profileDraft!==draft)return;const canvas=document.createElement('canvas'),s=Math.min(1,640/Math.max(img.naturalWidth,img.naturalHeight));canvas.width=Math.max(1,Math.round(img.naturalWidth*s));canvas.height=Math.max(1,Math.round(img.naturalHeight*s));canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);draft.photo=canvas.toDataURL('image/jpeg',.92);updatePhotoPreview(form);notify('Фото готово. Нажмите «Сохранить».')}catch{notify('Не удалось обработать фото')}finally{finish()}};
  img.onerror=()=>{finish();if(form.isConnected)notify('Не удалось открыть фото')};img.src=url;
 });
