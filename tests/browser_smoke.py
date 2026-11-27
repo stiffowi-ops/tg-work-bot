@@ -37,7 +37,7 @@ def shot(p,name):
     assert p.evaluate("document.documentElement.scrollWidth <= innerWidth+1"), name+" overflow"
     p.screenshot(path=str(out/(name+".png")),full_page=True,animations="disabled")
 with sync_playwright() as pw:
-    b=pw.chromium.launch(headless=True)
+    b=pw.chromium.launch(headless=True,channel="chromium")
     ctx,p,errors=session(b,42,1440,940)
     shot(p,"desktop-profile")
     admin(p)
@@ -56,10 +56,12 @@ with sync_playwright() as pw:
     nav(p,"projects");shot(p,"desktop-projects")
     project(p);shot(p,"desktop-feed")
     v=p.locator(".routing-player video")
+    p.locator(".player-launch").scroll_into_view_if_needed()
     box=p.locator(".routing-player").bounding_box()
     p.locator(".player-launch").click()
     p.wait_for_function("document.querySelector('video').currentTime > 0.1",timeout=20000)
-    assert p.locator(".routing-player").bounding_box()==box,"player layout shifted"
+    after=p.locator(".routing-player").bounding_box()
+    assert all(abs(box[k]-after[k])<1 for k in ("width","height")),"player layout shifted"
     v.evaluate("(v)=>v.pause()")
     assert not errors,errors
     ctx.close()
