@@ -116,13 +116,12 @@ type employeeAPI struct{
  client *http.Client
  setupError string
 }
-func newEmployeeAPI()*employeeAPI{
+func newEmployeeAPI(dir string)*employeeAPI{
  a:=&employeeAPI{}
  a.token=strings.TrimSpace(os.Getenv("BOT_TOKEN"))
  if a.token==""{a.setupError="Не настроен BOT_TOKEN. Проверьте переменные контейнера.";log.Print("access configuration: BOT_TOKEN missing");return a}
  chat,err:=strconv.ParseInt(strings.TrimSpace(os.Getenv("WORK_CHAT_ID")),10,64)
  if err!=nil||chat>=0{log.Print("access configuration: WORK_CHAT_ID missing or invalid; group access disabled")}else{a.chat=chat}
- dir:=strings.TrimSpace(os.Getenv("DATA_DIR"));if dir==""{dir="/app/runtime"}
  if err=os.MkdirAll(dir,0700);err!=nil{a.setupError="Хранилище профилей недоступно. Проверьте DATA_DIR и права записи.";log.Printf("access configuration: cannot create DATA_DIR: %v",err);return a}
  store,err:=openStore(filepath.Join(dir,"employees.json"))
  if err!=nil{a.setupError="Не удалось прочитать хранилище профилей. Проверьте DATA_DIR и employees.json.";log.Printf("access configuration: profile store open failed: %v",err);return a}
@@ -134,7 +133,7 @@ func newEmployeeAPI()*employeeAPI{
  a.client=&http.Client{Timeout:5*time.Second,CheckRedirect:func(*http.Request,[]*http.Request)error{return http.ErrUseLastResponse}}
  adminCount:=0
  for _,s:=range strings.Split(os.Getenv("ADMIN_USER_IDS"),","){s=strings.TrimSpace(s);if s==""{continue};id,err:=strconv.ParseInt(s,10,64);if err!=nil||id<=0||s!=strconv.FormatInt(id,10){log.Print("access configuration: invalid entry in ADMIN_USER_IDS");continue};adminCount++}
- log.Printf("access configuration: storage ready; group configured=%t; admin IDs configured=%d",a.chat<0,adminCount)
+ log.Printf("access configuration: storage ready; DATA_DIR=%q; group configured=%t; admin IDs configured=%d",dir,a.chat<0,adminCount)
  return a
 }
 func(a *employeeAPI)call(ctx context.Context,method string,params url.Values,out any)error{

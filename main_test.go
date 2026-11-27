@@ -28,3 +28,17 @@ func TestReleaseVersion(t *testing.T) {
  var body struct { Version string `json:"version"` }
  if r.Code != 200 || json.Unmarshal(r.Body.Bytes(), &body) != nil || body.Version != releaseVersion { t.Fatalf("release marker: %d %s", r.Code, r.Body.String()) }
 }
+
+func TestDataDirectory(t *testing.T) {
+ for _, tc := range []struct{ value, want string }{
+  {"", "/app/data"},
+  {"  ", "/app/data"},
+  {" /custom/workhub ", "/custom/workhub"},
+  {"/app/runtime", "/app/runtime"},
+ } {
+  t.Setenv("DATA_DIR", tc.value)
+  if got := dataDirectory(); got != tc.want {
+   t.Fatalf("DATA_DIR=%q: got %q, want %q", tc.value, got, tc.want)
+  }
+ }
+}

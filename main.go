@@ -11,6 +11,7 @@ import (
  "os"
  "os/signal"
  "path/filepath"
+ "strings"
  "syscall"
  "time"
 )
@@ -18,7 +19,14 @@ import (
 //go:embed web
 var webFiles embed.FS
 
-const releaseVersion = "V9.6.1-cabinet"
+const releaseVersion = "V9.7.1-storage"
+
+func dataDirectory() string {
+ if dir := strings.TrimSpace(os.Getenv("DATA_DIR")); dir != "" {
+  return dir
+ }
+ return "/app/data"
+}
 
 func routes() http.Handler {
  mux := http.NewServeMux()
@@ -27,9 +35,9 @@ func routes() http.Handler {
   w.Header().Set("Cache-Control", "no-store")
   _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "workhub", "stage": "employee-access", "version": releaseVersion})
  })
- employee := newEmployeeAPI()
+ dir := dataDirectory()
+ employee := newEmployeeAPI(dir)
  employee.register(mux)
- dir := os.Getenv("DATA_DIR"); if dir == "" { dir = "/app/runtime" }
  (&cms{auth:employee,root:filepath.Join(dir,"data","projects")}).register(mux)
  static, err := fs.Sub(webFiles, "web")
  if err != nil { panic(err) }
