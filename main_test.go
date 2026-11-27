@@ -21,3 +21,10 @@ func TestRoutes(t *testing.T) {
   if r.Code != want { t.Errorf("%s: got %d want %d", path, r.Code, want) }
  }
 }
+
+func TestReleaseVersion(t *testing.T) {
+ r := httptest.NewRecorder()
+ routes().ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+ var body struct { Version string `json:"version"` }
+ if r.Code != 200 || json.Unmarshal(r.Body.Bytes(), &body) != nil || body.Version != releaseVersion { t.Fatalf("release marker: %d %s", r.Code, r.Body.String()) }
+}

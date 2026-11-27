@@ -18,12 +18,14 @@ import (
 //go:embed web
 var webFiles embed.FS
 
+const releaseVersion = "V9.3-access-diagnostics"
+
 func routes() http.Handler {
  mux := http.NewServeMux()
  mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
   w.Header().Set("Content-Type", "application/json")
   w.Header().Set("Cache-Control", "no-store")
-  _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "workhub", "stage": "employee-access"})
+  _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "workhub", "stage": "employee-access", "version": releaseVersion})
  })
  employee := newEmployeeAPI()
  employee.register(mux)
@@ -36,6 +38,7 @@ func routes() http.Handler {
 }
 
 func main() {
+ log.Printf("WorkHub release: %s", releaseVersion)
  port := os.Getenv("PORT")
  if port == "" { port = "8080" }
  srv := &http.Server{Addr: ":" + port, Handler: routes(), ReadHeaderTimeout: 5*time.Second, ReadTimeout: 10*time.Minute, WriteTimeout: 10*time.Minute, IdleTimeout: 60*time.Second}
