@@ -1,0 +1,11 @@
+/* On phones, reserve a real navigation row instead of covering scrollable content. */
+@media(max-width:760px){
+ html{height:100%;overflow:hidden}
+ body{height:100vh;height:100dvh;height:min(100dvh,var(--tg-viewport-height,100dvh));min-height:0;display:flex;flex-direction:column;overflow:hidden}
+ body>.shell{flex:1 1 0;min-height:0;min-width:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior-y:contain;scroll-padding-top:76px;scroll-padding-bottom:12px}
+ body>.shell main{min-width:0}
+ body>.shell .wrap{padding-bottom:24px}
+ body>#mobile{position:relative;inset:auto;transform:none;flex:none;align-self:stretch;width:auto;margin:0 var(--content-pad) calc(10px + max(env(safe-area-inset-bottom,0px),var(--tg-safe-area-inset-bottom,0px),var(--tg-content-safe-area-inset-bottom,0px)));background:#222628;border-radius:15px;z-index:10}
+ body>#mobile.hidden{display:none!important}
+ #overlay:empty{display:none}
+}
