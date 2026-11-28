@@ -74,6 +74,7 @@ function cmsAdminPage(){
  const d=cmsDraft;
  return `<section class="projects-page"><header class="projects-heading"><h1>Администрирование</h1></header>
  <section class="feed-panel"><h2>Рабочая группа</h2><p class="muted">Проверка токена, ID группы, прав бота и вашего членства.</p><button class="secondary" data-action="cmsdiagnostic">Проверить подключение к Telegram</button><div id="cms-diagnostic" role="status"></div></section>
+ <section class="feed-panel"><h2>Достижения сотрудников</h2><button class="secondary" type="button" data-identity-admin>Открыть управление достижениями</button></section>
  ${cmsProjectPicker()}
  ${d?`<div class="cms-grid"><section class="feed-panel"><div class="cms-section-heading"><h2>Редактирование проекта</h2><a href="#cms-order-heading">К материалам ↓</a></div>
  <label>Название<input id="cms-title" value="${esc(d.title)}" maxlength="120"></label><label>Описание<textarea id="cms-desc" rows="3">${esc(d.description)}</textarea></label>
