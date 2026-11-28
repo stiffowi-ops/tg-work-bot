@@ -40,3 +40,6 @@
 .cms-remove-prompt>span,.cms-remove-error{font-size:13px}
 .cms-remove-prompt>span:empty,.cms-remove-error:empty{display:none}
 .cms-remove-error{color:#ffc0af}
+
+/* Content Builder: existing artwork, spacing and palette stay intact. */
+.cms-insert{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;min-height:44px;margin:6px 0;color:var(--accent);font-size:13px;border:1px dashed #d9b77d55;border-radius:10px;background:#ffffff03}.cms-insert:hover,.cms-insert:focus-visible{border-color:var(--accent);background:#d9b77d12}.cms-insert span{font-size:22px;line-height:1}.cms-insert-note{font-size:13px;color:var(--accent);overflow-wrap:anywhere}.cms-row-actions{flex-wrap:wrap}.feed-link-art{flex:none;width:68px;height:44px;aspect-ratio:auto;border-radius:7px}.cms-live-preview{display:grid;gap:14px;min-width:0}.cms-live-preview .cms-material-item{min-width:0}.cms-live-preview .material-grid,.cms-live-preview .link-grid{grid-template-columns:1fr}

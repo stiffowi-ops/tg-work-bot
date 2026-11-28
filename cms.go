@@ -264,9 +264,52 @@ func (c *cms) add(w http.ResponseWriter,r *http.Request){
  }
  if !validBlock(b){if dest!=""{_ = os.Remove(dest)};apiError(w,400,"Проверьте поля материала.");return}
  c.mu.Lock();defer c.mu.Unlock();p,err:=c.load(id)
- if err==nil&&len(p.Blocks)<200{p.Blocks=append(p.Blocks,b);p.Revision++;err=c.save(p)}else if err==nil{err=errors.New("too many blocks")}
+ if err==nil{
+  if rev:=r.FormValue("revision");rev!=""{
+   n,e:=strconv.ParseInt(rev,10,64);if e!=nil||n!=p.Revision{if dest!=""{_ = os.Remove(dest)};apiError(w,409,"Проект изменился. Откройте редактор заново.");return}
+  }
+  pos:=len(p.Blocks)
+  if before:=r.FormValue("before");before!=""{
+   pos=-1;for i,old:=range p.Blocks{if old.ID==before{pos=i;break}}
+   if pos<0{if dest!=""{_ = os.Remove(dest)};apiError(w,409,"Место вставки изменилось.");return}
+  }
+  if len(p.Blocks)>=200{if dest!=""{_ = os.Remove(dest)};apiError(w,400,"В проекте не более 200 блоков.");return}
+  p.Blocks=append(p.Blocks,contentBlock{});copy(p.Blocks[pos+1:],p.Blocks[pos:]);p.Blocks[pos]=b;p.Revision++;err=c.save(p)
+ }
  if err!=nil{if dest!=""{_ = os.Remove(dest)};apiError(w,500,"Не удалось сохранить материал.");return}
  writeJSON(w,201,p)
+}
+// Duplicate into a new draft, with an independent file for file-backed blocks.
+func (c *cms) duplicateBlock(w http.ResponseWriter,r *http.Request){
+ if _,ok:=c.admin(w,r);!ok{return}
+ id:=r.PathValue("project");if _,ok:=projectSeed(id);!ok{apiError(w,404,"Проект не найден.");return}
+ var body struct{Revision *int64}
+ dec:=json.NewDecoder(http.MaxBytesReader(w,r.Body,1024))
+ if dec.Decode(&body)!=nil||dec.Decode(new(any))!=io.EOF||body.Revision==nil{apiError(w,400,"Укажите версию проекта.");return}
+ c.mu.Lock();defer c.mu.Unlock()
+ p,err:=c.load(id);if err!=nil{apiError(w,500,"Ошибка хранения.");return}
+ if p.Revision!=*body.Revision{apiError(w,409,"Проект изменился. Откройте редактор заново.");return}
+ if len(p.Blocks)>=200{apiError(w,400,"В проекте не более 200 блоков.");return}
+ for i,old:=range p.Blocks{
+  if old.ID!=r.PathValue("block"){continue}
+  b:=old;b.ID,err=randomID();b.Published=false
+  if err!=nil{apiError(w,500,"Ошибка создания блока.");return}
+  var dest string
+  if fileKind(b.Kind){
+   if !validFileID(old.ID){apiError(w,400,"Некорректный файл.");return}
+   dir:=filepath.Join(c.dir(id),"files")
+   src,e:=os.Open(filepath.Join(dir,old.ID));if e!=nil{apiError(w,500,"Не удалось открыть исходный файл.");return}
+   defer src.Close()
+   dest=filepath.Join(dir,b.ID)
+   out,e:=os.OpenFile(dest,os.O_CREATE|os.O_EXCL|os.O_WRONLY,0600);if e!=nil{apiError(w,500,"Не удалось создать копию файла.");return}
+   n,copyErr:=io.Copy(out,io.LimitReader(src,(128<<20)+1));syncErr:=out.Sync();closeErr:=out.Close()
+   if n<=0||n>128<<20||copyErr!=nil||syncErr!=nil||closeErr!=nil{_ = os.Remove(dest);apiError(w,500,"Не удалось скопировать файл.");return}
+  }
+  p.Blocks=append(p.Blocks,contentBlock{});copy(p.Blocks[i+2:],p.Blocks[i+1:]);p.Blocks[i+1]=b;p.Revision++
+  if err=c.save(p);err!=nil{if dest!=""{_ = os.Remove(dest)};apiError(w,500,"Не удалось сохранить копию.");return}
+  writeJSON(w,201,p);return
+ }
+ apiError(w,404,"Материал не найден.")
 }
 func (c *cms) media(w http.ResponseWriter,r *http.Request){
  u,ok:=c.mediaUser(w,r);if !ok{return}
@@ -295,5 +338,6 @@ func (c *cms) register(mux *http.ServeMux){
  mux.HandleFunc("PUT /api/content/{project}",c.update)
  mux.HandleFunc("POST /api/content/{project}/blocks",c.add)
  mux.HandleFunc("DELETE /api/content/{project}/blocks/{block}",c.deleteBlock)
+ mux.HandleFunc("POST /api/content/{project}/blocks/{block}/duplicate",c.duplicateBlock)
  mux.HandleFunc("GET /api/content/{project}/file/{block}",c.media)
 }
