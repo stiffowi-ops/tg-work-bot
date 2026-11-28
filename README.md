@@ -1,4 +1,19 @@
-# Corporate Telegram Work Bot
+# WorkHub / Corporate Telegram Work Bot
+
+## Current WorkHub Mini App (Go)
+
+The current Mini App is deployed from `main` with the root `Dockerfile` and `docker-entrypoint.sh`. See [WORKHUB.md](WORKHUB.md) for deployment, Telegram authentication, CMS and storage instructions.
+
+Production environment: `DATA_DIR=/app/data`, with the existing persistent volume mounted at that exact path. Use the host-provided `PORT` (or 8080). Keep secrets in the hosting environment, not in Git.
+
+```bash
+go test ./...
+docker build -t workhub .
+```
+
+The Python polling bot below is a separate legacy service; do not use its start command for the Go Mini App.
+
+## Separate Python polling bot
 
 Асинхронный Telegram-бот для командной работы:
 

@@ -10,7 +10,6 @@ import (
  "net/http"
  "os"
  "os/signal"
- "path/filepath"
  "syscall"
  "time"
 )
@@ -18,7 +17,7 @@ import (
 //go:embed web
 var webFiles embed.FS
 
-const releaseVersion = "V9.6.2-admin-cards"
+const releaseVersion = "V9.6.3-storage"
 
 func routes() http.Handler {
  mux := http.NewServeMux()
@@ -27,10 +26,10 @@ func routes() http.Handler {
   w.Header().Set("Cache-Control", "no-store")
   _ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "workhub", "stage": "employee-access", "version": releaseVersion})
  })
- employee := newEmployeeAPI()
+ storage := resolveStorage(os.Getenv("DATA_DIR"))
+ employee := newEmployeeAPI(storage)
  employee.register(mux)
- dir := os.Getenv("DATA_DIR"); if dir == "" { dir = "/app/runtime" }
- (&cms{auth:employee,root:filepath.Join(dir,"data","projects")}).register(mux)
+ (&cms{auth:employee,root:storage.projects}).register(mux)
  static, err := fs.Sub(webFiles, "web")
  if err != nil { panic(err) }
  mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){if r.Method!="GET"&&r.Method!="HEAD"{w.Header().Set("Allow","GET, HEAD");http.Error(w,"Method Not Allowed",405);return};w.Header().Set("Cache-Control","no-cache");w.Header().Set("X-Content-Type-Options","nosniff");http.FileServer(http.FS(static)).ServeHTTP(w,r)}))

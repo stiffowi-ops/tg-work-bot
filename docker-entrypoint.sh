@@ -1,7 +1,16 @@
 #!/bin/sh
 set -eu
 
+# Normalize the same whitespace as the Go configuration for ordinary paths.
+DATA_DIR="$(printf '%s' "${DATA_DIR:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 export DATA_DIR="${DATA_DIR:-/app/data}"
+case "$DATA_DIR" in
+    /app/data/) export DATA_DIR=/app/data ;;
+    /app/runtime/) export DATA_DIR=/app/runtime ;;
+esac
+if [ "$DATA_DIR" = /app/runtime ]; then
+    echo "storage setup: explicit legacy DATA_DIR; preserve the existing volume before switching to /app/data" >&2
+fi
 
 # Bothost mounts its persistent volume after the image is built.
 # Prepare only the known storage directories; never follow symlinks.
