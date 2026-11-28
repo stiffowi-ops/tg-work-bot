@@ -425,7 +425,7 @@ with sync_playwright() as pw:
         expect(p.locator('.award-year')).to_be_visible()
         assert p.evaluate("""async () => {
             const frame=document.querySelector('.award-frame');
-            await frame.decode();
+            if(frame instanceof HTMLImageElement)await frame.decode();
             const r=frame.getBoundingClientRect(),a=document.querySelector('.award-avatar').getBoundingClientRect(),ribbon=document.querySelector('.award-ribbon').getBoundingClientRect(),year=document.querySelector('.award-year').getBoundingClientRect();
             const center=x=>x.left+x.width/2;
             return Math.abs(r.width-r.height)<=1&&Math.abs(center(r)-center(a))<=1&&Math.abs(center(ribbon)-center(a))<=1&&Math.abs(center(year)-center(a))<=1;
@@ -445,5 +445,36 @@ with sync_playwright() as pw:
             shot(p,"v99-achievement-detail")
             p.locator('.award-close').click()
         assert not errors,errors;ctx.close()
+    # V9.9.1: selection is persisted, locked styles are rejected, and colleagues see the selected identity.
+    ctx,p,errors=session(b,4,390,844)
+    expect(p.locator('.award-chips')).to_have_count(0)
+    p.locator('[data-appearance-open]').click()
+    expect(p.locator('.identity-settings')).to_be_visible()
+    shot(p,"v991-appearance-settings")
+    p.locator('[data-appearance="expert"]').click()
+    p.locator('[data-appearance-save]').click()
+    expect(p.locator('.award-ribbon')).to_have_text("Эксперт")
+    p.reload()
+    expect(p.locator('.award-ribbon')).to_have_text("Эксперт")
+    shot(p,"v991-mobile-expert")
+    assert not errors,errors;ctx.close()
+    ctx,p,errors=session(b,42,390,844)
+    nav(p,"team")
+    p.locator('[data-action="colleague:4"]').click()
+    expect(p.locator('.team-detail .award-ribbon')).to_have_text("Эксперт")
+    expect(p.locator('.team-detail .award-shelf')).to_contain_text("Достижения сотрудника")
+    shot(p,"v991-colleague")
+    p.locator('.team-detail .award-row.leader').click()
+    expect(p.locator('.award-dialog')).to_be_visible()
+    p.locator('.award-close').click()
+    assert not errors,errors;ctx.close()
+    ctx,p,errors=session(b,4,390,844)
+    p.locator('[data-appearance-open]').click()
+    p.locator('[data-appearance="none"]').click()
+    p.locator('[data-appearance-save]').click()
+    expect(p.locator('.employee-photo .award-frame')).to_have_count(0)
+    expect(p.locator('.award-row.leader')).to_be_visible()
+    shot(p,"v991-mobile-plain")
+    assert not errors,errors;ctx.close()
     b.close()
 print("Browser checks passed: real API, admin upload, draft visibility, download, desktop/mobile layout and playback.")

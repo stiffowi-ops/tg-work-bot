@@ -12,6 +12,7 @@ type employeeIdentity struct {
  StartMonth string `json:"startMonth,omitempty"`
  LeaderMonths []string `json:"leaderMonths,omitempty"`
  ExpertDates []string `json:"expertDates,omitempty"`
+ SelectedAppearance string `json:"selectedAppearance,omitempty"`
 }
 type identityAward struct {
  Kind string `json:"kind"`
@@ -23,7 +24,7 @@ type identityAward struct {
  History []string `json:"history,omitempty"`
  Appearance string `json:"appearance,omitempty"`
 }
-type identityProfile struct{employee;Achievements []identityAward `json:"achievements"`}
+type identityProfile struct{employee;Achievements []identityAward `json:"achievements"`;identityDecoration}
 var identityZone=time.FixedZone("MSK",3*60*60)
 func identityMonth(now time.Time)string{return now.In(identityZone).Format("2006-01")}
 func identityYears(start string,now time.Time)int{
@@ -41,7 +42,7 @@ func identityAwards(p employee,now time.Time)[]identityAward{
  if years:=identityYears(x.StartMonth,now);years>0{out=append(out,identityAward{Kind:"veteran",Count:1,Years:years,Subtitle:"За стаж в команде",Description:"Присваивается автоматически после года работы.",History:[]string{x.StartMonth}})}
  return out
 }
-func identityView(p employee,now time.Time)identityProfile{return identityProfile{p,identityAwards(p,now)}}
+func identityView(p employee,now time.Time)identityProfile{return identityProfile{p,identityAwards(p,now),decorationFor(p,now)}}
 type identityAdminRow struct{ID string `json:"id"`;Name string `json:"name"`;Identity employeeIdentity `json:"identity"`;Achievements []identityAward `json:"achievements"`}
 func identityRow(p employee,now time.Time)identityAdminRow{return identityAdminRow{p.ID,p.Name,p.Identity,identityAwards(p,now)}}
 type identityEdit struct{ID string `json:"id"`;Action string `json:"action"`;StartMonth string `json:"startMonth"`}
@@ -80,4 +81,45 @@ func(a *employeeAPI)identityAdmin(w http.ResponseWriter,r *http.Request){
  if !isAdmin(id){member,err:=a.member(r.Context(),id);if err!=nil{apiError(w,503,"Не удалось проверить членство.");return};if !member{apiError(w,403,"Сотрудник не состоит в рабочей группе.");return}}
  p,err:=a.store.editIdentity(c,now);if err!=nil{apiError(w,500,"Не удалось сохранить достижения.");return}
  writeJSON(w,200,identityRow(p,now))
+}
+
+type identityDecoration struct {
+ Appearance string `json:"appearance"`
+ TenureMonths int `json:"tenureMonths"`
+ AvailableAppearances []string `json:"availableAppearances"`
+}
+func identityMonths(start string,now time.Time) int{
+ t,e:=time.ParseInLocation("2006-01",start,identityZone);if e!=nil{return 0}
+ n:=now.In(identityZone);m:=(n.Year()-t.Year())*12+int(n.Month())-int(t.Month());if m<0{return 0};return m
+}
+func decorationFor(p employee,now time.Time)identityDecoration{
+ months:=identityMonths(p.Identity.StartMonth,now)
+ available:=[]string{"none"}
+ currentLeader:=false
+ for _,a:=range identityAwards(p,now){if a.Kind=="leader"&&a.Current{currentLeader=true;available=append(available,"leader")};if a.Kind=="expert"||a.Kind=="veteran"{available=append(available,a.Kind)}}
+ if months>=3{available=append(available,"tenure")}
+ chosen:=p.Identity.SelectedAppearance
+ if chosen==""{chosen="none";if currentLeader{chosen="leader"}else if months>=3{chosen="tenure"}}
+ for _,k:=range available{if chosen==k{return identityDecoration{chosen,months,available}}}
+ return identityDecoration{"none",months,available}
+}
+var errAppearanceLocked=errors.New("appearance not available")
+var errAppearanceMissing=errors.New("profile not found")
+func(s *employeeStore)selectAppearance(id,kind string,now time.Time)(employee,error){
+ s.mu.Lock();defer s.mu.Unlock()
+ p,ok:=s.people[id];if !ok{return p,errAppearanceMissing}
+ allowed:=false;for _,k:=range decorationFor(p,now).AvailableAppearances{if k==kind{allowed=true}}
+ if !allowed{return p,errAppearanceLocked}
+ p.Identity.SelectedAppearance=kind;return s.putLocked(p)
+}
+func(a *employeeAPI)appearance(w http.ResponseWriter,r *http.Request){
+ u,ok:=a.authorize(w,r);if !ok{return}
+ var body struct{Appearance string `json:"appearance"`}
+ d:=json.NewDecoder(http.MaxBytesReader(w,r.Body,1024));d.DisallowUnknownFields()
+ if d.Decode(&body)!=nil||d.Decode(new(any))!=io.EOF{apiError(w,400,"Некорректные данные.");return}
+ now:=time.Now();p,err:=a.store.selectAppearance(strconv.FormatInt(u.ID,10),body.Appearance,now)
+ if errors.Is(err,errAppearanceLocked){apiError(w,403,"Это оформление пока недоступно.");return}
+ if errors.Is(err,errAppearanceMissing){apiError(w,409,"Сначала откройте профиль.");return}
+ if err!=nil{apiError(w,500,"Не удалось сохранить оформление.");return}
+ writeJSON(w,200,identityView(p,now))
 }

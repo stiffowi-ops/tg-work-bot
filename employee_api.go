@@ -251,6 +251,8 @@ type colleague struct{
  Until string `json:"until"`
  Photo string `json:"photo"`
  Project string `json:"project"`
+ Achievements []identityAward `json:"achievements"`
+ identityDecoration
 }
 func(a *employeeAPI)team(w http.ResponseWriter,r *http.Request){
  u,ok:=a.authorize(w,r);if !ok{return}
@@ -268,7 +270,7 @@ func(a *employeeAPI)team(w http.ResponseWriter,r *http.Request){
  go func(){defer close(jobs);for _,p:=range people{select{case jobs<-p:case <-ctx.Done():return}}}()
  go func(){wg.Wait();close(checks)}()
  failed:=0
- for c:=range checks{if c.err!=nil{failed++;continue};if !c.allowed{continue};p:=c.p;result=append(result,colleague{p.ID,p.Username,p.Name,p.Role,p.Bio,p.Status,p.Until,p.Photo,p.Project})}
+ for c:=range checks{if c.err!=nil{failed++;continue};if !c.allowed{continue};p:=c.p;result=append(result,colleague{p.ID,p.Username,p.Name,p.Role,p.Bio,p.Status,p.Until,p.Photo,p.Project,identityAwards(p,time.Now()),decorationFor(p,time.Now())})}
  if ctx.Err()!=nil||failed>0{apiError(w,503,"Не удалось подтвердить полный состав зарегистрированных сотрудников. Повторите проверку.");return}
  sort.Slice(result,func(i,j int)bool{return result[i].Name<result[j].Name})
  writeJSON(w,200,result)
@@ -276,6 +278,7 @@ func(a *employeeAPI)team(w http.ResponseWriter,r *http.Request){
 func(a *employeeAPI)register(mux *http.ServeMux){
  mux.HandleFunc("GET /api/me",a.me)
  mux.HandleFunc("PUT /api/me",a.save)
+ mux.HandleFunc("PUT /api/me/appearance",a.appearance)
  mux.HandleFunc("GET /api/team",a.team)
  mux.HandleFunc("GET /api/admin/identity",a.identityAdmin)
  mux.HandleFunc("PUT /api/admin/identity",a.identityAdmin)
