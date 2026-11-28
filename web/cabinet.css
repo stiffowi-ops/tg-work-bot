@@ -45,7 +45,7 @@
 
 /* Compact material shelf: discreet segmented selector, edge-to-edge artwork. */
 .cabinet-view .cabinet-section-head h2{font-size:clamp(18px,2vw,21px);letter-spacing:-.4px}
-.cabinet-view .cabinet-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:min(100%,390px);justify-self:start;gap:3px;padding:3px;border:1px solid #ffffff0f;border-radius:10px;background:#1d2325}
+.cabinet-view .cabinet-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%;justify-self:stretch;gap:3px;padding:3px;border:1px solid #ffffff0f;border-radius:10px;background:#1d2325}
 .cabinet-view .cabinet-tabs button{display:flex;align-items:center;justify-content:center;text-align:center;min-height:36px;padding:4px 5px;border:1px solid transparent;border-radius:7px;background:transparent;color:#aeb6b2;font-size:12px;font-weight:550;line-height:1.2}
 .cabinet-view .cabinet-tabs button[aria-pressed=true]{background:#d9b77d12;color:#edbd79;border-color:#d9b77d40}
 .cabinet-view .cabinet-rail{gap:9px;padding:0 0 4px;scroll-padding-inline:0;cursor:grab}
@@ -72,7 +72,6 @@
  .cabinet-view .employee-bio{margin-top:10px;padding-top:9px}
  .cabinet-view .employee-shortcut{min-height:132px}
  .cabinet-view .cabinet-section{gap:8px}
- .cabinet-view .cabinet-tabs{width:min(100%,340px)}
  .cabinet-view .cabinet-tabs button{font-size:11px;min-height:34px}
  .cabinet-view .cabinet-tile{flex-basis:calc((100% - 18px)/2.28)}
  .cabinet-view .cabinet-tile-copy{padding:8px}
@@ -88,7 +87,7 @@
 .cabinet-view .employee-shortcut-copy{display:grid;grid-template-rows:1.25em 2.3em 1.3em;align-items:start;gap:4px;box-sizing:border-box}
 .cabinet-view .employee-shortcut-copy small,.cabinet-view .employee-shortcut-copy>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.25}
 .cabinet-view .employee-shortcut-copy strong{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;line-height:1.15}
-.cabinet-view .cabinet-tabs{grid-template-columns:repeat(3,minmax(0,1fr));justify-self:center;gap:4px;width:min(100%,390px);border-color:var(--cabinet-line);box-sizing:border-box}
+.cabinet-view .cabinet-tabs{grid-template-columns:repeat(3,minmax(0,1fr));justify-self:stretch;gap:4px;width:100%;border-color:var(--cabinet-line);box-sizing:border-box}
 .cabinet-view .cabinet-tabs button{height:36px;min-height:36px;min-width:0;white-space:nowrap;font-size:12px;line-height:1.2}
 .cabinet-view .cabinet-rail{--tile-art-ratio:2.45;--tile-copy-height:58px;--tile-width:calc((100% - 27px)/3.35);align-items:flex-start;gap:9px}
 .cabinet-view .cabinet-tile{box-sizing:border-box;flex:0 0 var(--tile-width);width:var(--tile-width);min-width:0;max-width:none;align-self:start;display:block;padding:0;border:1px solid var(--cabinet-line);border-radius:12px}
@@ -106,9 +105,11 @@
  .cabinet-view .employee-shortcut-copy{grid-template-rows:1.25em 2.3em 1.3em;padding:10px;gap:3px;font-size:14px}
  .cabinet-view .employee-shortcut-copy strong{font-size:14px;line-height:1.15}
  .cabinet-view .employee-shortcut-copy small,.cabinet-view .employee-shortcut-copy>span{font-size:11px}
- .cabinet-view .cabinet-tabs{width:min(100%,340px)}
  .cabinet-view .cabinet-tabs button{font-size:11px}
  .cabinet-view .cabinet-rail{--tile-art-ratio:1.9;--tile-copy-height:56px;--tile-width:calc((100% - 18px)/2.28)}
  .cabinet-view .cabinet-tile-copy{padding:8px;font-size:12px}
 }
 @media(pointer:coarse){.cabinet-view .cabinet-tabs button{height:40px;min-height:40px}}
+
+/* V9.8.1: selector and shelf use the same content edges on every screen. */
+.cabinet-view .cabinet-tabs,.cabinet-view .cabinet-rail{box-sizing:border-box;width:100%;max-width:none;min-width:0;justify-self:stretch}
