@@ -173,9 +173,58 @@ func (c *cms) update(w http.ResponseWriter,r *http.Request){
  next.Revision++
  if err=c.save(next);err!=nil{apiError(w,500,"Не удалось сохранить проект.");return}
  // Remove only files referenced by deleted blocks, after committing metadata.
- for _,b:=range old.Blocks{if !seen[b.ID]&&fileKind(b.Kind)&&validFileID(b.ID){_ = os.Remove(filepath.Join(c.dir(id),"files",b.ID))}}
+ for _,b:=range old.Blocks{if !seen[b.ID]{c.removeBlockFile(id,b)}}
  writeJSON(w,200,next)
 }
+func (c *cms) removeBlockFile(project string, b contentBlock) {
+	if fileKind(b.Kind) && validFileID(b.ID) {
+		_ = os.Remove(filepath.Join(c.dir(project), "files", b.ID))
+	}
+}
+
+func (c *cms) deleteBlock(w http.ResponseWriter, r *http.Request) {
+	if _, ok := c.admin(w, r); !ok {
+		return
+	}
+	project := r.PathValue("project")
+	if _, ok := projectSeed(project); !ok {
+		apiError(w, 404, "Проект не найден.")
+		return
+	}
+	var body struct{ Revision *int64 }
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
+	if dec.Decode(&body) != nil || dec.Decode(new(any)) != io.EOF || body.Revision == nil {
+		apiError(w, 400, "Укажите версию проекта.")
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, err := c.load(project)
+	if err != nil {
+		apiError(w, 500, "Не удалось загрузить проект.")
+		return
+	}
+	if p.Revision != *body.Revision {
+		apiError(w, 409, "Проект изменился. Откройте редактор заново и проверьте список.")
+		return
+	}
+	for i, b := range p.Blocks {
+		if b.ID != r.PathValue("block") {
+			continue
+		}
+		p.Blocks = append(p.Blocks[:i], p.Blocks[i+1:]...)
+		p.Revision++
+		if err := c.save(p); err != nil {
+			apiError(w, 500, "Не удалось удалить материал.")
+			return
+		}
+		c.removeBlockFile(project, b)
+		writeJSON(w, 200, p)
+		return
+	}
+	apiError(w, 404, "Материал не найден.")
+}
+
 func uploadType(kind,name string,head []byte)(string,bool){
  ext:=strings.ToLower(filepath.Ext(name));det:=http.DetectContentType(head)
  switch kind{
@@ -245,5 +294,6 @@ func (c *cms) register(mux *http.ServeMux){
  mux.HandleFunc("GET /api/content/{project}",c.get)
  mux.HandleFunc("PUT /api/content/{project}",c.update)
  mux.HandleFunc("POST /api/content/{project}/blocks",c.add)
+ mux.HandleFunc("DELETE /api/content/{project}/blocks/{block}",c.deleteBlock)
  mux.HandleFunc("GET /api/content/{project}/file/{block}",c.media)
 }

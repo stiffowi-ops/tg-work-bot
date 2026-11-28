@@ -29,3 +29,61 @@ func TestCMSValidation(t *testing.T){
  if _,ok:=uploadType("image","evil.svg",[]byte("<svg/>"));ok{t.Fatal("SVG allowed")}
  if _,ok:=uploadType("document","sample.pdf",[]byte("%PDF-1.7\n"));!ok{t.Fatal("PDF rejected")}
 }
+
+func TestCMSDeleteBlock(t *testing.T) {
+	dir := t.TempDir()
+	c := &cms{auth: testCMSAuth(t, dir), root: filepath.Join(dir, "projects")}
+	mux := http.NewServeMux()
+	c.register(mux)
+	p, err := c.load("industry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("a", 32)
+	p.Blocks = []contentBlock{{ID: id, Kind: "document", Title: "Материал", Filename: "sample.txt", MIME: "text/plain", Published: true}}
+	if err := c.save(p); err != nil {
+		t.Fatal(err)
+	}
+	files := filepath.Join(c.dir(p.ID), "files")
+	if err := os.MkdirAll(files, 0700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(files, id)
+	if err := os.WriteFile(file, []byte("document"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	call := func(user int64, path, body string, want int) {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodDelete, path, strings.NewReader(body))
+		if user != 0 {
+			r.Header.Set("Authorization", "tma "+signedInit(user, time.Now(), c.auth.token))
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != want {
+			t.Fatalf("%s: got %d, want %d: %s", path, w.Code, want, w.Body.String())
+		}
+	}
+	path := "/api/content/industry/blocks/"
+	const revision = `{"revision":0}`
+	call(0, path+id, revision, 401)
+	call(4, path+id, revision, 403)
+	call(42, path+id, "{}", 400)
+	call(42, path+id, `{"revision":1}`, 409)
+	call(42, path+"unknown", revision, 404)
+	call(42, "/api/content/calendar/blocks/"+id, revision, 404)
+	if _, err := os.Stat(file); err != nil {
+		t.Fatal(err)
+	}
+	call(42, path+id, revision, 200)
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		t.Fatal("file remains", err)
+	}
+	reopened := &cms{root: c.root}
+	saved, err := reopened.load("industry")
+	if err != nil || saved.Revision != 1 || len(saved.Blocks) != 0 {
+		t.Fatal(saved, err)
+	}
+	call(42, path+id, revision, 409)
+	call(42, path+id, `{"revision":1}`, 404)
+}

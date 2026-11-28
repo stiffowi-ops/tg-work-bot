@@ -14,7 +14,7 @@ Set ADMIN_USER_IDS to comma-separated numeric Telegram user IDs. Explicitly conf
 
 Group diagnostics: in Admin, open the Telegram connection check. It uses getMe, getChat, getChatMember and getChatMemberCount; the admin's own membership is checked independently of their app-admin exception. Existing group members can sign in on first launch without any prior join event. The directory is registered profiles only, not a full Telegram roster. Unknown membership states and Telegram errors do not grant employee access. Migration IDs are reported, not automatically adopted. No polling, history scraping or additional token needed.
 
-Deployment verification: GET /api/health returns the embedded release version (V9.6.1-cabinet). The same version is logged on startup, before access configuration. If it is absent after deployment, verify the host's checked-out branch and source revision; restarting the old image does not update the source.
+Deployment verification: GET /api/health returns the embedded release version (V9.6.2-admin-cards). The same version is logged on startup, before access configuration. If it is absent after deployment, verify the host's checked-out branch and source revision; restarting the old image does not update the source.
 
 Mobile layout: the scrollable shell and the bottom navigation occupy separate rows; the navigation no longer overlays the feed. Phone screenshots are viewport captures, not full-page composites. Use PORT supplied by the host if automatic, otherwise 8080, matching the proxy target. Preserve the existing persistent volume before deleting an old service.
 
