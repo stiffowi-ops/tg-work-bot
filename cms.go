@@ -48,6 +48,8 @@ func isAdmin(id int64)bool{
  for _,s:=range strings.Split(os.Getenv("ADMIN_USER_IDS"),","){if strings.TrimSpace(s)==strconv.FormatInt(id,10){return true}}
  return false
 }
+var projectIDs = [...]string{"calendar", "industry"}
+
 func projectSeed(id string)(projectContent,bool){
  switch id{
  case "calendar":return projectContent{ID:id,Title:"Календарное планирование",Description:"Планирование работы полевых сотрудников",Blocks:[]contentBlock{
@@ -65,8 +67,9 @@ func (c *cms) load(id string)(projectContent,error){
  raw,err:=os.ReadFile(filepath.Join(c.dir(id),"content.json"))
  if errors.Is(err,os.ErrNotExist){return p,nil}
  if err!=nil{return p,err}
- if err=json.Unmarshal(raw,&p);err!=nil||p.ID!=id||p.Blocks==nil{return p,errors.New("invalid project data")}
- return p,nil
+ var saved projectContent
+ if err=json.Unmarshal(raw,&saved);err!=nil||saved.ID!=id||saved.Blocks==nil{return projectContent{},errors.New("invalid project data")}
+ return saved,nil
 }
 func (c *cms) save(p projectContent)error{
  dir:=c.dir(p.ID);if err:=os.MkdirAll(dir,0700);err!=nil{return err}
@@ -138,7 +141,7 @@ func (c *cms) index(w http.ResponseWriter,r *http.Request){
  u,ok:=c.auth.authorize(w,r);if !ok{return}
  c.mu.Lock();defer c.mu.Unlock()
  list:=[]projectContent{};materials:=[]materialSummary{}
- for _,id:=range []string{"calendar","industry"}{p,err:=c.load(id);if err!=nil{apiError(w,500,"Не удалось загрузить проекты.");return};for _,b:=range p.Blocks{if b.Published{materials=append(materials,materialSummary{b.ID,id,b.Title,b.Kind})}};p.Blocks=nil;list=append(list,p)}
+ for _,id:=range projectIDs{p,err:=c.load(id);if err!=nil{apiError(w,500,"Не удалось загрузить проекты.");return};for _,b:=range p.Blocks{if b.Published{materials=append(materials,materialSummary{b.ID,id,b.Title,b.Kind})}};p.Blocks=nil;list=append(list,p)}
  writeJSON(w,200,map[string]any{"admin":isAdmin(u.ID),"projects":list,"materials":materials})
 }
 func (c *cms) refreshMediaSession(w http.ResponseWriter,r *http.Request){

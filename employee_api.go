@@ -116,20 +116,12 @@ type employeeAPI struct{
  client *http.Client
  setupError string
 }
-func newEmployeeAPI()*employeeAPI{
+func newEmployeeAPI(store *employeeStore)*employeeAPI{
  a:=&employeeAPI{}
  a.token=strings.TrimSpace(os.Getenv("BOT_TOKEN"))
  if a.token==""{a.setupError="Не настроен BOT_TOKEN. Проверьте переменные контейнера.";log.Print("access configuration: BOT_TOKEN missing");return a}
  chat,err:=strconv.ParseInt(strings.TrimSpace(os.Getenv("WORK_CHAT_ID")),10,64)
  if err!=nil||chat>=0{log.Print("access configuration: WORK_CHAT_ID missing or invalid; group access disabled")}else{a.chat=chat}
- dir:=strings.TrimSpace(os.Getenv("DATA_DIR"));if dir==""{dir="/app/runtime"}
- if err=os.MkdirAll(dir,0700);err!=nil{a.setupError="Хранилище профилей недоступно. Проверьте DATA_DIR и права записи.";log.Printf("access configuration: cannot create DATA_DIR: %v",err);return a}
- store,err:=openStore(filepath.Join(dir,"employees.json"))
- if err!=nil{a.setupError="Не удалось прочитать хранилище профилей. Проверьте DATA_DIR и employees.json.";log.Printf("access configuration: profile store open failed: %v",err);return a}
- probe,err:=os.CreateTemp(dir,".access-check-*")
- if err!=nil{a.setupError="Нет прав записи в хранилище профилей. Проверьте DATA_DIR.";log.Printf("access configuration: DATA_DIR not writable: %v",err);return a}
- probePath:=probe.Name();closeErr:=probe.Close();removeErr:=os.Remove(probePath)
- if closeErr!=nil||removeErr!=nil{a.setupError="Ошибка проверки хранилища профилей.";log.Print("access configuration: storage probe cleanup failed");return a}
  a.store=store
  a.client=&http.Client{Timeout:5*time.Second,CheckRedirect:func(*http.Request,[]*http.Request)error{return http.ErrUseLastResponse}}
  adminCount:=0

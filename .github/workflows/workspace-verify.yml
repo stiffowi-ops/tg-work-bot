@@ -25,6 +25,8 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -o /tmp/workhub .
       - name: Docker build
         run: docker build -t workhub-verification .
+      - name: Container startup and volume persistence
+        run: bash tests/docker_storage.sh workhub-verification
       - name: JavaScript syntax
         run: for f in web/components/*.js; do node --check "$f"; done
       - uses: actions/setup-python@v5
