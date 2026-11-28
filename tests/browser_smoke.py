@@ -349,6 +349,13 @@ with sync_playwright() as pw:
     }"""),"Photo assets do not decode"
     assert p.locator('.cabinet-rail').evaluate('el=>el.scrollWidth>el.clientWidth'),"No swipe overflow"
     shot(p,"mobile-cabinet-industry-saved")
+    p.locator('.cabinet-rail').scroll_into_view_if_needed()
+    shot(p,"mobile-cabinet-carousel")
+    assert p.locator('.cabinet-rail').evaluate("""el=>{const r=el.getBoundingClientRect();return [...el.children].some(c=>{const b=c.getBoundingClientRect();return b.left<r.right-12&&b.right>r.right+12})}"""),"No mobile partial card"
+    p.locator('.cabinet-rail').evaluate("el=>el.scrollLeft=el.scrollWidth")
+    p.wait_for_function("document.querySelector('.cabinet-rail').scrollLeft>30")
+    shot(p,"mobile-cabinet-carousel-end")
+    p.locator('.cabinet-rail').evaluate("el=>el.scrollLeft=0")
     p.locator('[data-action="cabinet-tab:recent"]').click()
     expect(p.locator('.cabinet-rail .cabinet-tile').first).to_contain_text("Сайт продукта")
     shot(p,"mobile-cabinet-industry-recent")
@@ -359,6 +366,20 @@ with sync_playwright() as pw:
     ctx,p,errors=session(b,4,1440,940)
     expect(p.locator('.cabinet-rail .cabinet-tile')).to_have_count(5)
     shot(p,"desktop-cabinet-industry")
+    rail=p.locator('.cabinet-rail')
+    assert rail.evaluate("""el=>{const r=el.getBoundingClientRect(),cards=[...el.children].map(c=>c.getBoundingClientRect());return cards.some(c=>c.left<r.right-12&&c.right>r.right+12)}"""),"No partial next card"
+    assert p.locator('.cabinet-tabs button').first.evaluate("el=>getComputedStyle(el).textAlign==='center'"),"Tab not centered"
+    rail.scroll_into_view_if_needed()
+    box=rail.bounding_box()
+    x=box["x"]+min(rail.locator('.cabinet-tile').first.bounding_box()["width"]*.35,100)
+    y=box["y"]+box["height"]*.55
+    p.mouse.move(x+150,y)
+    p.mouse.down()
+    p.mouse.move(x,y,steps=12)
+    p.mouse.up()
+    p.wait_for_function("document.querySelector('.cabinet-rail').scrollLeft>30")
+    expect(p.locator('.employee-shortcuts')).to_be_visible()
+    shot(p,"desktop-cabinet-carousel-drag")
     assert not errors,errors;ctx.close()
     b.close()
 print("Browser checks passed: real API, admin upload, draft visibility, download, desktop/mobile layout and playback.")

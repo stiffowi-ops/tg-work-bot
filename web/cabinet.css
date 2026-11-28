@@ -42,3 +42,40 @@
  .cabinet-view .employee-shortcut-team,.cabinet-view .employee-shortcut-project.industry{background-size:auto 68%}
  .cabinet-view .employee-shortcut::before{background:linear-gradient(180deg,#14191b00 0%,#171c1e15 25%,#202628dc 62%,#202628 84%)}
 }
+
+/* Compact material shelf: discreet segmented selector, edge-to-edge artwork. */
+.cabinet-view .cabinet-section-head h2{font-size:clamp(18px,2vw,21px);letter-spacing:-.4px}
+.cabinet-view .cabinet-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:min(100%,390px);justify-self:start;gap:3px;padding:3px;border:1px solid #ffffff0f;border-radius:10px;background:#1d2325}
+.cabinet-view .cabinet-tabs button{display:flex;align-items:center;justify-content:center;text-align:center;min-height:36px;padding:4px 5px;border:1px solid transparent;border-radius:7px;background:transparent;color:#aeb6b2;font-size:12px;font-weight:550;line-height:1.2}
+.cabinet-view .cabinet-tabs button[aria-pressed=true]{background:#d9b77d12;color:#edbd79;border-color:#d9b77d40}
+.cabinet-view .cabinet-rail{gap:9px;padding:0 0 4px;scroll-padding-inline:0;cursor:grab}
+.cabinet-view .cabinet-rail.is-dragging{cursor:grabbing;scroll-snap-type:none;user-select:none}
+.cabinet-view .cabinet-rail.is-dragging *{cursor:grabbing}
+.cabinet-view .cabinet-tile{background:#242a2c;border:1px solid #ffffff13;border-radius:12px;box-shadow:none}
+.cabinet-view .cabinet-tile-open,.cabinet-view .cabinet-category{padding:0;gap:0;min-width:0}
+.cabinet-view .cabinet-tile-art{display:grid;width:100%;margin:0;aspect-ratio:2.1;background-size:cover;background-position:center;border-radius:0}
+.cabinet-view .cabinet-tile-copy{padding:9px 10px 10px;gap:3px}
+.cabinet-view .cabinet-tile-copy strong{font-size:13px;font-weight:600;line-height:1.25}
+.cabinet-view .cabinet-tile-copy small{font-size:11px;color:#aeb6b2}
+.cabinet-view .cabinet-tile>.cabinet-bookmark{width:32px;height:32px;border-radius:8px;top:5px;right:5px;background:#202628e8;color:#d9b77d}
+.cabinet-view .cabinet-tile>.cabinet-bookmark svg{width:16px;height:16px}
+.cabinet-view .cabinet-tile>.cabinet-bookmark.on{background:#332e25e8}
+@media(min-width:761px){
+ .cabinet-view .cabinet-tile{flex-basis:calc((100% - 27px)/3.35)}
+ .cabinet-view .cabinet-tile-art{aspect-ratio:2.45}
+}
+@media(max-width:760px){
+ .cabinet-view .wrap.employee-view{padding-top:22px}
+ .cabinet-view .employee-start{gap:14px}
+ .cabinet-view .employee-welcome h1{font-size:28px;line-height:1.08}
+ .cabinet-view .employee-card{padding:14px}
+ .cabinet-view .employee-bio{margin-top:10px;padding-top:9px}
+ .cabinet-view .employee-shortcut{min-height:132px}
+ .cabinet-view .cabinet-section{gap:8px}
+ .cabinet-view .cabinet-tabs{width:min(100%,340px)}
+ .cabinet-view .cabinet-tabs button{font-size:11px;min-height:34px}
+ .cabinet-view .cabinet-tile{flex-basis:calc((100% - 18px)/2.28)}
+ .cabinet-view .cabinet-tile-copy{padding:8px}
+ .cabinet-view .cabinet-tile-art{aspect-ratio:1.9}
+}
+@media(pointer:coarse){.cabinet-view .cabinet-tabs button{min-height:38px}.cabinet-view .cabinet-tile>.cabinet-bookmark{width:40px;height:40px}}
