@@ -44,6 +44,7 @@ type employee struct {
  Project string `json:"project"`
  Saved []int `json:"saved"`
  SavedMaterials []string `json:"savedMaterials"`
+ RecentMaterials []string `json:"recentMaterials,omitempty"`
  Read []int `json:"read"`
  Progress int `json:"progress"`
 }
@@ -85,7 +86,7 @@ func(s *employeeStore)get(id string)(employee,bool){s.mu.Lock();defer s.mu.Unloc
 func(s *employeeStore)all()[]employee{s.mu.Lock();defer s.mu.Unlock();out:=make([]employee,0,len(s.people));for _,p:=range s.people{out=append(out,p)};return out}
 func(s *employeeStore)put(p employee,createOnly bool)(employee,error){
  s.mu.Lock();defer s.mu.Unlock()
- if old,ok:=s.people[p.ID];ok{if createOnly{return old,nil};p.SavedMaterials=old.SavedMaterials}
+ if old,ok:=s.people[p.ID];ok{if createOnly{return old,nil};p.SavedMaterials=old.SavedMaterials;p.RecentMaterials=old.RecentMaterials}
  return s.putLocked(p)
 }
 func(s *employeeStore)putLocked(p employee)(employee,error){
@@ -108,6 +109,14 @@ func(s *employeeStore)setSavedMaterial(id,ref string,saved bool)([]string,error)
  if saved{if len(next)>=500{return nil,errors.New("saved material limit")};next=append(next,ref)}
  p.SavedMaterials=next
  _,err:=s.putLocked(p);return next,err
+}
+func(s *employeeStore)recordRecent(id,ref string)([]string,error){
+ s.mu.Lock();defer s.mu.Unlock()
+ p,ok:=s.people[id];if !ok{return nil,errors.New("profile not found")}
+ next:=[]string{ref}
+ for _,v:=range p.RecentMaterials{if v!=ref&&len(next)<15{next=append(next,v)}}
+ if len(p.RecentMaterials)>0&&p.RecentMaterials[0]==ref{return p.RecentMaterials,nil}
+ p.RecentMaterials=next;_,err:=s.putLocked(p);return next,err
 }
 type employeeAPI struct{
  token string

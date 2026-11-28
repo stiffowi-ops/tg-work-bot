@@ -10,8 +10,8 @@ async function employeeRequest(path,method='GET',body){
  return data;
 }
 function accessScreen(message, retry=false){
- accessReady=false;cmsAdmin=false;cmsProject=null;cmsDraft=null;cmsTicket++;state={name:'',role:'',bio:'',photo:'',status:'away',project:'',saved:[],read:[],progress:0};teamRecords=[];
- document.body.classList.remove('team-view','projects-view','project-industry');document.body.classList.add('routing-view');document.getElementById('sidebar').innerHTML='';document.getElementById('top').innerHTML='<div class="v4-top-inner"><div class="v4-brand">'+brand()+'</div></div>';document.getElementById('mobile').classList.add('hidden');
+ accessReady=false;cabinetCatalog=null;cabinetTab='saved';cabinetPositions={saved:0,recent:0,project:0};cmsAdmin=false;cmsProject=null;cmsDraft=null;cmsTicket++;state={name:'',role:'',bio:'',photo:'',status:'away',project:'',saved:[],read:[],progress:0};teamRecords=[];
+ document.body.classList.remove('team-view','projects-view','project-industry','cabinet-view');document.body.classList.add('routing-view');document.getElementById('sidebar').innerHTML='';document.getElementById('top').innerHTML='<div class="v4-top-inner"><div class="v4-brand">'+brand()+'</div></div>';document.getElementById('mobile').classList.add('hidden');
  document.getElementById('overlay').innerHTML='';profileDraft=null;
  document.getElementById('content').innerHTML='<div class="panel access-panel"><h1>Рабочее пространство</h1><p>'+esc(message)+'</p>'+(retry?'<button class="secondary" id="access-retry">Повторить</button>':'')+'</div>';
  document.getElementById('access-retry')?.addEventListener('click',bootEmployee);

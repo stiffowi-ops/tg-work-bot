@@ -38,6 +38,23 @@ def project(p):
     nav(p,"projects");p.locator('[data-action="projectdocs:calendar"]').click()
     expect(p.locator(".feed-heading h1")).to_have_text("Календарное планирование")
     expect(p.locator(".routing-player")).to_be_visible(timeout=15000)
+def cabinet_geometry(p):
+    expect(p.locator('.cabinet-tile').first).to_be_visible()
+    assert p.locator(".cabinet-tile-open:not(.cabinet-category) .cabinet-tile-copy small").count()==0,"Redundant material types"
+    assert p.locator(".cabinet-tile-copy").evaluate_all("els=>els.every(e=>getComputedStyle(e).textAlign==='center'&&getComputedStyle(e).justifyContent==='center')"),"Uncentered card labels"
+    dims=p.evaluate("""() => {
+        const measure=(selector)=>[...document.querySelectorAll(selector)].map(e=>{const r=e.getBoundingClientRect();return [r.width,r.height]});
+        return {tiles:measure('.cabinet-tile'),art:measure('.cabinet-tile-art'),copy:measure('.cabinet-tile-copy'),tabs:measure('.cabinet-tabs button'),shortcuts:measure('.employee-shortcut')};
+    }""")
+    for group,rects in dims.items():
+        assert rects,group
+        assert all(abs(w-rects[0][0])<=1 and abs(h-rects[0][1])<=1 for w,h in rects),(group,rects)
+    return {k:v[0] for k,v in dims.items()}
+
+def same_cabinet_geometry(first,second):
+    for k in first:
+        assert all(abs(a-b)<=1 for a,b in zip(first[k],second[k])),(k,first[k],second[k])
+
 def shot(p,name):
     assert p.evaluate("document.documentElement.scrollWidth <= innerWidth+1"), name+" overflow"
     p.screenshot(path=str(out/(name+".png")),full_page=False,animations="disabled")
@@ -100,25 +117,26 @@ with sync_playwright() as pw:
     p.locator('.project-tile.calendar .project-pin').click()
     expect(p.locator('.project-tile.calendar .project-pin')).to_have_attribute("aria-pressed","true")
     nav(p,"profile")
-    expect(p.locator("#cabinet-work")).to_contain_text("Материалы моего проекта")
-    folder=p.locator(".cabinet-folder").filter(has_text="Документы").first
-    folder.locator("summary").click()
-    row=folder.locator(".cabinet-material-row").filter(has_text="Календарное планирование")
+    expect(p.locator(".employee-shortcut-project")).to_contain_text("Календарное планирование")
+    p.locator('[data-action="cabinet-tab:project"]').click()
+    p.locator('[data-action="cabinet-category:document"]').click()
+    row=p.locator("#overlay .cabinet-material-row").filter(has_text="Календарное планирование")
     row.locator(".cabinet-bookmark").click()
     expect(row.locator(".cabinet-bookmark")).to_have_attribute("aria-pressed","true")
-    shot(p,"mobile-cabinet-folders")
-    p.locator('[data-go="cabinet-saved"]').click()
-    expect(p.locator("#cabinet-saved-content")).to_contain_text("Календарное планирование")
-    p.reload()
-    expect(p.locator("#cabinet-work")).to_contain_text("Сохранённые материалы")
-    p.locator('[data-go="cabinet-saved"]').click()
-    expect(p.locator("#cabinet-saved-content .cabinet-folder")).to_be_visible()
-    p.locator("#cabinet-saved-content summary").click()
-    expect(p.locator("#cabinet-saved-content .cabinet-material-row").first.locator(".cabinet-bookmark")).to_have_attribute("aria-pressed","true")
+    p.get_by_role("button",name="Закрыть",exact=True).click()
+    p.locator('[data-action="cabinet-tab:saved"]').click()
+    expect(p.locator(".cabinet-rail")).to_contain_text("Календарное планирование")
     shot(p,"mobile-cabinet-saved")
-    p.locator("#cabinet-saved-content .cabinet-material-title").first.click()
+    p.locator(".cabinet-tile-open").first.click()
     expect(p.locator(".feed-heading h1")).to_have_text("Календарное планирование")
     expect(p.locator(".material-cover").first).to_be_visible()
+    nav(p,"profile")
+    p.locator('[data-action="cabinet-tab:recent"]').click()
+    expect(p.locator(".cabinet-rail")).to_contain_text("Календарное планирование")
+    p.reload()
+    p.locator('[data-action="cabinet-tab:recent"]').click()
+    expect(p.locator(".cabinet-rail")).to_contain_text("Календарное планирование")
+    shot(p,"mobile-cabinet-recent")
     nav(p,"projects");shot(p,"mobile-projects")
     project(p);expect(p.locator("#content")).not_to_contain_text("Скрытый черновик")
     shot(p,"mobile-feed")
@@ -319,6 +337,74 @@ with sync_playwright() as pw:
     expect(p.locator('[name=linkStyle][value=wide]')).to_be_checked()
     p.locator('.cms-link-covers').scroll_into_view_if_needed()
     shot(p,"industry-mobile-link-editor")
+    assert not errors,errors;ctx.close()
+    # Populated cabinet screenshots from actual employee and CMS APIs.
+    ctx,p,errors=session(b,4,390,844)
+    expect(p.locator('.cabinet-tabs')).to_be_visible()
+    p.evaluate("""async () => {
+        await employeeRequest('/api/me','PUT',{...state,name:'Александр Иванов',role:'Менеджер по развитию',bio:'Работаю с клиентами и развиваю отраслевые направления.',project:'industry'});
+        const project=await cmsRequest('/api/content/industry');
+        const wanted=['Сайт продукта','Скрипт первой встречи','Отраслевая презентация','Чек-лист квалификации'];
+        for(const title of wanted.reverse()){
+            const block=project.blocks.find(b=>b.title===title);
+            if(!block)throw Error('Missing fixture '+title);
+            await cmsRequest('/api/me/materials','PUT',{project:'industry',id:block.id,saved:true});
+            await cmsRequest('/api/me/recent','POST',{project:'industry',id:block.id});
+        }
+    }""")
+    p.reload()
+    expect(p.locator('.employee-bio')).to_contain_text("развиваю отраслевые направления")
+    expect(p.locator('.employee-shortcut-project')).to_contain_text("Отраслевое деление")
+    expect(p.locator('.cabinet-rail .cabinet-tile')).to_have_count(5)
+    assert p.evaluate("""async () => {
+        const nodes=[...document.querySelectorAll('.employee-shortcut')];
+        return (await Promise.all(nodes.map(async n=>{
+            const url=getComputedStyle(n).backgroundImage.match(/url\(["']?(.*?)["']?\)/)?.[1];
+            if(!url)return false;
+            const img=new Image();img.src=url;await img.decode();return img.naturalWidth>100;
+        }))).every(Boolean)
+    }"""),"Photo assets do not decode"
+    assert p.locator('.cabinet-rail').evaluate('el=>el.scrollWidth>el.clientWidth'),"No swipe overflow"
+    mobile_geometry=cabinet_geometry(p)
+    shot(p,"mobile-cabinet-industry-saved")
+    p.locator('.cabinet-rail').scroll_into_view_if_needed()
+    shot(p,"mobile-cabinet-carousel")
+    assert p.locator('.cabinet-rail').evaluate("""el=>{const r=el.getBoundingClientRect();return [...el.children].some(c=>{const b=c.getBoundingClientRect();return b.left<r.right-12&&b.right>r.right+12})}"""),"No mobile partial card"
+    p.locator('.cabinet-rail').evaluate("el=>el.scrollLeft=el.scrollWidth")
+    p.wait_for_function("document.querySelector('.cabinet-rail').scrollLeft>30")
+    shot(p,"mobile-cabinet-carousel-end")
+    p.locator('.cabinet-rail').evaluate("el=>el.scrollLeft=0")
+    p.locator('[data-action="cabinet-tab:recent"]').click()
+    expect(p.locator('.cabinet-rail .cabinet-tile').first).to_contain_text("Сайт продукта")
+    same_cabinet_geometry(mobile_geometry,cabinet_geometry(p))
+    shot(p,"mobile-cabinet-industry-recent")
+    p.locator('[data-action="cabinet-tab:project"]').click()
+    expect(p.locator('.cabinet-category').first).to_contain_text("Документы")
+    same_cabinet_geometry(mobile_geometry,cabinet_geometry(p))
+    shot(p,"mobile-cabinet-industry-project")
+    assert not errors,errors;ctx.close()
+    ctx,p,errors=session(b,4,1440,940)
+    expect(p.locator('.cabinet-rail .cabinet-tile')).to_have_count(5)
+    desktop_geometry=cabinet_geometry(p)
+    shot(p,"desktop-cabinet-industry")
+    rail=p.locator('.cabinet-rail')
+    assert rail.evaluate("""el=>{const r=el.getBoundingClientRect(),cards=[...el.children].map(c=>c.getBoundingClientRect());return cards.some(c=>c.left<r.right-12&&c.right>r.right+12)}"""),"No partial next card"
+    assert p.locator('.cabinet-tabs button').first.evaluate("el=>getComputedStyle(el).textAlign==='center'"),"Tab not centered"
+    rail.scroll_into_view_if_needed()
+    box=rail.bounding_box()
+    x=box["x"]+min(rail.locator('.cabinet-tile').first.bounding_box()["width"]*.35,100)
+    y=box["y"]+box["height"]*.55
+    p.mouse.move(x+150,y)
+    p.mouse.down()
+    p.mouse.move(x,y,steps=12)
+    p.mouse.up()
+    p.wait_for_function("document.querySelector('.cabinet-rail').scrollLeft>30")
+    expect(p.locator('.employee-shortcuts')).to_be_visible()
+    shot(p,"desktop-cabinet-carousel-drag")
+    for tab in ["recent","project"]:
+        p.locator(f'[data-action="cabinet-tab:{tab}"]').click()
+        same_cabinet_geometry(desktop_geometry,cabinet_geometry(p))
+        shot(p,"desktop-cabinet-industry-"+tab)
     assert not errors,errors;ctx.close()
     b.close()
 print("Browser checks passed: real API, admin upload, draft visibility, download, desktop/mobile layout and playback.")

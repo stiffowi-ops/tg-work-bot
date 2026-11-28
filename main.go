@@ -17,7 +17,7 @@ import (
 //go:embed web
 var webFiles embed.FS
 
-const releaseVersion = "V9.7.1-content-builder"
+const releaseVersion = "V9.8.0-cabinet"
 
 func routes() http.Handler {
  mux := http.NewServeMux()
