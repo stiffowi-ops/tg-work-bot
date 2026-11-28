@@ -47,6 +47,7 @@ type employee struct {
  RecentMaterials []string `json:"recentMaterials,omitempty"`
  Read []int `json:"read"`
  Progress int `json:"progress"`
+ Identity employeeIdentity `json:"identity,omitempty"`
 }
 var errUnauthorized=errors.New("invalid Telegram session")
 func hmac256(key, value []byte) []byte {
@@ -86,20 +87,23 @@ func(s *employeeStore)get(id string)(employee,bool){s.mu.Lock();defer s.mu.Unloc
 func(s *employeeStore)all()[]employee{s.mu.Lock();defer s.mu.Unlock();out:=make([]employee,0,len(s.people));for _,p:=range s.people{out=append(out,p)};return out}
 func(s *employeeStore)put(p employee,createOnly bool)(employee,error){
  s.mu.Lock();defer s.mu.Unlock()
- if old,ok:=s.people[p.ID];ok{if createOnly{return old,nil};p.SavedMaterials=old.SavedMaterials;p.RecentMaterials=old.RecentMaterials}
+ if old,ok:=s.people[p.ID];ok{if createOnly{return old,nil};p.SavedMaterials=old.SavedMaterials;p.RecentMaterials=old.RecentMaterials;p.Identity=old.Identity}else{p.Identity=employeeIdentity{}}
  return s.putLocked(p)
 }
 func(s *employeeStore)putLocked(p employee)(employee,error){
  next:=make(map[string]employee,len(s.people)+1);for k,v:=range s.people{next[k]=v};next[p.ID]=p
- raw,err:=json.Marshal(next);if err!=nil{return p,err}
- dir:=filepath.Dir(s.path);if err=os.MkdirAll(dir,0700);err!=nil{return p,err}
- f,err:=os.CreateTemp(dir,".profiles-*");if err!=nil{return p,err}
+ return p,s.persistEmployeesLocked(next)
+}
+func(s *employeeStore)persistEmployeesLocked(next map[string]employee)error{
+ raw,err:=json.Marshal(next);if err!=nil{return err}
+ dir:=filepath.Dir(s.path);if err=os.MkdirAll(dir,0700);err!=nil{return err}
+ f,err:=os.CreateTemp(dir,".profiles-*");if err!=nil{return err}
  defer os.Remove(f.Name())
- if _,err=f.Write(raw);err!=nil{f.Close();return p,err}
- if err=f.Sync();err!=nil{f.Close();return p,err}
- if err=f.Close();err!=nil{return p,err}
- if err=os.Rename(f.Name(),s.path);err!=nil{return p,err}
- s.people=next;return p,nil
+ if _,err=f.Write(raw);err!=nil{f.Close();return err}
+ if err=f.Sync();err!=nil{f.Close();return err}
+ if err=f.Close();err!=nil{return err}
+ if err=os.Rename(f.Name(),s.path);err!=nil{return err}
+ s.people=next;return nil
 }
 func(s *employeeStore)setSavedMaterial(id,ref string,saved bool)([]string,error){
  s.mu.Lock();defer s.mu.Unlock()
@@ -209,7 +213,7 @@ func (a *employeeAPI)me(w http.ResponseWriter,r *http.Request){
   var err error;p,err=a.store.put(p,true);if err!=nil{apiError(w,500,"Не удалось создать профиль.");return}
  }
  if p.SavedMaterials==nil{p.SavedMaterials=[]string{}}
- writeJSON(w,200,p)
+ writeJSON(w,200,identityView(p,time.Now()))
 }
 func normalizeEmployee(p *employee)error{
  p.Name=strings.TrimSpace(p.Name);p.Role=strings.TrimSpace(p.Role);p.Bio=strings.TrimSpace(p.Bio)
@@ -235,7 +239,7 @@ func(a *employeeAPI)save(w http.ResponseWriter,r *http.Request){
  if _,exists:=a.store.get(p.ID);!exists{apiError(w,409,"Сначала откройте профиль.");return}
  if err:=normalizeEmployee(&p);err!=nil{apiError(w,400,err.Error());return}
  saved,err:=a.store.put(p,false);if err!=nil{apiError(w,500,"Не удалось сохранить профиль.");return}
- writeJSON(w,200,saved)
+ writeJSON(w,200,identityView(saved,time.Now()))
 }
 type colleague struct{
  ID string `json:"id"`
@@ -273,6 +277,8 @@ func(a *employeeAPI)register(mux *http.ServeMux){
  mux.HandleFunc("GET /api/me",a.me)
  mux.HandleFunc("PUT /api/me",a.save)
  mux.HandleFunc("GET /api/team",a.team)
+ mux.HandleFunc("GET /api/admin/identity",a.identityAdmin)
+ mux.HandleFunc("PUT /api/admin/identity",a.identityAdmin)
  // Unknown API paths do not expose the static handler.
  mux.HandleFunc("/api/",func(w http.ResponseWriter,r *http.Request){apiError(w,404,"Не найдено.")})
 }
