@@ -12,3 +12,33 @@
 .cabinet-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.cabinet-tabs button{min-width:0;min-height:44px;padding:7px 3px;border:1px solid #ffffff25;border-radius:11px;background:#242a2c;color:#c2c7c3;font-size:13px;font-weight:600}.cabinet-tabs button[aria-pressed=true]{border-color:#edbd79;color:#edbd79;background:#d9b77d15}
 .cabinet-rail{display:flex;overflow-x:auto;gap:10px;scroll-snap-type:x proximity;scrollbar-width:none;min-width:0;overscroll-behavior-x:contain;padding:2px 2px 5px;touch-action:pan-x pan-y}.cabinet-rail::-webkit-scrollbar{display:none}.cabinet-tile{position:relative;flex:0 0 calc((100% - 34px)/3.2);min-width:0;border:1px solid #ffffff25;background:#262c2e;border-radius:15px;overflow:hidden;scroll-snap-align:start;text-align:left}.cabinet-tile-open{display:grid;width:100%;height:100%;text-align:left;color:inherit;grid-template-rows:auto 1fr}.cabinet-tile-art{display:grid;place-items:center;aspect-ratio:16/9;width:100%;background-size:cover}.cabinet-tile-art svg{width:26px;height:26px;color:#edbd79;background:#202628ce;padding:4px;border-radius:6px}.cabinet-tile-copy{display:grid;align-content:start;gap:4px;padding:11px;min-width:0}.cabinet-tile-copy strong{font-size:14px;line-height:1.3;overflow-wrap:anywhere}.cabinet-tile-copy small{font-size:12px;color:#b9bfba}.cabinet-tile>.cabinet-bookmark{position:absolute;top:5px;right:5px;width:34px;height:34px;background:#202426e8}.cabinet-tile>.cabinet-bookmark.on{background:#463c2a}.cabinet-training{display:flex;align-items:center;text-align:left;gap:12px;min-height:70px;width:100%;padding:14px;background:#262b2d;border:1px solid #ffffff25;border-radius:16px}.cabinet-training .grow{display:grid;gap:4px}.cabinet-training small{color:#b9bfba}.cabinet-training>svg{color:#edbd79}.cabinet-training .cabinet-folder-icon{width:44px;height:44px}
 @media(max-width:760px){.employee-shortcuts{gap:9px}.employee-shortcut{min-height:148px;aspect-ratio:auto;border-radius:15px;background-size:auto 78%}.employee-shortcut-copy{padding:10px;gap:3px}.employee-shortcut-copy small{font-size:11px}.employee-shortcut-copy strong{font-size:16px}.employee-shortcut-copy>span{font-size:11px}.cabinet-tile{flex-basis:44%;border-radius:12px}.cabinet-tile-copy{padding:9px}.cabinet-tile-copy strong{font-size:13px}.cabinet-tabs button{font-size:12px}.employee-bio{margin-top:12px;padding-top:12px;font-size:13px}}
+
+/* Visual review: keep the original shell, soften the background only in the cabinet. */
+.routing-view.cabinet-view::before{background:linear-gradient(90deg,#141819f5 0%,#141819e8 45%,#141819cb 100%),var(--routing-bg) right center/auto 100% no-repeat;background-color:#141819}
+.cabinet-view .employee-card{background:linear-gradient(110deg,#262d30f5,#242a2cee)}
+.cabinet-view .cabinet-tabs button{text-align:center}
+.cabinet-view .employee-shortcut{background-size:cover;background-position:center top}
+.cabinet-view .employee-shortcut::before{background:linear-gradient(180deg,#14191b08 0%,#171c1e19 28%,#202628c9 62%,#202628 100%)}
+.cabinet-view .employee-shortcut-copy{text-shadow:0 1px 5px #101416b0}
+.cabinet-view .cabinet-tile-art{background-position:center}
+@media(min-width:761px){
+ .cabinet-view .wrap.employee-view{max-width:960px;padding-top:24px}
+ .cabinet-view .employee-start{gap:16px}
+ .cabinet-view .employee-welcome h1{font-size:35px;line-height:1.04}
+ .cabinet-view .employee-card{padding:18px 22px}
+ .cabinet-view .employee-photo .avatar.big{width:72px;height:72px}
+ .cabinet-view .employee-bio{margin-top:12px;padding-top:10px}
+ .cabinet-view .employee-shortcut{min-height:154px;height:clamp(154px,18vh,182px);aspect-ratio:auto}
+ .cabinet-view .employee-shortcut-copy{padding:14px}
+ .cabinet-view .cabinet-work{gap:14px}
+ .cabinet-view .cabinet-section{gap:8px}
+ .cabinet-view .cabinet-tile{flex-basis:calc((100% - 34px)/3.2)}
+ .cabinet-view .cabinet-tile-art{aspect-ratio:2.25}
+ .cabinet-view .cabinet-training{min-height:62px;padding:10px 14px}
+}
+@media(max-width:760px){
+ .routing-view.cabinet-view::before{background:linear-gradient(180deg,#141819c9 0%,#141819ef 64%,#141819 100%),var(--routing-bg) center top/auto 65% no-repeat}
+ .cabinet-view .employee-shortcut{min-height:142px}
+ .cabinet-view .employee-shortcut-team,.cabinet-view .employee-shortcut-project.industry{background-size:auto 68%}
+ .cabinet-view .employee-shortcut::before{background:linear-gradient(180deg,#14191b00 0%,#171c1e15 25%,#202628dc 62%,#202628 84%)}
+}

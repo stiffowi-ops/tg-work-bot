@@ -321,5 +321,44 @@ with sync_playwright() as pw:
     p.locator('.cms-link-covers').scroll_into_view_if_needed()
     shot(p,"industry-mobile-link-editor")
     assert not errors,errors;ctx.close()
+    # Populated cabinet screenshots from actual employee and CMS APIs.
+    ctx,p,errors=session(b,4,390,844)
+    expect(p.locator('.cabinet-tabs')).to_be_visible()
+    p.evaluate("""async () => {
+        await employeeRequest('/api/me','PUT',{...state,name:'Александр Иванов',role:'Менеджер по развитию',bio:'Работаю с клиентами и развиваю отраслевые направления.',project:'industry'});
+        const project=await cmsRequest('/api/content/industry');
+        const wanted=['Сайт продукта','Скрипт первой встречи','Отраслевая презентация','Чек-лист квалификации'];
+        for(const title of wanted.reverse()){
+            const block=project.blocks.find(b=>b.title===title);
+            if(!block)throw Error('Missing fixture '+title);
+            await cmsRequest('/api/me/materials','PUT',{project:'industry',id:block.id,saved:true});
+            await cmsRequest('/api/me/recent','POST',{project:'industry',id:block.id});
+        }
+    }""")
+    p.reload()
+    expect(p.locator('.employee-bio')).to_contain_text("развиваю отраслевые направления")
+    expect(p.locator('.employee-shortcut-project')).to_contain_text("Отраслевое деление")
+    expect(p.locator('.cabinet-rail .cabinet-tile')).to_have_count(5)
+    assert p.evaluate("""async () => {
+        const nodes=[...document.querySelectorAll('.employee-shortcut')];
+        return (await Promise.all(nodes.map(async n=>{
+            const url=getComputedStyle(n).backgroundImage.match(/url\(["']?(.*?)["']?\)/)?.[1];
+            if(!url)return false;
+            const img=new Image();img.src=url;await img.decode();return img.naturalWidth>100;
+        }))).every(Boolean)
+    }"""),"Photo assets do not decode"
+    assert p.locator('.cabinet-rail').evaluate('el=>el.scrollWidth>el.clientWidth'),"No swipe overflow"
+    shot(p,"mobile-cabinet-industry-saved")
+    p.locator('[data-action="cabinet-tab:recent"]').click()
+    expect(p.locator('.cabinet-rail .cabinet-tile').first).to_contain_text("Сайт продукта")
+    shot(p,"mobile-cabinet-industry-recent")
+    p.locator('[data-action="cabinet-tab:project"]').click()
+    expect(p.locator('.cabinet-category').first).to_contain_text("Документы")
+    shot(p,"mobile-cabinet-industry-project")
+    assert not errors,errors;ctx.close()
+    ctx,p,errors=session(b,4,1440,940)
+    expect(p.locator('.cabinet-rail .cabinet-tile')).to_have_count(5)
+    shot(p,"desktop-cabinet-industry")
+    assert not errors,errors;ctx.close()
     b.close()
 print("Browser checks passed: real API, admin upload, draft visibility, download, desktop/mobile layout and playback.")
