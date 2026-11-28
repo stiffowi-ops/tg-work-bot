@@ -78,3 +78,21 @@
 .cabinet-view .award-avatar .avatar.big{top:11%;left:15.5%;width:69%;height:69%;box-sizing:border-box}
 .cabinet-view .award-profile .employee-photo{flex:0 0 auto;width:auto;height:auto;max-width:none;overflow:visible}
 .award-admin-form{display:grid;gap:12px}.award-admin-form label{display:grid;gap:6px}.award-admin-form select,.award-admin-form input{width:100%;min-width:0}
+
+.identity-avatar{position:relative;display:block;flex:none;width:var(--portrait-size,112px);aspect-ratio:1/1;isolation:isolate;overflow:visible}
+.identity-avatar .avatar.big{position:absolute!important;left:15.5%!important;top:11%!important;width:69%!important;height:69%!important;border:0!important;border-radius:50%;overflow:hidden;display:grid;place-items:center;background:#47433a;font-size:26px;color:#edce96}
+.identity-avatar .avatar img,.identity-plain img{display:block;width:100%;height:100%;object-fit:cover;border-radius:50%;transform:scale(1.08)}
+.identity-frame{position:absolute;inset:0;display:block;width:100%;height:100%;pointer-events:none;z-index:2;max-width:none}
+.identity-avatar .award-year{position:absolute;top:1%;left:50%;transform:translateX(-50%) rotate(45deg);width:15%;height:15%;border:1px solid var(--metal-light);background:linear-gradient(135deg,var(--metal-mid),#232625 80%);display:grid;place-items:center;box-sizing:border-box;z-index:3;box-shadow:0 1px 3px #0008}
+.identity-avatar .award-year b{transform:rotate(-45deg);font-size:clamp(10px,1.3vw,15px);line-height:1;color:var(--metal-light)}
+.identity-avatar .award-ribbon{position:absolute;left:50%;bottom:10%;transform:translateX(-50%);z-index:4;max-width:96%;width:max-content;white-space:nowrap;box-sizing:border-box;background:linear-gradient(100deg,var(--metal-dark),var(--metal-end) 27%,var(--metal-light) 52%,var(--metal-mid) 96%);color:#24201b;clip-path:polygon(0 0,100% 0,95% 50%,100% 100%,0 100%,5% 50%);font-size:clamp(8px,1vw,12px);font-weight:750;line-height:1.55;letter-spacing:.065em;text-transform:uppercase;padding:1px 10px;text-align:center}
+.identity-plain{display:grid;place-items:center;width:var(--portrait-size,112px);aspect-ratio:1}.identity-plain .avatar.big{display:grid;place-items:center;width:69%;height:69%;border:1px solid #ffffff35;border-radius:50%;overflow:hidden;background:#47433a;color:#edce96}
+.identity-settings-link{display:block;color:#dfc795;text-align:left;font-size:12px;padding:5px 0;margin-top:3px;min-height:26px}
+.identity-settings{display:grid;gap:14px}.identity-choices{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.identity-choice{display:grid;justify-items:center;gap:5px;padding:9px 3px;background:#242a29;border:1px solid #ffffff22;border-radius:12px;--portrait-size:110px}.identity-choice.chosen{border-color:#d5b77f;background:#343129}.identity-choice strong{font-size:12px}.identity-choice small{font-size:11px;color:#c7ba9b}.identity-choice .award-avatar{width:110px}.identity-choice .award-ribbon{font-size:8px}.identity-choice .award-year b{font-size:10px}.identity-choice:disabled{opacity:.42;cursor:not-allowed}
+.cabinet-view .employee-photo:has(.identity-plain){width:auto;height:auto;min-width:0;flex:none;overflow:visible;background:transparent}
+.cabinet-view .employee-photo .identity-plain{--portrait-size:112px}
+.cabinet-view .employee-photo .identity-plain .avatar.big{width:69%;height:69%}
+.team-detail-identity .identity-avatar,.team-detail-identity .identity-plain{--portrait-size:112px}
+.team-detail .award-shelf{width:100%;margin-block:12px}
+@media(max-width:760px){.cabinet-view .award-profile .award-avatar{width:96px}.cabinet-view .employee-photo .identity-plain{--portrait-size:96px}}
+@media(max-width:370px){.cabinet-view .award-profile .award-avatar{width:78px}.identity-avatar .award-ribbon{font-size:7px;padding-inline:5px}}

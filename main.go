@@ -17,7 +17,7 @@ import (
 //go:embed web
 var webFiles embed.FS
 
-const releaseVersion = "V9.9.0-personal-identity"
+const releaseVersion = "V9.9.1-personal-identity"
 
 func routes() http.Handler {
  mux := http.NewServeMux()
