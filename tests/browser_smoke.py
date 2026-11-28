@@ -411,5 +411,39 @@ with sync_playwright() as pw:
         same_cabinet_geometry(desktop_geometry,cabinet_geometry(p))
         shot(p,"desktop-cabinet-industry-"+tab)
     assert not errors,errors;ctx.close()
+    # V9.9: actual API-backed awards; fixture data only, no production mutations.
+    ctx,p,errors=session(b,42,1440,940)
+    p.evaluate("""async () => {
+        for(const data of [{id:'4',action:'start',startMonth:'2020-01'},{id:'4',action:'leader'},{id:'4',action:'expert'}])
+            await employeeRequest('/api/admin/identity','PUT',data);
+    }""")
+    assert not errors,errors;ctx.close()
+    for w,h in [(320,740),(390,844),(430,932),(1440,940)]:
+        ctx,p,errors=session(b,4,w,h)
+        expect(p.locator('.award-frame')).to_be_visible()
+        expect(p.locator('.award-ribbon')).to_have_text("Лидер × 1")
+        expect(p.locator('.award-year')).to_be_visible()
+        assert p.evaluate("""async () => {
+            const frame=document.querySelector('.award-frame');
+            await frame.decode();
+            const r=frame.getBoundingClientRect(),a=document.querySelector('.award-avatar').getBoundingClientRect(),ribbon=document.querySelector('.award-ribbon').getBoundingClientRect(),year=document.querySelector('.award-year').getBoundingClientRect();
+            const center=x=>x.left+x.width/2;
+            return Math.abs(r.width-r.height)<=1&&Math.abs(center(r)-center(a))<=1&&Math.abs(center(ribbon)-center(a))<=1&&Math.abs(center(year)-center(a))<=1;
+        }"""),"Award frame is not centered"
+        assert p.evaluate("""async () => {
+            const cards=[...document.querySelectorAll('.employee-shortcut')];
+            return (await Promise.all(cards.map(async c=>{
+                const url=getComputedStyle(c).backgroundImage.match(/url\\(["']?(.*?)["']?\\)/)?.[1];
+                if(!url)return false;
+                const image=new Image();image.src=url;await image.decode();return image.naturalWidth>=1000;
+            }))).every(Boolean);
+        }"""),"HD assets missing"
+        shot(p,"v99-profile-"+str(w))
+        if w==390:
+            p.locator('.award-row.leader').click()
+            expect(p.locator('.award-dialog')).to_be_visible()
+            shot(p,"v99-achievement-detail")
+            p.locator('.award-close').click()
+        assert not errors,errors;ctx.close()
     b.close()
 print("Browser checks passed: real API, admin upload, draft visibility, download, desktop/mobile layout and playback.")
