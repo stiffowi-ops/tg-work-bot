@@ -17,10 +17,10 @@ function cabinetArtwork(m){
  return 'cover-'+({text:'script',section:'analytics',faq:'instruction',image:'case'}[m.kind]||'general');
 }
 function cabinetTileFace(title,subtitle,art,icon=''){
- return '<span class="cabinet-tile-art cover-art '+art+'" aria-hidden="true">'+(icon?I(icon):'')+'</span><span class="cabinet-tile-copy"><strong title="'+esc(title)+'">'+esc(title)+'</strong><small>'+esc(subtitle)+'</small></span>'
+ return '<span class="cabinet-tile-art cover-art '+art+'" aria-hidden="true">'+(icon?I(icon):'')+'</span><span class="cabinet-tile-copy"><strong title="'+esc(title)+'">'+esc(title)+'</strong>'+(subtitle?'<small>'+esc(subtitle)+'</small>':'')+'</span>'
 }
 function cabinetTile(m){
- return '<div class="cabinet-tile"><button class="cabinet-tile-open" aria-label="'+esc(m.title)+'" data-action="cabinet-open:'+esc(cabinetRef(m))+'">'+cabinetTileFace(m.title,cmsKinds[m.kind]||'Материал',cabinetArtwork(m))+'</button>'+cabinetBookmark(m)+'</div>'
+ return '<div class="cabinet-tile"><button class="cabinet-tile-open" aria-label="'+esc(m.title)+'" data-action="cabinet-open:'+esc(cabinetRef(m))+'">'+cabinetTileFace(m.title,'',cabinetArtwork(m))+'</button>'+cabinetBookmark(m)+'</div>'
 }
 function cabinetCategory(k,title,icon,count){
  const art='cover-'+({document:'presentation',video:'video',link:'website link-art-website',image:'case',faq:'instruction',text:'script',section:'analytics'}[k]);

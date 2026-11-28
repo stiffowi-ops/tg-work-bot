@@ -40,6 +40,8 @@ def project(p):
     expect(p.locator(".routing-player")).to_be_visible(timeout=15000)
 def cabinet_geometry(p):
     expect(p.locator('.cabinet-tile').first).to_be_visible()
+    assert p.locator(".cabinet-tile-open:not(.cabinet-category) .cabinet-tile-copy small").count()==0,"Redundant material types"
+    assert p.locator(".cabinet-tile-copy").evaluate_all("els=>els.every(e=>getComputedStyle(e).textAlign==='center'&&getComputedStyle(e).justifyContent==='center')"),"Uncentered card labels"
     dims=p.evaluate("""() => {
         const measure=(selector)=>[...document.querySelectorAll(selector)].map(e=>{const r=e.getBoundingClientRect();return [r.width,r.height]});
         return {tiles:measure('.cabinet-tile'),art:measure('.cabinet-tile-art'),copy:measure('.cabinet-tile-copy'),tabs:measure('.cabinet-tabs button'),shortcuts:measure('.employee-shortcut')};
