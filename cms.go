@@ -27,6 +27,7 @@ type contentBlock struct {
  Text string `json:"text"`
  URL string `json:"url"`
  Cover string `json:"cover"`
+ LinkStyle string `json:"linkStyle,omitempty"`
  Filename string `json:"filename,omitempty"`
  MIME string `json:"mime,omitempty"`
  Published bool `json:"published"`
@@ -82,7 +83,7 @@ func validLink(s string)bool{u,err:=url.Parse(s);return err==nil&&u.Scheme=="htt
 func fileKind(k string)bool{return k=="document"||k=="video"||k=="image"}
 func validBlock(b contentBlock)bool{
  if strings.TrimSpace(b.Title)==""||!cleanLength(b.Title,140)||!cleanLength(b.Text,12000)||!cleanLength(b.URL,2048)||!cleanLength(b.Cover,40){return false}
- switch b.Kind{case "text","faq","section":return true;case "link":return validLink(b.URL);case "document","video","image":return b.Filename!=""&&b.MIME!="";default:return false}
+ switch b.Kind{case "text","faq","section":return true;case "link":return validLink(b.URL)&&(b.LinkStyle==""||b.LinkStyle=="compact"||b.LinkStyle=="wide"||b.LinkStyle=="minimal");case "document","video","image":return b.Filename!=""&&b.MIME!="";default:return false}
 }
 func randomID()(string,error){b:=make([]byte,16);_,err:=rand.Read(b);return hex.EncodeToString(b),err}
 func validFileID(id string)bool{b,err:=hex.DecodeString(id);return err==nil&&len(b)==16}
@@ -246,7 +247,7 @@ func (c *cms) add(w http.ResponseWriter,r *http.Request){
  if err:=r.ParseMultipartForm(1<<20);err!=nil{apiError(w,400,"Не удалось прочитать загрузку (лимит 128 МБ).");return}
  defer r.MultipartForm.RemoveAll()
  bid,err:=randomID();if err!=nil{apiError(w,500,"Ошибка создания блока.");return}
- b:=contentBlock{ID:bid,Kind:r.FormValue("kind"),Title:strings.TrimSpace(r.FormValue("title")),Text:r.FormValue("text"),URL:r.FormValue("url"),Cover:r.FormValue("cover"),Published:r.FormValue("published")=="true"}
+ b:=contentBlock{ID:bid,Kind:r.FormValue("kind"),Title:strings.TrimSpace(r.FormValue("title")),Text:r.FormValue("text"),URL:r.FormValue("url"),Cover:r.FormValue("cover"),LinkStyle:r.FormValue("linkStyle"),Published:r.FormValue("published")=="true"}
  var dest string
  if fileKind(b.Kind){
   f,header,e:=r.FormFile("file");if e!=nil{apiError(w,400,"Выберите файл.");return};defer f.Close()

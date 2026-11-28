@@ -14,7 +14,7 @@ Set ADMIN_USER_IDS to comma-separated numeric Telegram user IDs. Explicitly conf
 
 Group diagnostics: in Admin, open the Telegram connection check. It uses getMe, getChat, getChatMember and getChatMemberCount; the admin's own membership is checked independently of their app-admin exception. Existing group members can sign in on first launch without any prior join event. The directory is registered profiles only, not a full Telegram roster. Unknown membership states and Telegram errors do not grant employee access. Migration IDs are reported, not automatically adopted. No polling, history scraping or additional token needed.
 
-Deployment verification: GET /api/health returns the embedded release version (V9.7.0-content-builder). The same version is logged on startup, before access configuration. If it is absent after deployment, verify the host's checked-out branch and source revision; restarting the old image does not update the source.
+Deployment verification: GET /api/health returns the embedded release version (V9.7.1-content-builder). The same version is logged on startup, before access configuration. If it is absent after deployment, verify the host's checked-out branch and source revision; restarting the old image does not update the source.
 
 Mobile layout: the scrollable shell and the bottom navigation occupy separate rows; the navigation no longer overlays the feed. Phone screenshots are viewport captures, not full-page composites. Use PORT supplied by the host if automatic, otherwise 8080, matching the proxy target. Preserve the existing persistent volume before deleting an old service.
 
@@ -30,3 +30,5 @@ Production: use one Dockerfile and set DATA_DIR=/app/data in Bothost. Mount the 
 
 ## Content Builder V9.7
 The existing ordered block array supports up to 200 mixed materials. Insert at any boundary; the upload checks the current revision and insertion anchor. Duplicates are independent unpublished drafts (file copies are independent, too). Preview shows published blocks using the employee rendering function. Existing document artwork and compact legacy links stay intact; links optionally use the same selectable cover artwork. No storage migration or change to authentication.
+
+Links support compact, wide and minimal formats; new links default to compact with the globe (website) cover. Existing links without a style retain their previous appearance, and document covers are unchanged. Link-specific SVG assets are local and require no network.
