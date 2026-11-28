@@ -42,6 +42,11 @@ def cabinet_geometry(p):
     expect(p.locator('.cabinet-tile').first).to_be_visible()
     assert p.locator(".cabinet-tile-open:not(.cabinet-category) .cabinet-tile-copy small").count()==0,"Redundant material types"
     assert p.locator(".cabinet-tile-copy").evaluate_all("els=>els.every(e=>getComputedStyle(e).textAlign==='center'&&getComputedStyle(e).justifyContent==='center')"),"Uncentered card labels"
+    assert p.evaluate("""() => {
+        const rect=s=>document.querySelector(s).getBoundingClientRect();
+        const tabs=rect('.cabinet-tabs'),rail=rect('.cabinet-rail'),section=rect('.cabinet-section'),shortcuts=rect('.employee-shortcuts');
+        return [rail,section,shortcuts].every(r=>Math.abs(tabs.left-r.left)<=1&&Math.abs(tabs.right-r.right)<=1);
+    }"""),"Cabinet tabs, rail and navigation cards must share both edges"
     dims=p.evaluate("""() => {
         const measure=(selector)=>[...document.querySelectorAll(selector)].map(e=>{const r=e.getBoundingClientRect();return [r.width,r.height]});
         return {tiles:measure('.cabinet-tile'),art:measure('.cabinet-tile-art'),copy:measure('.cabinet-tile-copy'),tabs:measure('.cabinet-tabs button'),shortcuts:measure('.employee-shortcut')};
