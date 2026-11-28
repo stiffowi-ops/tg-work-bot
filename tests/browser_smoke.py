@@ -38,6 +38,21 @@ def project(p):
     nav(p,"projects");p.locator('[data-action="projectdocs:calendar"]').click()
     expect(p.locator(".feed-heading h1")).to_have_text("Календарное планирование")
     expect(p.locator(".routing-player")).to_be_visible(timeout=15000)
+def cabinet_geometry(p):
+    expect(p.locator('.cabinet-tile').first).to_be_visible()
+    dims=p.evaluate("""() => {
+        const measure=(selector)=>[...document.querySelectorAll(selector)].map(e=>{const r=e.getBoundingClientRect();return [r.width,r.height]});
+        return {tiles:measure('.cabinet-tile'),art:measure('.cabinet-tile-art'),copy:measure('.cabinet-tile-copy'),tabs:measure('.cabinet-tabs button'),shortcuts:measure('.employee-shortcut')};
+    }""")
+    for group,rects in dims.items():
+        assert rects,group
+        assert all(abs(w-rects[0][0])<=1 and abs(h-rects[0][1])<=1 for w,h in rects),(group,rects)
+    return {k:v[0] for k,v in dims.items()}
+
+def same_cabinet_geometry(first,second):
+    for k in first:
+        assert all(abs(a-b)<=1 for a,b in zip(first[k],second[k])),(k,first[k],second[k])
+
 def shot(p,name):
     assert p.evaluate("document.documentElement.scrollWidth <= innerWidth+1"), name+" overflow"
     p.screenshot(path=str(out/(name+".png")),full_page=False,animations="disabled")
@@ -348,6 +363,7 @@ with sync_playwright() as pw:
         }))).every(Boolean)
     }"""),"Photo assets do not decode"
     assert p.locator('.cabinet-rail').evaluate('el=>el.scrollWidth>el.clientWidth'),"No swipe overflow"
+    mobile_geometry=cabinet_geometry(p)
     shot(p,"mobile-cabinet-industry-saved")
     p.locator('.cabinet-rail').scroll_into_view_if_needed()
     shot(p,"mobile-cabinet-carousel")
@@ -358,13 +374,16 @@ with sync_playwright() as pw:
     p.locator('.cabinet-rail').evaluate("el=>el.scrollLeft=0")
     p.locator('[data-action="cabinet-tab:recent"]').click()
     expect(p.locator('.cabinet-rail .cabinet-tile').first).to_contain_text("Сайт продукта")
+    same_cabinet_geometry(mobile_geometry,cabinet_geometry(p))
     shot(p,"mobile-cabinet-industry-recent")
     p.locator('[data-action="cabinet-tab:project"]').click()
     expect(p.locator('.cabinet-category').first).to_contain_text("Документы")
+    same_cabinet_geometry(mobile_geometry,cabinet_geometry(p))
     shot(p,"mobile-cabinet-industry-project")
     assert not errors,errors;ctx.close()
     ctx,p,errors=session(b,4,1440,940)
     expect(p.locator('.cabinet-rail .cabinet-tile')).to_have_count(5)
+    desktop_geometry=cabinet_geometry(p)
     shot(p,"desktop-cabinet-industry")
     rail=p.locator('.cabinet-rail')
     assert rail.evaluate("""el=>{const r=el.getBoundingClientRect(),cards=[...el.children].map(c=>c.getBoundingClientRect());return cards.some(c=>c.left<r.right-12&&c.right>r.right+12)}"""),"No partial next card"
@@ -380,6 +399,10 @@ with sync_playwright() as pw:
     p.wait_for_function("document.querySelector('.cabinet-rail').scrollLeft>30")
     expect(p.locator('.employee-shortcuts')).to_be_visible()
     shot(p,"desktop-cabinet-carousel-drag")
+    for tab in ["recent","project"]:
+        p.locator(f'[data-action="cabinet-tab:{tab}"]').click()
+        same_cabinet_geometry(desktop_geometry,cabinet_geometry(p))
+        shot(p,"desktop-cabinet-industry-"+tab)
     assert not errors,errors;ctx.close()
     b.close()
 print("Browser checks passed: real API, admin upload, draft visibility, download, desktop/mobile layout and playback.")

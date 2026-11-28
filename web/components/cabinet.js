@@ -16,8 +16,16 @@ function cabinetArtwork(m){
  if(m.kind==='video')return 'cover-video';
  return 'cover-'+({text:'script',section:'analytics',faq:'instruction',image:'case'}[m.kind]||'general');
 }
+function cabinetTileFace(title,subtitle,art,icon=''){
+ return '<span class="cabinet-tile-art cover-art '+art+'" aria-hidden="true">'+(icon?I(icon):'')+'</span><span class="cabinet-tile-copy"><strong title="'+esc(title)+'">'+esc(title)+'</strong><small>'+esc(subtitle)+'</small></span>'
+}
 function cabinetTile(m){
- return '<div class="cabinet-tile"><button class="cabinet-tile-open" data-action="cabinet-open:'+esc(cabinetRef(m))+'"><span class="cabinet-tile-art cover-art '+cabinetArtwork(m)+'"></span><span class="cabinet-tile-copy"><strong>'+esc(m.title)+'</strong><small>'+esc(cmsKinds[m.kind]||'Материал')+'</small></span></button>'+cabinetBookmark(m)+'</div>'
+ return '<div class="cabinet-tile"><button class="cabinet-tile-open" aria-label="'+esc(m.title)+'" data-action="cabinet-open:'+esc(cabinetRef(m))+'">'+cabinetTileFace(m.title,cmsKinds[m.kind]||'Материал',cabinetArtwork(m))+'</button>'+cabinetBookmark(m)+'</div>'
+}
+function cabinetCategory(k,title,icon,count){
+ const art='cover-'+({document:'presentation',video:'video',link:'website link-art-website',image:'case',faq:'instruction',text:'script',section:'analytics'}[k]);
+ const label=count+' '+(count%10===1&&count%100!==11?'материал':count%10>=2&&count%10<=4&&(count%100<12||count%100>14)?'материала':'материалов');
+ return '<div class="cabinet-tile"><button class="cabinet-tile-open cabinet-category" aria-label="'+esc(title)+'" data-action="cabinet-category:'+k+'">'+cabinetTileFace(title,label,art,icon)+'</button></div>'
 }
 function cabinetWork(){
  const p=active(),catalog=cabinetCatalog||[],items=p?catalog.filter(m=>m.project===p.id):[];
@@ -27,7 +35,7 @@ function cabinetWork(){
  let body='';
  if(cabinetCatalog===null)body='<p class="cabinet-note">'+esc(cabinetError||'Загружаем материалы…')+'</p>'+(cabinetError?btn('Повторить','cabinet-refresh'):'');
  else if(cabinetTab==='project'){
-  body=p?'<div class="cabinet-rail" tabindex="0" role="region" aria-label="Карусель материалов">'+cabinetGroups.map(([k,t,i])=>{const n=items.filter(m=>m.kind===k).length;return n?'<button class="cabinet-tile cabinet-category" data-action="cabinet-category:'+k+'"><span class="cabinet-tile-art cover-art cover-'+({document:'presentation',video:'video',link:'general',image:'case',faq:'instruction',text:'script',section:'analytics'}[k])+'">'+I(i)+'</span><span class="cabinet-tile-copy"><strong>'+esc(t)+'</strong><small>'+n+' мат.</small></span></button>':''}).join('')+'</div>':'<p class="cabinet-note">Закрепите проект, чтобы его материалы были под рукой.</p>';
+  body=p?'<div class="cabinet-rail" tabindex="0" role="region" aria-label="Карусель материалов">'+cabinetGroups.map(([k,t,i])=>{const n=items.filter(m=>m.kind===k).length;return n?cabinetCategory(k,t,i,n):''}).join('')+'</div>':'<p class="cabinet-note">Закрепите проект, чтобы его материалы были под рукой.</p>';
   if(p&&!items.length)body='<p class="cabinet-note">В проекте пока нет опубликованных материалов.</p>';
  }else body=matches.length?'<div class="cabinet-rail" tabindex="0" role="region" aria-label="Карусель материалов">'+matches.map(cabinetTile).join('')+'</div>':'<p class="cabinet-note">'+(cabinetTab==='recent'?'Здесь появятся материалы, которые вы открывали.':'Сохраните нужный материал с помощью закладки.')+'</p>';
  return '<section class="cabinet-section"><div class="cabinet-section-head"><h2>Мои материалы</h2></div><div class="cabinet-tabs" role="group" aria-label="Подборка материалов">'+[['saved','Сохранённые'],['recent','Недавние'],['project','Мой проект']].map(([k,t])=>'<button data-action="cabinet-tab:'+k+'" aria-pressed="'+(cabinetTab===k)+'">'+t+'</button>').join('')+'</div>'+body+'</section><button class="cabinet-training" data-go="tests"><span class="cabinet-folder-icon">'+I('test')+'</span><span class="grow"><strong>Моё обучение</strong><small>Тесты и задания</small></span>'+I('arrow')+'</button>';
