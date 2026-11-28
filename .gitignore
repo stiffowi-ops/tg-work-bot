@@ -11,3 +11,10 @@ __pycache__/
 *.iml
 .DS_Store
 Thumbs.db
+
+# Local WorkHub runtime state (never commit employee data or uploads)
+/data/
+/runtime/
+/AppData/
+/AppRuntime/
+/test-screenshots/

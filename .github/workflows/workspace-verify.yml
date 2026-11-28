@@ -25,6 +25,26 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -o /tmp/workhub .
       - name: Docker build
         run: docker build -t workhub-verification .
+      - name: Docker persistent storage smoke test
+        run: |
+          set -eu
+          docker volume create workhub-storage-test
+          trap 'docker rm -f workhub-storage-test >/dev/null 2>&1 || true; docker volume rm workhub-storage-test >/dev/null 2>&1 || true' EXIT
+          docker run -d --name workhub-storage-test -e BOT_TOKEN=test-token -e WORK_CHAT_ID=-100123 -v workhub-storage-test:/app/data workhub-verification
+          for i in $(seq 1 30); do
+            if docker logs workhub-storage-test 2>&1 | grep -q 'storage ready; DATA_DIR=/app/data'; then break; fi
+            sleep 1
+          done
+          docker logs workhub-storage-test 2>&1 | grep 'storage ready; DATA_DIR=/app/data'
+          docker exec -u workhub workhub-storage-test sh -c 'mkdir -p "$DATA_DIR/data/projects/calendar"; echo retained > "$DATA_DIR/data/projects/calendar/.storage-test"'
+          docker rm -f workhub-storage-test
+          docker run -d --name workhub-storage-test -e BOT_TOKEN=test-token -e WORK_CHAT_ID=-100123 -v workhub-storage-test:/app/data workhub-verification
+          for i in $(seq 1 30); do
+            if docker logs workhub-storage-test 2>&1 | grep -q 'storage ready; DATA_DIR=/app/data'; then break; fi
+            sleep 1
+          done
+          docker logs workhub-storage-test 2>&1 | grep 'storage ready; DATA_DIR=/app/data'
+          docker exec -u workhub workhub-storage-test sh -c 'test "$(cat "$DATA_DIR/data/projects/calendar/.storage-test")" = retained'
       - name: JavaScript syntax
         run: for f in web/components/*.js; do node --check "$f"; done
       - uses: actions/setup-python@v5
